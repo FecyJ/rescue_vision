@@ -1,0 +1,17 @@
+# Numerical computing
+numpy>=1.24,<2.0
+scipy>=1.9.3,<2.0
+
+# Computer vision
+# 与当前 Hailo Apps 官方依赖保持一致，避免安装新版 OpenCV 产生兼容问题
+opencv-python==4.10.0.84
+
+# Configuration
+PyYAML>=6.0,<7.0
+
+# Raspberry Pi <-> STM32 serial communication
+pyserial>=3.5,<4.0
+
+# Logging and diagnostics
+loguru>=0.7,<1.0
+tqdm>=4.66,<5.0
