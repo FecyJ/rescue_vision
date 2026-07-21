@@ -81,9 +81,11 @@ class GroundProjector:
         """
         将机器人地面坐标系中的二维点转换为去畸变图像中的像素坐标
         """
-        ground_array = pixels_to_array(ground_points)  # shape=(N, 2)
+        points_array = np.array(
+            [[[p.x, p.y]] for p in ground_points],dtype=np.float64
+        )
         pixel_points = cv2.perspectiveTransform(
-            ground_array.reshape(-1, 1, 2), self.ground_to_image
+            points_array.reshape(-1, 1, 2), self.ground_to_image
         ).reshape(-1, 2)
         return array_to_pixels(pixel_points, UndistortedPixel)
 

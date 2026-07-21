@@ -6,15 +6,15 @@ from rescue_vision.geometry.ground_projector import (
     BevConfig,
     GroundProjector,
 )
-from rescue_vision.geometry.types import RawPixel
+from rescue_vision.geometry.types import RawPixel, GroundPoint, UndistortedPixel
 
-IMAGE_SIZE = (1536, 864)  # OpenCV 顺序：(width, height)
+IMAGE_SIZE = (2304, 1296)  # (width, height)
 
 CAMERA_MATRIX = np.array(
     [
-        [510.0,   0.0, 768.0],
-        [  0.0, 510.0, 432.0],
-        [  0.0,   0.0,   1.0],
+        [982.1,   0.0, 1152.0],
+        [  0.0, 982.1,  648.0],
+        [  0.0,   0.0,    1.0],
     ],
     dtype=np.float64,
 )
@@ -26,13 +26,71 @@ CAMERA_MATRIX = np.array(
 # 仅用于验证去畸变代码和坐标转换流程。
 DISTORTION = np.array(
     [
-        -0.0600,
-         0.0120,
-        -0.0020,
-         0.0003,
+        0.17,
+        0.15,
+        -0.05,
+        0.00,
     ],
     dtype=np.float64,
 ).reshape(4, 1)
+
+
+def draw_bev_source_region(
+    undistorted_image: np.ndarray,
+    projector,
+) -> np.ndarray:
+    config = projector.bev_config
+
+    ground_corners = [
+        GroundPoint(config.x_max, config.y_max),
+        GroundPoint(config.x_max, config.y_min),
+        GroundPoint(config.x_min, config.y_min),
+        GroundPoint(config.x_min, config.y_max),
+    ]
+
+    image_corners = [
+        projector.ground_to_pixel(point)
+        for point in ground_corners
+    ]
+
+    polygon = np.array(
+        [
+            [round(point.u), round(point.v)]
+            for point in image_corners
+        ],
+        dtype=np.int32,
+    )
+
+    output = undistorted_image.copy()
+
+    cv2.polylines(
+        output,
+        [polygon],
+        isClosed=True,
+        color=(0, 255, 0),
+        thickness=3,
+    )
+
+    for index, point in enumerate(polygon):
+        cv2.circle(
+            output,
+            tuple(point),
+            radius=6,
+            color=(0, 0, 255),
+            thickness=-1,
+        )
+
+        cv2.putText(
+            output,
+            str(index),
+            tuple(point + [8, -8]),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 255),
+            2,
+        )
+
+    return output
 
 
 def main():
@@ -68,6 +126,7 @@ def main():
 
     bev = projector.make_bev_image(undistorted_frame)
     cv2.imwrite("bev.jpg", bev)
+    cv2.imwrite("undistorted.jpg", undistorted_frame)
 
     raw_contact = RawPixel(
         u=820.0,
@@ -83,6 +142,16 @@ def main():
     )
 
     print(ground_contact)
+
+    debug_image = draw_bev_source_region(
+        undistorted_frame,
+        projector,
+    )
+
+    cv2.imwrite(
+        "bev_source_region.jpg",
+        debug_image,
+    )
 
 if __name__ == "__main__":
     main()
