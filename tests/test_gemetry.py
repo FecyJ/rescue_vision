@@ -118,15 +118,15 @@ def main():
     )
 
 
-    raw_frame = cv2.imread("frame.png")
+    raw_frame = cv2.imread("tmp/captured_frame.jpg")
 
     undistorted_frame = camera_model.undistort_image(
         raw_frame
     )
 
     bev = projector.make_bev_image(undistorted_frame)
-    cv2.imwrite("bev.jpg", bev)
-    cv2.imwrite("undistorted.jpg", undistorted_frame)
+    cv2.imwrite("tmp/bev.jpg", bev)
+    cv2.imwrite("tmp/undistorted.jpg", undistorted_frame)
 
     raw_contact = RawPixel(
         u=820.0,
@@ -149,7 +149,7 @@ def main():
     )
 
     cv2.imwrite(
-        "bev_source_region.jpg",
+        "tmp/bev_source_region.jpg",
         debug_image,
     )
 

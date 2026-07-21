@@ -8,13 +8,12 @@ camera = PiCameraSource(
     lens_position=1.0
 )
 
-camera.start()
-
 try:
+    camera.start()
     frame = camera.read()
 
     print(f"Frame {frame.sequence} captured at {frame.timestamp} ns, shape: {frame.image_bgr.shape}")
 
-    cv2.imwrite("captured_frame.jpg", frame.image_bgr)
+    cv2.imwrite("tmp/captured_frame.jpg", frame.image_bgr)
 finally:
     camera.stop()
