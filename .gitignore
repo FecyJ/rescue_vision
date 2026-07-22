@@ -5,3 +5,9 @@ tmp/
 
 calibration_captures/
 output/
+
+# Large local data and generated reports
+recordings/
+datasets/raw/
+reports/
+models/*.hef

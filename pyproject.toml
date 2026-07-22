@@ -7,5 +7,19 @@ name = "rescue-vision"
 version = "0.1.0"
 requires-python = ">=3.10"
 
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[project.scripts]
+rescue-vision-evaluate = "rescue_vision.evaluation.cli:main"
+rescue-vision-manifest = "rescue_vision.data.build_manifest:main"
+rescue-vision-record = "rescue_vision.camera.record_cli:main"
+rescue-vision-split = "rescue_vision.data.split_manifest:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"
