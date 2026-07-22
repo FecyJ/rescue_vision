@@ -1,0 +1,97 @@
+from __future__ import annotations
+
+import json
+
+import cv2
+import numpy as np
+import pytest
+
+from rescue_vision.geometry.camera_model import (
+    CameraCalibration,
+    CameraModel,
+    CameraModelType,
+)
+from rescue_vision.geometry.types import RawPixel
+
+
+def calibration(model: CameraModelType) -> CameraCalibration:
+    distortion_size = 4 if model is CameraModelType.FISHEYE else 5
+    return CameraCalibration(
+        model=model,
+        image_size=(32, 24),
+        K=np.array([[20.0, 0.0, 16.0], [0.0, 20.0, 12.0], [0.0, 0.0, 1.0]]),
+        D=np.zeros(distortion_size),
+        new_K=np.array(
+            [[20.0, 0.0, 16.0], [0.0, 20.0, 12.0], [0.0, 0.0, 1.0]]
+        ),
+    )
+
+
+@pytest.mark.parametrize("model", list(CameraModelType))
+def test_all_models_undistort_points_and_image(model: CameraModelType) -> None:
+    parameters = calibration(model)
+    camera = CameraModel(parameters)
+    raw = np.array([[[3.0, 4.0]], [[20.0, 10.0]]], dtype=np.float64)
+    points = camera.undistort_pixels([RawPixel(3.0, 4.0), RawPixel(20.0, 10.0)])
+    if model is CameraModelType.FISHEYE:
+        expected = cv2.fisheye.undistortPoints(
+            raw,
+            parameters.K,
+            parameters.D,
+            R=np.eye(3),
+            P=parameters.new_K,
+        )
+    else:
+        expected = cv2.undistortPoints(
+            raw,
+            parameters.K,
+            parameters.D,
+            R=np.eye(3),
+            P=parameters.new_K,
+        )
+    assert np.allclose(
+        np.array([(point.u, point.v) for point in points]),
+        expected.reshape(-1, 2),
+    )
+    image = np.zeros((24, 32, 3), dtype=np.uint8)
+    assert camera.undistort_image(image).shape == image.shape
+
+
+def test_calibration_fingerprint_changes_with_model() -> None:
+    assert calibration(CameraModelType.PINHOLE).fingerprint() != calibration(
+        CameraModelType.PINHOLE_RATIONAL
+    ).fingerprint()
+
+
+def test_unusable_calibration_is_rejected(tmp_path) -> None:
+    document = {
+        "model_type": "pinhole",
+        "image_size": [32, 24],
+        "camera_matrix": calibration(CameraModelType.PINHOLE).K.tolist(),
+        "distortion": [0, 0, 0, 0, 0],
+        "new_camera_matrix": calibration(CameraModelType.PINHOLE).new_K.tolist(),
+        "quality": {"usable": False},
+    }
+    path = tmp_path / "intrinsics.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(ValueError, match="marked unusable"):
+        CameraCalibration.from_json(path)
+    loaded = CameraCalibration.from_json(path, allow_unusable=True)
+    assert loaded.model is CameraModelType.PINHOLE
+
+
+def test_image_size_mismatch_is_rejected() -> None:
+    camera = CameraModel(calibration(CameraModelType.PINHOLE))
+    with pytest.raises(ValueError, match="does not match calibration"):
+        camera.undistort_image(np.zeros((10, 10, 3), dtype=np.uint8))
+
+
+def test_invalid_distortion_count_is_rejected() -> None:
+    with pytest.raises(ValueError, match="exactly 4"):
+        CameraCalibration(
+            model=CameraModelType.FISHEYE,
+            image_size=(32, 24),
+            K=np.eye(3),
+            D=np.zeros(5),
+            new_K=np.eye(3),
+        )

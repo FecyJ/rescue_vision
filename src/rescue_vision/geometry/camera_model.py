@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -64,6 +65,44 @@ class CameraCalibration:
     D: FloatArray
     new_K: FloatArray
 
+    def __post_init__(self) -> None:
+        model = CameraModelType.parse(self.model)
+        image_size = tuple(int(value) for value in self.image_size)
+        K = np.ascontiguousarray(self.K, dtype=np.float64)
+        D = np.ascontiguousarray(self.D, dtype=np.float64).reshape(-1, 1)
+        new_K = np.ascontiguousarray(self.new_K, dtype=np.float64)
+
+        if len(image_size) != 2 or any(value <= 0 for value in image_size):
+            raise ValueError(
+                f"image_size must be two positive integers, got {image_size}."
+            )
+        if K.shape != (3, 3):
+            raise ValueError(f"K must have shape (3, 3), got {K.shape}.")
+        if new_K.shape != (3, 3):
+            raise ValueError(f"new_K must have shape (3, 3), got {new_K.shape}.")
+        if not np.all(np.isfinite(K)) or not np.all(np.isfinite(new_K)):
+            raise ValueError("K and new_K must contain only finite values.")
+        if not np.all(np.isfinite(D)):
+            raise ValueError("D must contain only finite values.")
+        if model is CameraModelType.FISHEYE and D.size != 4:
+            raise ValueError("Fisheye D must contain exactly 4 parameters.")
+        if model is not CameraModelType.FISHEYE and D.size not in {
+            4,
+            5,
+            8,
+            12,
+            14,
+        }:
+            raise ValueError(
+                "Pinhole D must contain 4, 5, 8, 12 or 14 parameters."
+            )
+
+        object.__setattr__(self, "model", model)
+        object.__setattr__(self, "image_size", image_size)
+        object.__setattr__(self, "K", K)
+        object.__setattr__(self, "D", D)
+        object.__setattr__(self, "new_K", new_K)
+
     @classmethod
     def from_json(
         cls,
@@ -78,11 +117,21 @@ class CameraCalibration:
         """
 
         data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return cls.from_dict(data, allow_unusable=allow_unusable)
 
-        if (
-            not allow_unusable
-            and data.get("quality", {}).get("usable") is False
-        ):
+    @classmethod
+    def from_dict(
+        cls,
+        data: dict[str, object],
+        *,
+        allow_unusable: bool = False,
+    ) -> CameraCalibration:
+        """从新版或旧版内参字典加载并执行统一校验。"""
+
+        quality = data.get("quality", {})
+        if not isinstance(quality, dict):
+            raise ValueError("Calibration quality must be a mapping when present.")
+        if not allow_unusable and quality.get("usable") is False:
             raise ValueError(
                 "Calibration result is marked unusable. Inspect comparison.json "
                 "and diagnostics before loading it."
@@ -102,13 +151,35 @@ class CameraCalibration:
                 "and new_camera_matrix."
             )
 
+        image_size_value = data.get("image_size")
+        if not isinstance(image_size_value, (list, tuple)):
+            raise ValueError("Calibration image_size must be [width, height].")
+
         return cls(
             model=CameraModelType.parse(model_value),
-            image_size=tuple(int(value) for value in data["image_size"]),
+            image_size=tuple(int(value) for value in image_size_value),
             K=np.asarray(K_value, dtype=np.float64),
             D=np.asarray(D_value, dtype=np.float64),
             new_K=np.asarray(new_K_value, dtype=np.float64),
         )
+
+    def fingerprint(self) -> str:
+        """返回与模型、尺寸和全部投影参数绑定的稳定 SHA-256。"""
+
+        payload = {
+            "model_type": self.model.value,
+            "image_size": list(self.image_size),
+            "camera_matrix": self.K.tolist(),
+            "distortion": self.D.reshape(-1).tolist(),
+            "new_camera_matrix": self.new_K.tolist(),
+        }
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
 
 class CameraModel:
@@ -123,7 +194,6 @@ class CameraModel:
         self.D = np.ascontiguousarray(calibration.D, dtype=np.float64).reshape(-1, 1)
         self.new_K = np.ascontiguousarray(calibration.new_K, dtype=np.float64)
 
-        self._validate_calibration()
         self.map1, self.map2 = self._create_undistort_maps()
 
         # 去畸变图中哪些像素确实来自原始图像，可用于排除黑边。
@@ -150,26 +220,6 @@ class CameraModel:
                 allow_unusable=allow_unusable,
             )
         )
-
-    def _validate_calibration(self) -> None:
-        if self.K.shape != (3, 3):
-            raise ValueError(f"K must have shape (3, 3), got {self.K.shape}.")
-        if self.new_K.shape != (3, 3):
-            raise ValueError(
-                f"new_K must have shape (3, 3), got {self.new_K.shape}."
-            )
-        if self.model is CameraModelType.FISHEYE and self.D.size != 4:
-            raise ValueError("Fisheye D must contain exactly 4 parameters.")
-        if self.model is not CameraModelType.FISHEYE and self.D.size not in {
-            4,
-            5,
-            8,
-            12,
-            14,
-        }:
-            raise ValueError(
-                "Pinhole D must contain 4, 5, 8, 12 or 14 parameters."
-            )
 
     def _create_undistort_maps(self) -> tuple[np.ndarray, np.ndarray]:
         identity = np.eye(3, dtype=np.float64)
@@ -232,6 +282,17 @@ class CameraModel:
 
     def undistort_image(self, image: np.ndarray) -> np.ndarray:
         """将原始畸变图像转换为固定 ``new_K`` 坐标系下的图像。"""
+
+        if image.ndim not in {2, 3}:
+            raise ValueError(
+                f"image must have 2 or 3 dimensions, got shape {image.shape}."
+            )
+        actual_size = (int(image.shape[1]), int(image.shape[0]))
+        if actual_size != self.image_size:
+            raise ValueError(
+                f"Image size {actual_size} does not match calibration "
+                f"{self.image_size}."
+            )
 
         return cv2.remap(
             image,

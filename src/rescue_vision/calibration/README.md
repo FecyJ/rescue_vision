@@ -1,30 +1,33 @@
-# 相机标定脚本
+# 相机与地面标定
 
-目录约定：
+本页是相机内参与地面映射的唯一操作说明。标定脚本默认使用本目录下的路径，不受终端当前目录影响；现场生成的 `calibration_captures/` 和 `output/` 已被 Git 忽略。运行时结构和坐标边界见[项目结构](../../../docs/项目结构.md)。
 
-```text
-src/rescue_vision/calibration/
-├── capture_chessboard_images.py
-├── calibrate_intrinsics_fisheye.py
-├── calibrate_extrinsics_ground.py
-├── ground_points.example.json
-├── calibration_captures/
-└── output/
-```
+## 固定条件
 
-所有默认路径均相对于本目录，不受当前终端工作目录影响。
+一套标定只对以下条件组合有效：
 
-## 1. 采集内参标定图
+- 相机与镜头个体；
+- `2304 × 1296` 取流分辨率和裁剪模式；
+- 固定 `LensPosition`；
+- 相机安装位置和姿态；
+- 相机模型及 `new_camera_matrix`；
+- 地面点坐标定义。
 
-相机分辨率固定为 `(2304, 1296)`，棋盘格为 12×9 格、11×8 内角点。
+分辨率、焦点、镜头或 `new_K` 改变时至少重新做内参验证；安装位姿改变时必须重新做地面映射。不要只凭肉眼观察去畸变图判断标定质量。
+
+## 1. 采集棋盘图
+
+标定板为 12×9 个实体方格、11×8 个内角点。测量实际方格边长，并让棋盘覆盖画面中央、四角、边缘、近处、远处和多种倾角。避免同一姿态重复采样。
 
 ```bash
 python -m rescue_vision.calibration.capture_chessboard_images \
-  --lens-position 0.8 \
+  --lens-position 1.0 \
   --target 50
 ```
 
-采集结果：
+如果不提供 `--lens-position`，脚本会先执行一次自动对焦再锁焦。比赛运行必须复用 `session.json` 记录的焦点位置。
+
+输出：
 
 ```text
 calibration_captures/chessboard_2304x1296_时间戳/
@@ -34,42 +37,47 @@ calibration_captures/chessboard_2304x1296_时间戳/
 └── images.jsonl
 ```
 
-## 2. 计算 Fisheye 内参
+## 2. 求解并选择内参模型
 
-将 `15.0` 替换为标定板实测方格边长。
+脚本比较标准针孔、Rational 针孔和 OpenCV Fisheye 模型。选择依据是 K 折验证集重投影 RMSE，而不是只看全量拟合误差。
 
 ```bash
-python -m rescue_vision.calibration.calibrate_intrinsics_fisheye \
+python -m rescue_vision.calibration.calibrate_intrinsics \
   --square-size-mm 15.0 \
-  --balance 0.35
+  --folds 5
 ```
 
-默认使用最新采集批次。指定批次：
+指定采集批次：
 
 ```bash
-python -m rescue_vision.calibration.calibrate_intrinsics_fisheye \
-  --session src/rescue_vision/calibration/calibration_captures/chessboard_2304x1296_20260721_120000 \
+python -m rescue_vision.calibration.calibrate_intrinsics \
+  --session src/rescue_vision/calibration/calibration_captures/chessboard_2304x1296_YYYYMMDD_HHMMSS \
   --square-size-mm 15.0
 ```
 
-输出：
+输出目录带时间戳：
 
 ```text
-output/fisheye_intrinsics_2304x1296.json
-output/fisheye_intrinsics_2304x1296.npz
-output/intrinsics_diagnostics/
+output/intrinsics_YYYYMMDD_HHMMSS/
+├── comparison.json
+├── selected_calibration.json
+├── selected_calibration.npz
+├── models/
+└── diagnostics/
 ```
 
-## 3. 准备外参和地面映射数据
+部署前检查：
 
-必须等相机安装位置固定后执行，并保持：
+- `selected_calibration.json` 中 `quality.usable` 必须为 `true`；
+- 比较交叉验证 RMSE、最大单图误差和位姿求解成功率；
+- 查看各模型诊断图，尤其是图像边缘直线和有效区域；
+- 用独立于标定集的图片/测量点做验证。
 
-- 同一相机及 2304×1296 取流模式；
-- 同一个固定 `LensPosition`；
-- 同一个内参文件和 `new_K`；
-- 机器人坐标约定：x 向前、y 向左、z 向上，单位 mm。
+`CameraModel.from_json(...)` 默认拒绝 `quality.usable=false` 的结果。
 
-创建：
+## 3. 准备地面映射数据
+
+此步骤只能在相机最终固定后进行。创建：
 
 ```text
 calibration_captures/ground_mapping/
@@ -77,34 +85,28 @@ calibration_captures/ground_mapping/
 └── ground_points.json
 ```
 
-`ground_image.png` 是固定安装后的原始畸变图像。把 `ground_points.example.json` 复制为 `ground_points.json`，根据实际布置修改坐标。建议使用 12～20 个清晰、分布均匀的地面标记点，不要让点集中在一条线或一小片区域。
+`ground_image.png` 是固定安装条件下的原始畸变图。参考 `ground_points.example.json` 建立 12～20 个分布均匀、易准确点击的地面点，覆盖实际工作区域和远近范围，避免共线或集中于局部。
 
-## 4. 计算外参和地面映射
+坐标约定为机器人地面系 `x` 向前、`y` 向左、`z` 向上，单位 mm。
 
-```bash
-python -m rescue_vision.calibration.calibrate_extrinsics_ground
-```
+## 4. 求解地面映射
 
-首次运行会显示 `ground_image.png`：
-
-- 按 `ground_points.json` 中的顺序点击对应标记中心；
-- `Enter` / `Space`：确认当前点击；
-- `Backspace`：撤销；
-- `Q` / `Esc`：退出。
-
-点击结果保存为：
-
-```text
-calibration_captures/ground_mapping/correspondences.json
-```
-
-重新点击：
+脚本复用 `CameraCalibration` / `CameraModel`，支持 pinhole、pinhole_rational 和 fisheye，默认拒绝 `quality.usable=false` 的内参。默认选择最新时间戳目录，也可显式指定：
 
 ```bash
-python -m rescue_vision.calibration.calibrate_extrinsics_ground --recollect
+python -m rescue_vision.calibration.calibrate_extrinsics_ground \
+  --intrinsics src/rescue_vision/calibration/output/intrinsics_YYYYMMDD_HHMMSS/selected_calibration.json
 ```
 
-输出：
+首次运行按 `ground_points.json` 顺序点击原图中的点：
+
+- 鼠标左键选择；
+- `Enter` / `Space` 确认；
+- `Backspace` 撤销；
+- `Q` / `Esc` 退出；
+- `--recollect` 强制重新选点。
+
+脚本当前输出：
 
 ```text
 output/ground_mapping.json
@@ -115,11 +117,18 @@ output/ground_diagnostics/
 └── bev_preview.png
 ```
 
-`ground_mapping.json` 中：
+`image_to_ground` 表示去畸变像素到机器人地面毫米坐标。直接单应拟合用于地面点定位；PnP 推导矩阵用于交叉诊断。部署前必须使用未参与拟合的保留点实测地面误差，并复核 BEV 有效范围。
 
-- `image_to_ground`：去畸变像素 → 机器人地面毫米坐标，供 `GroundProjector` 使用；
-- `ground_to_image`：机器人地面坐标 → 去畸变像素；
-- `extrinsics`：机器人坐标系与 OpenCV 相机坐标系的外参；
-- `bev`：上方为机器人前方、左侧为机器人左方的 BEV 变换。
+输出 schema v2 同时保存 `model_type` 与内参 SHA-256 指纹。运行时 `GroundProjector.from_json(...)` 会核对图像尺寸、模型和指纹，禁止把不同内参与地面映射混用。基础矩阵往返和 BEV 四角方向已有自动测试；实际安装仍必须使用独立保留点测量地面误差。
 
-直接拟合的 `image_to_ground` 优先用于地面定位；由 PnP 外参推导的 `pose_image_to_ground` 主要用于检查两种结果是否一致。
+## 5. 产物管理
+
+原始采集和临时输出不提交 Git。最终部署应保留一份经过验收的配置，并同时记录：
+
+- 相机序列/硬件标识、分辨率和焦点；
+- 标定日期、代码提交和 OpenCV 版本；
+- 原始结果文件的校验和；
+- 内参与地面映射误差摘要；
+- 相机安装版本或可复现的机械定位方式。
+
+如果这些元数据无法对应，宁可重新标定，也不要混用两次标定产物。

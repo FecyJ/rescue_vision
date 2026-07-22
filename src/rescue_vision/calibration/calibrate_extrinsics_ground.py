@@ -47,14 +47,16 @@ from typing import Any
 import cv2
 import numpy as np
 
+from rescue_vision.geometry.camera_model import CameraCalibration, CameraModel
+from rescue_vision.geometry.ground_projector import BevConfig, GroundProjector
+from rescue_vision.geometry.types import RawPixel
+
 
 CALIBRATION_DIR = Path(__file__).resolve().parent
 CAPTURES_DIR = CALIBRATION_DIR / "calibration_captures"
 OUTPUT_DIR = CALIBRATION_DIR / "output"
 
 DEFAULT_SESSION_DIR = CAPTURES_DIR / "ground_mapping"
-DEFAULT_INTRINSICS = OUTPUT_DIR / "fisheye_intrinsics_2304x1296.json"
-
 WINDOW_NAME = "Ground Correspondence Collector"
 
 
@@ -71,8 +73,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--intrinsics",
         type=Path,
-        default=DEFAULT_INTRINSICS,
-        help="Fisheye intrinsic calibration JSON.",
+        default=None,
+        help=(
+            "Intrinsic selected_calibration.json. Defaults to the latest "
+            "timestamped intrinsic output."
+        ),
     )
     parser.add_argument(
         "--image",
@@ -136,33 +141,25 @@ def save_json(path: Path, data: dict[str, Any]) -> None:
     )
 
 
-def load_intrinsics(path: Path) -> tuple[
-    tuple[int, int],
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    dict[str, Any],
-]:
+def find_latest_intrinsics() -> Path:
+    candidates = sorted(
+        path
+        for path in OUTPUT_DIR.glob("intrinsics_*/selected_calibration.json")
+        if path.is_file()
+    )
+    if not candidates:
+        raise FileNotFoundError(
+            f"No selected_calibration.json found under {OUTPUT_DIR}"
+        )
+    return candidates[-1]
+
+
+def load_intrinsics(
+    path: Path,
+) -> tuple[CameraCalibration, dict[str, Any]]:
     data = load_json(path)
-
-    if data.get("model") != "opencv_fisheye":
-        raise ValueError("The intrinsic file is not an OpenCV fisheye model")
-
-    image_size = tuple(int(value) for value in data["image_size"])
-    camera_matrix = np.asarray(data["camera_matrix"], dtype=np.float64)
-    distortion = np.asarray(data["distortion"], dtype=np.float64).reshape(4, 1)
-    new_camera_matrix = np.asarray(
-        data["new_camera_matrix"],
-        dtype=np.float64,
-    )
-
-    return (
-        image_size,
-        camera_matrix,
-        distortion,
-        new_camera_matrix,
-        data,
-    )
+    calibration = CameraCalibration.from_dict(data)
+    return calibration, data
 
 
 def load_ground_points(path: Path) -> list[dict[str, Any]]:
@@ -357,45 +354,6 @@ def load_correspondences(path: Path) -> list[dict[str, Any]]:
     return result
 
 
-def undistort_image(
-    image: np.ndarray,
-    image_size: tuple[int, int],
-    camera_matrix: np.ndarray,
-    distortion: np.ndarray,
-    new_camera_matrix: np.ndarray,
-) -> np.ndarray:
-    map1, map2 = cv2.fisheye.initUndistortRectifyMap(
-        camera_matrix,
-        distortion,
-        np.eye(3),
-        new_camera_matrix,
-        image_size,
-        cv2.CV_16SC2,
-    )
-    return cv2.remap(
-        image,
-        map1,
-        map2,
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-    )
-
-
-def undistort_pixels(
-    pixels_raw: np.ndarray,
-    camera_matrix: np.ndarray,
-    distortion: np.ndarray,
-    new_camera_matrix: np.ndarray,
-) -> np.ndarray:
-    return cv2.fisheye.undistortPoints(
-        pixels_raw.reshape(-1, 1, 2),
-        camera_matrix,
-        distortion,
-        R=np.eye(3),
-        P=new_camera_matrix,
-    ).reshape(-1, 2)
-
-
 def transform_points(points: np.ndarray, homography: np.ndarray) -> np.ndarray:
     return cv2.perspectiveTransform(
         points.reshape(-1, 1, 2).astype(np.float64),
@@ -528,22 +486,6 @@ def pose_ground_homography(
     return ground_to_image, image_to_ground
 
 
-def make_ground_to_bev(
-    x_max_mm: float,
-    y_max_mm: float,
-    mm_per_pixel: float,
-) -> np.ndarray:
-    scale = 1.0 / mm_per_pixel
-    return np.array(
-        [
-            [0.0, -scale, y_max_mm * scale],
-            [-scale, 0.0, x_max_mm * scale],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
-    )
-
-
 def save_point_preview(
     image: np.ndarray,
     correspondences: list[dict[str, Any]],
@@ -586,20 +528,21 @@ def main() -> None:
         if args.correspondences is not None
         else session_dir / "correspondences.json"
     )
-    intrinsics_path = args.intrinsics.expanduser().resolve()
+    intrinsics_path = (
+        args.intrinsics.expanduser().resolve()
+        if args.intrinsics is not None
+        else find_latest_intrinsics().resolve()
+    )
 
     session_dir.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     diagnostics_dir = OUTPUT_DIR / "ground_diagnostics"
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
 
-    (
-        image_size,
-        camera_matrix,
-        distortion,
-        new_camera_matrix,
-        intrinsic_data,
-    ) = load_intrinsics(intrinsics_path)
+    calibration, intrinsic_data = load_intrinsics(intrinsics_path)
+    camera_model = CameraModel(calibration)
+    image_size = calibration.image_size
+    new_camera_matrix = calibration.new_K
 
     image = cv2.imread(str(image_path))
     if image is None:
@@ -636,19 +579,16 @@ def main() -> None:
         dtype=np.float64,
     )
 
-    undistorted_pixels = undistort_pixels(
-        raw_pixels,
-        camera_matrix,
-        distortion,
-        new_camera_matrix,
+    undistorted_pixels = np.asarray(
+        [
+            [point.u, point.v]
+            for point in camera_model.undistort_pixels(
+                [RawPixel(float(u), float(v)) for u, v in raw_pixels]
+            )
+        ],
+        dtype=np.float64,
     )
-    undistorted_image = undistort_image(
-        image,
-        image_size,
-        camera_matrix,
-        distortion,
-        new_camera_matrix,
-    )
+    undistorted_image = camera_model.undistort_image(image)
 
     image_to_ground, inliers, ground_errors_mm = fit_ground_homography(
         undistorted_pixels,
@@ -690,23 +630,18 @@ def main() -> None:
     camera_to_robot[:3, :3] = rotation_camera_to_robot
     camera_to_robot[:3, 3] = translation_camera_to_robot
 
-    bev_width = int(
-        round(
-            (args.bev_y_max_mm - args.bev_y_min_mm)
-            / args.bev_mm_per_pixel
-        )
+    bev_config = BevConfig(
+        x_min=args.bev_x_min_mm,
+        x_max=args.bev_x_max_mm,
+        y_min=args.bev_y_min_mm,
+        y_max=args.bev_y_max_mm,
+        mm_per_pixel=args.bev_mm_per_pixel,
     )
-    bev_height = int(
-        round(
-            (args.bev_x_max_mm - args.bev_x_min_mm)
-            / args.bev_mm_per_pixel
-        )
-    )
+    bev_width = bev_config.width
+    bev_height = bev_config.height
 
-    ground_to_bev = make_ground_to_bev(
-        args.bev_x_max_mm,
-        args.bev_y_max_mm,
-        args.bev_mm_per_pixel,
+    ground_to_bev = GroundProjector.make_ground_to_bev_matrix(
+        bev_config,
     )
     image_to_bev = ground_to_bev @ image_to_ground
 
@@ -756,7 +691,7 @@ def main() -> None:
     inlier_errors = ground_errors_mm[inliers]
 
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "coordinate_frames": {
             "robot": {
                 "x": "forward",
@@ -776,6 +711,11 @@ def main() -> None:
             "intrinsics": str(intrinsics_path),
             "ground_image": str(image_path),
             "correspondences": str(correspondences_path),
+        },
+        "intrinsics": {
+            "model_type": calibration.model.value,
+            "fingerprint_sha256": calibration.fingerprint(),
+            "quality": intrinsic_data.get("quality"),
         },
         "image_size": list(image_size),
         "lens_position": intrinsic_data.get("lens_position"),

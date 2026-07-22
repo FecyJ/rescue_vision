@@ -1,14 +1,15 @@
-"""
-各坐标系点的定义
-"""
+"""视觉系统使用的坐标点类型。"""
+
+from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, TypeVar
+from collections.abc import Callable, Iterable
+from typing import TypeVar
 
 import numpy as np
 import numpy.typing as npt
 
-FloatArray= npt.NDArray[np.float64]
+FloatArray = npt.NDArray[np.float64]
 
 @dataclass(frozen=True, slots=True)
 class RawPixel:
@@ -20,7 +21,7 @@ class RawPixel:
     """
     u: float
     v: float
-    
+
     def as_array(self) -> FloatArray:
         return np.array([self.u, self.v], dtype=np.float64)
 
@@ -31,7 +32,7 @@ class UndistortedPixel:
     """
     u: float
     v: float
-    
+
     def as_array(self) -> FloatArray:
         return np.array([self.u, self.v], dtype=np.float64)
 
@@ -69,19 +70,33 @@ class BevPixel:
     """
     u: float
     v: float
-    
+
     def as_array(self) -> FloatArray:
         return np.array([self.u, self.v], dtype=np.float64)
 
 
-def pixels_to_array(pixels: Iterable[RawPixel | UndistortedPixel | BevPixel]) -> FloatArray:
+PixelPoint = RawPixel | UndistortedPixel | BevPixel
+Point2D = PixelPoint | GroundPoint | FieldPoint
+PointT = TypeVar("PointT", bound=Point2D)
+
+
+def pixels_to_array(pixels: Iterable[PixelPoint]) -> FloatArray:
     """
     将像素点列表转换为 shape=(N, 2) 的二维数组
     """
-    return np.array([[p.u, p.v] for p in pixels], dtype=np.float64)
+    values = [[point.u, point.v] for point in pixels]
+    return np.asarray(values, dtype=np.float64).reshape(-1, 2)
 
-def array_to_pixels(array: FloatArray, pixel_type: Iterable[RawPixel | UndistortedPixel | BevPixel]) -> list[RawPixel | UndistortedPixel | BevPixel]:
+
+def array_to_points(
+    array: FloatArray,
+    point_type: Callable[[float, float], PointT],
+) -> list[PointT]:
     """
-    将 shape=(N, 2) 的二维数组转换为像素点列表
+    将 shape=(N, 2) 的二维数组转换为指定二维点列表。
     """
-    return [pixel_type(u, v) for u, v in array.reshape(-1, 2)]
+    return [point_type(float(a), float(b)) for a, b in array.reshape(-1, 2)]
+
+
+# 兼容已有调用；名称将在上层迁移完成后移除。
+array_to_pixels = array_to_points
