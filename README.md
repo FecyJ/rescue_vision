@@ -1,85 +1,90 @@
-# 工创赛智能救援-上位机视觉
-工创赛智能救援赛道视觉工程，运行于 Raspberry Pi 5 + Hailo AI HAT+（Hailo-8L），相机为 Raspberry Pi Camera Module 3 NoIR Wide。
+# 工创赛智能救援上位机视觉
 
-## 环境
+2027 工创赛“智能救援”赛项的上位机视觉工程。目标平台是 Raspberry Pi 5、Hailo-8L 和 Camera Module 3 NoIR Wide。
 
-- Raspberry Pi OS Trixie
-- Python 3.13.5
-- 相机分辨率：2304 × 1296
-- OpenCV、Picamera2、NumPy、HailoRT 使用系统包
-- 其余 Python 依赖见 `requirements.txt`
+当前完成的是可复现的视觉基础设施，不是完整比赛程序：相机、标定、地面投影、配置、录制回放、数据集工具和离线评测已经实现；感知、跟踪、定位、世界模型、规则状态机、规划、通信和应用入口尚未实现。P0 还缺四类规则目标的现场实拍数据。
 
-## 安装
+## 从这里开始
+
+| 要做的事 | 首先查看 |
+| --- | --- |
+| 了解代码放在哪里 | [项目结构](docs/项目结构.md) |
+| 选择下一项工作 | [后续优先级](docs/后续优先级.md) |
+| 理解比赛语义和安全约束 | [赛题约束与视觉需求](docs/赛题约束与视觉需求.md) |
+| 标定相机或地面 | [标定说明](src/rescue_vision/calibration/README.md) |
+| 录制、划分或评测数据 | [数据集与评测](docs/数据集与评测.md) |
+| 到现场采集四类目标 | [目标数据采集清单](docs/目标数据采集清单.md) |
+| 运行真机或 GUI 检查 | [人工验收脚本](manual_tests/README.md) |
+| 修改仓库 | [AGENTS.md](AGENTS.md) |
+
+官方资料位于 `docs/命题文件/`。仓库内的解释用于工程设计；发生冲突时以最新正式文件和现场通知为准。
+
+## 当前能力
+
+| 目录 | 状态 | 责任 |
+| --- | --- | --- |
+| `camera/` | 已实现 | 两种真机后端、统一帧、离线回放和异步记录 |
+| `calibration/` | 已实现 | 棋盘采集、三模型内参比较、地面映射 |
+| `geometry/` | 已实现 | 去畸变、坐标类型、地面与 BEV 转换 |
+| `config/` | 已实现 | schema v1 严格配置和标定一致性校验 |
+| `data/` | 已实现 | 记录转清单、哈希验证、按录像整组划分 |
+| `evaluation/` | 已实现 | 分类、地面误差、时延和失败样例报告 |
+| `manual_tests/` | 人工验收 | 相机、GUI、实际地面映射 |
+| 感知到通信主链路 | 未实现 | 只在功能落地时创建对应目录 |
+
+核心数据流：
+
+```text
+FrameSource → CameraFrame → CameraModel → 感知（未实现）
+                                      ↓
+                              GroundProjector
+                                      ↓
+                 跟踪/定位/世界模型/策略（未实现）
+```
+
+坐标必须显式区分 `RawPixel`、`UndistortedPixel`、`GroundPoint`、`FieldPoint` 和 `BevPixel`。机器人地面坐标为 `x` 向前、`y` 向左、单位 mm；像素为 `u` 向右、`v` 向下。
+
+## 安装与检查
+
+目标环境为 Raspberry Pi OS Trixie、Python 3.13；包支持 Python 3.10 及以上。当前实现使用系统提供的 OpenCV、NumPy、Picamera2 和 libcamera：
 
 ```bash
 sudo apt update
-sudo apt install -y \
-    python3-venv \
-    python3-numpy \
-    python3-opencv \
-    python3-picamera2 \
-    dkms \
-    hailo-all
-```
+sudo apt install -y python3-venv python3-numpy python3-opencv \
+  python3-picamera2
 
-```bash
 python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
-
-python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-
-python -m pip install -e .
+python -m pip install -e '.[dev]'
 ```
 
-## 工程结构
+Hailo 和串口依赖等对应模块落地后再安装，不作为当前开发、标定或数据工具的前置条件。
 
-```text
-rescue_vision/
-├── configs/                    # 相机、地面映射、场地与运行配置
-├── src/rescue_vision/
-│   ├── camera/                 # Picamera2 图像采集
-│   ├── geometry/               # 去畸变、地面投影、坐标类型
-│   ├── perception/             # YOLO Pose 与 OpenCV 感知
-│   ├── localization/           # 视觉、编码器和 IMU 定位融合
-│   ├── tracking/               # 目标跟踪
-│   ├── world/                  # 静态地图与动态目标地图
-│   └── interfaces/             # STM32 等外部接口
-├── scripts/                    # 标定与测试脚本
-├── tests/
-└── requirements.txt
-```
-
-## 几何约定
-
-- 原始像素：`RawPixel`
-- 去畸变像素：`UndistortedPixel`
-- 机器人地面坐标：`GroundPoint`
-- 地面坐标中 `x` 向前，`y` 向左，单位为毫米
-- BEV 图像上方对应机器人前方，左侧对应机器人左方
-
-处理链路：
-
-```text
-相机原图
-→ CameraModel 去畸变
-→ GroundProjector 地面映射 / BEV
-→ 目标与场地特征检测
-→ 定位和世界模型
-```
-
-## 运行前注意
-
-相机内参、畸变参数、`new_camera_matrix` 和地面单应矩阵必须在最终的以下条件下重新标定：
-
-- 2304 × 1296 分辨率
-- 固定相机安装位置
-- 固定 `LensPosition`
-- 固定去畸变模型与参数
-
-测试前可先验证：
+开发机基础验证：
 
 ```bash
-python -c "import cv2, numpy, yaml, serial; from picamera2 import Picamera2; print('OK')"
-hailortcli fw-control identify
+python -m compileall -q src tests manual_tests
+python -m pytest
 ```
+
+`tests/` 不依赖相机或 Hailo；需要硬件、显示器或本地标定资产的检查只放在 `manual_tests/`。
+
+## 工具入口
+
+| 命令 | 用途 |
+| --- | --- |
+| `rescue-vision-record` | 录制可回放相机会话 |
+| `rescue-vision-manifest` | 记录目录转严格数据清单 |
+| `rescue-vision-split` | 按 `recording_id` 防泄漏划分 |
+| `rescue-vision-evaluate` | 生成离线评测报告 |
+
+参数、示例和 schema 统一见[数据集与评测](docs/数据集与评测.md)。`examples/` 只是格式夹具，不能充当训练或现场验证数据。
+
+## 关键约束
+
+- `CameraModel` 是去畸变唯一权威；`GroundProjector` 是去畸变像素与机器人地面的唯一权威。
+- 相机、分辨率、裁剪、焦点、安装姿态或 `new_K` 改变后必须重新验证相应标定。
+- 实时路径只处理最新帧；录像、显示和日志使用有界旁路。
+- 危险目标允许“未知/疑似危险”，不得为了总体指标降低危险类安全要求。
+- 原始录像、批量图片、标定临时输出和模型权重不提交 Git。
