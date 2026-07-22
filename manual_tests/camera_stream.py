@@ -4,11 +4,11 @@ from time import perf_counter
 
 import cv2
 
-from rescue_vision.camera.source import PiCameraSource
+from rescue_vision.camera.rpicam_source import RpicamSource
 
 
 def main() -> None:
-    camera = PiCameraSource(
+    camera = RpicamSource(
         image_size=(2304, 1296),
         fps=30,
         lens_position=1.0,
@@ -41,7 +41,7 @@ def main() -> None:
                 print(
                     f"FPS: {frame_count / elapsed:.1f}, "
                     f"sequence: {frame.sequence}, "
-                    f"timestamp: {frame.timestamp}"
+                    f"timestamp_ns: {frame.timestamp_ns}"
                 )
 
                 frame_count = 0

@@ -1,4 +1,4 @@
-# tests/test_picamera_minimal.py
+"""Picamera2 最小真机人工验收脚本。"""
 
 from time import sleep
 

@@ -1,7 +1,11 @@
 import cv2
 import numpy as np
 
-from rescue_vision.geometry.camera_model import CameraModel, CameraCalibration
+from rescue_vision.geometry.camera_model import (
+    CameraCalibration,
+    CameraModel,
+    CameraModelType,
+)
 from rescue_vision.geometry.ground_projector import (
     BevConfig,
     GroundProjector,
@@ -95,6 +99,7 @@ def draw_bev_source_region(
 
 def main():
     camera_config = CameraCalibration(
+        model=CameraModelType.FISHEYE,
         K=CAMERA_MATRIX,
         D=DISTORTION,
         new_K=CAMERA_MATRIX,

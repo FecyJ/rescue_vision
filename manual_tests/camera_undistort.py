@@ -1,22 +1,25 @@
-# tests/test_camera_stream.py
+"""真机去畸变人工验收；需要通过参数提供标定文件。"""
+
+import argparse
 
 from time import perf_counter
 
 import cv2
 import numpy as np
 
-from rescue_vision.camera.source import PiCameraSource
-from rescue_vision.geometry.camera_model import CameraModel, CameraCalibration
+from rescue_vision.camera.rpicam_source import RpicamSource
+from rescue_vision.geometry.camera_model import CameraModel
 
 IMAGE_SIZE = (2304, 1296)
 
 
 def main() -> None:
-    camera_model = CameraModel.from_json(
-        "src/rescue_vision/calibration/output/intrinsics_20260722_160344/selected_calibration.json"
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--intrinsics", required=True)
+    args = parser.parse_args()
+    camera_model = CameraModel.from_json(args.intrinsics)
 
-    camera = PiCameraSource(
+    camera = RpicamSource(
         image_size=IMAGE_SIZE,
         fps=30,
         lens_position=1.0,
@@ -52,7 +55,7 @@ def main() -> None:
                 print(
                     f"FPS: {frame_count / elapsed:.1f}, "
                     f"sequence: {frame.sequence}, "
-                    f"timestamp: {frame.timestamp}"
+                    f"timestamp_ns: {frame.timestamp_ns}"
                 )
 
                 frame_count = 0

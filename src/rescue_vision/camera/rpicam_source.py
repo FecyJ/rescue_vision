@@ -11,7 +11,7 @@ import numpy as np
 from .frame import CameraFrame
 
 
-class PiCameraSource:
+class RpicamSource:
     """
     使用官方 rpicam-vid 持续采集 YUV420。
 
@@ -25,6 +25,15 @@ class PiCameraSource:
         fps: int = 20,
         lens_position: float = 1.0,
     ) -> None:
+        if len(image_size) != 2 or any(value <= 0 for value in image_size):
+            raise ValueError(f"image_size must be positive, got {image_size}.")
+        if fps <= 0:
+            raise ValueError(f"fps must be positive, got {fps}.")
+        if not np.isfinite(lens_position) or lens_position < 0:
+            raise ValueError(
+                f"lens_position must be finite and non-negative, got "
+                f"{lens_position}."
+            )
         self.width, self.height = image_size
         self.fps = fps
         self.lens_position = lens_position
@@ -39,13 +48,27 @@ class PiCameraSource:
 
         self._condition = threading.Condition()
         self._latest_yuv: bytearray | None = None
+        self._latest_timestamp_ns: int | None = None
         self._latest_sequence = -1
         self._delivered_sequence = -1
         self._reader_error: BaseException | None = None
 
         self._running = False
 
+    @property
+    def image_size(self) -> tuple[int, int]:
+        return (self.width, self.height)
+
     def start(self) -> None:
+        with self._condition:
+            if self._running or self._process is not None:
+                raise RuntimeError("Camera source is already started.")
+            self._latest_yuv = None
+            self._latest_timestamp_ns = None
+            self._latest_sequence = -1
+            self._delivered_sequence = -1
+            self._reader_error = None
+
         command = [
             "rpicam-vid",
             "--nopreview",
@@ -108,7 +131,12 @@ class PiCameraSource:
 
         若处理速度落后，只返回当前最新帧。
         """
+        if timeout < 0:
+            raise ValueError(f"timeout must be non-negative, got {timeout}.")
+
         with self._condition:
+            if not self._running:
+                raise RuntimeError("Camera source is not started.")
             ready = self._condition.wait_for(
                 lambda: (
                     self._latest_sequence
@@ -127,10 +155,12 @@ class PiCameraSource:
                 ) from self._reader_error
 
             raw_yuv = self._latest_yuv
+            timestamp_ns = self._latest_timestamp_ns
             sequence = self._latest_sequence
             self._delivered_sequence = sequence
 
         assert raw_yuv is not None
+        assert timestamp_ns is not None
 
         yuv = np.frombuffer(
             raw_yuv,
@@ -148,17 +178,23 @@ class PiCameraSource:
         return CameraFrame(
             sequence=sequence,
 
-            # 这是应用收到完整帧的单调时钟时间，
+            # 这是后台线程收到完整帧的单调时钟时间，
             # 不是传感器曝光开始时间。
-            timestamp=time.monotonic_ns(),
+            timestamp_ns=timestamp_ns,
 
             image_bgr=image_bgr,
+            metadata={
+                "source": "rpicam-vid",
+                "configured_fps": self.fps,
+                "lens_position": self.lens_position,
+            },
         )
 
     def stop(self) -> None:
         process = self._process
 
         if process is None:
+            self._running = False
             return
 
         # rpicam-vid 显式处理 SIGINT，并执行正常停止流程。
@@ -211,6 +247,7 @@ class PiCameraSource:
                 with self._condition:
                     # 直接覆盖旧帧，不让视觉延迟积累。
                     self._latest_yuv = frame
+                    self._latest_timestamp_ns = time.monotonic_ns()
                     self._latest_sequence = sequence
                     self._condition.notify_all()
 
@@ -248,7 +285,7 @@ class PiCameraSource:
 
         return buffer
 
-    def __enter__(self) -> PiCameraSource:
+    def __enter__(self) -> RpicamSource:
         self.start()
         return self
 
