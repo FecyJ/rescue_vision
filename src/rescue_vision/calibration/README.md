@@ -2,6 +2,24 @@
 
 本页是相机内参与地面映射的唯一操作说明。标定脚本默认使用本目录下的路径，不受终端当前目录影响；现场生成的 `calibration_captures/` 和 `output/` 已被 Git 忽略。运行时结构和坐标边界见[项目结构](../../../docs/项目结构.md)。
 
+## 最简示例
+
+```bash
+# 1. 采集棋盘图
+python -m rescue_vision.calibration.capture_chessboard_images \
+  --lens-position 1.0 --target 50
+
+# 2. 比较三种模型并选择内参
+python -m rescue_vision.calibration.calibrate_intrinsics \
+  --square-size-mm 15.0 --folds 5
+
+# 3. 相机最终固定并准备地面点后，求解地面映射
+python -m rescue_vision.calibration.calibrate_extrinsics_ground \
+  --intrinsics src/rescue_vision/calibration/output/内参目录/selected_calibration.json
+```
+
+前两步只依赖相机和棋盘；第三步必须等相机安装姿态固定，并准备 `ground_image.png` 与 `ground_points.json`。不要把不同焦点、分辨率或安装条件的产物混用。
+
 ## 固定条件
 
 一套标定只对以下条件组合有效：

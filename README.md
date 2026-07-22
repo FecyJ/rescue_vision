@@ -23,14 +23,16 @@
 
 | 目录 | 状态 | 责任 |
 | --- | --- | --- |
-| `camera/` | 已实现 | 两种真机后端、统一帧、离线回放和异步记录 |
-| `calibration/` | 已实现 | 棋盘采集、三模型内参比较、地面映射 |
-| `geometry/` | 已实现 | 去畸变、坐标类型、地面与 BEV 转换 |
-| `config/` | 已实现 | schema v1 严格配置和标定一致性校验 |
-| `data/` | 已实现 | 记录转清单、哈希验证、按录像整组划分 |
-| `evaluation/` | 已实现 | 分类、地面误差、时延和失败样例报告 |
+| [`camera/`](src/rescue_vision/camera/README.md) | 已实现 | 两种真机后端、统一帧、离线回放和异步记录 |
+| [`calibration/`](src/rescue_vision/calibration/README.md) | 已实现 | 棋盘采集、三模型内参比较、地面映射 |
+| [`geometry/`](src/rescue_vision/geometry/README.md) | 已实现 | 去畸变、坐标类型、地面与 BEV 转换 |
+| [`config/`](src/rescue_vision/config/README.md) | 已实现 | schema v1 严格配置和标定一致性校验 |
+| [`data/`](src/rescue_vision/data/README.md) | 已实现 | 记录转清单、哈希验证、按录像整组划分 |
+| [`evaluation/`](src/rescue_vision/evaluation/README.md) | 已实现 | 分类、地面误差、时延和失败样例报告 |
 | `manual_tests/` | 人工验收 | 相机、GUI、实际地面映射 |
 | 感知到通信主链路 | 未实现 | 只在功能落地时创建对应目录 |
+
+各包的最简 Python 示例和典型用法汇总见 [`src/rescue_vision/README.md`](src/rescue_vision/README.md)。
 
 核心数据流：
 
