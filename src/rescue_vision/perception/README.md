@@ -9,6 +9,8 @@
 | `InferenceBackend` | 推理后端协议：`infer()`、模型身份和 `close()` |
 | `HailoYolo26PoseBackend` | HEF 推理与 ONNX 后处理的真实后端 |
 | `TargetPoseDetector` | 阈值、类别映射、观测年龄和可选 K0 地面投影 |
+| `RealtimeDetectionResult` | 实时检测结果，并明确记录是否丢弃了过期帧 |
+| `StaleObservationError` | 严格 `detect()` 在结果超过允许年龄时抛出的异常 |
 | `ModelDetection` | 后端输出；框和 K0 已反映射到去畸变原尺寸 |
 | `TargetObservation` | 下游跟踪、定位和评测消费的统一观测 |
 | `TargetClass` | 四类任务目标及运行时 `unknown` |
@@ -62,10 +64,19 @@ with source, detector:
     undistorted_bgr = geometry.camera_model.undistort_image(
         raw_frame.image_bgr
     )
-    observations = detector.detect(raw_frame, undistorted_bgr)
+    result = detector.detect_realtime(raw_frame, undistorted_bgr)
+    if result.stale_dropped:
+        # 记录性能异常即可；过期结果已经被模块清空，不会传给下游。
+        print("dropped stale frame:", result.dropped_stale_age_ms)
+    observations = result.observations
 ```
 
 `detect()` 的两个输入必须属于同一采集帧：第一个参数提供原始 `sequence/timestamp_ns`，第二个参数是该帧经当前 `CameraModel` 产生的去畸变图。不能把缓存旧图、裁剪图或另一相机的图像配给当前帧。
+
+实时调用统一使用 `detect_realtime()`：它只兜底
+`StaleObservationError`，返回空观测并通过 `stale_dropped` /
+`dropped_stale_age_ms` 记录原因。输入尺寸、类别映射、模型或硬件异常仍会抛出。
+离线评测和需要严格失败语义的工具可以直接调用 `detect()`。
 
 若 `ground_mapping_enabled: false`，检测仍正常运行，但所有 `ground_point` 为 `None`。后续定位模块不能把 `None` 当作 `(0, 0)`。
 
@@ -154,7 +165,7 @@ hailo:
   max_detections: 100
 ```
 
-`raw_classes` 的位置就是模型 class ID。`HailoConfig.build_backend()` 会延迟导入 HailoRT 并校验部署资产；`TargetPoseDetector.close()` 会继续关闭后端，所以优先使用检测器上下文管理。
+`raw_classes` 的位置就是模型 class ID。`config.hailo.class_mapping` 是内部的顺序元组；创建检测器时必须调用 `config.hailo.model_class_mapping()` 得到整数 ID 映射。`HailoConfig.build_backend()` 会延迟导入 HailoRT 并校验部署资产；`TargetPoseDetector` 从构造开始接管后端，构造校验失败也会关闭它，因此优先使用检测器上下文管理。
 
 真机单图验收命令：
 
@@ -165,6 +176,14 @@ python manual_tests/hailo_pose.py \
 ```
 
 输入必须已经是与配置内参一致的去畸变图。该命令用于部署连通性检查，不替代正式数据集指标、持续运行时延和温度验收。
+
+实时相机、去畸变、推理和叠加预览：
+
+```bash
+python manual_tests/camera_undistort_perception.py
+```
+
+窗口中的绿色框为目标框、红点为 K0，启用地面映射后标签会附加机器人地面 `(x, y) mm`。
 
 ## 转换为评测输入
 

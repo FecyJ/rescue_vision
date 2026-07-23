@@ -12,6 +12,7 @@ from rescue_vision.perception import (
     FakeInferenceBackend,
     ModelDetection,
     ObservationQuality,
+    StaleObservationError,
     TargetClass,
     TargetObservation,
     TargetPoseDetector,
@@ -75,6 +76,21 @@ def test_target_classes_follow_pose_convention() -> None:
         TargetClass("hazard")
 
 
+def test_detector_closes_backend_when_constructor_validation_fails() -> None:
+    backend = FakeInferenceBackend([])
+    with pytest.raises(ValueError, match="model_class_mapping"):
+        TargetPoseDetector(
+            backend,
+            class_mapping=(TargetClass.GREEN_SUPPLY,),  # type: ignore[arg-type]
+            detection_threshold=0.25,
+            semantic_threshold=0.5,
+            k0_threshold=0.5,
+            max_observation_age_ms=150.0,
+        )
+
+    assert backend.closed
+
+
 def test_detector_builds_observation_and_projects_k0() -> None:
     projector = GroundProjector(np.array([[2.0, 0, 0], [0, 3.0, 0], [0, 0, 1]]))
     observations = detector([[detection()]], projector=projector).detect(
@@ -121,14 +137,49 @@ def test_detector_filters_low_detection_and_supports_empty() -> None:
 
 
 def test_detector_rejects_stale_or_unmapped_results() -> None:
-    with pytest.raises(ValueError, match="exceeds"):
+    with pytest.raises(StaleObservationError, match="exceeds") as raised:
         detector([[detection()]]).detect(
             frame(),
             np.zeros((12, 16, 3), dtype=np.uint8),
             result_timestamp_ns=1_151_000_000,
         )
+    assert raised.value.age_ms == pytest.approx(151.0)
+    assert raised.value.max_age_ms == pytest.approx(150.0)
     with pytest.raises(ValueError, match="no configured mapping"):
         detector([[detection(class_id=4)]]).detect(
+            frame(),
+            np.zeros((12, 16, 3), dtype=np.uint8),
+            result_timestamp_ns=1_010_000_000,
+        )
+
+
+def test_realtime_detector_drops_only_stale_observations() -> None:
+    result = detector([[detection()]]).detect_realtime(
+        frame(),
+        np.zeros((12, 16, 3), dtype=np.uint8),
+        result_timestamp_ns=1_151_000_000,
+    )
+
+    assert result.observations == ()
+    assert result.stale_dropped
+    assert result.dropped_stale_age_ms == pytest.approx(151.0)
+
+
+def test_realtime_detector_returns_current_observations() -> None:
+    result = detector([[detection()]]).detect_realtime(
+        frame(),
+        np.zeros((12, 16, 3), dtype=np.uint8),
+        result_timestamp_ns=1_010_000_000,
+    )
+
+    assert len(result.observations) == 1
+    assert not result.stale_dropped
+    assert result.dropped_stale_age_ms is None
+
+
+def test_realtime_detector_preserves_non_stale_errors() -> None:
+    with pytest.raises(ValueError, match="no configured mapping"):
+        detector([[detection(class_id=4)]]).detect_realtime(
             frame(),
             np.zeros((12, 16, 3), dtype=np.uint8),
             result_timestamp_ns=1_010_000_000,
