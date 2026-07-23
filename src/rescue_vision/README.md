@@ -33,6 +33,7 @@ if geometry is not None:
 | `data` | 记录转清单及防泄漏划分 | [README](data/README.md) |
 | `evaluation` | 离线分类、地面误差和时延报告 | [README](evaluation/README.md) |
 | `geometry` | 坐标类型、去畸变、地面和 BEV 转换 | [README](geometry/README.md) |
+| `perception` | 任务目标观测、K0 投影和可替换推理后端 | [README](perception/README.md) |
 
 `versioning.py` 是跨数据记录和评测共享的小模块，用于取得带 dirty 状态的 Git 版本，不单独建立子包。
 
@@ -41,4 +42,4 @@ if geometry is not None:
 - 算法依赖 `FrameSource`，不要在算法内部创建具体相机后端。
 - 原始像素先经 `CameraModel`，只有 `UndistortedPixel` 才能传给 `GroundProjector`。
 - 配置在启动时加载一次；实时循环不重复读文件。
-- 当前没有感知、跟踪、定位、世界模型、任务状态机、通信或应用入口。
+- 当前没有跟踪、定位、世界模型、任务状态机、通信或应用入口；感知只完成任务目标 Pose 契约与后端，正式模型指标仍待 P1C。

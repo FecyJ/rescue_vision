@@ -9,5 +9,6 @@
 - `camera_undistort.py --intrinsics PATH`：加载指定内参实时预览去畸变结果。
 - `picamera_minimal.py`：直接使用 Picamera2 的最小检查。
 - `geometry_projection.py`：使用本地测试图片人工检查 BEV 和点投影。
+- `hailo_pose.py`：从实际 `runtime.yaml` 加载 YOLO Pose 部署包，检查单张去畸变图像的 K0 观测。
 
 运行前先执行 `python -m pip install -e .`，并确保系统包和显示环境可用。

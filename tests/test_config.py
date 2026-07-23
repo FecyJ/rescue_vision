@@ -35,7 +35,7 @@ def write_intrinsics(path, *, usable: bool = True) -> CameraCalibration:
 
 
 def config_text(*, image_size: str = "[32, 24]", extra: str = "") -> str:
-    return f"""schema_version: 1
+    return f"""schema_version: 2
 camera:
   backend: rpicam_vid
   image_size: {image_size}
@@ -50,6 +50,19 @@ recording:
   image_format: png
 processing:
   max_observation_age_ms: 150.0
+hailo:
+  enabled: false
+  hef_path: null
+  postprocess_onnx_path: null
+  output_mapping_path: null
+  model_version: null
+  hef_sha256: null
+  raw_classes: []
+  class_mapping: {{}}
+  detection_threshold: 0.25
+  semantic_threshold: 0.5
+  k0_threshold: 0.5
+  max_detections: 100
 {extra}"""
 
 
@@ -100,3 +113,43 @@ def test_unusable_intrinsics_fail_at_startup(tmp_path) -> None:
     path.write_text(config_text(), encoding="utf-8")
     with pytest.raises(ValueError, match="marked unusable"):
         load_runtime_config(path).build_geometry()
+
+
+def test_hailo_class_mapping_and_relative_paths(tmp_path) -> None:
+    text = config_text().replace(
+        """  enabled: false
+  hef_path: null
+  postprocess_onnx_path: null
+  output_mapping_path: null
+  model_version: null
+  hef_sha256: null
+  raw_classes: []
+  class_mapping: {}""",
+        """  enabled: true
+  hef_path: bundle/model.hef
+  postprocess_onnx_path: bundle/postprocess.onnx
+  output_mapping_path: bundle/mapping.json
+  model_version: model-v1
+  hef_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  raw_classes: [raw_a, raw_b]
+  class_mapping:
+    raw_a: green_supply
+    raw_b: blue_danger""",
+    )
+    path = tmp_path / "runtime.yaml"
+    path.write_text(text, encoding="utf-8")
+    config = load_runtime_config(path)
+    assert config.hailo.hef_path == (tmp_path / "bundle/model.hef").resolve()
+    assert config.hailo.model_class_mapping()[0].value == "green_supply"
+    assert config.hailo.model_class_mapping()[1].value == "blue_danger"
+
+
+def test_hailo_mapping_must_be_exhaustive(tmp_path) -> None:
+    text = config_text().replace(
+        "  raw_classes: []\n  class_mapping: {}",
+        "  raw_classes: [raw_a]\n  class_mapping: {}",
+    )
+    path = tmp_path / "runtime.yaml"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError, match="exactly match"):
+        load_runtime_config(path)

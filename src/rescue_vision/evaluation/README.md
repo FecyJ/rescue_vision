@@ -12,8 +12,8 @@ report = evaluate_records(
         "schema_version": 1,
         "sample_id": "session_001/frame_00000001",
         "object_id": "target_01",
-        "ground_truth_class": "hazard",
-        "predicted_class": "hazard",
+        "ground_truth_class": "blue_danger",
+        "predicted_class": "blue_danger",
         "confidence": 0.95,
     }],
     model_version="baseline-v1",
@@ -21,7 +21,7 @@ report = evaluate_records(
     code_version="git-sha",
 )
 
-print(report["per_class"]["hazard"]["recall"])
+print(report["per_class"]["blue_danger"]["recall"])
 ```
 
 ## 命令行用法

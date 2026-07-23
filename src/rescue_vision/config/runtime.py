@@ -10,9 +10,10 @@ import yaml
 
 from rescue_vision.geometry.camera_model import CameraCalibration, CameraModel
 from rescue_vision.geometry.ground_projector import GroundProjector
+from rescue_vision.perception.types import TargetClass
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _mapping(value: object, location: str) -> dict[str, Any]:
@@ -65,6 +66,16 @@ def _path_or_none(value: object, base_dir: Path, location: str) -> Path | None:
     return path.resolve() if path.is_absolute() else (base_dir / path).resolve()
 
 
+def _string(value: object, location: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{location} must be a non-empty string.")
+    return value.strip()
+
+
+def _threshold(value: object, location: str) -> float:
+    return _finite_float(value, location, minimum=0.0)
+
+
 @dataclass(frozen=True, slots=True)
 class CameraConfig:
     backend: str
@@ -92,6 +103,48 @@ class ProcessingConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class HailoConfig:
+    enabled: bool
+    hef_path: Path | None
+    postprocess_onnx_path: Path | None
+    output_mapping_path: Path | None
+    model_version: str | None
+    hef_sha256: str | None
+    raw_classes: tuple[str, ...]
+    class_mapping: tuple[TargetClass, ...]
+    detection_threshold: float
+    semantic_threshold: float
+    k0_threshold: float
+    max_detections: int
+
+    def build_backend(self):
+        """延迟导入并创建 Hailo 后端；禁用时返回 ``None``。"""
+
+        if not self.enabled:
+            return None
+        assert self.hef_path is not None
+        assert self.postprocess_onnx_path is not None
+        assert self.output_mapping_path is not None
+        assert self.model_version is not None
+        assert self.hef_sha256 is not None
+        from rescue_vision.perception.hailo_yolo26_pose import HailoYolo26PoseBackend
+
+        return HailoYolo26PoseBackend(
+            hef_path=self.hef_path,
+            postprocess_onnx_path=self.postprocess_onnx_path,
+            output_mapping_path=self.output_mapping_path,
+            model_version=self.model_version,
+            model_sha256=self.hef_sha256,
+            class_count=len(self.raw_classes),
+            max_detections=self.max_detections,
+            score_threshold=self.detection_threshold,
+        )
+
+    def model_class_mapping(self) -> dict[int, TargetClass]:
+        return dict(enumerate(self.class_mapping))
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeGeometry:
     camera_model: CameraModel
     ground_projector: GroundProjector
@@ -104,6 +157,7 @@ class AppConfig:
     geometry: GeometryConfig
     recording: RecordingConfig
     processing: ProcessingConfig
+    hailo: HailoConfig
 
     def build_geometry(self) -> RuntimeGeometry | None:
         """加载并交叉验证内参、运行分辨率和地面映射。"""
@@ -130,14 +184,21 @@ class AppConfig:
 
 
 def load_runtime_config(path: str | Path) -> AppConfig:
-    """从 YAML 加载 schema v1；缺项和未知字段均视为错误。"""
+    """从 YAML 加载 schema v2；缺项和未知字段均视为错误。"""
 
     config_path = Path(path).expanduser().resolve()
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     root = _mapping(raw, "root")
     _reject_unknown(
         root,
-        {"schema_version", "camera", "geometry", "recording", "processing"},
+        {
+            "schema_version",
+            "camera",
+            "geometry",
+            "recording",
+            "processing",
+            "hailo",
+        },
         "root",
     )
 
@@ -237,4 +298,147 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         )
     )
 
-    return AppConfig(SCHEMA_VERSION, camera, geometry, recording, processing)
+    hailo_raw = _mapping(_required(root, "hailo", "root"), "hailo")
+    _reject_unknown(
+        hailo_raw,
+        {
+            "enabled",
+            "hef_path",
+            "postprocess_onnx_path",
+            "output_mapping_path",
+            "model_version",
+            "hef_sha256",
+            "raw_classes",
+            "class_mapping",
+            "detection_threshold",
+            "semantic_threshold",
+            "k0_threshold",
+            "max_detections",
+        },
+        "hailo",
+    )
+    hailo_enabled = _required(hailo_raw, "enabled", "hailo")
+    if not isinstance(hailo_enabled, bool):
+        raise ValueError("hailo.enabled must be a boolean.")
+    hef_path = _path_or_none(
+        hailo_raw.get("hef_path"), base_dir, "hailo.hef_path"
+    )
+    postprocess_onnx_path = _path_or_none(
+        hailo_raw.get("postprocess_onnx_path"),
+        base_dir,
+        "hailo.postprocess_onnx_path",
+    )
+    output_mapping_path = _path_or_none(
+        hailo_raw.get("output_mapping_path"),
+        base_dir,
+        "hailo.output_mapping_path",
+    )
+    model_version_value = hailo_raw.get("model_version")
+    model_version = (
+        _string(model_version_value, "hailo.model_version")
+        if model_version_value is not None
+        else None
+    )
+    checksum_value = hailo_raw.get("hef_sha256")
+    checksum = (
+        _string(checksum_value, "hailo.hef_sha256").lower()
+        if checksum_value is not None
+        else None
+    )
+    if checksum is not None and (
+        len(checksum) != 64
+        or any(character not in "0123456789abcdef" for character in checksum)
+    ):
+        raise ValueError("hailo.hef_sha256 must be 64 hexadecimal characters.")
+
+    raw_classes_value = hailo_raw.get("raw_classes", [])
+    if not isinstance(raw_classes_value, list):
+        raise ValueError("hailo.raw_classes must be a list.")
+    raw_classes = tuple(
+        _string(value, f"hailo.raw_classes[{index}]")
+        for index, value in enumerate(raw_classes_value)
+    )
+    if len(set(raw_classes)) != len(raw_classes):
+        raise ValueError("hailo.raw_classes must not contain duplicates.")
+
+    mapping_value = hailo_raw.get("class_mapping", {})
+    mapping_raw = _mapping(mapping_value, "hailo.class_mapping")
+    if set(mapping_raw) != set(raw_classes):
+        raise ValueError(
+            "hailo.class_mapping keys must exactly match hailo.raw_classes."
+        )
+    try:
+        class_mapping = tuple(
+            TargetClass(_string(mapping_raw[name], f"hailo.class_mapping.{name}"))
+            for name in raw_classes
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "hailo.class_mapping values must be green_supply, black_core, "
+            "orange_injured, blue_danger or unknown."
+        ) from exc
+
+    detection_threshold = _threshold(
+        _required(hailo_raw, "detection_threshold", "hailo"),
+        "hailo.detection_threshold",
+    )
+    semantic_threshold = _threshold(
+        _required(hailo_raw, "semantic_threshold", "hailo"),
+        "hailo.semantic_threshold",
+    )
+    k0_threshold = _threshold(
+        _required(hailo_raw, "k0_threshold", "hailo"),
+        "hailo.k0_threshold",
+    )
+    for location, value in (
+        ("hailo.detection_threshold", detection_threshold),
+        ("hailo.semantic_threshold", semantic_threshold),
+        ("hailo.k0_threshold", k0_threshold),
+    ):
+        if value > 1.0:
+            raise ValueError(f"{location} must be <= 1.0.")
+    if semantic_threshold < detection_threshold:
+        raise ValueError(
+            "hailo.semantic_threshold must be >= hailo.detection_threshold."
+        )
+    max_detections = _positive_int(
+        _required(hailo_raw, "max_detections", "hailo"),
+        "hailo.max_detections",
+    )
+
+    required_assets = (
+        hef_path,
+        postprocess_onnx_path,
+        output_mapping_path,
+        model_version,
+        checksum,
+    )
+    if hailo_enabled and (
+        any(value is None for value in required_assets) or not raw_classes
+    ):
+        raise ValueError(
+            "Enabled hailo requires all asset paths, model identity and raw_classes."
+        )
+    hailo = HailoConfig(
+        enabled=hailo_enabled,
+        hef_path=hef_path,
+        postprocess_onnx_path=postprocess_onnx_path,
+        output_mapping_path=output_mapping_path,
+        model_version=model_version,
+        hef_sha256=checksum,
+        raw_classes=raw_classes,
+        class_mapping=class_mapping,
+        detection_threshold=detection_threshold,
+        semantic_threshold=semantic_threshold,
+        k0_threshold=k0_threshold,
+        max_detections=max_detections,
+    )
+
+    return AppConfig(
+        SCHEMA_VERSION,
+        camera,
+        geometry,
+        recording,
+        processing,
+        hailo,
+    )

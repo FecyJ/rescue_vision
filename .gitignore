@@ -11,3 +11,6 @@ recordings/
 datasets/raw/
 reports/
 models/*.hef
+
+*.log
+configs/runtime.yaml

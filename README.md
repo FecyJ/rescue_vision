@@ -2,7 +2,7 @@
 
 2027 工创赛“智能救援”赛项的上位机视觉工程。目标平台是 Raspberry Pi 5、Hailo-8L 和 Camera Module 3 NoIR Wide。
 
-当前完成的是可复现的视觉基础设施，不是完整比赛程序：相机、标定、地面投影、配置、录制回放、数据集工具和离线评测已经实现；感知、跟踪、定位、世界模型、规则状态机、规划、通信和应用入口尚未实现。P0 还缺四类规则目标的现场实拍数据。
+当前完成的是可复现的视觉基础设施和任务目标感知契约，不是完整比赛程序：相机、标定、地面投影、配置、录制回放、数据集工具、离线评测、统一目标观测与 Hailo YOLO Pose 后端已经实现；训练完成的单 K0 正式模型、跟踪、定位、世界模型、规则状态机、规划、通信和应用入口尚未实现。P0 还缺四类规则目标的现场实拍数据。
 
 ## 从这里开始
 
@@ -14,6 +14,7 @@
 | 标定相机或地面 | [标定说明](src/rescue_vision/calibration/README.md) |
 | 录制、划分或评测数据 | [数据集与评测](docs/数据集与评测.md) |
 | 到现场采集四类目标 | [目标数据采集清单](docs/目标数据采集清单.md) |
+| 标注或部署任务目标模型 | [Pose 视觉模型约定](docs/Pose视觉模型约定.md) |
 | 运行真机或 GUI 检查 | [人工验收脚本](manual_tests/README.md) |
 | 修改仓库 | [AGENTS.md](AGENTS.md) |
 
@@ -26,22 +27,23 @@
 | [`camera/`](src/rescue_vision/camera/README.md) | 已实现 | 两种真机后端、统一帧、离线回放和异步记录 |
 | [`calibration/`](src/rescue_vision/calibration/README.md) | 已实现 | 棋盘采集、三模型内参比较、地面映射 |
 | [`geometry/`](src/rescue_vision/geometry/README.md) | 已实现 | 去畸变、坐标类型、地面与 BEV 转换 |
-| [`config/`](src/rescue_vision/config/README.md) | 已实现 | schema v1 严格配置和标定一致性校验 |
+| [`config/`](src/rescue_vision/config/README.md) | 已实现 | schema v2 严格配置、标定一致性和模型校验和校验 |
 | [`data/`](src/rescue_vision/data/README.md) | 已实现 | 记录转清单、哈希验证、按录像整组划分 |
 | [`evaluation/`](src/rescue_vision/evaluation/README.md) | 已实现 | 分类、地面误差、时延和失败样例报告 |
+| [`perception/`](src/rescue_vision/perception/README.md) | 已实现 | 四类目标契约、K0 投影、假后端、评测适配和 Hailo YOLO Pose 后端 |
 | `manual_tests/` | 人工验收 | 相机、GUI、实际地面映射 |
-| 感知到通信主链路 | 未实现 | 只在功能落地时创建对应目录 |
+| 跟踪到通信主链路 | 未实现 | 只在功能落地时创建对应目录 |
 
 各包的最简 Python 示例和典型用法汇总见 [`src/rescue_vision/README.md`](src/rescue_vision/README.md)。
 
 核心数据流：
 
 ```text
-FrameSource → CameraFrame → CameraModel → 感知（未实现）
-                                      ↓
-                              GroundProjector
-                                      ↓
-                 跟踪/定位/世界模型/策略（未实现）
+FrameSource → CameraFrame → CameraModel → TargetPoseDetector
+                                      ↓             ↓
+                              GroundProjector → TargetObservation
+                                                    ↓
+                               跟踪/定位/世界模型/策略（未实现）
 ```
 
 坐标必须显式区分 `RawPixel`、`UndistortedPixel`、`GroundPoint`、`FieldPoint` 和 `BevPixel`。机器人地面坐标为 `x` 向前、`y` 向左、单位 mm；像素为 `u` 向右、`v` 向下。
@@ -61,7 +63,7 @@ python -m pip install -r requirements.txt
 python -m pip install -e '.[dev]'
 ```
 
-Hailo 和串口依赖等对应模块落地后再安装，不作为当前开发、标定或数据工具的前置条件。
+HailoRT 与 ONNX Runtime 只在创建实际 Hailo 后端时需要，不是开发机测试、标定或数据工具的前置条件。串口依赖等对应模块落地后再安装。
 
 开发机基础验证：
 
