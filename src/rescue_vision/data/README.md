@@ -51,4 +51,4 @@ background, target_pose, contact_state
 
 缺失信息显式写为 `unknown`，不能省略或写空字符串。同一录像、连拍或相同物理布置必须共享 `recording_id`。
 
-完整 schema、工具流程和现场覆盖项分别见仓库的 `docs/数据集与评测.md`、`docs/数据采集工具使用.md` 与 `docs/目标数据采集清单.md`。
+完整 schema 见仓库的 `docs/数据集与评测.md`；采集命令、现场覆盖和排障统一见 `docs/数据采集工具使用.md`。

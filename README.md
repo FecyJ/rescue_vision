@@ -1,57 +1,14 @@
 # 工创赛智能救援上位机视觉
 
-2027 工创赛“智能救援”赛项的上位机视觉工程。目标平台是 Raspberry Pi 5、Hailo-8L 和 Camera Module 3 NoIR Wide。
+2027 工创赛“智能救援”赛项的上位机视觉工程，目标平台为 Raspberry Pi 5、Hailo-8L 和 Camera Module 3 NoIR Wide。
 
-当前完成的是可复现的视觉基础设施和任务目标感知契约，不是完整比赛程序：相机、标定、地面投影、配置、录制回放、数据集工具、离线评测、统一目标观测与 Hailo YOLO Pose 后端已经实现；训练完成的单 K0 正式模型、跟踪、定位、世界模型、规则状态机、规划、通信和应用入口尚未实现。P0 还缺四类规则目标的现场实拍数据。
+当前已完成相机、标定与地面几何、严格配置、录制回放、数据集工具、离线评测、统一目标观测和 Hailo YOLO Pose 后端；尚未完成正式四类目标模型、跟踪、定位、世界模型、规则状态机、规划、通信和应用入口。这不是可直接参赛的完整程序。
 
-## 从这里开始
+## 快速上手
 
-| 要做的事 | 首先查看 |
-| --- | --- |
-| 了解代码放在哪里 | [项目结构](docs/项目结构.md) |
-| 选择下一项工作 | [后续优先级](docs/后续优先级.md) |
-| 理解比赛语义和安全约束 | [赛题约束与视觉需求](docs/赛题约束与视觉需求.md) |
-| 标定相机或地面 | [标定说明](src/rescue_vision/calibration/README.md) |
-| 录制、划分或评测数据 | [数据集与评测](docs/数据集与评测.md) |
-| 执行相机采集和单会话验收 | [数据采集工具使用手册](docs/数据采集工具使用.md) |
-| 到现场采集四类目标 | [目标数据采集清单](docs/目标数据采集清单.md) |
-| 标注或部署任务目标模型 | [Pose 视觉模型约定](docs/Pose视觉模型约定.md) |
-| 运行真机或 GUI 检查 | [人工验收脚本](manual_tests/README.md) |
-| 修改仓库 | [AGENTS.md](AGENTS.md) |
+### 1. 安装
 
-官方资料位于 `docs/命题文件/`。仓库内的解释用于工程设计；发生冲突时以最新正式文件和现场通知为准。
-
-## 当前能力
-
-| 目录 | 状态 | 责任 |
-| --- | --- | --- |
-| [`camera/`](src/rescue_vision/camera/README.md) | 已实现 | 两种真机后端、统一帧、离线回放和异步记录 |
-| [`calibration/`](src/rescue_vision/calibration/README.md) | 已实现 | 棋盘采集、三模型内参比较、地面映射 |
-| [`geometry/`](src/rescue_vision/geometry/README.md) | 已实现 | 去畸变、坐标类型、地面与 BEV 转换 |
-| [`config/`](src/rescue_vision/config/README.md) | 已实现 | schema v2 严格配置、标定一致性和模型校验和校验 |
-| [`data/`](src/rescue_vision/data/README.md) | 已实现 | 记录转清单、哈希验证、按录像整组划分 |
-| [`evaluation/`](src/rescue_vision/evaluation/README.md) | 已实现 | 分类、地面误差、时延和失败样例报告 |
-| [`perception/`](src/rescue_vision/perception/README.md) | 已实现 | 四类目标契约、K0 投影、假后端、评测适配和 Hailo YOLO Pose 后端 |
-| `manual_tests/` | 人工验收 | 相机、GUI、实际地面映射 |
-| 跟踪到通信主链路 | 未实现 | 只在功能落地时创建对应目录 |
-
-各包的最简 Python 示例和典型用法汇总见 [`src/rescue_vision/README.md`](src/rescue_vision/README.md)。
-
-核心数据流：
-
-```text
-FrameSource → CameraFrame → CameraModel → TargetPoseDetector
-                                      ↓             ↓
-                              GroundProjector → TargetObservation
-                                                    ↓
-                               跟踪/定位/世界模型/策略（未实现）
-```
-
-坐标必须显式区分 `RawPixel`、`UndistortedPixel`、`GroundPoint`、`FieldPoint` 和 `BevPixel`。机器人地面坐标为 `x` 向前、`y` 向左、单位 mm；像素为 `u` 向右、`v` 向下。
-
-## 安装与检查
-
-目标环境为 Raspberry Pi OS Trixie、Python 3.13；包支持 Python 3.10 及以上。当前实现使用系统提供的 OpenCV、NumPy、Picamera2 和 libcamera：
+目标环境为 Raspberry Pi OS Trixie、Python 3.13；代码支持 Python 3.10 及以上。
 
 ```bash
 sudo apt update
@@ -64,33 +21,70 @@ python -m pip install -r requirements.txt
 python -m pip install -e '.[dev]'
 ```
 
-HailoRT 与 ONNX Runtime 只在创建实际 Hailo 后端时需要，不是开发机测试、标定或数据工具的前置条件。串口依赖等对应模块落地后再安装。
+HailoRT 与 ONNX Runtime 仅在创建真实 Hailo 后端时需要；开发机测试、标定和数据工具不依赖它们。
 
-开发机基础验证：
+### 2. 验证开发环境
 
 ```bash
 python -m compileall -q src tests manual_tests
 python -m pytest
 ```
 
-`tests/` 不依赖相机或 Hailo；需要硬件、显示器或本地标定资产的检查只放在 `manual_tests/`。
+`tests/` 不访问相机或 Hailo。需要相机、显示器、Hailo 或本地标定资产的检查在 [`manual_tests/`](manual_tests/README.md)。
 
-## 工具入口
+### 3. 选择当前工作
+
+| 目的 | 从这里开始 |
+| --- | --- |
+| 相机已经接好，准备采集数据 | [数据采集手册](docs/数据采集工具使用.md) |
+| 采集棋盘、求内参或地面映射 | [标定说明](src/rescue_vision/calibration/README.md) |
+| 标注或部署四类目标模型 | [Pose 模型约定](docs/Pose视觉模型约定.md) |
+| 开发新模块 | [项目结构](docs/项目结构.md) → [后续优先级](docs/后续优先级.md) |
+| 理解比赛类别和安全规则 | [赛题约束与视觉需求](docs/赛题约束与视觉需求.md) |
+| 查数据或评测 JSONL 格式 | [数据集与评测 schema](docs/数据集与评测.md) |
+| 修改仓库 | [AGENTS.md](AGENTS.md) |
+
+官方资料位于 `docs/命题文件/`。项目文档用于工程实现；冲突时以最新正式文件和现场通知为准。
+
+## 当前模块
+
+| 模块 | 状态 | 责任 |
+| --- | --- | --- |
+| [`camera`](src/rescue_vision/camera/README.md) | 已实现 | 真机最新帧、离线回放和有界异步记录 |
+| [`calibration`](src/rescue_vision/calibration/README.md) | 已实现 | 棋盘采集、三模型内参比较和地面映射 |
+| [`geometry`](src/rescue_vision/geometry/README.md) | 已实现 | 去畸变、显式坐标类型、地面与 BEV 转换 |
+| [`config`](src/rescue_vision/config/README.md) | 已实现 | schema v2 配置、标定一致性和模型身份校验 |
+| [`data`](src/rescue_vision/data/README.md) | 已实现 | 记录检查、清单生成和按会话防泄漏划分 |
+| [`evaluation`](src/rescue_vision/evaluation/README.md) | 已实现 | 分类、地面误差、时延和失败样例报告 |
+| [`perception`](src/rescue_vision/perception/README.md) | 已实现基础设施 | 四类目标契约、K0 投影、假后端和 Hailo 后端；正式模型待训练 |
+| 跟踪至通信主链路 | 未实现 | 只在真实实现和测试落地时创建模块 |
+
+各包最简 Python 示例见 [`src/rescue_vision/README.md`](src/rescue_vision/README.md)。
+
+## 核心数据流
+
+```text
+FrameSource → CameraFrame → CameraModel → TargetPoseDetector
+                                      ↓             ↓
+                              GroundProjector → TargetObservation
+                                                    ↓
+                               跟踪/定位/世界模型/策略（未实现）
+```
+
+- 像素必须区分 `RawPixel` 与 `UndistortedPixel`；地面点使用 `GroundPoint`，单位 mm。
+- `CameraModel` 是去畸变唯一权威；`GroundProjector` 是去畸变像素与机器人地面的唯一权威。
+- 实时路径只处理最新帧；录像、显示和日志使用有界旁路。
+- 危险目标允许 `unknown`/疑似危险，不得用总体指标掩盖危险类漏检。
+- 原始录像、批量图片、标定临时输出、正式数据集和模型权重不提交 Git。
+
+## 命令行工具
 
 | 命令 | 用途 |
 | --- | --- |
 | `rescue-vision-record` | 录制可回放相机会话 |
-| `rescue-vision-check-recording` | 完整回放并检查单次采集健康状态 |
+| `rescue-vision-check-recording` | 检查单次采集的完整性、帧率、丢帧和元数据 |
 | `rescue-vision-manifest` | 记录目录转严格数据清单 |
-| `rescue-vision-split` | 按 `recording_id` 防泄漏划分 |
+| `rescue-vision-split` | 按 `recording_id` 整组划分 |
 | `rescue-vision-evaluate` | 生成离线评测报告 |
 
-参数、示例和 schema 统一见[数据集与评测](docs/数据集与评测.md)。`examples/` 只是格式夹具，不能充当训练或现场验证数据。
-
-## 关键约束
-
-- `CameraModel` 是去畸变唯一权威；`GroundProjector` 是去畸变像素与机器人地面的唯一权威。
-- 相机、分辨率、裁剪、焦点、安装姿态或 `new_K` 改变后必须重新验证相应标定。
-- 实时路径只处理最新帧；录像、显示和日志使用有界旁路。
-- 危险目标允许“未知/疑似危险”，不得为了总体指标降低危险类安全要求。
-- 原始录像、批量图片、标定临时输出和模型权重不提交 Git。
+采集命令与现场步骤统一见[数据采集手册](docs/数据采集工具使用.md)，格式定义见[数据集与评测 schema](docs/数据集与评测.md)。`examples/` 仅是合成格式夹具，不能作为实拍或性能证据。

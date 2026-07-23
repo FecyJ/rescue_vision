@@ -14,14 +14,15 @@
 | 比赛类别、区域、安全规则 | `docs/赛题约束与视觉需求.md`，必要时核对官方 PDF |
 | 新模块、优先级、依赖 | `docs/后续优先级.md` |
 | 相机或地面标定 | `src/rescue_vision/calibration/README.md` |
-| 录制、清单、划分、评测 | `docs/数据集与评测.md` |
-| 现场四类目标采集 | `docs/目标数据采集清单.md` |
+| 录制、检查、清单与划分 | `docs/数据采集工具使用.md`；schema 再看 `docs/数据集与评测.md` |
+| 现场四类目标采集 | `docs/数据采集工具使用.md` 的“正式采集覆盖” |
+| 目标标注或 Hailo Pose | `docs/Pose视觉模型约定.md`、`src/rescue_vision/perception/README.md` |
 | 真机或 GUI 验收 | `manual_tests/README.md` |
 
 ## 当前事实
 
-- 已实现：最新帧相机源、三模型内参/地面标定、去畸变、BEV、严格配置、录制回放、数据清单划分和离线评测。
-- 未实现：感知、跟踪、定位、世界模型、规则状态机、规划、通信和应用入口。
+- 已实现：最新帧相机源、三模型内参/地面标定、去畸变、BEV、严格配置、录制回放、数据工具、离线评测、任务目标观测契约和 Hailo YOLO Pose 后端。
+- 未实现：正式任务目标模型、跟踪、定位、世界模型、规则状态机、规划、通信和应用入口。
 - `tests/` 是无 Raspberry Pi、相机和 Hailo 也能运行的 pytest；硬件/GUI 检查在 `manual_tests/`。
 - 当前缺四类规则目标的系统实拍数据；`examples/` 仅是 schema 夹具。
 

@@ -14,7 +14,7 @@
 | `blue_danger` | 危险目标 |
 | `unknown` | 仅用于运行时保守降级，不是第五个训练标签 |
 
-公共契约只包含 `K0 bottom_contact_anchor`。第一版 `simv1_1` 虽然输出 K0、K1、K2，后端也只读取 K0；以后部署包应使用 `kpt_shape: [1, 3]`。
+公共契约只包含 `K0 bottom_contact_anchor`。后端仍能读取旧的三关键点部署包，但只消费 K0；新部署包使用 `kpt_shape: [1, 3]`。
 
 ## 最简示例
 
@@ -99,7 +99,7 @@ hailo:
 
 `raw_classes` 的顺序就是模型 class ID；映射键必须完整覆盖该列表。决赛现场若模型标签或顺序改变，只替换部署包和这段配置，不修改任务代码。
 
-Hailo 后端直接使用系统 `hailo_platform` 和 ONNX Runtime。当前 `simv1_1` 清单要求 HailoRT 4.23.x。模块导入和假后端不会导入 HailoRT；只有调用 `config.hailo.build_backend()` 才创建 VDevice。使用上下文管理或 `try/finally` 调用 `close()`，确保异步作业和设备上下文在异常路径也释放。
+Hailo 后端直接使用系统 `hailo_platform` 和 ONNX Runtime，具体版本必须以部署包清单为准。模块导入和假后端不会导入 HailoRT；只有调用 `config.hailo.build_backend()` 才创建 VDevice。使用上下文管理或 `try/finally` 调用 `close()`，确保异步作业和设备上下文在异常路径也释放。
 
 真机单图检查：
 
@@ -109,4 +109,4 @@ python manual_tests/hailo_pose.py \
   --undistorted-image path/to/undistorted.png
 ```
 
-该脚本不替代 P1C 的目标硬件持续运行、观测年龄和温度验收。
+该脚本不替代路线图 P2 的目标硬件持续运行、观测年龄和温度验收。
