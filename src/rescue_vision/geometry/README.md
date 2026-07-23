@@ -1,63 +1,126 @@
-# `geometry`：相机与地面几何
+# `geometry`：相机、地面与 BEV 几何
 
-本包是坐标类型、镜头去畸变、地面投影和 BEV 的唯一权威实现。调用链固定为 `RawPixel → UndistortedPixel → GroundPoint`。
+本包是坐标类型、镜头去畸变、去畸变像素到机器人地面以及 BEV 转换的唯一权威。业务模块不得读取标定 JSON 后自行复制矩阵。
 
-## 最简示例
+## 常用类和函数
+
+| 入口 | 作用 |
+| --- | --- |
+| `CameraModel.undistort_image()` | 原始整帧转固定 `new_K` 下的全尺寸去畸变图 |
+| `CameraModel.undistort_pixel()` / `undistort_pixels()` | `RawPixel` 转 `UndistortedPixel` |
+| `CameraModel.valid_mask` | 标记去畸变图中确实来自原图的像素 |
+| `GroundProjector.pixel_to_ground()` / `pixels_to_ground()` | 去畸变像素转机器人地面毫米坐标 |
+| `GroundProjector.ground_to_pixel()` / `ground_to_pixels()` | 地面点反投影到去畸变图 |
+| `GroundProjector.ground_to_bev_pixel()` / `ground_to_bev_pixels()` | 地面点转鸟瞰图像素 |
+| `GroundProjector.bev_pixel_to_ground()` / `bev_pixels_to_ground()` | 鸟瞰像素转地面点 |
+| `GroundProjector.make_bev_image()` | 按地面映射生成完整 BEV |
+| `CameraCalibration.fingerprint()` | 标识模型、尺寸、`K/D/new_K` 的稳定 SHA-256 |
+
+坐标数据结构：
+
+| 类型 | 坐标约定 |
+| --- | --- |
+| `RawPixel(u, v)` | 原始畸变图；`u` 向右、`v` 向下 |
+| `UndistortedPixel(u, v)` | 固定 `new_K` 的去畸变图 |
+| `GroundPoint(x, y)` | 机器人地面系；`x` 向前、`y` 向左，单位 mm |
+| `BevPixel(u, v)` | 图像上方为机器人前方，左侧为机器人左方 |
+| `FieldPoint(x, y)` | 场地全局点；仅在全局坐标定义明确的模块中使用 |
+
+## 从运行配置装配
+
+实际运行优先通过 `configs/runtime.yaml` 构建对象，而不是在业务代码中写标定路径：
 
 ```python
-from rescue_vision.geometry.camera_model import CameraCalibration, CameraModel
-from rescue_vision.geometry.ground_projector import GroundProjector
-from rescue_vision.geometry.types import RawPixel
+from rescue_vision.config import load_runtime_config
 
-calibration = CameraCalibration.from_json("selected_calibration.json")
-camera = CameraModel(calibration)
-projector = GroundProjector.from_json(
-    "ground_mapping.json",
-    camera_calibration=calibration,
+config = load_runtime_config("configs/runtime.yaml")
+geometry = config.build_geometry()
+if geometry is None:
+    raise RuntimeError("此流程需要启用 geometry.intrinsics_enabled")
+
+camera_model = geometry.camera_model
+ground_projector = geometry.ground_projector
+```
+
+配置装配会检查运行分辨率、标定可用性、相机模型以及地面映射中的内参指纹。只有内参时 `ground_projector` 合法地为 `None`。
+
+## 一帧图像的典型处理
+
+```python
+from rescue_vision.camera.picamera2_source import Picamera2Source
+from rescue_vision.config import load_runtime_config
+
+config = load_runtime_config("configs/runtime.yaml")
+geometry = config.build_geometry()
+if geometry is None:
+    raise RuntimeError("需要有效内参")
+
+with Picamera2Source(
+    image_size=config.camera.image_size,
+    fps=config.camera.fps,
+    lens_position=config.camera.lens_position,
+) as source:
+    raw_frame = source.read(timeout=1.0)
+
+# 图像仍对应同一帧号和 timestamp_ns；只改变像素坐标系。
+undistorted_bgr = geometry.camera_model.undistort_image(
+    raw_frame.image_bgr
 )
 
-undistorted = camera.undistort_pixel(RawPixel(u=1200.0, v=900.0))
-ground = projector.pixel_to_ground(undistorted)
-print(ground.x, ground.y)  # mm；x 向前，y 向左
+# 完整 BEV 成本较高，只在确实需要场地结构图时生成。
+if geometry.ground_projector is not None:
+    bev_bgr = geometry.ground_projector.make_bev_image(undistorted_bgr)
 ```
 
-`GroundProjector.from_json()` 会校验图像尺寸、相机模型和内参指纹，不能混用不同标定批次。
+不要把去畸变图重新包装成“新的采集帧”并生成新时间戳。下游观测必须继续携带原 `CameraFrame.sequence` 和 `timestamp_ns`。
 
-## 去畸变整帧与生成 BEV
+## 投影 K0 或其他少量地面点
 
 ```python
-undistorted_image = camera.undistort_image(frame.image_bgr)
-bev_image = projector.make_bev_image(undistorted_image)
+from rescue_vision.geometry.types import UndistortedPixel
+
+projector = geometry.ground_projector
+if projector is None:
+    raise RuntimeError("runtime.yaml 尚未启用地面映射")
+
+# K0 已由 Pose 后端反映射到全尺寸去畸变图坐标。
+k0 = UndistortedPixel(u=1175.0, v=1012.0)
+ground = projector.pixel_to_ground(k0)
+print(f"前方 {ground.x:.0f} mm，左侧 {ground.y:.0f} mm")
 ```
 
-完整 BEV 只在场地结构检测或调试时按需生成。少量目标接触点直接调用 `pixel_to_ground()`，不要先生成 BEV 再查坐标。
+一帧有多个点时使用 `pixels_to_ground()` 批量转换；空序列会返回空列表。少量目标接触点不要先生成 BEV 再查坐标。
 
 ## 去畸变边缘填充
 
-`undistort_image()` 保持标定分辨率不变，无法从原图采样的边缘像素统一填充为 BGR `(114, 114, 114)`，与 YOLO Letterbox 一致，避免纯黑边缘形成额外的训练特征。`camera.valid_mask` 仍以 0 标记这些填充像素，有效比例可这样查看：
+`CameraModel.undistort_image()` 保持标定分辨率不变，把无法从原图采样的边缘统一填充为 BGR `(114, 114, 114)`，与 YOLO Letterbox 一致。无效位置仍由 `valid_mask == 0` 表示：
 
 ```python
 import cv2
 
-valid_ratio = cv2.countNonZero(camera.valid_mask) / camera.valid_mask.size
+valid_ratio = (
+    cv2.countNonZero(camera_model.valid_mask)
+    / camera_model.valid_mask.size
+)
 ```
 
-当前不自动裁除填充边缘，因为裁剪会改变图像尺寸、主点、检测框和 K0 坐标，并使 `new_K` 与地面映射失配。标注、训练和推理都保留同一全尺寸灰色边缘；不得在 `valid_mask == 0` 的区域标注目标。若无效区域过大，应重新选择标定的 `new_K`。未来若引入裁剪，必须记录 ROI、生成裁后 `new_K`，并重做地面映射和数据集版本。
+不自动裁除填充边缘，因为裁剪会改变图像尺寸、主点、检测框和 K0 坐标，并使 `new_K` 与地面映射失配。标注、训练和推理保留同一全尺寸图，不得在无效区标注目标。
 
-填充值在图像编码前精确为 `114`。若记录格式为有损 JPEG，重新解码后边缘附近可能因压缩出现小幅波动；`undistort_fill_value: 114` 表示编码前的预处理契约，不承诺 JPEG 文件逐像素严格等于 `114`。
+填充值在编码前精确为 `114`。JPEG 解码后边界附近可能因有损压缩略有波动；session 中的 `undistort_fill_value: 114` 描述编码前预处理契约。
 
-## 坐标类型
+## 直接加载产物的适用场景
 
-| 类型 | 含义 |
-| --- | --- |
-| `RawPixel` | 原始畸变图像，`u` 右、`v` 下 |
-| `UndistortedPixel` | 固定 `new_K` 下的去畸变图像 |
-| `GroundPoint` | 机器人地面系，`x` 前、`y` 左，单位 mm |
-| `BevPixel` | 上方为前、左侧为左的鸟瞰像素 |
-| `FieldPoint` | 场地全局点；全局定义冻结后再作为稳定接口 |
+标定工具、资产检查器等尚未加载运行配置的底层程序可以直接使用：
 
-禁止用裸 `(u, v)` 跨模块传递坐标。批量接口包括 `undistort_pixels()`、`pixels_to_ground()`、`ground_to_pixels()`、`ground_to_bev_pixels()` 和 `bev_pixels_to_ground()`；空列表会返回空列表。
+```python
+from rescue_vision.geometry.camera_model import CameraModel
+from rescue_vision.geometry.ground_projector import GroundProjector
 
-## 标定条件
+camera_model = CameraModel.from_json("selected_calibration.json")
+projector = GroundProjector.from_json(
+    "ground_mapping.json",
+    camera_calibration=camera_model.calibration,
+)
+```
 
-相机、分辨率、裁剪、焦点、安装位姿或 `new_K` 改变后必须重新验证相应标定。标定操作见相邻的 `calibration/README.md`。
+业务运行代码仍应优先使用 `AppConfig.build_geometry()`。相机、分辨率、裁剪、焦点、安装位姿或 `new_K` 改变后必须重新验证相应标定；操作步骤见 [`calibration/README.md`](../calibration/README.md)。

@@ -1,116 +1,194 @@
-# `camera`：帧源、回放与记录
+# `camera`：帧源、回放、显示与记录
 
-本包统一真机和离线输入。所有帧源实现 `FrameSource` 的 `start/read/stop` 生命周期，输出只读的 BGR `CameraFrame`。
+本包统一真机和离线输入。所有帧源遵循 `FrameSource` 的 `start/read/stop` 生命周期并输出 `CameraFrame`；算法层只依赖这个协议，不直接创建 Picamera2 或外部进程。
 
-## 最简示例：离线读取一张图
+## 常用类、函数和命令
 
-```python
-from rescue_vision.camera.replay import ImageDirectorySource
+| 入口 | 用途 | 关键行为 |
+| --- | --- | --- |
+| `CameraFrame` | 一帧 BGR 图、序号、采集时间和元数据 | `image_bgr` 只读；时间单位为 ns |
+| `FrameSource` | 相机与离线源共同协议 | `read(timeout)` 交付一帧 |
+| `Picamera2Source` | 正式采集首选真机源 | 保存曝光、增益、焦点等逐帧元数据 |
+| `RpicamSource` | `rpicam-vid` 低开销真机源 | 不承诺完整传感器元数据 |
+| `RecordingSource` | 严格回放记录目录 | 验证图片 SHA-256，保留原序号和时间 |
+| `ImageDirectorySource` | 稳定顺序读取图片目录 | 按文件名排序并按 FPS 生成时间 |
+| `VideoFileSource` | 读取普通视频 | 使用视频或覆盖 FPS 生成时间 |
+| `FrameRecorder` | 有界异步写盘 | 队列满时返回 `False`，不阻塞主链路 |
+| `OpenCvFrameViewer` | 可选缩放预览 | `Q/Esc` 返回 `False` |
+| `record_session()` | 组合一个 `FrameSource` 和 `FrameRecorder` | 保证异常路径按相机、记录器顺序收尾 |
+| `undistort_camera_frame()` | 保留帧身份并附加去畸变元数据 | 供自定义录制主循环复用 |
+| `rescue-vision-record` | 配置驱动的正式录制入口 | 自动去畸变并写完整 session |
 
-with ImageDirectorySource("images", fps=20.0) as source:
-    frame = source.read()
-
-print(frame.sequence, frame.timestamp_ns, frame.image_bgr.shape)
-```
-
-图片按文件名稳定排序；读完后 `read()` 抛出 `EOFError`。需要修改图像时先调用 `frame.image_bgr.copy()`。
-
-## 真机最新帧
-
-需要逐帧曝光、增益和传感器时间时使用 Picamera2：
+## 按运行配置创建真机源
 
 ```python
 from rescue_vision.camera.picamera2_source import Picamera2Source
+from rescue_vision.camera.rpicam_source import RpicamSource
+from rescue_vision.config import load_runtime_config
 
-with Picamera2Source(image_size=(2304, 1296), fps=20) as source:
+config = load_runtime_config("configs/runtime.yaml")
+
+# 具体后端只在装配层选择，下游算法仍只接收 FrameSource。
+source_class = (
+    Picamera2Source
+    if config.camera.backend == "picamera2"
+    else RpicamSource
+)
+source = source_class(
+    image_size=config.camera.image_size,
+    fps=config.camera.fps,
+    lens_position=config.camera.lens_position,
+)
+
+with source:
     frame = source.read(timeout=1.0)
+    print(frame.sequence, frame.timestamp_ns, frame.image_bgr.shape)
     print(frame.metadata.get("sensor_timestamp_ns"))
 ```
 
-只需要低开销 BGR 帧时可以使用 `rpicam-vid` 后端：
+两个真机源都会在后台持续排空输入，只向调用方交付最新完整帧。处理速度不足时可能跳过旧序号，但不会积累越来越陈旧的帧。用 `CameraFrame.age_ns()` 或 `is_stale()` 判断观测是否过期：
 
 ```python
-from rescue_vision.camera.rpicam_source import RpicamSource
+import time
 
-with RpicamSource(image_size=(2304, 1296), fps=20) as source:
-    frame = source.read(timeout=1.0)
+age_ms = frame.age_ns(time.monotonic_ns()) / 1_000_000
+if frame.is_stale(
+    time.monotonic_ns(),
+    config.processing.max_observation_age_ms,
+):
+    # 下游应保守丢弃过期观测，而不是继续用于定位或决策。
+    print(f"stale frame: {age_ms:.1f} ms")
 ```
 
-两个真机源都会持续排空输入并只保存最新帧；处理速度低于相机帧率时会跳过旧帧，不会积累延迟。
-
-## 回放已有数据
+## 回放正式记录
 
 ```python
-from rescue_vision.camera.replay import RecordingSource, VideoFileSource
+from rescue_vision.camera.replay import RecordingSource
 
 with RecordingSource("recordings/session_001") as source:
-    recorded_frame = source.read()
+    while True:
+        try:
+            frame = source.read()
+        except EOFError:
+            break
 
-with VideoFileSource("clip.mp4", fps_override=20.0) as source:
-    video_frame = source.read()
+        # 回放帧已经保持 session 声明的 raw_pixel 或
+        # undistorted_pixel 身份，不要再次盲目去畸变。
+        print(frame.sequence, frame.metadata["image_coordinate_system"])
 ```
 
-`RecordingSource` 保留原序号、时间戳和元数据，并验证图像 SHA-256；视频和图片目录使用帧序生成确定性时间戳。
+`RecordingSource` 会拒绝不支持的 session schema、图片哈希错误、尺寸错误和坐标元数据矛盾。`ImageDirectorySource`、`VideoFileSource` 更适合外部素材导入，不具备记录目录的完整 provenance。
 
-## 异步记录
+## 正式录制命令
 
-日常采集优先使用命令行入口：
+日常采集应使用命令，而不是自行拼装 `FrameRecorder`：
 
 ```bash
 rescue-vision-record \
-  --config configs/runtime.example.yaml \
+  --config configs/runtime.yaml \
   --output recordings/session_001 \
-  --frames 100 \
-  --display
+  --duration-seconds 10 \
+  --display \
+  --tag lighting=indoor_bright \
+  --tag distance=near \
+  --tag occlusion=none \
+  --tag motion_blur=low \
+  --tag background=official_mat \
+  --tag target_pose=upright \
+  --tag contact_state=isolated
 ```
 
-`rescue-vision-record` 会读取 schema v3 几何配置：
+命令会：
 
-- `intrinsics_enabled: true` 时，写盘前使用 `CameraModel` 去畸变，记录标记为 `undistorted_pixel`；
-- `intrinsics_enabled: false` 时保存相机原图，记录标记为 `raw_pixel`；
-- `ground_mapping_enabled` 不参与录制，可在尚无地面映射时保持关闭。
+1. 按 `camera.backend` 创建真机源；
+2. 在 `intrinsics_enabled: true` 时用 `CameraModel` 去畸变；
+3. 写入 session schema v3、内参指纹、有效像素比例和填充值；
+4. 使用 `FrameRecorder` 异步编码，正常关闭相机、线程和窗口。
 
-任务目标标注、训练和推理统一使用去畸变图，因此正式数据采集必须启用经过验收且与当前分辨率、焦点匹配的内参。去畸变无效边缘统一填充为与 YOLO Letterbox 相同的 BGR `(114, 114, 114)`，并在 session schema v3 的 `undistort_fill_value` 中记录。原图模式只用于标定或诊断，不能生成任务目标 manifest。
+`--display` 展示实际交给记录器的画面，预览缩放不改变保存分辨率；按 `Q/Esc` 正常结束并收尾 session。显示可能降低吞吐，性能门禁应另做一次不带 `--display` 的短录。
 
-`--display` 显示经过配置去畸变、即将交给记录器的画面；预览会按比例缩小，但不修改写盘图像。按 `Q` 或 `Esc` 会正常结束录制并收尾 session。无桌面、SSH 未转发图形界面或追求最低显示开销时不要使用该选项；帧率与丢帧性能门禁应另做一次不带 `--display` 的短录。
+## 在程序中使用旁路记录器
 
-程序内的最简查看器用法：
-
-```python
-from rescue_vision.camera.viewer import OpenCvFrameViewer
-
-with OpenCvFrameViewer("preview") as viewer:
-    viewer.show(frame.image_bgr)  # False 表示按下了 Q/Esc
-```
-
-程序内也可以旁路提交帧：
+只有应用主循环需要同步保留其他状态时才直接使用 `FrameRecorder`。构造参数必须与实际提交图像一致：
 
 ```python
+from pathlib import Path
+
+import cv2
+import yaml
+
+from rescue_vision.camera.picamera2_source import Picamera2Source
+from rescue_vision.camera.record_cli import undistort_camera_frame
 from rescue_vision.camera.recording import FrameRecorder
+from rescue_vision.camera.rpicam_source import RpicamSource
+from rescue_vision.config import load_runtime_config
+from rescue_vision.geometry.camera_model import IMAGE_BORDER_FILL_VALUE
+from rescue_vision.versioning import git_version
 
-with FrameRecorder(
+config_path = Path("configs/runtime.yaml").resolve()
+config = load_runtime_config(config_path)
+camera_model = config.build_camera_model()
+if camera_model is None:
+    raise RuntimeError("任务目标记录需要启用内参")
+
+source_class = (
+    Picamera2Source
+    if config.camera.backend == "picamera2"
+    else RpicamSource
+)
+source = source_class(
+    image_size=config.camera.image_size,
+    fps=config.camera.fps,
+    lens_position=config.camera.lens_position,
+)
+
+recorder = FrameRecorder(
     "recordings/session_001",
-    image_size=source.image_size,
-    config_snapshot={},
-    versions={"code": "dev"},
-) as recorder:
-    recorder.record(frame)  # False 表示有界队列已满
+    image_size=config.camera.image_size,
+    # 保存完整配置快照，后续才能复现这次采集。
+    config_snapshot=yaml.safe_load(
+        config_path.read_text(encoding="utf-8")
+    ),
+    versions={"code": git_version(), "opencv": cv2.__version__},
+    session_tags={
+        "lighting": "indoor_bright",
+        "distance": "near",
+        "occlusion": "none",
+        "motion_blur": "low",
+        "background": "official_mat",
+        "target_pose": "upright",
+        "contact_state": "isolated",
+    },
+    queue_capacity=config.recording.queue_capacity,
+    image_format=config.recording.image_format,
+    image_coordinate_system="undistorted_pixel",
+    intrinsics_fingerprint_sha256=camera_model.calibration.fingerprint(),
+    valid_pixel_ratio=(
+        cv2.countNonZero(camera_model.valid_mask)
+        / camera_model.valid_mask.size
+    ),
+    undistort_fill_value=IMAGE_BORDER_FILL_VALUE,
+)
+
+with source, recorder:
+    raw_frame = source.read(timeout=1.0)
+    frame_to_store = undistort_camera_frame(
+        raw_frame,
+        camera_model=camera_model,
+    )
+    accepted = recorder.record(frame_to_store)
 ```
 
-输出目录必须为空。编码和写盘在线程中完成，队列满时丢弃记录请求并累计 `dropped_frames`，不会阻塞实时主链路。
-
-采集模板默认使用质量 95 的 JPEG；2304×1296、20 FPS 下应先以短录检查确认存储吞吐。PNG 只有在降低帧率并通过同样检查后再使用。
-
-真机短录后使用 `rescue-vision-check-recording` 验证全部图片哈希、有效帧率、丢帧率和元数据覆盖。完整采集流程见仓库的 [`docs/数据采集工具使用.md`](../../../docs/数据采集工具使用.md)。
+`accepted=False` 表示有界队列已满；应用可记录告警，但不能改为无界堆积或阻塞实时感知。完整现场流程和标签要求见 [`docs/数据采集工具使用.md`](../../../docs/数据采集工具使用.md)。
 
 ## 文件定位
 
 | 文件 | 用途 |
 | --- | --- |
-| `frame.py` | `CameraFrame`、`FrameSource`、元数据值类型 |
-| `picamera2_source.py` | 带逐帧传感器元数据的真机源 |
-| `rpicam_source.py` | 基于 `rpicam-vid` 的真机源 |
-| `replay.py` | 图片目录、视频和记录目录回放 |
+| `frame.py` | `CameraFrame`、`FrameSource` |
+| `picamera2_source.py` | 带逐帧元数据的最新帧源 |
+| `rpicam_source.py` | 基于 `rpicam-vid` 的最新帧源 |
+| `replay.py` | 图片、视频和记录目录回放 |
 | `recording.py` | 有界异步记录器 |
-| `record_cli.py` | `rescue-vision-record` 入口 |
-| `viewer.py` | 录制与回放命令共用的可缩放 OpenCV 查看器 |
+| `record_cli.py` | 配置驱动录制工作流 |
+| `viewer.py` | 录制与检查命令共用的 OpenCV 查看器 |

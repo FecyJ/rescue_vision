@@ -59,7 +59,7 @@ python -m pytest
 | [`perception`](src/rescue_vision/perception/README.md) | 已实现基础设施 | 四类目标契约、K0 投影、假后端和 Hailo 后端；正式模型待训练 |
 | 跟踪至通信主链路 | 未实现 | 只在真实实现和测试落地时创建模块 |
 
-各包最简 Python 示例见 [`src/rescue_vision/README.md`](src/rescue_vision/README.md)。
+各包常用 API、命令和实际对接示例见 [`src/rescue_vision/README.md`](src/rescue_vision/README.md)。
 
 ## 核心数据流
 

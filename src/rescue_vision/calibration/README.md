@@ -1,8 +1,18 @@
-# 相机与地面标定
+# `calibration`：相机与地面标定
 
 本页是相机内参与地面映射的唯一操作说明。标定脚本默认使用本目录下的路径，不受终端当前目录影响；现场生成的 `calibration_captures/` 和 `output/` 已被 Git 忽略。运行时结构和坐标边界见[项目结构](../../../docs/项目结构.md)。
 
-## 最简示例
+## 常用命令与产物
+
+| 命令 | 使用时机 | 主要产物 |
+| --- | --- | --- |
+| `python -m rescue_vision.calibration.capture_chessboard_images` | 相机条件固定后采集内参样本 | 棋盘原图、检测图、逐帧元数据 |
+| `python -m rescue_vision.calibration.calibrate_intrinsics` | 比较三种模型并选择内参 | `selected_calibration.json`、诊断图 |
+| `python -m rescue_vision.calibration.calibrate_extrinsics_ground` | 相机安装姿态最终固定后 | `ground_mapping.json`、BEV 与误差诊断 |
+| `CameraModel.from_json()` | 独立检查标定产物 | 默认拒绝 `quality.usable=false` |
+| `load_runtime_config(...).build_geometry()` | 实际运行接入 | 联合验证内参、分辨率和地面映射指纹 |
+
+## 完整工作流速览
 
 ```bash
 # 1. 采集棋盘图
@@ -166,3 +176,33 @@ output/ground_diagnostics/
 - 相机安装版本或可复现的机械定位方式。
 
 如果这些元数据无法对应，宁可重新标定，也不要混用两次标定产物。
+
+## 接入 `configs/runtime.yaml`
+
+内参验收后先启用去畸变；地面映射完成并通过保留点验证后再单独启用：
+
+```yaml
+geometry:
+  intrinsics_enabled: true
+  intrinsics_path: ../src/rescue_vision/calibration/output/intrinsics_YYYYMMDD_HHMMSS/selected_calibration.json
+  ground_mapping_enabled: true
+  ground_mapping_path: ../src/rescue_vision/calibration/output/ground_mapping.json
+```
+
+从仓库根目录执行一次真实装配检查：
+
+```bash
+python - <<'PY'
+from rescue_vision.config import load_runtime_config
+
+config = load_runtime_config("configs/runtime.yaml")
+geometry = config.build_geometry()
+if geometry is None:
+    raise RuntimeError("内参未启用")
+
+print("intrinsics:", geometry.camera_model.calibration.fingerprint())
+print("ground mapping:", geometry.ground_projector is not None)
+PY
+```
+
+这一步比只解析 YAML 更重要：它会真正读取产物并检查运行分辨率、标定质量、模型类型和指纹。应用代码随后只使用 `geometry.camera_model` 与 `geometry.ground_projector`，不再直接解释 JSON 字段。

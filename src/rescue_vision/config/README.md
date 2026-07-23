@@ -1,68 +1,95 @@
-# `config`：运行配置
+# `config`：运行配置与对象装配
 
-本包加载 schema v3 YAML，并在启动阶段校验未知字段、类型、尺寸、标定质量、相机模型、内参指纹和 Hailo 模型身份。配置示例位于 `configs/runtime.example.yaml`；本机实际值写入不提交的 `configs/runtime.yaml`。
+本包是运行参数的唯一入口。`load_runtime_config()` 加载 schema v3 YAML，拒绝缺失字段、未知字段、错误类型和不一致资产；相对路径以 YAML 所在目录为基准。
 
-## 最简示例
+本机运行统一读取不提交的 `configs/runtime.yaml`。`configs/runtime.example.yaml` 只用于创建新配置：
 
-```python
-from rescue_vision.config import load_runtime_config
-
-config = load_runtime_config("configs/runtime.example.yaml")
-print(config.camera.backend, config.camera.image_size)
+```bash
+cp configs/runtime.example.yaml configs/runtime.yaml
 ```
 
-配置对象是不可变 dataclass；运行循环应复用它，不要反复读取 YAML。
+## 常用类和函数
 
-## 独立装配内参与地面映射
+| 入口 | 用途 | 重要返回语义 |
+| --- | --- | --- |
+| `load_runtime_config(path)` | 严格读取一次 YAML | 返回不可变 `AppConfig` |
+| `AppConfig.build_camera_model()` | 按内参开关创建 `CameraModel` | 内参关闭时返回 `None` |
+| `AppConfig.build_geometry()` | 创建相机模型和可选地面映射 | 内参关闭时返回 `None`；只有内参时 projector 为 `None` |
+| `HailoConfig.build_backend()` | 校验模型资产并创建 Hailo 后端 | Hailo 关闭时返回 `None` |
+| `HailoConfig.model_class_mapping()` | 把模型 class ID 映射为 `TargetClass` | 直接传给 `TargetPoseDetector` |
+
+主要配置 dataclass：
+
+| 类 | 常用字段 |
+| --- | --- |
+| `CameraConfig` | `backend`、`image_size`、`fps`、`lens_position` |
+| `GeometryConfig` | 内参与地面映射各自的开关和路径 |
+| `RecordingConfig` | `queue_capacity`、`image_format` |
+| `ProcessingConfig` | `max_observation_age_ms` |
+| `HailoConfig` | 模型资产、身份、类别映射和阈值 |
+| `RuntimeGeometry` | `camera_model`、可选 `ground_projector` |
+
+## 启动时的典型用法
 
 ```python
 from rescue_vision.config import load_runtime_config
 
-config = load_runtime_config("path/to/runtime.yaml")
-camera_model = config.build_camera_model()
+config = load_runtime_config("configs/runtime.yaml")
+
+# build_geometry() 会同时检查运行分辨率、标定可用性、
+# 相机模型和地面映射中的内参指纹。
 geometry = config.build_geometry()
+if geometry is None:
+    raise RuntimeError("当前功能需要在 runtime.yaml 中启用内参")
 
-if geometry is not None and geometry.ground_projector is not None:
-    ground_projector = geometry.ground_projector
+camera_model = geometry.camera_model
+ground_projector = geometry.ground_projector  # 尚无地面映射时为 None
+
+# 只有真正需要推理时才创建 Hailo 设备。
+backend = config.hailo.build_backend()
+if backend is None:
+    raise RuntimeError("当前功能需要在 runtime.yaml 中启用 Hailo")
+
+class_mapping = config.hailo.model_class_mapping()
 ```
 
-配置使用两个开关：
+配置对象和已构建对象应在进程生命周期内复用，不能在逐帧循环中重新读取 YAML、重新生成去畸变映射或重复创建 Hailo 设备。
+
+## 几何开关组合
 
 ```yaml
 geometry:
   intrinsics_enabled: true
-  intrinsics_path: ../path/to/selected_calibration.json
+  intrinsics_path: ../src/rescue_vision/calibration/output/内参目录/selected_calibration.json
   ground_mapping_enabled: false
   ground_mapping_path: null
 ```
 
-- `intrinsics_enabled: true`：加载 `CameraModel`；录制命令保存去畸变图。
-- `ground_mapping_enabled: true`：在内参基础上再加载 `GroundProjector`。
-- 地面映射依赖内参，不能在内参关闭时单独启用。
-- 只有内参、暂时没有地面映射时，按上例配置即可正常采集。
+| 内参 | 地面映射 | 结果 |
+| --- | --- | --- |
+| 关 | 关 | 原图采集或非几何诊断；`build_geometry()` 返回 `None` |
+| 开 | 关 | 可去畸变、录制目标数据和运行图像检测 |
+| 开 | 开 | 可进一步把 K0 投影到机器人地面毫米坐标 |
+| 关 | 开 | 非法配置，加载阶段直接拒绝 |
 
-加载过程会拒绝不可用内参、错误分辨率以及地面映射模型或指纹不一致。`build_geometry()` 在内参关闭时返回 `None`；只启用内参时返回 `RuntimeGeometry(camera_model, ground_projector=None)`。
+正式四类目标采集和感知必须启用内参。地面映射尚未完成时保持关闭，不应伪造路径或绕过指纹校验。
 
-相对路径以配置文件所在目录为基准，而不是当前终端目录。若配置文件位于 `configs/`，指向仓库根目录文件通常需要以 `../` 开头。
+## Hailo 装配
 
-## 配置分区
+`hailo.enabled: false` 时，导入配置和运行无硬件测试不会导入 HailoRT。启用后，`build_backend()` 才会：
 
-| 分区 | 内容 |
-| --- | --- |
-| `camera` | 后端、`[width, height]`、FPS、固定焦点 |
-| `geometry` | 内参和地面映射各自的开关与路径 |
-| `recording` | 有界队列容量、图像格式 |
-| `processing` | 最大观测年龄 |
-| `hailo` | 模型资产、版本、HEF 哈希、类别映射和推理阈值 |
+1. 检查 HEF、ONNX 后处理和张量映射文件；
+2. 核对 HEF SHA-256；
+3. 使用 `raw_classes` 数量和推理阈值创建后端；
+4. 打开 Hailo 设备资源。
 
-`hailo.enabled: false` 时不会导入 HailoRT。启用后调用 `config.hailo.build_backend()` 才检查三个部署资产、HEF SHA-256 和模型输出约定并创建设备。
+后端必须由调用方 `close()`，通常交给 `TargetPoseDetector` 的上下文管理统一释放。
 
-schema v2 不会被静默兼容。迁移到 v3 时：
+## schema 与路径
 
-- 原 `geometry.enabled: false` 改成两个开关均为 `false`；
-- 原 `geometry.enabled: true` 改成两个开关均为 `true`；
-- 只有内参时设置 `intrinsics_enabled: true`、`ground_mapping_enabled: false`。
+- 当前运行配置为 schema v3。
+- schema v2 的 `geometry.enabled` 不会被静默兼容，应拆成两个独立开关。
+- 位于 `configs/` 的 YAML 指向仓库根目录资产时通常以 `../` 开头。
+- 路径、类别、阈值和模型哈希只在配置中维护，不在业务模块再次硬编码。
 
-没有 Hailo 的开发机配置应显式设置 `hailo.enabled: false`。
-
-新增配置字段时要提升或兼容 schema、补充严格校验和无硬件测试，并同步 `configs/runtime.example.yaml`。
+新增配置字段时必须同步严格校验、`configs/runtime.example.yaml`、无硬件测试和受影响模块 README。
