@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import cv2
@@ -32,6 +33,48 @@ def parse_tags(values: list[str]) -> dict[str, str]:
             raise ValueError(f"Tag {name!r} cannot be empty.")
         tags[name] = tag_value
     return tags
+
+
+def record_session(
+    camera: FrameSource,
+    recorder: FrameRecorder,
+    *,
+    frame_limit: int | None = None,
+    duration_seconds: float | None = None,
+    monotonic_ns: Callable[[], int] = time.monotonic_ns,
+) -> int:
+    """启动帧源与记录器并采集，始终按相机、记录器顺序释放资源。"""
+
+    if frame_limit is not None and frame_limit <= 0:
+        raise ValueError("frame_limit must be positive.")
+    if duration_seconds is not None and duration_seconds <= 0:
+        raise ValueError("duration_seconds must be positive.")
+    if frame_limit is not None and duration_seconds is not None:
+        raise ValueError("frame_limit and duration_seconds are mutually exclusive.")
+
+    delivered = 0
+    try:
+        camera.start()
+        recorder.start()
+        started_ns = monotonic_ns()
+        while True:
+            frame = camera.read()
+            recorder.record(frame)
+            delivered += 1
+            if frame_limit is not None and delivered >= frame_limit:
+                break
+            if duration_seconds is not None:
+                elapsed = (monotonic_ns() - started_ns) / 1_000_000_000
+                if elapsed >= duration_seconds:
+                    break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            camera.stop()
+        finally:
+            recorder.stop()
+    return delivered
 
 
 def main() -> None:
@@ -93,28 +136,12 @@ def main() -> None:
         image_format=config.recording.image_format,
     )
 
-    delivered = 0
-    try:
-        camera.start()
-        recorder.start()
-        started_ns = time.monotonic_ns()
-        while True:
-            frame = camera.read()
-            recorder.record(frame)
-            delivered += 1
-            if args.frames is not None and delivered >= args.frames:
-                break
-            if args.duration_seconds is not None:
-                elapsed = (time.monotonic_ns() - started_ns) / 1_000_000_000
-                if elapsed >= args.duration_seconds:
-                    break
-    except KeyboardInterrupt:
-        pass
-    finally:
-        try:
-            camera.stop()
-        finally:
-            recorder.stop()
+    delivered = record_session(
+        camera,
+        recorder,
+        frame_limit=args.frames,
+        duration_seconds=args.duration_seconds,
+    )
 
     if recorder.written_frames == 0:
         raise RuntimeError(
