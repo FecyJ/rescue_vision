@@ -60,7 +60,8 @@ with VideoFileSource("clip.mp4", fps_override=20.0) as source:
 rescue-vision-record \
   --config configs/runtime.example.yaml \
   --output recordings/session_001 \
-  --frames 100
+  --frames 100 \
+  --display
 ```
 
 `rescue-vision-record` 会读取 schema v3 几何配置：
@@ -70,6 +71,17 @@ rescue-vision-record \
 - `ground_mapping_enabled` 不参与录制，可在尚无地面映射时保持关闭。
 
 任务目标标注、训练和推理统一使用去畸变图，因此正式数据采集必须启用经过验收且与当前分辨率、焦点匹配的内参。去畸变无效边缘统一填充为与 YOLO Letterbox 相同的 BGR `(114, 114, 114)`，并在 session schema v3 的 `undistort_fill_value` 中记录。原图模式只用于标定或诊断，不能生成任务目标 manifest。
+
+`--display` 显示经过配置去畸变、即将交给记录器的画面；预览会按比例缩小，但不修改写盘图像。按 `Q` 或 `Esc` 会正常结束录制并收尾 session。无桌面、SSH 未转发图形界面或追求最低显示开销时不要使用该选项；帧率与丢帧性能门禁应另做一次不带 `--display` 的短录。
+
+程序内的最简查看器用法：
+
+```python
+from rescue_vision.camera.viewer import OpenCvFrameViewer
+
+with OpenCvFrameViewer("preview") as viewer:
+    viewer.show(frame.image_bgr)  # False 表示按下了 Q/Esc
+```
 
 程序内也可以旁路提交帧：
 
@@ -101,3 +113,4 @@ with FrameRecorder(
 | `replay.py` | 图片目录、视频和记录目录回放 |
 | `recording.py` | 有界异步记录器 |
 | `record_cli.py` | `rescue-vision-record` 入口 |
+| `viewer.py` | 录制与回放命令共用的可缩放 OpenCV 查看器 |

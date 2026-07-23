@@ -62,6 +62,22 @@ def test_inspection_replays_hashes_and_reports_capture_health(tmp_path) -> None:
     )
 
 
+def test_inspection_stops_display_but_finishes_verification(tmp_path) -> None:
+    displayed_sequences: list[int] = []
+
+    def display(frame: CameraFrame) -> bool:
+        displayed_sequences.append(frame.sequence)
+        return False
+
+    report = inspect_recording(
+        make_recording(tmp_path),
+        frame_observer=display,
+    )
+
+    assert displayed_sequences == [0]
+    assert report["frame_count"] == 3
+
+
 def test_requirements_report_actionable_failures(tmp_path) -> None:
     report = inspect_recording(make_recording(tmp_path))
     report["configured_fps"] = 40.0

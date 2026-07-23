@@ -15,6 +15,7 @@ from rescue_vision.camera.frame import CameraFrame, FrameSource
 from rescue_vision.camera.picamera2_source import Picamera2Source
 from rescue_vision.camera.recording import FrameRecorder
 from rescue_vision.camera.rpicam_source import RpicamSource
+from rescue_vision.camera.viewer import OpenCvFrameViewer
 from rescue_vision.config.runtime import load_runtime_config
 from rescue_vision.data.split_manifest import REQUIRED_TAGS
 from rescue_vision.geometry.camera_model import (
@@ -48,6 +49,7 @@ def record_session(
     duration_seconds: float | None = None,
     monotonic_ns: Callable[[], int] = time.monotonic_ns,
     frame_transform: Callable[[CameraFrame], CameraFrame] | None = None,
+    frame_observer: Callable[[CameraFrame], bool] | None = None,
 ) -> int:
     """启动帧源与记录器并采集，始终按相机、记录器顺序释放资源。"""
 
@@ -77,6 +79,8 @@ def record_session(
                 frame = transformed
             recorder.record(frame)
             delivered += 1
+            if frame_observer is not None and not frame_observer(frame):
+                break
             if frame_limit is not None and delivered >= frame_limit:
                 break
             if duration_seconds is not None:
@@ -136,6 +140,14 @@ def main() -> None:
     limit = parser.add_mutually_exclusive_group()
     limit.add_argument("--frames", type=int, default=None)
     limit.add_argument("--duration-seconds", type=float, default=None)
+    parser.add_argument(
+        "--display",
+        action="store_true",
+        help=(
+            "Show the post-undistortion frame being recorded; Q/Esc stops "
+            "the recording cleanly."
+        ),
+    )
     args = parser.parse_args()
     if args.frames is not None and args.frames <= 0:
         parser.error("--frames must be positive")
@@ -194,17 +206,31 @@ def main() -> None:
         ),
     )
 
-    delivered = record_session(
-        camera,
-        recorder,
-        frame_limit=args.frames,
-        duration_seconds=args.duration_seconds,
-        frame_transform=(
-            partial(undistort_camera_frame, camera_model=camera_model)
-            if camera_model is not None
-            else None
-        ),
+    viewer = (
+        OpenCvFrameViewer("rescue-vision-record — Q/Esc to stop")
+        if args.display
+        else None
     )
+    try:
+        delivered = record_session(
+            camera,
+            recorder,
+            frame_limit=args.frames,
+            duration_seconds=args.duration_seconds,
+            frame_transform=(
+                partial(undistort_camera_frame, camera_model=camera_model)
+                if camera_model is not None
+                else None
+            ),
+            frame_observer=(
+                (lambda frame: viewer.show(frame.image_bgr))
+                if viewer is not None
+                else None
+            ),
+        )
+    finally:
+        if viewer is not None:
+            viewer.close()
 
     if recorder.written_frames == 0:
         raise RuntimeError(

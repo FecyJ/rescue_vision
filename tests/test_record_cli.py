@@ -89,6 +89,28 @@ def test_record_session_applies_frame_transform_before_writing(tmp_path) -> None
         assert np.all(replay.read().image_bgr == 123)
 
 
+def test_record_session_display_observer_can_stop_capture(tmp_path) -> None:
+    source = FakeSource()
+    recorder = make_recorder(tmp_path)
+    displayed_sequences: list[int] = []
+
+    def display(frame: CameraFrame) -> bool:
+        displayed_sequences.append(frame.sequence)
+        return frame.sequence < 1
+
+    delivered = record_session(
+        source,
+        recorder,
+        frame_limit=10,
+        frame_observer=display,
+    )
+
+    assert delivered == 2
+    assert recorder.written_frames == 2
+    assert displayed_sequences == [0, 1]
+    assert source.stopped
+
+
 def test_record_session_rejects_transform_that_changes_frame_identity(
     tmp_path,
 ) -> None:

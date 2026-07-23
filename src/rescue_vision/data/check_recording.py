@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
 
+from rescue_vision.camera.frame import CameraFrame
 from rescue_vision.camera.replay import RecordingSource
+from rescue_vision.camera.viewer import OpenCvFrameViewer, playback_delay_ms
 from rescue_vision.geometry.camera_model import IMAGE_BORDER_FILL_VALUE
 
 
@@ -41,7 +44,11 @@ def _non_negative_integer(value: object, location: str) -> int:
     return value
 
 
-def inspect_recording(session_directory: str | Path) -> dict[str, Any]:
+def inspect_recording(
+    session_directory: str | Path,
+    *,
+    frame_observer: Callable[[CameraFrame], bool] | None = None,
+) -> dict[str, Any]:
     """完整回放记录并返回适合保存为 JSON 的诊断报告。"""
 
     directory = Path(session_directory).expanduser().resolve()
@@ -73,6 +80,7 @@ def inspect_recording(session_directory: str | Path) -> dict[str, Any]:
     luma_means: list[float] = []
     luma_standard_deviations: list[float] = []
     metadata_counts: dict[str, int] = {}
+    active_observer = frame_observer
     with source:
         while True:
             try:
@@ -87,6 +95,8 @@ def inspect_recording(session_directory: str | Path) -> dict[str, Any]:
             for name, value in frame.metadata.items():
                 if value is not None:
                     metadata_counts[name] = metadata_counts.get(name, 0) + 1
+            if active_observer is not None and not active_observer(frame):
+                active_observer = None
 
     frame_count = len(sequences)
     if frame_count == 0:
@@ -260,10 +270,52 @@ def main() -> None:
             "Target-data checks require undistorted_pixel by default."
         ),
     )
+    parser.add_argument(
+        "--display",
+        action="store_true",
+        help=(
+            "Replay frames in a window using capture timing. Q/Esc closes "
+            "the window while verification continues headlessly."
+        ),
+    )
+    parser.add_argument(
+        "--playback-speed",
+        type=float,
+        default=1.0,
+        help="Display playback speed multiplier, default: 1.0.",
+    )
     args = parser.parse_args()
+    if not np.isfinite(args.playback_speed) or args.playback_speed <= 0.0:
+        parser.error("--playback-speed must be positive and finite")
+
+    viewer = (
+        OpenCvFrameViewer(
+            "rescue-vision-check-recording — Q/Esc closes preview"
+        )
+        if args.display
+        else None
+    )
+    previous_timestamp_ns: int | None = None
+
+    def observe_frame(frame: CameraFrame) -> bool:
+        nonlocal previous_timestamp_ns
+        assert viewer is not None
+        delay_ms = playback_delay_ms(
+            previous_timestamp_ns,
+            frame.timestamp_ns,
+            speed=args.playback_speed,
+        )
+        previous_timestamp_ns = frame.timestamp_ns
+        keep_displaying = viewer.show(frame.image_bgr, delay_ms=delay_ms)
+        if not keep_displaying:
+            viewer.close()
+        return keep_displaying
 
     try:
-        report = inspect_recording(args.recording)
+        report = inspect_recording(
+            args.recording,
+            frame_observer=observe_frame if viewer is not None else None,
+        )
         failures = check_requirements(
             report,
             minimum_frames=args.minimum_frames,
@@ -274,8 +326,17 @@ def main() -> None:
             ),
             require_undistorted=not args.allow_raw,
         )
-    except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        json.JSONDecodeError,
+        cv2.error,
+    ) as error:
         parser.error(str(error))
+    finally:
+        if viewer is not None:
+            viewer.close()
 
     report["requirements"] = {
         "minimum_frames": args.minimum_frames,
@@ -287,6 +348,8 @@ def main() -> None:
             else []
         ),
         "require_undistorted": not args.allow_raw,
+        "display": args.display,
+        "playback_speed": args.playback_speed,
     }
     report["passed"] = not failures
     report["failures"] = failures

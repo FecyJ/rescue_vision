@@ -13,4 +13,4 @@
 
 运行前先执行 `python -m pip install -e .`，并确保系统包和显示环境可用。
 
-数据采集不另建重复的硬件脚本：用 `rescue-vision-record --frames 200` 执行真机短录，再用 `rescue-vision-check-recording` 做完整回放、哈希、帧率、丢帧和元数据验收。完整步骤见 [`docs/数据采集工具使用.md`](../docs/数据采集工具使用.md)。
+数据采集不另建重复的硬件脚本：用 `rescue-vision-record --frames 200 --display` 执行真机短录，再用 `rescue-vision-check-recording RECORDING --display` 可视化回放并完成哈希、帧率、丢帧和元数据验收。完整步骤见 [`docs/数据采集工具使用.md`](../docs/数据采集工具使用.md)。
