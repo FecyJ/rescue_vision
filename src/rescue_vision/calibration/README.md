@@ -93,6 +93,22 @@ output/intrinsics_YYYYMMDD_HHMMSS/
 
 `CameraModel.from_json(...)` 默认拒绝 `quality.usable=false` 的结果。
 
+### 控制去畸变黑边
+
+去畸变的视野保留越多，边缘越可能出现无法从原图采样的黑色区域。应在生成 `new_K` 时处理这个取舍，不要在录制后直接裁图：
+
+```bash
+# 针孔 / Rational 模型：减小 alpha 会减少黑边，但也会缩小有效视野
+python -m rescue_vision.calibration.calibrate_intrinsics \
+  --square-size-mm 15.0 --alpha 0.0
+
+# Fisheye 模型：减小 balance 会减少黑边，但也会缩小有效视野
+python -m rescue_vision.calibration.calibrate_intrinsics \
+  --square-size-mm 15.0 --balance 0.0
+```
+
+默认值均为 `0.35`，应结合诊断图、`CameraModel.valid_mask` 的有效比例和比赛所需视野选择。参数变化会生成不同的 `new_K` 和内参指纹；确定新参数后必须重新验证内参，并重新制作所有依赖旧指纹的地面映射和任务数据。不能只修改 `selected_calibration.json` 中的数值。
+
 ## 3. 准备地面映射数据
 
 此步骤只能在相机最终固定后进行。创建：

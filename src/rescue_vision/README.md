@@ -21,7 +21,7 @@ if geometry is not None:
     image = geometry.camera_model.undistort_image(image)
 ```
 
-示例配置默认关闭几何，因此 `geometry` 可以为 `None`。比赛运行前启用几何时，必须填写匹配当前相机条件的内参和地面映射路径。
+示例配置默认关闭内参和地面映射，因此 `geometry` 可以为 `None`。只有内参时可单独开启去畸变；地面投影必须等匹配该内参的地面映射可用后再开启。
 
 ## 子包索引
 

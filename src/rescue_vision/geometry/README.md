@@ -32,6 +32,18 @@ bev_image = projector.make_bev_image(undistorted_image)
 
 完整 BEV 只在场地结构检测或调试时按需生成。少量目标接触点直接调用 `pixel_to_ground()`，不要先生成 BEV 再查坐标。
 
+## 去畸变黑边
+
+`undistort_image()` 保持标定分辨率不变，无法从原图采样的边缘像素填黑。`camera.valid_mask` 给出有效像素，比例可这样查看：
+
+```python
+import cv2
+
+valid_ratio = cv2.countNonZero(camera.valid_mask) / camera.valid_mask.size
+```
+
+当前不自动裁黑边，因为裁剪会改变图像尺寸、主点、检测框和 K0 坐标，并使 `new_K` 与地面映射失配。标注、训练和推理都保留同一全尺寸黑边；不得在 `valid_mask == 0` 的区域标注目标。若无效区域过大，应重新选择标定的 `new_K`。未来若引入裁剪，必须记录 ROI、生成裁后 `new_K`，并重做地面映射和数据集版本。
+
 ## 坐标类型
 
 | 类型 | 含义 |
