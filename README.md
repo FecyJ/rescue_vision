@@ -13,6 +13,7 @@
 | 理解比赛语义和安全约束 | [赛题约束与视觉需求](docs/赛题约束与视觉需求.md) |
 | 标定相机或地面 | [标定说明](src/rescue_vision/calibration/README.md) |
 | 录制、划分或评测数据 | [数据集与评测](docs/数据集与评测.md) |
+| 执行相机采集和单会话验收 | [数据采集工具使用手册](docs/数据采集工具使用.md) |
 | 到现场采集四类目标 | [目标数据采集清单](docs/目标数据采集清单.md) |
 | 标注或部署任务目标模型 | [Pose 视觉模型约定](docs/Pose视觉模型约定.md) |
 | 运行真机或 GUI 检查 | [人工验收脚本](manual_tests/README.md) |
@@ -79,6 +80,7 @@ python -m pytest
 | 命令 | 用途 |
 | --- | --- |
 | `rescue-vision-record` | 录制可回放相机会话 |
+| `rescue-vision-check-recording` | 完整回放并检查单次采集健康状态 |
 | `rescue-vision-manifest` | 记录目录转严格数据清单 |
 | `rescue-vision-split` | 按 `recording_id` 防泄漏划分 |
 | `rescue-vision-evaluate` | 生成离线评测报告 |

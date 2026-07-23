@@ -23,6 +23,10 @@ split_samples, report = split_records(records, seed="rescue-vision-v1")
 ## 命令行用法
 
 ```bash
+rescue-vision-check-recording recordings/session_001 \
+  --report reports/session_001.json \
+  --require-picamera2-metadata
+
 rescue-vision-manifest \
   --dataset-root recordings \
   --dataset-version rescue-targets-v1 \
@@ -33,6 +37,8 @@ rescue-vision-split dataset.jsonl \
   --output dataset.split.jsonl \
   --report split-report.json
 ```
+
+单会话检查会完整回放并验证图像哈希，报告有效帧率、记录旁路丢帧率、序号缺口、元数据覆盖和亮度诊断。它是采集后的快速门禁；正式数据清单仍由 `rescue-vision-manifest` 严格生成。
 
 发布数据版本时不要使用 `--skip-image-verification`。该选项只用于已知数据完整、需要快速本地迭代的场景。
 
@@ -45,4 +51,4 @@ background, target_pose, contact_state
 
 缺失信息显式写为 `unknown`，不能省略或写空字符串。同一录像、连拍或相同物理布置必须共享 `recording_id`。
 
-完整 schema 和现场流程见仓库的 `docs/数据集与评测.md` 与 `docs/目标数据采集清单.md`。
+完整 schema、工具流程和现场覆盖项分别见仓库的 `docs/数据集与评测.md`、`docs/数据采集工具使用.md` 与 `docs/目标数据采集清单.md`。

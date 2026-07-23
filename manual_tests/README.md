@@ -12,3 +12,5 @@
 - `hailo_pose.py`：从实际 `runtime.yaml` 加载 YOLO Pose 部署包，检查单张去畸变图像的 K0 观测。
 
 运行前先执行 `python -m pip install -e .`，并确保系统包和显示环境可用。
+
+数据采集不另建重复的硬件脚本：用 `rescue-vision-record --frames 200` 执行真机短录，再用 `rescue-vision-check-recording` 做完整回放、哈希、帧率、丢帧和元数据验收。完整步骤见 [`docs/数据采集工具使用.md`](../docs/数据采集工具使用.md)。
