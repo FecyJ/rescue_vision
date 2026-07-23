@@ -41,6 +41,8 @@ from typing import Any, Callable
 import cv2
 import numpy as np
 
+from rescue_vision.geometry.camera_model import IMAGE_BORDER_FILL_VALUE
+
 
 CALIBRATION_DIR = Path(__file__).resolve().parent
 CAPTURES_DIR = CALIBRATION_DIR / "calibration_captures"
@@ -871,6 +873,7 @@ def undistort_image(
         map2,
         interpolation=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(IMAGE_BORDER_FILL_VALUE,) * 3,
     )
 
 

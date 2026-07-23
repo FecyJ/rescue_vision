@@ -18,7 +18,7 @@ records = build_dataset_records(
 split_samples, report = split_records(records, seed="rescue-vision-v1")
 ```
 
-输入会话必须标记为完成，包含全部分层标签，坐标系为 `undistorted_pixel`，且图像默认通过 SHA-256 验证。原图会话不能进入任务目标数据清单。
+输入会话必须标记为完成，包含全部分层标签，坐标系为 `undistorted_pixel`、`undistort_fill_value` 为 `114`，且图像默认通过 SHA-256 验证。原图会话不能进入任务目标数据清单；当前输出的数据清单为 schema v2。
 
 ## 命令行用法
 

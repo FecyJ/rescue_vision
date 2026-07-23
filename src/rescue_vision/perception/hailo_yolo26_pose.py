@@ -11,6 +11,7 @@ from typing import Any
 import cv2
 import numpy as np
 
+from rescue_vision.geometry.camera_model import IMAGE_BORDER_FILL_VALUE
 from rescue_vision.geometry.types import UndistortedPixel
 from rescue_vision.perception.types import ModelDetection, UndistortedBoundingBox
 
@@ -65,7 +66,11 @@ def letterbox_bgr(
     )
     x_offset = (model_width - resized_width) // 2
     y_offset = (model_height - resized_height) // 2
-    output = np.full((model_height, model_width, 3), 114, dtype=np.uint8)
+    output = np.full(
+        (model_height, model_width, 3),
+        IMAGE_BORDER_FILL_VALUE,
+        dtype=np.uint8,
+    )
     output[
         y_offset : y_offset + resized_height,
         x_offset : x_offset + resized_width,

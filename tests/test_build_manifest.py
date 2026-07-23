@@ -27,6 +27,7 @@ def test_recording_builds_verified_dataset_manifest(tmp_path) -> None:
         image_coordinate_system="undistorted_pixel",
         intrinsics_fingerprint_sha256=INTRINSICS_FINGERPRINT,
         valid_pixel_ratio=0.95,
+        undistort_fill_value=114,
     )
     recorder.start()
     assert recorder.record(
@@ -52,6 +53,8 @@ def test_recording_builds_verified_dataset_manifest(tmp_path) -> None:
     assert record["image_coordinate_system"] == "undistorted_pixel"
     assert record["intrinsics_fingerprint_sha256"] == INTRINSICS_FINGERPRINT
     assert record["valid_pixel_ratio"] == 0.95
+    assert record["undistort_fill_value"] == 114
+    assert record["schema_version"] == 2
     assert record["tags"] == dict(sorted(tags.items()))
     assert not str(record["image_path"]).startswith("/")
 
@@ -66,6 +69,7 @@ def test_manifest_rejects_missing_session_tags(tmp_path) -> None:
         image_coordinate_system="undistorted_pixel",
         intrinsics_fingerprint_sha256=INTRINSICS_FINGERPRINT,
         valid_pixel_ratio=0.95,
+        undistort_fill_value=114,
     )
     recorder.start()
     recorder.record(
@@ -95,6 +99,7 @@ def test_manifest_detects_image_corruption(tmp_path) -> None:
         image_coordinate_system="undistorted_pixel",
         intrinsics_fingerprint_sha256=INTRINSICS_FINGERPRINT,
         valid_pixel_ratio=0.95,
+        undistort_fill_value=114,
     )
     recorder.start()
     recorder.record(

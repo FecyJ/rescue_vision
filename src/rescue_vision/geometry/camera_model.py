@@ -22,6 +22,7 @@ from rescue_vision.geometry.types import (
 
 
 FloatArray = npt.NDArray[np.float64]
+IMAGE_BORDER_FILL_VALUE = 114
 
 
 class CameraModelType(str, Enum):
@@ -196,7 +197,7 @@ class CameraModel:
 
         self.map1, self.map2 = self._create_undistort_maps()
 
-        # 去畸变图中哪些像素确实来自原始图像，可用于排除黑边。
+        # 去畸变图中哪些像素确实来自原始图像，可用于排除填充边缘。
         source_mask = np.full(self.image_size[::-1], 255, dtype=np.uint8)
         self.valid_mask = cv2.remap(
             source_mask,
@@ -294,11 +295,17 @@ class CameraModel:
                 f"{self.image_size}."
             )
 
-        return cv2.remap(
+        undistorted = cv2.remap(
             image,
             self.map1,
             self.map2,
             interpolation=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
+            borderValue=(
+                IMAGE_BORDER_FILL_VALUE
+                if image.ndim == 2
+                else (IMAGE_BORDER_FILL_VALUE,) * image.shape[2]
+            ),
         )
+        undistorted[self.valid_mask == 0] = IMAGE_BORDER_FILL_VALUE
+        return undistorted

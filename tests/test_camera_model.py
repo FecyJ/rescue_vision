@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from rescue_vision.geometry.camera_model import (
+    IMAGE_BORDER_FILL_VALUE,
     CameraCalibration,
     CameraModel,
     CameraModelType,
@@ -84,6 +85,27 @@ def test_image_size_mismatch_is_rejected() -> None:
     camera = CameraModel(calibration(CameraModelType.PINHOLE))
     with pytest.raises(ValueError, match="does not match calibration"):
         camera.undistort_image(np.zeros((10, 10, 3), dtype=np.uint8))
+
+
+def test_undistort_fills_invalid_pixels_with_letterbox_value() -> None:
+    parameters = calibration(CameraModelType.PINHOLE)
+    shifted = CameraCalibration(
+        model=parameters.model,
+        image_size=parameters.image_size,
+        K=parameters.K,
+        D=parameters.D,
+        new_K=np.array(
+            [[20.0, 0.0, -20.0], [0.0, 20.0, -20.0], [0.0, 0.0, 1.0]]
+        ),
+    )
+    camera = CameraModel(shifted)
+    result = camera.undistort_image(
+        np.zeros((24, 32, 3), dtype=np.uint8)
+    )
+    invalid = camera.valid_mask == 0
+
+    assert np.any(invalid)
+    assert np.all(result[invalid] == IMAGE_BORDER_FILL_VALUE)
 
 
 def test_invalid_distortion_count_is_rejected() -> None:

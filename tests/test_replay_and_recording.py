@@ -66,9 +66,10 @@ def test_recorder_roundtrip_is_deterministic(tmp_path) -> None:
     assert np.array_equal(repeated.image_bgr, first.image_bgr)
 
     session_document = json.loads((session / "session.json").read_text())
-    assert session_document["schema_version"] == 2
+    assert session_document["schema_version"] == 3
     assert session_document["image_coordinate_system"] == "raw_pixel"
     assert session_document["intrinsics_fingerprint_sha256"] is None
+    assert session_document["undistort_fill_value"] is None
     assert session_document["completed"] is True
     assert session_document["statistics"]["dropped_frames"] == 0
 
@@ -116,6 +117,7 @@ def test_undistorted_recording_replays_calibration_identity(tmp_path) -> None:
         image_coordinate_system="undistorted_pixel",
         intrinsics_fingerprint_sha256=fingerprint,
         valid_pixel_ratio=0.95,
+        undistort_fill_value=114,
     )
     recorder.start()
     recorder.record(frame(0, 10))
@@ -127,6 +129,7 @@ def test_undistorted_recording_replays_calibration_identity(tmp_path) -> None:
     assert replayed.metadata["image_coordinate_system"] == "undistorted_pixel"
     assert replayed.metadata["intrinsics_fingerprint_sha256"] == fingerprint
     assert replayed.metadata["valid_pixel_ratio"] == 0.95
+    assert replayed.metadata["undistort_fill_value"] == 114
 
 
 def test_image_directory_source_has_stable_order_and_time(tmp_path) -> None:

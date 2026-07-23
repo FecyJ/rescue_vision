@@ -17,7 +17,10 @@ from rescue_vision.camera.recording import FrameRecorder
 from rescue_vision.camera.rpicam_source import RpicamSource
 from rescue_vision.config.runtime import load_runtime_config
 from rescue_vision.data.split_manifest import REQUIRED_TAGS
-from rescue_vision.geometry.camera_model import CameraModel
+from rescue_vision.geometry.camera_model import (
+    IMAGE_BORDER_FILL_VALUE,
+    CameraModel,
+)
 from rescue_vision.versioning import git_version
 
 
@@ -102,6 +105,7 @@ def undistort_camera_frame(
     metadata["intrinsics_fingerprint_sha256"] = (
         camera_model.calibration.fingerprint()
     )
+    metadata["undistort_fill_value"] = IMAGE_BORDER_FILL_VALUE
     return CameraFrame(
         sequence=frame.sequence,
         timestamp_ns=frame.timestamp_ns,
@@ -184,6 +188,9 @@ def main() -> None:
             / camera_model.valid_mask.size
             if camera_model is not None
             else None
+        ),
+        undistort_fill_value=(
+            IMAGE_BORDER_FILL_VALUE if camera_model is not None else None
         ),
     )
 

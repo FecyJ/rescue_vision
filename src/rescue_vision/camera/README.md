@@ -69,7 +69,7 @@ rescue-vision-record \
 - `intrinsics_enabled: false` 时保存相机原图，记录标记为 `raw_pixel`；
 - `ground_mapping_enabled` 不参与录制，可在尚无地面映射时保持关闭。
 
-任务目标标注、训练和推理统一使用去畸变图，因此正式数据采集必须启用经过验收且与当前分辨率、焦点匹配的内参。原图模式只用于标定或诊断，不能生成任务目标 manifest。
+任务目标标注、训练和推理统一使用去畸变图，因此正式数据采集必须启用经过验收且与当前分辨率、焦点匹配的内参。去畸变无效边缘统一填充为与 YOLO Letterbox 相同的 BGR `(114, 114, 114)`，并在 session schema v3 的 `undistort_fill_value` 中记录。原图模式只用于标定或诊断，不能生成任务目标 manifest。
 
 程序内也可以旁路提交帧：
 

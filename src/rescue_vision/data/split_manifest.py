@@ -9,8 +9,9 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+from rescue_vision.geometry.camera_model import IMAGE_BORDER_FILL_VALUE
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 REQUIRED_TAGS = {
     "lighting",
     "distance",
@@ -66,7 +67,9 @@ def split_records(
 
     for index, record in enumerate(records):
         if record.get("schema_version") != SCHEMA_VERSION:
-            raise ValueError(f"Record {index} schema_version must be 1.")
+            raise ValueError(
+                f"Record {index} schema_version must be {SCHEMA_VERSION}."
+            )
         sample_id = record.get("sample_id")
         recording_id = record.get("recording_id")
         record_dataset_version = record.get("dataset_version")
@@ -75,6 +78,7 @@ def split_records(
             "intrinsics_fingerprint_sha256"
         )
         valid_pixel_ratio = record.get("valid_pixel_ratio")
+        undistort_fill_value = record.get("undistort_fill_value")
         tags = record.get("tags")
         if (
             not isinstance(record_dataset_version, str)
@@ -119,6 +123,11 @@ def split_records(
         ):
             raise ValueError(
                 f"Record {index} has invalid valid_pixel_ratio."
+            )
+        if undistort_fill_value != IMAGE_BORDER_FILL_VALUE:
+            raise ValueError(
+                f"Record {index} undistort_fill_value must be "
+                f"{IMAGE_BORDER_FILL_VALUE}."
             )
         if not isinstance(tags, dict):
             raise ValueError(f"Record {index} tags must be a mapping.")

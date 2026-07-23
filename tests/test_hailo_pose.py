@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from rescue_vision.geometry.camera_model import IMAGE_BORDER_FILL_VALUE
 from rescue_vision.perception.hailo_yolo26_pose import (
     HailoYolo26PoseBackend,
     letterbox_bgr,
@@ -15,6 +16,7 @@ def test_letterbox_and_coordinate_round_trip() -> None:
     image = np.zeros((100, 200, 3), dtype=np.uint8)
     padded, transform = letterbox_bgr(image, (640, 640))
     assert padded.shape == (640, 640, 3)
+    assert np.all(padded[: transform.y_offset] == IMAGE_BORDER_FILL_VALUE)
     assert transform.scale == pytest.approx(3.2)
     point = transform.point_to_original(
         50 * transform.scale + transform.x_offset,

@@ -32,9 +32,9 @@ bev_image = projector.make_bev_image(undistorted_image)
 
 完整 BEV 只在场地结构检测或调试时按需生成。少量目标接触点直接调用 `pixel_to_ground()`，不要先生成 BEV 再查坐标。
 
-## 去畸变黑边
+## 去畸变边缘填充
 
-`undistort_image()` 保持标定分辨率不变，无法从原图采样的边缘像素填黑。`camera.valid_mask` 给出有效像素，比例可这样查看：
+`undistort_image()` 保持标定分辨率不变，无法从原图采样的边缘像素统一填充为 BGR `(114, 114, 114)`，与 YOLO Letterbox 一致，避免纯黑边缘形成额外的训练特征。`camera.valid_mask` 仍以 0 标记这些填充像素，有效比例可这样查看：
 
 ```python
 import cv2
@@ -42,7 +42,9 @@ import cv2
 valid_ratio = cv2.countNonZero(camera.valid_mask) / camera.valid_mask.size
 ```
 
-当前不自动裁黑边，因为裁剪会改变图像尺寸、主点、检测框和 K0 坐标，并使 `new_K` 与地面映射失配。标注、训练和推理都保留同一全尺寸黑边；不得在 `valid_mask == 0` 的区域标注目标。若无效区域过大，应重新选择标定的 `new_K`。未来若引入裁剪，必须记录 ROI、生成裁后 `new_K`，并重做地面映射和数据集版本。
+当前不自动裁除填充边缘，因为裁剪会改变图像尺寸、主点、检测框和 K0 坐标，并使 `new_K` 与地面映射失配。标注、训练和推理都保留同一全尺寸灰色边缘；不得在 `valid_mask == 0` 的区域标注目标。若无效区域过大，应重新选择标定的 `new_K`。未来若引入裁剪，必须记录 ROI、生成裁后 `new_K`，并重做地面映射和数据集版本。
+
+填充值在图像编码前精确为 `114`。若记录格式为有损 JPEG，重新解码后边缘附近可能因压缩出现小幅波动；`undistort_fill_value: 114` 表示编码前的预处理契约，不承诺 JPEG 文件逐像素严格等于 `114`。
 
 ## 坐标类型
 

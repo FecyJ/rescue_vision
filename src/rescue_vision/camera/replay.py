@@ -187,8 +187,8 @@ class RecordingSource(_FiniteSource):
         session = json.loads(
             (self.session_directory / "session.json").read_text(encoding="utf-8")
         )
-        if session.get("schema_version") != 2:
-            raise ValueError("Recording session schema_version must be 2.")
+        if session.get("schema_version") != 3:
+            raise ValueError("Recording session schema_version must be 3.")
         image_size = session.get("image_size")
         if not isinstance(image_size, list) or len(image_size) != 2:
             raise ValueError("Recording session image_size must be [width, height].")
@@ -229,6 +229,19 @@ class RecordingSource(_FiniteSource):
             raise ValueError(
                 "Raw recording must not declare valid_pixel_ratio."
             )
+        undistort_fill_value = session.get("undistort_fill_value")
+        if coordinate_system == "undistorted_pixel" and (
+            isinstance(undistort_fill_value, bool)
+            or not isinstance(undistort_fill_value, int)
+            or not 0 <= undistort_fill_value <= 255
+        ):
+            raise ValueError(
+                "Undistorted recording has invalid undistort_fill_value."
+            )
+        if coordinate_system == "raw_pixel" and undistort_fill_value is not None:
+            raise ValueError(
+                "Raw recording must not declare undistort_fill_value."
+            )
         self.image_coordinate_system = coordinate_system
         self.intrinsics_fingerprint_sha256 = fingerprint
         self.valid_pixel_ratio = (
@@ -236,6 +249,7 @@ class RecordingSource(_FiniteSource):
             if valid_pixel_ratio is not None
             else None
         )
+        self.undistort_fill_value = undistort_fill_value
         self.records = [
             json.loads(line)
             for line in (self.session_directory / "frames.jsonl")
@@ -292,6 +306,7 @@ class RecordingSource(_FiniteSource):
                 self.intrinsics_fingerprint_sha256
             )
             metadata["valid_pixel_ratio"] = self.valid_pixel_ratio
+            metadata["undistort_fill_value"] = self.undistort_fill_value
         return CameraFrame(
             sequence=int(record["sequence"]),
             timestamp_ns=int(record["timestamp_ns"]),

@@ -82,6 +82,7 @@ def test_requirements_report_actionable_failures(tmp_path) -> None:
     assert any("effective_fps" in failure for failure in failures)
     assert any("lens_position" in failure for failure in failures)
     assert any("undistorted_pixel" in failure for failure in failures)
+    assert any("undistort_fill_value" in failure for failure in failures)
 
 
 def test_inspection_rejects_incomplete_or_corrupt_recording(tmp_path) -> None:

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from rescue_vision.data.split_manifest import REQUIRED_TAGS
+from rescue_vision.geometry.camera_model import IMAGE_BORDER_FILL_VALUE
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -43,8 +44,8 @@ def build_dataset_records(
     for directory_value in recording_directories:
         directory = directory_value.expanduser().resolve()
         session = _load_json(directory / "session.json")
-        if session.get("schema_version") != 2:
-            raise ValueError(f"{directory}: session schema_version must be 2.")
+        if session.get("schema_version") != 3:
+            raise ValueError(f"{directory}: session schema_version must be 3.")
         if session.get("completed") is not True:
             raise ValueError(f"{directory}: recording is not marked completed.")
         if session.get("image_coordinate_system") != "undistorted_pixel":
@@ -74,6 +75,12 @@ def build_dataset_records(
             or not 0.0 < float(valid_pixel_ratio) <= 1.0
         ):
             raise ValueError(f"{directory}: invalid valid_pixel_ratio.")
+        undistort_fill_value = session.get("undistort_fill_value")
+        if undistort_fill_value != IMAGE_BORDER_FILL_VALUE:
+            raise ValueError(
+                f"{directory}: undistort_fill_value must be "
+                f"{IMAGE_BORDER_FILL_VALUE}."
+            )
         recording_id = session.get("recording_id")
         if not isinstance(recording_id, str) or not recording_id:
             raise ValueError(f"{directory}: invalid recording_id.")
@@ -160,7 +167,7 @@ def build_dataset_records(
             frame_count += 1
             output.append(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "dataset_version": dataset_version,
                     "sample_id": sample_id,
                     "recording_id": recording_id,
@@ -171,6 +178,7 @@ def build_dataset_records(
                     "image_coordinate_system": "undistorted_pixel",
                     "intrinsics_fingerprint_sha256": intrinsics_fingerprint,
                     "valid_pixel_ratio": float(valid_pixel_ratio),
+                    "undistort_fill_value": undistort_fill_value,
                     "annotation_manifest": _relative_to_root(
                         annotation_path,
                         dataset_root,

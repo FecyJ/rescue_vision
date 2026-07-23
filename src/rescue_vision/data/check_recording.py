@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 
 from rescue_vision.camera.replay import RecordingSource
+from rescue_vision.geometry.camera_model import IMAGE_BORDER_FILL_VALUE
 
 
 PICAMERA2_METADATA = (
@@ -45,8 +46,8 @@ def inspect_recording(session_directory: str | Path) -> dict[str, Any]:
 
     directory = Path(session_directory).expanduser().resolve()
     session = _load_object(directory / "session.json")
-    if session.get("schema_version") != 2:
-        raise ValueError("Recording session schema_version must be 2.")
+    if session.get("schema_version") != 3:
+        raise ValueError("Recording session schema_version must be 3.")
     if session.get("completed") is not True:
         raise ValueError(f"Recording is not marked completed: {directory}.")
 
@@ -144,6 +145,7 @@ def inspect_recording(session_directory: str | Path) -> dict[str, Any]:
             "intrinsics_fingerprint_sha256"
         ),
         "valid_pixel_ratio": session.get("valid_pixel_ratio"),
+        "undistort_fill_value": session.get("undistort_fill_value"),
         "configured_fps": configured_fps,
         "frame_count": frame_count,
         "first_sequence": sequences[0],
@@ -201,6 +203,13 @@ def check_requirements(
     ):
         failures.append(
             "image_coordinate_system must be 'undistorted_pixel'"
+        )
+    if (
+        require_undistorted
+        and report.get("undistort_fill_value") != IMAGE_BORDER_FILL_VALUE
+    ):
+        failures.append(
+            f"undistort_fill_value must be {IMAGE_BORDER_FILL_VALUE}"
         )
     frame_count = int(report["frame_count"])
     if frame_count < minimum_frames:

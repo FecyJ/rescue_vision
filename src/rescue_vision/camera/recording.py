@@ -36,6 +36,7 @@ class FrameRecorder:
         image_coordinate_system: str = "raw_pixel",
         intrinsics_fingerprint_sha256: str | None = None,
         valid_pixel_ratio: float | None = None,
+        undistort_fill_value: int | None = None,
     ) -> None:
         if len(image_size) != 2 or any(value <= 0 for value in image_size):
             raise ValueError(f"image_size must be positive, got {image_size}.")
@@ -74,9 +75,19 @@ class FrameRecorder:
                     "(0, 1]."
                 )
             valid_pixel_ratio = float(valid_pixel_ratio)
+            if (
+                isinstance(undistort_fill_value, bool)
+                or not isinstance(undistort_fill_value, int)
+                or not 0 <= undistort_fill_value <= 255
+            ):
+                raise ValueError(
+                    "Undistorted recordings require integer "
+                    "undistort_fill_value in [0, 255]."
+                )
         elif (
             intrinsics_fingerprint_sha256 is not None
             or valid_pixel_ratio is not None
+            or undistort_fill_value is not None
         ):
             raise ValueError(
                 "Raw recordings cannot declare intrinsics-derived metadata."
@@ -98,6 +109,7 @@ class FrameRecorder:
         self.image_coordinate_system = image_coordinate_system
         self.intrinsics_fingerprint_sha256 = intrinsics_fingerprint_sha256
         self.valid_pixel_ratio = valid_pixel_ratio
+        self.undistort_fill_value = undistort_fill_value
         self._queue: queue.Queue[CameraFrame | object] = queue.Queue(queue_capacity)
         self._thread: threading.Thread | None = None
         self._worker_error: BaseException | None = None
@@ -220,7 +232,7 @@ class FrameRecorder:
 
     def _write_session(self, *, completed: bool) -> None:
         document = {
-            "schema_version": 2,
+            "schema_version": 3,
             "recording_id": self.session_directory.name,
             "created_at": self._created_at,
             "completed_at": (
@@ -234,6 +246,7 @@ class FrameRecorder:
                 self.intrinsics_fingerprint_sha256
             ),
             "valid_pixel_ratio": self.valid_pixel_ratio,
+            "undistort_fill_value": self.undistort_fill_value,
             "time_base": "application_monotonic_ns",
             "config": self.config_snapshot,
             "versions": self.versions,

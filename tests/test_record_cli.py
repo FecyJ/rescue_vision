@@ -11,6 +11,7 @@ from rescue_vision.camera.record_cli import (
 from rescue_vision.camera.replay import RecordingSource
 from rescue_vision.camera.recording import FrameRecorder
 from rescue_vision.geometry.camera_model import (
+    IMAGE_BORDER_FILL_VALUE,
     CameraCalibration,
     CameraModel,
     CameraModelType,
@@ -137,6 +138,7 @@ def test_undistort_camera_frame_records_coordinate_identity() -> None:
     assert result.metadata["intrinsics_fingerprint_sha256"] == (
         calibration.fingerprint()
     )
+    assert result.metadata["undistort_fill_value"] == IMAGE_BORDER_FILL_VALUE
 
 
 def test_record_session_releases_resources_after_camera_failure(tmp_path) -> None:
