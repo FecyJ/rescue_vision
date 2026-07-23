@@ -16,7 +16,8 @@ geometry:
 recording:
   # 队列满时丢弃记录请求，不阻塞实时视觉线程。
   queue_capacity: 8
-  image_format: png
+  # 2304×1296、20 FPS 采集默认使用 JPEG 95；PNG 编码可能无法持续跟上。
+  image_format: jpg
 
 processing:
   # 超过该观测年龄时，上层必须丢弃或进入保守降级；需由实测继续收敛。
