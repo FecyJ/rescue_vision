@@ -12,6 +12,9 @@ from rescue_vision.data.split_manifest import REQUIRED_TAGS
 from rescue_vision.camera.recording import FrameRecorder
 
 
+INTRINSICS_FINGERPRINT = "a" * 64
+
+
 def test_recording_builds_verified_dataset_manifest(tmp_path) -> None:
     recording = tmp_path / "recording-a"
     tags = {name: f"value-{name}" for name in REQUIRED_TAGS}
@@ -21,6 +24,9 @@ def test_recording_builds_verified_dataset_manifest(tmp_path) -> None:
         config_snapshot={"schema_version": 1},
         versions={"code": "abc-dirty"},
         session_tags=tags,
+        image_coordinate_system="undistorted_pixel",
+        intrinsics_fingerprint_sha256=INTRINSICS_FINGERPRINT,
+        valid_pixel_ratio=0.95,
     )
     recorder.start()
     assert recorder.record(
@@ -43,6 +49,9 @@ def test_recording_builds_verified_dataset_manifest(tmp_path) -> None:
     assert record["recording_id"] == "recording-a"
     assert record["dataset_version"] == "dataset-v1"
     assert record["timestamp_ns"] == 123456
+    assert record["image_coordinate_system"] == "undistorted_pixel"
+    assert record["intrinsics_fingerprint_sha256"] == INTRINSICS_FINGERPRINT
+    assert record["valid_pixel_ratio"] == 0.95
     assert record["tags"] == dict(sorted(tags.items()))
     assert not str(record["image_path"]).startswith("/")
 
@@ -54,6 +63,9 @@ def test_manifest_rejects_missing_session_tags(tmp_path) -> None:
         image_size=(8, 6),
         config_snapshot={"schema_version": 1},
         versions={"code": "abc"},
+        image_coordinate_system="undistorted_pixel",
+        intrinsics_fingerprint_sha256=INTRINSICS_FINGERPRINT,
+        valid_pixel_ratio=0.95,
     )
     recorder.start()
     recorder.record(
@@ -80,6 +92,9 @@ def test_manifest_detects_image_corruption(tmp_path) -> None:
         config_snapshot={"schema_version": 1},
         versions={"code": "abc"},
         session_tags={name: "unknown" for name in REQUIRED_TAGS},
+        image_coordinate_system="undistorted_pixel",
+        intrinsics_fingerprint_sha256=INTRINSICS_FINGERPRINT,
+        valid_pixel_ratio=0.95,
     )
     recorder.start()
     recorder.record(
@@ -95,6 +110,33 @@ def test_manifest_detects_image_corruption(tmp_path) -> None:
     )
     (recording / frame_record["image_path"]).write_bytes(b"corrupt")
     with pytest.raises(ValueError, match="hash mismatch"):
+        build_dataset_records(
+            [recording],
+            dataset_root=tmp_path,
+            dataset_version="dataset-v1",
+        )
+
+
+def test_manifest_rejects_raw_pixel_recording(tmp_path) -> None:
+    recording = tmp_path / "recording-a"
+    recorder = FrameRecorder(
+        recording,
+        image_size=(8, 6),
+        config_snapshot={"schema_version": 3},
+        versions={"code": "abc"},
+        session_tags={name: "unknown" for name in REQUIRED_TAGS},
+    )
+    recorder.start()
+    recorder.record(
+        CameraFrame(
+            sequence=0,
+            timestamp_ns=1,
+            image_bgr=np.zeros((6, 8, 3), dtype=np.uint8),
+        )
+    )
+    recorder.stop()
+
+    with pytest.raises(ValueError, match="require undistorted_pixel"):
         build_dataset_records(
             [recording],
             dataset_root=tmp_path,

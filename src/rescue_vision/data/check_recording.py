@@ -45,8 +45,8 @@ def inspect_recording(session_directory: str | Path) -> dict[str, Any]:
 
     directory = Path(session_directory).expanduser().resolve()
     session = _load_object(directory / "session.json")
-    if session.get("schema_version") != 1:
-        raise ValueError("Recording session schema_version must be 1.")
+    if session.get("schema_version") != 2:
+        raise ValueError("Recording session schema_version must be 2.")
     if session.get("completed") is not True:
         raise ValueError(f"Recording is not marked completed: {directory}.")
 
@@ -139,6 +139,11 @@ def inspect_recording(session_directory: str | Path) -> dict[str, Any]:
         "session_directory": str(directory),
         "image_size": session.get("image_size"),
         "image_format": session.get("image_format"),
+        "image_coordinate_system": session.get("image_coordinate_system"),
+        "intrinsics_fingerprint_sha256": session.get(
+            "intrinsics_fingerprint_sha256"
+        ),
+        "valid_pixel_ratio": session.get("valid_pixel_ratio"),
         "configured_fps": configured_fps,
         "frame_count": frame_count,
         "first_sequence": sequences[0],
@@ -178,6 +183,7 @@ def check_requirements(
     maximum_drop_ratio: float,
     minimum_fps_ratio: float,
     required_metadata: tuple[str, ...] = (),
+    require_undistorted: bool = False,
 ) -> list[str]:
     """根据显式门限返回失败原因；空列表表示通过。"""
 
@@ -189,6 +195,13 @@ def check_requirements(
         raise ValueError("minimum_fps_ratio must be in (0, 1].")
 
     failures: list[str] = []
+    if (
+        require_undistorted
+        and report.get("image_coordinate_system") != "undistorted_pixel"
+    ):
+        failures.append(
+            "image_coordinate_system must be 'undistorted_pixel'"
+        )
     frame_count = int(report["frame_count"])
     if frame_count < minimum_frames:
         failures.append(
@@ -230,6 +243,14 @@ def main() -> None:
         action="store_true",
         help="Require sensor/exposure/gain/focus metadata on every frame.",
     )
+    parser.add_argument(
+        "--allow-raw",
+        action="store_true",
+        help=(
+            "Allow raw_pixel recordings for calibration/diagnostics. "
+            "Target-data checks require undistorted_pixel by default."
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -242,6 +263,7 @@ def main() -> None:
             required_metadata=(
                 PICAMERA2_METADATA if args.require_picamera2_metadata else ()
             ),
+            require_undistorted=not args.allow_raw,
         )
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
         parser.error(str(error))
@@ -255,6 +277,7 @@ def main() -> None:
             if args.require_picamera2_metadata
             else []
         ),
+        "require_undistorted": not args.allow_raw,
     }
     report["passed"] = not failures
     report["failures"] = failures

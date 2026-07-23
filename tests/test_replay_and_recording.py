@@ -53,6 +53,7 @@ def test_recorder_roundtrip_is_deterministic(tmp_path) -> None:
     assert (first.timestamp_ns, second.timestamp_ns) == (1_350_000_000, 1_400_000_000)
     assert np.array_equal(first.image_bgr, frame(7, 11).image_bgr)
     assert first.metadata["exposure_time_us"] == 1007
+    assert first.metadata["image_coordinate_system"] == "raw_pixel"
     assert first.age_ns(first.timestamp_ns + 10_000_000) == 10_000_000
     assert first.is_stale(first.timestamp_ns + 151_000_000, 150.0)
 
@@ -65,6 +66,9 @@ def test_recorder_roundtrip_is_deterministic(tmp_path) -> None:
     assert np.array_equal(repeated.image_bgr, first.image_bgr)
 
     session_document = json.loads((session / "session.json").read_text())
+    assert session_document["schema_version"] == 2
+    assert session_document["image_coordinate_system"] == "raw_pixel"
+    assert session_document["intrinsics_fingerprint_sha256"] is None
     assert session_document["completed"] is True
     assert session_document["statistics"]["dropped_frames"] == 0
 
@@ -100,6 +104,29 @@ def test_recorder_queue_full_does_not_block(tmp_path, monkeypatch) -> None:
         (tmp_path / "recording" / "session.json").read_text(encoding="utf-8")
     )
     assert session["completed"] is False
+
+
+def test_undistorted_recording_replays_calibration_identity(tmp_path) -> None:
+    fingerprint = "a" * 64
+    recorder = FrameRecorder(
+        tmp_path / "recording",
+        image_size=(8, 6),
+        config_snapshot={"schema_version": 3},
+        versions={"code": "abc"},
+        image_coordinate_system="undistorted_pixel",
+        intrinsics_fingerprint_sha256=fingerprint,
+        valid_pixel_ratio=0.95,
+    )
+    recorder.start()
+    recorder.record(frame(0, 10))
+    recorder.stop()
+
+    with RecordingSource(tmp_path / "recording") as source:
+        replayed = source.read()
+
+    assert replayed.metadata["image_coordinate_system"] == "undistorted_pixel"
+    assert replayed.metadata["intrinsics_fingerprint_sha256"] == fingerprint
+    assert replayed.metadata["valid_pixel_ratio"] == 0.95
 
 
 def test_image_directory_source_has_stable_order_and_time(tmp_path) -> None:

@@ -12,6 +12,9 @@ def record(sample_id: str, recording_id: str) -> dict:
         "sample_id": sample_id,
         "recording_id": recording_id,
         "image_path": f"{sample_id}.png",
+        "image_coordinate_system": "undistorted_pixel",
+        "intrinsics_fingerprint_sha256": "a" * 64,
+        "valid_pixel_ratio": 0.95,
         "tags": {tag: "known" for tag in REQUIRED_TAGS},
     }
 
@@ -47,3 +50,10 @@ def test_split_rejects_mixed_dataset_versions() -> None:
     second["dataset_version"] = "dataset-v2"
     with pytest.raises(ValueError, match="does not match"):
         split_records([first, second], seed="fixed")
+
+
+def test_split_rejects_raw_or_unidentified_image_coordinates() -> None:
+    invalid = record("sample", "recording")
+    invalid["image_coordinate_system"] = "raw_pixel"
+    with pytest.raises(ValueError, match="undistorted_pixel"):
+        split_records([invalid], seed="fixed")

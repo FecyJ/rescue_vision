@@ -17,6 +17,7 @@ from rescue_vision.camera.frame import CameraFrame
 
 
 _STOP = object()
+IMAGE_COORDINATE_SYSTEMS = {"raw_pixel", "undistorted_pixel"}
 
 
 class FrameRecorder:
@@ -32,6 +33,9 @@ class FrameRecorder:
         session_tags: Mapping[str, str] | None = None,
         queue_capacity: int = 8,
         image_format: str = "png",
+        image_coordinate_system: str = "raw_pixel",
+        intrinsics_fingerprint_sha256: str | None = None,
+        valid_pixel_ratio: float | None = None,
     ) -> None:
         if len(image_size) != 2 or any(value <= 0 for value in image_size):
             raise ValueError(f"image_size must be positive, got {image_size}.")
@@ -39,6 +43,44 @@ class FrameRecorder:
             raise ValueError("queue_capacity must be positive.")
         if image_format not in {"png", "jpg"}:
             raise ValueError("image_format must be 'png' or 'jpg'.")
+        if image_coordinate_system not in IMAGE_COORDINATE_SYSTEMS:
+            raise ValueError(
+                "image_coordinate_system must be 'raw_pixel' or "
+                "'undistorted_pixel'."
+            )
+        if image_coordinate_system == "undistorted_pixel":
+            if (
+                not isinstance(intrinsics_fingerprint_sha256, str)
+                or len(intrinsics_fingerprint_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in intrinsics_fingerprint_sha256.lower()
+                )
+            ):
+                raise ValueError(
+                    "Undistorted recordings require a 64-character "
+                    "intrinsics_fingerprint_sha256."
+                )
+            intrinsics_fingerprint_sha256 = (
+                intrinsics_fingerprint_sha256.lower()
+            )
+            if (
+                isinstance(valid_pixel_ratio, bool)
+                or not isinstance(valid_pixel_ratio, (int, float))
+                or not 0.0 < float(valid_pixel_ratio) <= 1.0
+            ):
+                raise ValueError(
+                    "Undistorted recordings require valid_pixel_ratio in "
+                    "(0, 1]."
+                )
+            valid_pixel_ratio = float(valid_pixel_ratio)
+        elif (
+            intrinsics_fingerprint_sha256 is not None
+            or valid_pixel_ratio is not None
+        ):
+            raise ValueError(
+                "Raw recordings cannot declare intrinsics-derived metadata."
+            )
         self.session_directory = Path(session_directory).expanduser().resolve()
         self.image_size = image_size
         self.config_snapshot = dict(config_snapshot)
@@ -53,6 +95,9 @@ class FrameRecorder:
         ):
             raise ValueError("session_tags must contain non-empty string pairs.")
         self.image_format = image_format
+        self.image_coordinate_system = image_coordinate_system
+        self.intrinsics_fingerprint_sha256 = intrinsics_fingerprint_sha256
+        self.valid_pixel_ratio = valid_pixel_ratio
         self._queue: queue.Queue[CameraFrame | object] = queue.Queue(queue_capacity)
         self._thread: threading.Thread | None = None
         self._worker_error: BaseException | None = None
@@ -175,7 +220,7 @@ class FrameRecorder:
 
     def _write_session(self, *, completed: bool) -> None:
         document = {
-            "schema_version": 1,
+            "schema_version": 2,
             "recording_id": self.session_directory.name,
             "created_at": self._created_at,
             "completed_at": (
@@ -184,6 +229,11 @@ class FrameRecorder:
             "completed": completed,
             "image_size": list(self.image_size),
             "image_format": self.image_format,
+            "image_coordinate_system": self.image_coordinate_system,
+            "intrinsics_fingerprint_sha256": (
+                self.intrinsics_fingerprint_sha256
+            ),
+            "valid_pixel_ratio": self.valid_pixel_ratio,
             "time_base": "application_monotonic_ns",
             "config": self.config_snapshot,
             "versions": self.versions,

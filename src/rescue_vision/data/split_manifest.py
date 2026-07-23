@@ -70,6 +70,11 @@ def split_records(
         sample_id = record.get("sample_id")
         recording_id = record.get("recording_id")
         record_dataset_version = record.get("dataset_version")
+        image_coordinate_system = record.get("image_coordinate_system")
+        intrinsics_fingerprint = record.get(
+            "intrinsics_fingerprint_sha256"
+        )
+        valid_pixel_ratio = record.get("valid_pixel_ratio")
         tags = record.get("tags")
         if (
             not isinstance(record_dataset_version, str)
@@ -90,6 +95,31 @@ def split_records(
         seen_samples.add(sample_id)
         if not isinstance(recording_id, str) or not recording_id:
             raise ValueError(f"Record {index} has invalid recording_id.")
+        if image_coordinate_system != "undistorted_pixel":
+            raise ValueError(
+                f"Record {index} image_coordinate_system must be "
+                "'undistorted_pixel'."
+            )
+        if (
+            not isinstance(intrinsics_fingerprint, str)
+            or len(intrinsics_fingerprint) != 64
+            or intrinsics_fingerprint != intrinsics_fingerprint.lower()
+            or any(
+                character not in "0123456789abcdef"
+                for character in intrinsics_fingerprint
+            )
+        ):
+            raise ValueError(
+                f"Record {index} has invalid intrinsics fingerprint."
+            )
+        if (
+            isinstance(valid_pixel_ratio, bool)
+            or not isinstance(valid_pixel_ratio, (int, float))
+            or not 0.0 < float(valid_pixel_ratio) <= 1.0
+        ):
+            raise ValueError(
+                f"Record {index} has invalid valid_pixel_ratio."
+            )
         if not isinstance(tags, dict):
             raise ValueError(f"Record {index} tags must be a mapping.")
         missing_tags = sorted(REQUIRED_TAGS - set(tags))

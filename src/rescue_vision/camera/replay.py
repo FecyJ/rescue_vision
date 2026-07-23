@@ -187,12 +187,55 @@ class RecordingSource(_FiniteSource):
         session = json.loads(
             (self.session_directory / "session.json").read_text(encoding="utf-8")
         )
-        if session.get("schema_version") != 1:
-            raise ValueError("Recording session schema_version must be 1.")
+        if session.get("schema_version") != 2:
+            raise ValueError("Recording session schema_version must be 2.")
         image_size = session.get("image_size")
         if not isinstance(image_size, list) or len(image_size) != 2:
             raise ValueError("Recording session image_size must be [width, height].")
         self._image_size = (int(image_size[0]), int(image_size[1]))
+        coordinate_system = session.get("image_coordinate_system")
+        if coordinate_system not in {"raw_pixel", "undistorted_pixel"}:
+            raise ValueError(
+                "Recording session image_coordinate_system must be "
+                "'raw_pixel' or 'undistorted_pixel'."
+            )
+        fingerprint = session.get("intrinsics_fingerprint_sha256")
+        if coordinate_system == "undistorted_pixel" and (
+            not isinstance(fingerprint, str)
+            or len(fingerprint) != 64
+            or fingerprint != fingerprint.lower()
+            or any(
+                character not in "0123456789abcdef"
+                for character in fingerprint.lower()
+            )
+        ):
+            raise ValueError(
+                "Undistorted recording is missing its intrinsics fingerprint."
+            )
+        if coordinate_system == "raw_pixel" and fingerprint is not None:
+            raise ValueError(
+                "Raw recording must not declare an intrinsics fingerprint."
+            )
+        valid_pixel_ratio = session.get("valid_pixel_ratio")
+        if coordinate_system == "undistorted_pixel" and (
+            isinstance(valid_pixel_ratio, bool)
+            or not isinstance(valid_pixel_ratio, (int, float))
+            or not 0.0 < float(valid_pixel_ratio) <= 1.0
+        ):
+            raise ValueError(
+                "Undistorted recording has invalid valid_pixel_ratio."
+            )
+        if coordinate_system == "raw_pixel" and valid_pixel_ratio is not None:
+            raise ValueError(
+                "Raw recording must not declare valid_pixel_ratio."
+            )
+        self.image_coordinate_system = coordinate_system
+        self.intrinsics_fingerprint_sha256 = fingerprint
+        self.valid_pixel_ratio = (
+            float(valid_pixel_ratio)
+            if valid_pixel_ratio is not None
+            else None
+        )
         self.records = [
             json.loads(line)
             for line in (self.session_directory / "frames.jsonl")
@@ -242,9 +285,16 @@ class RecordingSource(_FiniteSource):
                 f"Recorded frame size {actual_size} differs from "
                 f"session {self._image_size}."
             )
+        metadata = dict(record.get("metadata", {}))
+        metadata["image_coordinate_system"] = self.image_coordinate_system
+        if self.intrinsics_fingerprint_sha256 is not None:
+            metadata["intrinsics_fingerprint_sha256"] = (
+                self.intrinsics_fingerprint_sha256
+            )
+            metadata["valid_pixel_ratio"] = self.valid_pixel_ratio
         return CameraFrame(
             sequence=int(record["sequence"]),
             timestamp_ns=int(record["timestamp_ns"]),
             image_bgr=image,
-            metadata=dict(record.get("metadata", {})),
+            metadata=metadata,
         )

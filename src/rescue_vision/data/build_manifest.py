@@ -43,10 +43,37 @@ def build_dataset_records(
     for directory_value in recording_directories:
         directory = directory_value.expanduser().resolve()
         session = _load_json(directory / "session.json")
-        if session.get("schema_version") != 1:
-            raise ValueError(f"{directory}: session schema_version must be 1.")
+        if session.get("schema_version") != 2:
+            raise ValueError(f"{directory}: session schema_version must be 2.")
         if session.get("completed") is not True:
             raise ValueError(f"{directory}: recording is not marked completed.")
+        if session.get("image_coordinate_system") != "undistorted_pixel":
+            raise ValueError(
+                f"{directory}: target datasets require undistorted_pixel "
+                "recordings."
+            )
+        intrinsics_fingerprint = session.get(
+            "intrinsics_fingerprint_sha256"
+        )
+        if (
+            not isinstance(intrinsics_fingerprint, str)
+            or len(intrinsics_fingerprint) != 64
+            or intrinsics_fingerprint != intrinsics_fingerprint.lower()
+            or any(
+                character not in "0123456789abcdef"
+                for character in intrinsics_fingerprint.lower()
+            )
+        ):
+            raise ValueError(
+                f"{directory}: invalid intrinsics fingerprint."
+            )
+        valid_pixel_ratio = session.get("valid_pixel_ratio")
+        if (
+            isinstance(valid_pixel_ratio, bool)
+            or not isinstance(valid_pixel_ratio, (int, float))
+            or not 0.0 < float(valid_pixel_ratio) <= 1.0
+        ):
+            raise ValueError(f"{directory}: invalid valid_pixel_ratio.")
         recording_id = session.get("recording_id")
         if not isinstance(recording_id, str) or not recording_id:
             raise ValueError(f"{directory}: invalid recording_id.")
@@ -141,6 +168,9 @@ def build_dataset_records(
                     "timestamp_ns": timestamp_ns,
                     "image_path": _relative_to_root(image_path, dataset_root),
                     "image_sha256": expected_hash,
+                    "image_coordinate_system": "undistorted_pixel",
+                    "intrinsics_fingerprint_sha256": intrinsics_fingerprint,
+                    "valid_pixel_ratio": float(valid_pixel_ratio),
                     "annotation_manifest": _relative_to_root(
                         annotation_path,
                         dataset_root,

@@ -43,6 +43,7 @@ def test_inspection_replays_hashes_and_reports_capture_health(tmp_path) -> None:
     report = inspect_recording(make_recording(tmp_path))
 
     assert report["frame_count"] == 3
+    assert report["image_coordinate_system"] == "raw_pixel"
     assert report["effective_fps"] == pytest.approx(20.0)
     assert report["drop_ratio"] == 0.0
     assert report["sequence_gap_count"] == 0
@@ -55,6 +56,7 @@ def test_inspection_replays_hashes_and_reports_capture_health(tmp_path) -> None:
             maximum_drop_ratio=0.0,
             minimum_fps_ratio=1.0,
             required_metadata=PICAMERA2_METADATA,
+            require_undistorted=False,
         )
         == []
     )
@@ -72,12 +74,14 @@ def test_requirements_report_actionable_failures(tmp_path) -> None:
         maximum_drop_ratio=0.05,
         minimum_fps_ratio=0.8,
         required_metadata=("lens_position",),
+        require_undistorted=True,
     )
 
     assert any("frame_count" in failure for failure in failures)
     assert any("drop_ratio" in failure for failure in failures)
     assert any("effective_fps" in failure for failure in failures)
     assert any("lens_position" in failure for failure in failures)
+    assert any("undistorted_pixel" in failure for failure in failures)
 
 
 def test_inspection_rejects_incomplete_or_corrupt_recording(tmp_path) -> None:

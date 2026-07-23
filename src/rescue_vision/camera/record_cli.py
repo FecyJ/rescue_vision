@@ -5,17 +5,19 @@ from __future__ import annotations
 import argparse
 import time
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 
 import cv2
 import yaml
 
-from rescue_vision.camera.frame import FrameSource
+from rescue_vision.camera.frame import CameraFrame, FrameSource
 from rescue_vision.camera.picamera2_source import Picamera2Source
 from rescue_vision.camera.recording import FrameRecorder
 from rescue_vision.camera.rpicam_source import RpicamSource
 from rescue_vision.config.runtime import load_runtime_config
 from rescue_vision.data.split_manifest import REQUIRED_TAGS
+from rescue_vision.geometry.camera_model import CameraModel
 from rescue_vision.versioning import git_version
 
 
@@ -42,6 +44,7 @@ def record_session(
     frame_limit: int | None = None,
     duration_seconds: float | None = None,
     monotonic_ns: Callable[[], int] = time.monotonic_ns,
+    frame_transform: Callable[[CameraFrame], CameraFrame] | None = None,
 ) -> int:
     """启动帧源与记录器并采集，始终按相机、记录器顺序释放资源。"""
 
@@ -59,6 +62,16 @@ def record_session(
         started_ns = monotonic_ns()
         while True:
             frame = camera.read()
+            if frame_transform is not None:
+                transformed = frame_transform(frame)
+                if (
+                    transformed.sequence != frame.sequence
+                    or transformed.timestamp_ns != frame.timestamp_ns
+                ):
+                    raise ValueError(
+                        "frame_transform must preserve sequence and timestamp_ns."
+                    )
+                frame = transformed
             recorder.record(frame)
             delivered += 1
             if frame_limit is not None and delivered >= frame_limit:
@@ -77,9 +90,32 @@ def record_session(
     return delivered
 
 
+def undistort_camera_frame(
+    frame: CameraFrame,
+    *,
+    camera_model: CameraModel,
+) -> CameraFrame:
+    """把相机原始帧转换为感知统一使用的去畸变帧。"""
+
+    metadata = dict(frame.metadata)
+    metadata["image_coordinate_system"] = "undistorted_pixel"
+    metadata["intrinsics_fingerprint_sha256"] = (
+        camera_model.calibration.fingerprint()
+    )
+    return CameraFrame(
+        sequence=frame.sequence,
+        timestamp_ns=frame.timestamp_ns,
+        image_bgr=camera_model.undistort_image(frame.image_bgr),
+        metadata=metadata,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Record raw camera frames without blocking the live source."
+        description=(
+            "Record camera frames without blocking the live source; apply the "
+            "configured intrinsics undistortion when enabled."
+        )
     )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -108,6 +144,7 @@ def main() -> None:
 
     config_path = args.config.expanduser().resolve()
     config = load_runtime_config(config_path)
+    camera_model = config.build_camera_model()
     config_snapshot = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     camera: FrameSource
     if config.camera.backend == "picamera2":
@@ -134,6 +171,20 @@ def main() -> None:
         session_tags=session_tags,
         queue_capacity=config.recording.queue_capacity,
         image_format=config.recording.image_format,
+        image_coordinate_system=(
+            "undistorted_pixel" if camera_model is not None else "raw_pixel"
+        ),
+        intrinsics_fingerprint_sha256=(
+            camera_model.calibration.fingerprint()
+            if camera_model is not None
+            else None
+        ),
+        valid_pixel_ratio=(
+            cv2.countNonZero(camera_model.valid_mask)
+            / camera_model.valid_mask.size
+            if camera_model is not None
+            else None
+        ),
     )
 
     delivered = record_session(
@@ -141,6 +192,11 @@ def main() -> None:
         recorder,
         frame_limit=args.frames,
         duration_seconds=args.duration_seconds,
+        frame_transform=(
+            partial(undistort_camera_frame, camera_model=camera_model)
+            if camera_model is not None
+            else None
+        ),
     )
 
     if recorder.written_frames == 0:
