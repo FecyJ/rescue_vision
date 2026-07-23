@@ -34,16 +34,23 @@ def write_intrinsics(path, *, usable: bool = True) -> CameraCalibration:
     return calibration
 
 
-def config_text(*, image_size: str = "[32, 24]", extra: str = "") -> str:
-    return f"""schema_version: 2
+def config_text(
+    *,
+    image_size: str = "[32, 24]",
+    intrinsics_enabled: bool = True,
+    ground_mapping_enabled: bool = True,
+    extra: str = "",
+) -> str:
+    return f"""schema_version: 3
 camera:
   backend: rpicam_vid
   image_size: {image_size}
   fps: 20
   lens_position: 1.0
 geometry:
-  enabled: true
+  intrinsics_enabled: {str(intrinsics_enabled).lower()}
   intrinsics_path: intrinsics.json
+  ground_mapping_enabled: {str(ground_mapping_enabled).lower()}
   ground_mapping_path: ground.json
 recording:
   queue_capacity: 4
@@ -88,6 +95,49 @@ def test_strict_config_and_geometry_build(tmp_path) -> None:
     geometry = config.build_geometry()
     assert geometry is not None
     assert geometry.camera_model.image_size == (32, 24)
+    assert geometry.ground_projector is not None
+
+
+def test_intrinsics_can_be_enabled_without_ground_mapping(tmp_path) -> None:
+    write_intrinsics(tmp_path / "intrinsics.json")
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text(ground_mapping_enabled=False),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(path)
+    camera_model = config.build_camera_model()
+    geometry = config.build_geometry()
+
+    assert camera_model is not None
+    assert geometry is not None
+    assert geometry.camera_model.image_size == (32, 24)
+    assert geometry.ground_projector is None
+
+
+def test_ground_mapping_requires_enabled_intrinsics(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text(intrinsics_enabled=False, ground_mapping_enabled=True),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="requires.*intrinsics_enabled=true"):
+        load_runtime_config(path)
+
+
+def test_both_geometry_stages_can_be_disabled(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text(
+            intrinsics_enabled=False,
+            ground_mapping_enabled=False,
+        ),
+        encoding="utf-8",
+    )
+    config = load_runtime_config(path)
+    assert config.build_camera_model() is None
+    assert config.build_geometry() is None
 
 
 def test_unknown_config_key_is_rejected(tmp_path) -> None:

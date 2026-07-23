@@ -1,4 +1,4 @@
-schema_version: 2
+schema_version: 3
 
 camera:
   # picamera2 可记录逐帧曝光/增益等元数据；rpicam_vid 是低开销备选。
@@ -8,9 +8,11 @@ camera:
   lens_position: 1.0
 
 geometry:
-  # 数据采集阶段可以关闭；比赛运行前应启用并填写经过验收的产物。
-  enabled: false
+  # 正式任务数据统一保存去畸变图；填写可用内参后开启。
+  intrinsics_enabled: false
   intrinsics_path: null
+  # 尚未得到地面映射时保持关闭，不影响使用内参去畸变。
+  ground_mapping_enabled: false
   ground_mapping_path: null
 
 recording:

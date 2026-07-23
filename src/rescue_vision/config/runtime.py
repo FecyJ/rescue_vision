@@ -13,7 +13,7 @@ from rescue_vision.geometry.ground_projector import GroundProjector
 from rescue_vision.perception.types import TargetClass
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _mapping(value: object, location: str) -> dict[str, Any]:
@@ -86,8 +86,9 @@ class CameraConfig:
 
 @dataclass(frozen=True, slots=True)
 class GeometryConfig:
-    enabled: bool
+    intrinsics_enabled: bool
     intrinsics_path: Path | None
+    ground_mapping_enabled: bool
     ground_mapping_path: Path | None
 
 
@@ -147,7 +148,7 @@ class HailoConfig:
 @dataclass(frozen=True, slots=True)
 class RuntimeGeometry:
     camera_model: CameraModel
-    ground_projector: GroundProjector
+    ground_projector: GroundProjector | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,13 +160,12 @@ class AppConfig:
     processing: ProcessingConfig
     hailo: HailoConfig
 
-    def build_geometry(self) -> RuntimeGeometry | None:
-        """加载并交叉验证内参、运行分辨率和地面映射。"""
+    def build_camera_model(self) -> CameraModel | None:
+        """内参启用时加载并校验与运行分辨率一致的相机模型。"""
 
-        if not self.geometry.enabled:
+        if not self.geometry.intrinsics_enabled:
             return None
         assert self.geometry.intrinsics_path is not None
-        assert self.geometry.ground_mapping_path is not None
 
         calibration = CameraCalibration.from_json(
             self.geometry.intrinsics_path,
@@ -176,15 +176,26 @@ class AppConfig:
                 f"Runtime camera image_size {self.camera.image_size} does not "
                 f"match intrinsics {calibration.image_size}."
             )
+        return CameraModel(calibration)
+
+    def build_geometry(self) -> RuntimeGeometry | None:
+        """按独立开关装配相机模型，并可选装配地面映射。"""
+
+        camera_model = self.build_camera_model()
+        if camera_model is None:
+            return None
+        if not self.geometry.ground_mapping_enabled:
+            return RuntimeGeometry(camera_model, None)
+        assert self.geometry.ground_mapping_path is not None
         projector = GroundProjector.from_json(
             self.geometry.ground_mapping_path,
-            camera_calibration=calibration,
+            camera_calibration=camera_model.calibration,
         )
-        return RuntimeGeometry(CameraModel(calibration), projector)
+        return RuntimeGeometry(camera_model, projector)
 
 
 def load_runtime_config(path: str | Path) -> AppConfig:
-    """从 YAML 加载 schema v2；缺项和未知字段均视为错误。"""
+    """从 YAML 加载 schema v3；缺项和未知字段均视为错误。"""
 
     config_path = Path(path).expanduser().resolve()
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -241,12 +252,28 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     geometry_raw = _mapping(_required(root, "geometry", "root"), "geometry")
     _reject_unknown(
         geometry_raw,
-        {"enabled", "intrinsics_path", "ground_mapping_path"},
+        {
+            "intrinsics_enabled",
+            "intrinsics_path",
+            "ground_mapping_enabled",
+            "ground_mapping_path",
+        },
         "geometry",
     )
-    enabled = _required(geometry_raw, "enabled", "geometry")
-    if not isinstance(enabled, bool):
-        raise ValueError("geometry.enabled must be a boolean.")
+    intrinsics_enabled = _required(
+        geometry_raw,
+        "intrinsics_enabled",
+        "geometry",
+    )
+    if not isinstance(intrinsics_enabled, bool):
+        raise ValueError("geometry.intrinsics_enabled must be a boolean.")
+    ground_mapping_enabled = _required(
+        geometry_raw,
+        "ground_mapping_enabled",
+        "geometry",
+    )
+    if not isinstance(ground_mapping_enabled, bool):
+        raise ValueError("geometry.ground_mapping_enabled must be a boolean.")
     base_dir = config_path.parent
     intrinsics_path = _path_or_none(
         geometry_raw.get("intrinsics_path"),
@@ -258,11 +285,24 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         base_dir,
         "geometry.ground_mapping_path",
     )
-    if enabled and (intrinsics_path is None or ground_mapping_path is None):
+    if intrinsics_enabled and intrinsics_path is None:
         raise ValueError(
-            "Enabled geometry requires intrinsics_path and ground_mapping_path."
+            "Enabled intrinsics requires geometry.intrinsics_path."
         )
-    geometry = GeometryConfig(enabled, intrinsics_path, ground_mapping_path)
+    if ground_mapping_enabled and not intrinsics_enabled:
+        raise ValueError(
+            "Enabled ground mapping requires geometry.intrinsics_enabled=true."
+        )
+    if ground_mapping_enabled and ground_mapping_path is None:
+        raise ValueError(
+            "Enabled ground mapping requires geometry.ground_mapping_path."
+        )
+    geometry = GeometryConfig(
+        intrinsics_enabled,
+        intrinsics_path,
+        ground_mapping_enabled,
+        ground_mapping_path,
+    )
 
     recording_raw = _mapping(_required(root, "recording", "root"), "recording")
     _reject_unknown(recording_raw, {"queue_capacity", "image_format"}, "recording")
