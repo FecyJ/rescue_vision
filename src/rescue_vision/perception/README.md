@@ -14,6 +14,7 @@
 | `ModelDetection` | 后端输出；框和 K0 已反映射到去畸变原尺寸 |
 | `TargetObservation` | 下游跟踪、定位和评测消费的统一观测 |
 | `TargetClass` | 四类任务目标及运行时 `unknown` |
+| `ClassProbabilities` | 四类目标证据和 `unknown` 剩余概率的完整分布 |
 | `ObservationQuality` | 保留低分类置信度、K0 不可用等降级原因 |
 | `UndistortedBoundingBox` | 去畸变图中的 `(left, top, right, bottom)` |
 | `TargetAnnotation` | 评测适配器使用的人工目标真值 |
@@ -114,6 +115,7 @@ for observation in observations:
 | `capture_timestamp_ns` | 相机帧进入应用的单调时间 |
 | `result_timestamp_ns` | 推理结果产生时间 |
 | `target_class` / `class_probabilities` | 保守类别及概率 |
+| `detection_confidence` | 后端原始目标存在分；UNKNOWN 降级时也不改写 |
 | `box` | 全尺寸去畸变图中的目标框 |
 | `k0` / `k0_confidence` | 目标与地面的接触锚点及置信度 |
 | `ground_point` | 可选机器人地面系毫米坐标 |
@@ -159,11 +161,17 @@ hailo:
     black_core: black_core
     orange_injured: orange_injured
     blue_danger: blue_danger
+  backend_score_threshold: 0.01
   detection_threshold: 0.25
   semantic_threshold: 0.50
   k0_threshold: 0.50
   max_detections: 100
 ```
+
+`backend_score_threshold` 是 Hailo/后处理的低成本粗筛，必须不高于
+`detection_threshold`；后者决定检测是否进入统一观测。
+`semantic_threshold` 决定观测能否保留模型类别，否则输出 `unknown`；
+`k0_threshold` 只决定接触锚点及地面坐标是否可用。
 
 `raw_classes` 的位置就是模型 class ID。`config.hailo.class_mapping` 是内部的顺序元组；创建检测器时必须调用 `config.hailo.model_class_mapping()` 得到整数 ID 映射。`HailoConfig.build_backend()` 会延迟导入 HailoRT 并校验部署资产；`TargetPoseDetector` 从构造开始接管后端，构造校验失败也会关闭它，因此优先使用检测器上下文管理。
 

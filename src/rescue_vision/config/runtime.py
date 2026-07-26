@@ -131,6 +131,7 @@ class HailoConfig:
     hef_sha256: str | None
     raw_classes: tuple[str, ...]
     class_mapping: tuple[TargetClass, ...]
+    backend_score_threshold: float
     detection_threshold: float
     semantic_threshold: float
     k0_threshold: float
@@ -156,7 +157,7 @@ class HailoConfig:
             model_sha256=self.hef_sha256,
             class_count=len(self.raw_classes),
             max_detections=self.max_detections,
-            score_threshold=self.detection_threshold,
+            score_threshold=self.backend_score_threshold,
         )
 
     def model_class_mapping(self) -> dict[int, TargetClass]:
@@ -614,6 +615,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "hef_sha256",
             "raw_classes",
             "class_mapping",
+            "backend_score_threshold",
             "detection_threshold",
             "semantic_threshold",
             "k0_threshold",
@@ -682,6 +684,10 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "orange_injured, blue_danger or unknown."
         ) from exc
 
+    backend_score_threshold = _threshold(
+        _required(hailo_raw, "backend_score_threshold", "hailo"),
+        "hailo.backend_score_threshold",
+    )
     detection_threshold = _threshold(
         _required(hailo_raw, "detection_threshold", "hailo"),
         "hailo.detection_threshold",
@@ -695,6 +701,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         "hailo.k0_threshold",
     )
     for location, value in (
+        ("hailo.backend_score_threshold", backend_score_threshold),
         ("hailo.detection_threshold", detection_threshold),
         ("hailo.semantic_threshold", semantic_threshold),
         ("hailo.k0_threshold", k0_threshold),
@@ -704,6 +711,12 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     if semantic_threshold < detection_threshold:
         raise ValueError(
             "hailo.semantic_threshold must be >= hailo.detection_threshold."
+        )
+    if backend_score_threshold > detection_threshold:
+        raise ValueError(
+            "hailo.backend_score_threshold must be <= "
+            f"hailo.detection_threshold, got {backend_score_threshold} > "
+            f"{detection_threshold}."
         )
     max_detections = _positive_int(
         _required(hailo_raw, "max_detections", "hailo"),
@@ -732,6 +745,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         hef_sha256=checksum,
         raw_classes=raw_classes,
         class_mapping=class_mapping,
+        backend_score_threshold=backend_score_threshold,
         detection_threshold=detection_threshold,
         semantic_threshold=semantic_threshold,
         k0_threshold=k0_threshold,

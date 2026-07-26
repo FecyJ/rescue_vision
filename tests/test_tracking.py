@@ -54,6 +54,7 @@ def observation(
             target_class,
             confidence,
         ),
+        detection_confidence=confidence,
         box=box or UndistortedBoundingBox(10.0, 10.0, 30.0, 40.0),
         k0=k0,
         k0_confidence=0.9 if k0 is not None else 0.0,

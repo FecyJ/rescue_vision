@@ -36,6 +36,20 @@ def test_split_is_deterministic_and_groups_never_leak() -> None:
         group_splits.setdefault(item["recording_id"], set()).add(item["split"])
     assert all(len(splits) == 1 for splits in group_splits.values())
     assert set(first_report["tag_distribution"])
+    assert set(first_report["sample_counts"]) == {"train", "validation", "test"}
+    assert set(first_report["group_counts"]) == {"train", "validation", "test"}
+    assert sum(first_report["sample_counts"].values()) == len(records)
+    assert sum(first_report["realized_ratios"].values()) == pytest.approx(1.0)
+
+
+def test_small_split_reports_empty_partitions_explicitly() -> None:
+    _, report = split_records(
+        [record("green_supply_1/frame_00000000", "green_supply_1")],
+        seed="rescue-targets-2026-07-23-v1",
+    )
+    assert 0 in report["sample_counts"].values()
+    assert report["warnings"]
+    assert {warning["code"] for warning in report["warnings"]} == {"empty_split"}
 
 
 def test_split_rejects_missing_stratification_tag() -> None:

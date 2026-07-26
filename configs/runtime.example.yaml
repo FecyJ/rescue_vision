@@ -59,6 +59,7 @@ hailo:
   hef_sha256: null
   raw_classes: []
   class_mapping: {}
+  backend_score_threshold: 0.01
   detection_threshold: 0.25
   semantic_threshold: 0.50
   k0_threshold: 0.50

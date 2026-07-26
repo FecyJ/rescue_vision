@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -86,6 +87,7 @@ hailo:
   hef_sha256: null
   raw_classes: []
   class_mapping: {{}}
+  backend_score_threshold: 0.01
   detection_threshold: 0.25
   semantic_threshold: 0.5
   k0_threshold: 0.5
@@ -98,7 +100,11 @@ def test_strict_config_and_geometry_build(tmp_path) -> None:
     (tmp_path / "ground.json").write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                    "schema_version": 3,
+                    "quality": {
+                        "usable": True,
+                        "physically_valid": True,
+                    },
                 "image_size": [32, 24],
                 "intrinsics": {
                     "model_type": "pinhole",
@@ -223,6 +229,27 @@ def test_hailo_mapping_must_be_exhaustive(tmp_path) -> None:
     path.write_text(text, encoding="utf-8")
     with pytest.raises(ValueError, match="exactly match"):
         load_runtime_config(path)
+
+
+def test_backend_threshold_must_not_hide_detector_candidates(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text().replace(
+            "  backend_score_threshold: 0.01",
+            "  backend_score_threshold: 0.30",
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="backend_score_threshold"):
+        load_runtime_config(path)
+
+
+def test_runtime_example_matches_strict_schema() -> None:
+    example = (
+        Path(__file__).resolve().parents[1] / "configs" / "runtime.example.yaml"
+    )
+    config = load_runtime_config(example)
+    assert config.schema_version == 4
 
 
 def test_p1_config_builds_algorithms_and_regions(tmp_path) -> None:

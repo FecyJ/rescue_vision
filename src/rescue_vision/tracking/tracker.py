@@ -353,7 +353,7 @@ class MultiTargetTracker:
     ) -> TrackedTarget:
         track_id = self._next_track_id
         self._next_track_id += 1
-        confidence = max(observation.class_probabilities.as_dict().values())
+        confidence = observation.detection_confidence
         status = (
             TrackStatus.CONFIRMED
             if self._config.confirmation_hits == 1
@@ -385,9 +385,7 @@ class MultiTargetTracker:
         observation: TargetObservation,
         timestamp_ns: int,
     ) -> TrackedTarget:
-        observation_confidence = max(
-            observation.class_probabilities.as_dict().values()
-        )
+        observation_confidence = observation.detection_confidence
         confidence = 1.0 - (
             (1.0 - track.confidence) * (1.0 - observation_confidence)
         )

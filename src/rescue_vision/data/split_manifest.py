@@ -158,6 +158,31 @@ def split_records(
     for split in group_splits.values():
         group_counts[split] += 1
 
+    split_names = ("train", "validation", "test")
+    sample_counts = {
+        split: int(split_counts[split]) for split in split_names
+    }
+    explicit_group_counts = {
+        split: int(group_counts[split]) for split in split_names
+    }
+    total_samples = len(output)
+    realized_ratios = {
+        split: (
+            sample_counts[split] / total_samples
+            if total_samples
+            else 0.0
+        )
+        for split in split_names
+    }
+    warnings = [
+        {
+            "code": "empty_split",
+            "split": split,
+            "message": f"{split} contains no recording groups or samples.",
+        }
+        for split in split_names
+        if explicit_group_counts[split] == 0
+    ]
     report = {
         "schema_version": 1,
         "dataset_version": dataset_version,
@@ -167,8 +192,10 @@ def split_records(
             "validation": validation_ratio,
             "test": 1.0 - train_ratio - validation_ratio,
         },
-        "sample_counts": dict(sorted(split_counts.items())),
-        "group_counts": dict(sorted(group_counts.items())),
+        "realized_ratios": realized_ratios,
+        "sample_counts": sample_counts,
+        "group_counts": explicit_group_counts,
+        "warnings": warnings,
         "tag_distribution": {
             name: dict(sorted(counts.items()))
             for name, counts in sorted(tag_counts.items())
@@ -216,6 +243,8 @@ def main() -> None:
         json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
         encoding="utf-8",
     )
+    if report["warnings"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

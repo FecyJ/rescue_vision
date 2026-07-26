@@ -53,7 +53,7 @@ python -m pytest
 | [`camera`](src/rescue_vision/camera/README.md) | 已实现 | 真机最新帧、离线回放和有界异步记录 |
 | [`calibration`](src/rescue_vision/calibration/README.md) | 已实现 | 棋盘采集、三模型内参比较和地面映射 |
 | [`geometry`](src/rescue_vision/geometry/README.md) | 已实现 | 去畸变、显式坐标类型、地面与 BEV 转换 |
-| [`config`](src/rescue_vision/config/README.md) | 已实现 | schema v4 配置、几何/模型身份和 P1 算法装配 |
+| [`config`](src/rescue_vision/config/README.md) | 已实现 | schema v4 配置、几何/模型身份和纯逻辑算法装配 |
 | [`data`](src/rescue_vision/data/README.md) | 已实现 | 记录检查、清单生成和按会话防泄漏划分 |
 | [`evaluation`](src/rescue_vision/evaluation/README.md) | 已实现 | 分类、地面误差、时延和失败样例报告 |
 | [`perception`](src/rescue_vision/perception/README.md) | 已实现基础设施 | 四类目标契约、K0 投影、假后端和 Hailo 后端；正式模型待训练 |

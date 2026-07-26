@@ -166,6 +166,7 @@ class TargetObservation:
     image_size: tuple[int, int]
     target_class: TargetClass
     class_probabilities: ClassProbabilities
+    detection_confidence: float
     box: UndistortedBoundingBox
     k0: UndistortedPixel | None
     k0_confidence: float
@@ -215,6 +216,7 @@ class TargetObservation:
             raise ValueError(
                 "class_probabilities must be a ClassProbabilities value."
             )
+        _probability(self.detection_confidence, "detection_confidence")
         self.box.validate_image_size(self.image_size)
         _probability(self.k0_confidence, "k0_confidence")
         if self.k0 is not None:

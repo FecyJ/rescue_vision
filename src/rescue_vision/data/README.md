@@ -11,7 +11,7 @@
 | `PICAMERA2_METADATA` | 正式 Picamera2 会话要求的逐帧元数据名 |
 | `build_dataset_records()` | 把一个或多个合格 session 转为数据清单记录 |
 | `split_records()` | 按 `recording_id` 确定性分配 train/validation/test |
-| `assign_split()` | 查询单个会话在给定 seed 下的分区 |
+| `assign_split(group_id, *, seed, train_ratio, validation_ratio)` | 查询单个会话在给定 seed 和比例下的分区 |
 | `rescue-vision-check-recording` | 单会话验收及可选回放 |
 | `rescue-vision-manifest` | 生成 schema v2 数据集 JSONL |
 | `rescue-vision-split` | 写入分区字段并输出分布报告 |
@@ -60,6 +60,11 @@ rescue-vision-split \
 `--display` 按采集时间回放；`--playback-speed 2` 可二倍速。按 `Q/Esc` 只关闭窗口，剩余帧仍在后台完成校验。
 
 发布数据版本时不能使用 `--skip-image-verification`。该选项只允许在已知资产未变化的本地迭代中临时加速。
+
+划分报告始终显式包含 train/validation/test 的样本数、会话数和实际比例。
+任一集合为空时 `warnings` 会列出 `empty_split`，CLI 在写完报告后以退出码
+1 结束；必须增加独立会话或调整版本后重新划分，不能把空测试集当作可发布结果。
+纯哈希分配在会话少于约 20 个时方差很大，四类各一个会话不构成可靠划分。
 
 ## 在程序中组合数据流程
 

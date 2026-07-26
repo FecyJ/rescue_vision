@@ -343,6 +343,23 @@ class MissionStateMachine:
         if direct_reason is not None:
             return self._terminate(timestamp_ns, direct_reason)
 
+        elapsed_s = (
+            timestamp_ns - self._start_timestamp_ns
+        ) / 1_000_000_000.0
+        if elapsed_s >= self._config.match_duration_s:
+            return self._terminate(
+                timestamp_ns,
+                TerminationReason.MATCH_TIMEOUT,
+            )
+        still_s = (
+            timestamp_ns - safety.last_motion_timestamp_ns
+        ) / 1_000_000_000.0
+        if still_s >= self._config.no_motion_timeout_s:
+            return self._terminate(
+                timestamp_ns,
+                TerminationReason.NO_MOTION_TIMEOUT,
+            )
+
         delivery_signature = None
         if delivery is not None:
             delivery_signature = (
@@ -421,25 +438,14 @@ class MissionStateMachine:
         ):
             return self._hold(timestamp_ns, "suspected_danger_engaged")
 
-        elapsed_s = (
-            timestamp_ns - self._start_timestamp_ns
-        ) / 1_000_000_000.0
-        if elapsed_s >= self._config.match_duration_s:
-            return self._terminate(
-                timestamp_ns,
-                TerminationReason.MATCH_TIMEOUT,
-            )
-        still_s = (
-            timestamp_ns - safety.last_motion_timestamp_ns
-        ) / 1_000_000_000.0
-        if still_s >= self._config.no_motion_timeout_s:
-            return self._terminate(
-                timestamp_ns,
-                TerminationReason.NO_MOTION_TIMEOUT,
-            )
-
         if WorldUncertainty.STALE_VISION in snapshot.uncertainties:
             return self._hold(timestamp_ns, "stale_vision")
+        if (
+            WorldUncertainty.MISSING_ROBOT_FIELD_POSITION
+            in snapshot.uncertainties
+            or snapshot.robot_field_point is None
+        ):
+            return self._hold(timestamp_ns, "robot_field_position_missing")
 
         if safety.opponent_contact_since_ns is not None:
             contact_s = (

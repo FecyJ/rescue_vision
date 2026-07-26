@@ -117,7 +117,8 @@ decisions = replay_mission(
 SEARCH  APPROACH  PUSH  AVOID  DELIVER  STOP
 ```
 
-- `SAFETY_HOLD / STOP` 可由新鲜视觉、同一 track ID 恢复或接触解除证据恢复；
+- `SAFETY_HOLD / STOP` 可由新鲜视觉、同一 track ID 恢复、接触解除，
+  或重新提供机器人场地位置证据恢复；
 - `ENDED / STOPPED` 是吸收态，后续高收益事件也只能得到 `STOP`；
 - 只有显式 `reset()` 才能开始新一轮，活动中的状态机拒绝复位；
 - 时间倒退、未来运动/接触时间和非法输入立即报错。

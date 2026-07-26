@@ -39,8 +39,11 @@ def observations_to_evaluation_records(
 
     if not sample_id.strip():
         raise ValueError("sample_id must be non-empty.")
-    if not 0.0 <= iou_threshold <= 1.0:
-        raise ValueError("iou_threshold must be in [0, 1].")
+    if not 0.0 < iou_threshold <= 1.0:
+        raise ValueError("iou_threshold must be in (0, 1].")
+    object_ids = [annotation.object_id for annotation in annotations]
+    if len(set(object_ids)) != len(object_ids):
+        raise ValueError("annotations must contain unique object_id values.")
     if result_timestamp_ns < capture_timestamp_ns:
         raise ValueError("result_timestamp_ns must not precede capture_timestamp_ns.")
     for observation in observations:
@@ -93,7 +96,7 @@ def observations_to_evaluation_records(
         records.append(
             _record(
                 sample_id=sample_id,
-                object_id=f"prediction_{prediction_index:04d}",
+                object_id=f"__prediction__{prediction_index:04d}",
                 truth=None,
                 observation=observation,
                 capture_timestamp_ns=capture_timestamp_ns,
@@ -118,11 +121,7 @@ def _record(
     result_timestamp_ns: int,
     tags: Mapping[str, str],
 ) -> dict[str, object]:
-    confidence = (
-        observation.class_probabilities.probability(observation.target_class)
-        if observation is not None
-        else None
-    )
+    confidence = observation.detection_confidence if observation is not None else None
     return {
         "schema_version": 1,
         "sample_id": sample_id,
@@ -130,6 +129,17 @@ def _record(
         "ground_truth_class": truth.target_class.value if truth else None,
         "predicted_class": observation.target_class.value if observation else None,
         "confidence": confidence,
+        "quality": (
+            sorted(item.value for item in observation.quality)
+            if observation is not None
+            else []
+        ),
+        "model_sha256": (
+            observation.model_sha256 if observation is not None else None
+        ),
+        "k0_confidence": (
+            observation.k0_confidence if observation is not None else None
+        ),
         "ground_truth_ground_mm": _ground(truth.ground_point) if truth else None,
         "predicted_ground_mm": (
             _ground(observation.ground_point) if observation else None

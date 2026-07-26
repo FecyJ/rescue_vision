@@ -7,9 +7,12 @@ from typing import Any
 
 import numpy as np
 
+from rescue_vision.perception.types import TargetClass
+
 
 BACKGROUND = "__background__"
 MISSED = "__missed__"
+DEFAULT_CLASSES = tuple(target_class.value for target_class in TargetClass)
 
 
 def _ground_point(value: object, location: str) -> np.ndarray | None:
@@ -31,6 +34,7 @@ def evaluate_records(
     model_version: str,
     dataset_version: str,
     code_version: str,
+    classes: tuple[str, ...] = DEFAULT_CLASSES,
 ) -> dict[str, Any]:
     """评测已经完成匹配的逐对象记录。
 
@@ -39,9 +43,19 @@ def evaluate_records(
 
     if not model_version or not dataset_version or not code_version:
         raise ValueError("model, dataset and code versions must be non-empty.")
+    if not records:
+        raise ValueError("Evaluation records must not be empty.")
+    if (
+        not classes
+        or len(set(classes)) != len(classes)
+        or any(not isinstance(label, str) or not label for label in classes)
+        or BACKGROUND in classes
+        or MISSED in classes
+    ):
+        raise ValueError("classes must contain unique, non-empty class names.")
+    allowed_labels = set(classes)
 
     normalized: list[tuple[str | None, str | None]] = []
-    labels: set[str] = set()
     ground_errors: list[float] = []
     sample_latencies_ms: dict[str, float] = {}
     failures: list[dict[str, Any]] = []
@@ -78,10 +92,15 @@ def evaluate_records(
             or not 0.0 <= float(confidence) <= 1.0
         ):
             raise ValueError(f"Record {index} confidence must be in [0, 1] or null.")
-        if truth is not None:
-            labels.add(truth)
-        if prediction is not None:
-            labels.add(prediction)
+        for field_name, label in (
+            ("ground_truth_class", truth),
+            ("predicted_class", prediction),
+        ):
+            if label is not None and label not in allowed_labels:
+                raise ValueError(
+                    f"Record {index} {field_name} {label!r} is outside "
+                    f"the configured classes {list(classes)!r}."
+                )
         normalized.append((truth, prediction))
 
         truth_ground = _ground_point(
@@ -134,7 +153,7 @@ def evaluate_records(
                 }
             )
 
-    ordered_labels = sorted(labels)
+    ordered_labels = list(classes)
     matrix_rows = ordered_labels + [BACKGROUND]
     matrix_columns = ordered_labels + [MISSED]
     matrix: dict[str, Counter[str]] = {
@@ -168,13 +187,13 @@ def evaluate_records(
             if true_positive + false_negative
             else None
         )
-        f1 = (
-            2 * precision * recall / (precision + recall)
-            if precision is not None
-            and recall is not None
-            and precision + recall > 0
-            else None
-        )
+        f1 = None
+        if precision is not None and recall is not None:
+            f1 = (
+                2 * precision * recall / (precision + recall)
+                if precision + recall > 0
+                else 0.0
+            )
         per_class[label] = {
             "true_positive": true_positive,
             "false_positive": false_positive,
@@ -185,6 +204,16 @@ def evaluate_records(
         }
 
     latencies_ms = list(sample_latencies_ms.values())
+    warnings: list[dict[str, str]] = []
+    danger_label = TargetClass.BLUE_DANGER.value
+    if not any(truth == danger_label for truth, _ in normalized):
+        warnings.append(
+            {
+                "code": "danger_class_has_no_ground_truth",
+                "class": danger_label,
+                "message": "blue_danger has no ground-truth samples.",
+            }
+        )
     return {
         "schema_version": 1,
         "versions": {
@@ -219,4 +248,5 @@ def evaluate_records(
         },
         "failure_count": len(failures),
         "failures": failures,
+        "warnings": warnings,
     }

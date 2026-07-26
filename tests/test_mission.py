@@ -79,7 +79,7 @@ def snapshot(
     *,
     regions: frozenset[RegionKind] = frozenset(),
     uncertainties: frozenset[WorldUncertainty] = frozenset(),
-    robot_field_point: FieldPoint | None = None,
+    robot_field_point: FieldPoint | None = FieldPoint(-1000.0, -1000.0),
     static_regions: tuple[StaticRegion, ...] = (),
     opponent_occupancies: tuple[OpponentOccupancy, ...] = (),
 ) -> WorldSnapshot:
@@ -490,6 +490,59 @@ def test_motion_and_match_timeouts_terminate() -> None:
     machine = started_machine()
     timed_out = step(machine, 180_000_000_000)
     assert timed_out.termination_reason is TerminationReason.MATCH_TIMEOUT
+
+
+@pytest.mark.parametrize(
+    "transport_ids",
+    [(999,), (1,)],
+)
+def test_timeouts_preempt_transport_holds(
+    transport_ids: tuple[int, ...],
+) -> None:
+    machine = started_machine()
+    targets = (
+        (target(1, TargetClass.UNKNOWN, hazard_state=HazardState.SUSPECTED),)
+        if transport_ids == (1,)
+        else ()
+    )
+    decision = step(
+        machine,
+        180_000_000_000,
+        targets,
+        transport_ids=transport_ids,
+    )
+    assert decision.termination_reason is TerminationReason.MATCH_TIMEOUT
+
+
+def test_missing_robot_field_position_holds_but_does_not_mask_timeout() -> None:
+    machine = started_machine()
+    current = machine.step(
+        snapshot(
+            1,
+            (target(1, TargetClass.GREEN_SUPPLY),),
+            robot_field_point=None,
+            uncertainties=frozenset(
+                {WorldUncertainty.MISSING_ROBOT_FIELD_POSITION}
+            ),
+        ),
+        transport=TransportStatus(),
+        safety=SafetySignals.nominal(1),
+    )
+    assert current.activity is ActivityState.SAFETY_HOLD
+    assert current.reason == "robot_field_position_missing"
+
+    timeout = machine.step(
+        snapshot(
+            180_000_000_000,
+            robot_field_point=None,
+            uncertainties=frozenset(
+                {WorldUncertainty.MISSING_ROBOT_FIELD_POSITION}
+            ),
+        ),
+        transport=TransportStatus(),
+        safety=SafetySignals.nominal(180_000_000_000),
+    )
+    assert timeout.termination_reason is TerminationReason.MATCH_TIMEOUT
 
 
 def test_wrong_opponent_and_outside_deliveries_do_not_advance_phase() -> None:

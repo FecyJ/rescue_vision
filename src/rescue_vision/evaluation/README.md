@@ -108,8 +108,13 @@ evaluation_records = observations_to_evaluation_records(
 - `predicted_class: null` 表示漏检。
 - 二者不能同时为 `null`。
 - 真值和预测地面点同时存在时才统计毫米误差。
-- 捕获时间和结果时间同时存在时按 sample 统计端到端时延。
+- 捕获时间和结果时间必须同时存在或同时缺失；只有一个时间戳属于
+  schema 错误。两者存在时按 sample 统计端到端时延。
 - 同一 `(sample_id, object_id)` 不能重复。
+
+默认词表固定为五个 `TargetClass` 值，词表外类别会被拒绝，空输入也会被
+拒绝。报告始终保留危险类 `blue_danger`；若没有危险真值样本，
+`warnings` 会包含 `danger_class_has_no_ground_truth`。
 
 报告中的 `per_class` 必须逐类审阅，危险类 `blue_danger` 单列。总体平均值不能掩盖危险目标漏检；`failures` 中的样例应回到原图、标注和模型输出联合复盘。
 

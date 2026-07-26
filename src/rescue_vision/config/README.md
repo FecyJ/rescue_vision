@@ -58,7 +58,7 @@ if backend is None:
 
 class_mapping = config.hailo.model_class_mapping()
 
-# P1 纯逻辑对象同样只装配一次；每轮结束后显式 reset，
+# 纯逻辑对象同样只装配一次；每轮结束后显式 reset，
 # 或为下一轮创建新对象，不能在逐帧循环中反复构造。
 tracker = config.tracking.build_tracker()
 world_model = config.world.build_model()
@@ -96,6 +96,11 @@ geometry:
 4. 打开 Hailo 设备资源。
 
 后端必须由调用方 `close()`，通常交给 `TargetPoseDetector` 的上下文管理统一释放。
+
+阈值分为三层：`backend_score_threshold` 是后端粗筛，必须小于等于
+`detection_threshold`；`detection_threshold` 决定是否形成观测；
+`semantic_threshold` 决定是否保留模型类别，低于它时保守降级为
+`unknown`。`k0_threshold` 独立控制地面接触点是否可用。
 
 ## schema 与路径
 

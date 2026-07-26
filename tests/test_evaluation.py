@@ -69,3 +69,45 @@ def test_report_rejects_non_monotonic_timestamps() -> None:
             dataset_version="d",
             code_version="c",
         )
+
+
+def test_report_rejects_empty_and_unknown_vocabulary() -> None:
+    with pytest.raises(ValueError, match="must not be empty"):
+        evaluate_records(
+            [],
+            model_version="m",
+            dataset_version="d",
+            code_version="c",
+        )
+    with pytest.raises(ValueError, match="outside the configured classes"):
+        evaluate_records(
+            [item("1", "hazard", "hazard")],
+            model_version="m",
+            dataset_version="d",
+            code_version="c",
+        )
+
+
+def test_report_keeps_danger_visible_when_dataset_has_no_danger_truth() -> None:
+    report = evaluate_records(
+        [item("1", "green_supply", None)],
+        model_version="m",
+        dataset_version="d",
+        code_version="c",
+    )
+    assert "blue_danger" in report["classes"]
+    assert report["per_class"]["blue_danger"]["true_positive"] == 0
+    assert report["warnings"][0]["code"] == "danger_class_has_no_ground_truth"
+
+
+def test_complete_failure_f1_is_zero() -> None:
+    report = evaluate_records(
+        [
+            item("1", "blue_danger", None),
+            item("2", None, "blue_danger"),
+        ],
+        model_version="m",
+        dataset_version="d",
+        code_version="c",
+    )
+    assert report["per_class"]["blue_danger"]["f1"] == 0.0

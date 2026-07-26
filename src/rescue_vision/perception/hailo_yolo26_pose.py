@@ -42,40 +42,56 @@ class LetterboxTransform:
         return UndistortedBoundingBox(left, top, right, bottom)
 
 
-def letterbox_bgr(
+def letterbox_bgr_to_rgb(
     image_bgr: np.ndarray,
     model_size: tuple[int, int],
 ) -> tuple[np.ndarray, LetterboxTransform]:
-    """按参考运行时使用 114 灰色填充并保持宽高比。"""
+    """将 BGR 原图转换为模型所需的 RGB letterbox uint8 输入。"""
 
     if image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
         raise ValueError(
             f"image_bgr must have shape (height, width, 3), got {image_bgr.shape}."
         )
+
     model_width, model_height = model_size
     if model_width <= 0 or model_height <= 0:
         raise ValueError(f"model_size must be positive, got {model_size!r}.")
+
     original_height, original_width = image_bgr.shape[:2]
-    scale = min(model_width / original_width, model_height / original_height)
-    resized_width = int(original_width * scale)
-    resized_height = int(original_height * scale)
-    resized = cv2.resize(
+    scale = min(
+        model_width / original_width,
+        model_height / original_height,
+    )
+
+    # 使用 round，而不是直接 int 截断。
+    resized_width = int(round(original_width * scale))
+    resized_height = int(round(original_height * scale))
+
+    resized_bgr = cv2.resize(
         image_bgr,
         (resized_width, resized_height),
-        interpolation=cv2.INTER_CUBIC,
+        interpolation=cv2.INTER_LINEAR,
     )
-    x_offset = (model_width - resized_width) // 2
-    y_offset = (model_height - resized_height) // 2
-    output = np.full(
+    resized_rgb = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB)
+
+    horizontal_padding = model_width - resized_width
+    vertical_padding = model_height - resized_height
+
+    # 与 Ultralytics 居中 LetterBox 的取整方式保持一致。
+    x_offset = int(round(horizontal_padding / 2 - 0.1))
+    y_offset = int(round(vertical_padding / 2 - 0.1))
+
+    output_rgb = np.full(
         (model_height, model_width, 3),
         IMAGE_BORDER_FILL_VALUE,
         dtype=np.uint8,
     )
-    output[
+    output_rgb[
         y_offset : y_offset + resized_height,
         x_offset : x_offset + resized_width,
-    ] = resized
-    return output, LetterboxTransform(
+    ] = resized_rgb
+
+    return output_rgb, LetterboxTransform(
         original_size=(original_width, original_height),
         model_size=model_size,
         scale=scale,
@@ -154,7 +170,8 @@ def parse_yolo26_pose_output(
             f"Pose output must have shape (N, {expected_width}), got "
             f"{detections.shape}."
         )
-    valid = detections[detections[:, 4] >= score_threshold]
+    scores = detections[:, 4]
+    valid = detections[np.isfinite(scores) & (scores >= score_threshold)]
     if valid.size:
         valid = valid[np.argsort(-valid[:, 4], kind="stable")[:max_detections]]
 
@@ -164,8 +181,17 @@ def parse_yolo26_pose_output(
         class_id = int(class_value)
         if not np.isfinite(class_value) or class_value != class_id or class_id < 0:
             raise ValueError(f"Invalid model class ID {class_value!r}.")
-        box = transform.box_to_original(*[float(value) for value in row[:4]])
-        k0_confidence = float(row[8])
+        try:
+            box = transform.box_to_original(
+                *[float(value) for value in row[:4]]
+            )
+        except ValueError:
+            # 填充区或垃圾输出裁剪后可能退化为零面积框；单条坏输出
+            # 不应击穿整帧实时推理。
+            continue
+        k0_confidence = (
+            float(row[8]) if np.isfinite(row[8]) else 0.0
+        )
         k0 = (
             transform.point_to_original(float(row[6]), float(row[7]))
             if np.isfinite(row[6:9]).all()
@@ -250,6 +276,7 @@ class HailoYolo26PoseBackend:
         try:
             import onnxruntime as ort
             from hailo_platform import (
+                FormatOrder,
                 FormatType,
                 HailoSchedulingAlgorithm,
                 VDevice,
@@ -295,10 +322,17 @@ class HailoYolo26PoseBackend:
                         f"HEF output {hef_name!r} shape {actual_hwc} does not "
                         f"match configured CHW {expected_chw}."
                     )
+
+            # 显式要求 HailoRT 输出 NHWC
+            input_stream = self._infer_model.input()
+            input_stream.set_format_type(FormatType.UINT8)
+            input_stream.set_format_order(FormatOrder.NHWC)
+
             for output in self._infer_model.outputs:
-                self._infer_model.output(output.name).set_format_type(
-                    FormatType.FLOAT32
-                )
+                output_stream = self._infer_model.output(output.name)
+                output_stream.set_format_type(FormatType.FLOAT32)
+                output_stream.set_format_order(FormatOrder.NHWC)
+
             self._configure_context = self._infer_model.configure()
             self._configured_model = self._configure_context.__enter__()
             input_shape = tuple(self._infer_model.input().shape)
@@ -332,7 +366,7 @@ class HailoYolo26PoseBackend:
     def infer(self, image_bgr: np.ndarray) -> list[ModelDetection]:
         if self._closed:
             raise RuntimeError("HailoYolo26PoseBackend is closed.")
-        preprocessed, transform = letterbox_bgr(image_bgr, self._model_size)
+        preprocessed, transform = letterbox_bgr_to_rgb(image_bgr, self._model_size)
         output_buffers = {
             output.name: np.empty(output.shape, dtype=np.float32)
             for output in self._infer_model.outputs
@@ -376,14 +410,28 @@ class HailoYolo26PoseBackend:
         if getattr(self, "_closed", False):
             return
         self._closed = True
-        if self._last_job is not None:
-            self._last_job.wait(10_000)
-        context = getattr(self, "_configure_context", None)
-        if context is not None:
-            context.__exit__(None, None, None)
-        device = getattr(self, "_device", None)
-        if device is not None and hasattr(device, "release"):
-            device.release()
+        first_error: BaseException | None = None
+        try:
+            if self._last_job is not None:
+                self._last_job.wait(10_000)
+        except BaseException as error:
+            first_error = error
+        try:
+            context = getattr(self, "_configure_context", None)
+            if context is not None:
+                context.__exit__(None, None, None)
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+        try:
+            device = getattr(self, "_device", None)
+            if device is not None and hasattr(device, "release"):
+                device.release()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+        if first_error is not None:
+            raise RuntimeError("Hailo backend shutdown failed.") from first_error
 
     def __enter__(self) -> HailoYolo26PoseBackend:
         return self

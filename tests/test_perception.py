@@ -103,6 +103,7 @@ def test_detector_builds_observation_and_projects_k0() -> None:
     assert observation.target_class is TargetClass.GREEN_SUPPLY
     assert observation.class_probabilities.green_supply == pytest.approx(0.8)
     assert observation.class_probabilities.unknown == pytest.approx(0.2)
+    assert observation.detection_confidence == pytest.approx(0.8)
     assert observation.ground_point == GroundPoint(10.0, 18.0)
     assert observation.quality == frozenset()
 
@@ -116,7 +117,9 @@ def test_low_class_and_k0_confidence_degrade_conservatively() -> None:
         result_timestamp_ns=1_010_000_000,
     )[0]
     assert observation.target_class is TargetClass.UNKNOWN
-    assert observation.class_probabilities.unknown == 1.0
+    assert observation.class_probabilities.green_supply == pytest.approx(0.4)
+    assert observation.class_probabilities.unknown == pytest.approx(0.6)
+    assert observation.detection_confidence == pytest.approx(0.4)
     assert observation.k0 is None
     assert observation.ground_point is None
     assert observation.quality == frozenset(
@@ -197,6 +200,7 @@ def test_invalid_observation_coordinates_and_version_fail() -> None:
             class_probabilities=ClassProbabilities.from_top_class(
                 TargetClass.GREEN_SUPPLY, 0.8
             ),
+            detection_confidence=0.8,
             box=UndistortedBoundingBox(0, 0, 5, 5),
             k0=UndistortedPixel(11, 1),
             k0_confidence=0.9,
@@ -256,3 +260,7 @@ def test_observations_to_evaluation_records_full_chain() -> None:
     assert report["failure_count"] == 3
     assert report["per_class"]["blue_danger"]["false_positive"] == 1
     assert report["per_class"]["orange_injured"]["false_negative"] == 1
+    matched = next(record for record in records if record["object_id"] == "truth_1")
+    assert matched["confidence"] == pytest.approx(0.8)
+    assert matched["model_sha256"] == "0" * 64
+    assert matched["quality"] == []

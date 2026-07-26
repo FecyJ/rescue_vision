@@ -164,7 +164,7 @@ class TargetPoseDetector:
             if detection.confidence < self._semantic_threshold:
                 target_class = TargetClass.UNKNOWN
                 probabilities = ClassProbabilities.from_top_class(
-                    TargetClass.UNKNOWN, 1.0
+                    mapped_class, detection.confidence
                 )
                 quality.add(ObservationQuality.LOW_CLASS_CONFIDENCE)
             else:
@@ -198,6 +198,7 @@ class TargetPoseDetector:
                     image_size=image_size,
                     target_class=target_class,
                     class_probabilities=probabilities,
+                    detection_confidence=detection.confidence,
                     box=detection.box,
                     k0=k0,
                     k0_confidence=detection.k0_confidence,
