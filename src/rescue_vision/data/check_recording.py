@@ -332,6 +332,8 @@ def main() -> None:
         KeyError,
         json.JSONDecodeError,
         cv2.error,
+        RuntimeError,
+        TypeError,
     ) as error:
         parser.error(str(error))
     finally:

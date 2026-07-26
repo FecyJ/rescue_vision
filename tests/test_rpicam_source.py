@@ -60,6 +60,11 @@ def test_read_before_start_and_negative_timeout_are_rejected() -> None:
         camera.read(timeout=-1)
 
 
+def test_yuv420_rejects_odd_image_dimensions() -> None:
+    with pytest.raises(ValueError, match="must be even"):
+        RpicamSource(image_size=(5, 4))
+
+
 def test_process_start_failure_leaves_source_stopped(monkeypatch) -> None:
     def fail(*args, **kwargs):
         raise FileNotFoundError("rpicam-vid")

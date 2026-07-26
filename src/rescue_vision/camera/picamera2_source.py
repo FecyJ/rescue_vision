@@ -85,12 +85,22 @@ class Picamera2Source:
                 timeout=5.0,
             )
         if not ready:
-            self.stop()
-            raise TimeoutError("等待 Picamera2 第一帧超时")
+            error = TimeoutError("等待 Picamera2 第一帧超时")
+            try:
+                self.stop()
+            except BaseException as cleanup_error:
+                error.add_note(f"Picamera2 cleanup also failed: {cleanup_error!r}")
+            raise error
         if self._reader_error is not None:
             error = self._reader_error
-            self.stop()
-            raise RuntimeError("Picamera2 采集启动失败") from error
+            startup_error = RuntimeError("Picamera2 采集启动失败")
+            try:
+                self.stop()
+            except BaseException as cleanup_error:
+                startup_error.add_note(
+                    f"Picamera2 cleanup also failed: {cleanup_error!r}"
+                )
+            raise startup_error from error
 
     def _create_camera(self) -> tuple[Any, dict[str, Any]]:
         if self._camera_factory is not None:
@@ -138,12 +148,9 @@ class Picamera2Source:
             self._thread.join(timeout=2.0)
             if self._thread.is_alive() and stop_error is None:
                 stop_error = TimeoutError("Picamera2 reader thread did not stop.")
-        close_error = (
-            self._bounded_call(camera.close, timeout=2.0)
-            if not isinstance(stop_error, TimeoutError)
-            else None
-        )
-        self._thread = None
+        close_error = self._bounded_call(camera.close, timeout=2.0)
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = None
         self._camera = None
         resource_error = stop_error or close_error
         if resource_error is not None:
@@ -239,4 +246,10 @@ class Picamera2Source:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
-        self.stop()
+        try:
+            self.stop()
+        except BaseException as cleanup_error:
+            if isinstance(exc, BaseException):
+                exc.add_note(f"Picamera2 cleanup also failed: {cleanup_error!r}")
+                return
+            raise

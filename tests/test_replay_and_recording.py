@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import queue
+import threading
 
 import cv2
 import numpy as np
@@ -105,6 +106,31 @@ def test_recorder_queue_full_does_not_block(tmp_path, monkeypatch) -> None:
         (tmp_path / "recording" / "session.json").read_text(encoding="utf-8")
     )
     assert session["completed"] is False
+
+
+def test_recorder_stop_does_not_block_after_worker_death_with_full_queue(
+    tmp_path,
+) -> None:
+    recorder = FrameRecorder(
+        tmp_path / "recording-dead-worker",
+        image_size=(8, 6),
+        config_snapshot={"schema_version": 1},
+        versions={"code": "abc"},
+        queue_capacity=1,
+    )
+    recorder.session_directory.mkdir()
+    recorder._created_at = "test"
+    recorder._started = True
+    recorder._worker_error = OSError("manifest unavailable")
+    recorder._queue.put_nowait(frame(0, 0))
+    thread = threading.Thread(target=lambda: None)
+    thread.start()
+    thread.join()
+    recorder._thread = thread
+
+    with pytest.raises(RuntimeError, match="worker failed"):
+        recorder.stop()
+    assert recorder._started is False
 
 
 def test_undistorted_recording_replays_calibration_identity(tmp_path) -> None:

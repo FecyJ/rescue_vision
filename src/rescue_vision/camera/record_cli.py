@@ -61,6 +61,8 @@ def record_session(
         raise ValueError("frame_limit and duration_seconds are mutually exclusive.")
 
     delivered = 0
+    primary_error: BaseException | None = None
+    interrupted = False
     try:
         camera.start()
         recorder.start()
@@ -88,12 +90,31 @@ def record_session(
                 if elapsed >= duration_seconds:
                     break
     except KeyboardInterrupt:
-        pass
-    finally:
-        try:
-            camera.stop()
-        finally:
-            recorder.stop()
+        interrupted = True
+    except BaseException as error:
+        primary_error = error
+
+    cleanup_errors: list[tuple[str, BaseException]] = []
+    try:
+        camera.stop()
+    except BaseException as error:
+        cleanup_errors.append(("camera.stop", error))
+    try:
+        recorder.stop()
+    except BaseException as error:
+        cleanup_errors.append(("recorder.stop", error))
+
+    if primary_error is not None:
+        for location, error in cleanup_errors:
+            primary_error.add_note(f"{location} also failed: {error!r}")
+        raise primary_error.with_traceback(primary_error.__traceback__)
+    if cleanup_errors:
+        location, error = cleanup_errors[0]
+        for later_location, later_error in cleanup_errors[1:]:
+            error.add_note(f"{later_location} also failed: {later_error!r}")
+        raise RuntimeError(f"Capture cleanup failed in {location}.") from error
+    if interrupted:
+        return delivered
     return delivered
 
 

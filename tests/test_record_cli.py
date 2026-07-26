@@ -174,6 +174,35 @@ def test_record_session_releases_resources_after_camera_failure(tmp_path) -> Non
     assert recorder.written_frames == 1
 
 
+def test_record_session_preserves_body_error_when_both_cleanups_fail() -> None:
+    class FailingSource(FakeSource):
+        def read(self, timeout: float = 1.0) -> CameraFrame:
+            raise ValueError("primary capture error")
+
+        def stop(self) -> None:
+            raise RuntimeError("camera cleanup")
+
+    class FailingRecorder:
+        def start(self) -> None:
+            pass
+
+        def record(self, frame: CameraFrame) -> bool:
+            return True
+
+        def stop(self) -> None:
+            raise RuntimeError("recorder cleanup")
+
+    with pytest.raises(ValueError, match="primary capture error") as raised:
+        record_session(
+            FailingSource(),
+            FailingRecorder(),  # type: ignore[arg-type]
+            frame_limit=1,
+        )
+    notes = getattr(raised.value, "__notes__", [])
+    assert any("camera.stop" in note for note in notes)
+    assert any("recorder.stop" in note for note in notes)
+
+
 @pytest.mark.parametrize(
     ("frame_limit", "duration_seconds", "message"),
     [

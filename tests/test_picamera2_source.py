@@ -116,3 +116,24 @@ def test_picamera2_source_rejects_read_before_start() -> None:
     )
     with pytest.raises(RuntimeError, match="not started"):
         source.read()
+
+
+def test_picamera2_stop_still_closes_after_stop_timeout(monkeypatch) -> None:
+    camera = FakeCamera()
+    source = Picamera2Source(
+        image_size=(8, 6),
+        camera_factory=lambda: camera,
+    )
+    source._camera = camera
+    source._running = True
+
+    def bounded(action, *, timeout):
+        if action.__name__ == "stop":
+            return TimeoutError("stop timeout")
+        action()
+        return None
+
+    monkeypatch.setattr(source, "_bounded_call", bounded)
+    with pytest.raises(RuntimeError, match="shutdown"):
+        source.stop()
+    assert camera.closed

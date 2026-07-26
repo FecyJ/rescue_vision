@@ -177,10 +177,23 @@ class FrameRecorder:
     def stop(self) -> None:
         if not self._started:
             return
-        self._queue.put(_STOP)
         assert self._thread is not None
-        self._thread.join()
-        self._thread = None
+        thread = self._thread
+        if thread.is_alive():
+            try:
+                self._queue.put(_STOP, timeout=1.0)
+            except queue.Full:
+                if self._worker_error is None:
+                    self._worker_error = TimeoutError(
+                        "Recorder stop sentinel could not be queued within 1.0 seconds."
+                    )
+        thread.join(timeout=5.0)
+        if thread.is_alive() and self._worker_error is None:
+            self._worker_error = TimeoutError(
+                "Recorder worker did not stop within 5.0 seconds."
+            )
+        if not thread.is_alive():
+            self._thread = None
         self._started = False
         self._write_session(
             completed=self._worker_error is None and self.written_frames > 0
@@ -189,16 +202,17 @@ class FrameRecorder:
             raise RuntimeError("Recorder worker failed.") from self._worker_error
 
     def _worker(self) -> None:
-        manifest_path = self.session_directory / "frames.jsonl"
-        with manifest_path.open("a", encoding="utf-8") as manifest:
-            while True:
-                item = self._queue.get()
-                if item is _STOP:
-                    return
-                assert isinstance(item, CameraFrame)
-                if self._worker_error is not None:
-                    continue
-                try:
+        try:
+            manifest_path = self.session_directory / "frames.jsonl"
+            with manifest_path.open("a", encoding="utf-8") as manifest:
+                while True:
+                    item = self._queue.get()
+                    if item is _STOP:
+                        return
+                    assert isinstance(item, CameraFrame)
+                    if self._worker_error is not None:
+                        self.dropped_frames += 1
+                        continue
                     extension = f".{self.image_format}"
                     parameters = (
                         [cv2.IMWRITE_JPEG_QUALITY, 95]
@@ -227,8 +241,15 @@ class FrameRecorder:
                     )
                     manifest.flush()
                     self.written_frames += 1
-                except BaseException as error:
-                    self._worker_error = error
+        except BaseException as error:
+            self._worker_error = error
+            while True:
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(item, CameraFrame):
+                    self.dropped_frames += 1
 
     def _write_session(self, *, completed: bool) -> None:
         document = {
@@ -273,4 +294,10 @@ class FrameRecorder:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
-        self.stop()
+        try:
+            self.stop()
+        except BaseException as cleanup_error:
+            if isinstance(exc, BaseException):
+                exc.add_note(f"FrameRecorder cleanup also failed: {cleanup_error!r}")
+                return
+            raise

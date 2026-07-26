@@ -27,6 +27,10 @@ class RpicamSource:
     ) -> None:
         if len(image_size) != 2 or any(value <= 0 for value in image_size):
             raise ValueError(f"image_size must be positive, got {image_size}.")
+        if any(value % 2 for value in image_size):
+            raise ValueError(
+                f"YUV420 image_size values must be even, got {image_size}."
+            )
         if fps <= 0:
             raise ValueError(f"fps must be positive, got {fps}.")
         if not np.isfinite(lens_position) or lens_position < 0:
@@ -116,14 +120,23 @@ class RpicamSource:
             )
 
         if not ready:
-            self.stop()
-            raise TimeoutError("等待相机第一帧超时")
+            error = TimeoutError("等待相机第一帧超时")
+            try:
+                self.stop()
+            except BaseException as cleanup_error:
+                error.add_note(f"rpicam cleanup also failed: {cleanup_error!r}")
+            raise error
 
         if self._reader_error is not None:
-            self.stop()
-            raise RuntimeError(
-                "相机采集进程启动失败"
-            ) from self._reader_error
+            reader_error = self._reader_error
+            startup_error = RuntimeError("相机采集进程启动失败")
+            try:
+                self.stop()
+            except BaseException as cleanup_error:
+                startup_error.add_note(
+                    f"rpicam cleanup also failed: {cleanup_error!r}"
+                )
+            raise startup_error from reader_error
 
     def read(self, timeout: float = 1.0) -> CameraFrame:
         """
@@ -194,8 +207,14 @@ class RpicamSource:
         process = self._process
 
         if process is None:
-            self._running = False
+            with self._condition:
+                self._running = False
+                self._condition.notify_all()
             return
+
+        with self._condition:
+            self._running = False
+            self._condition.notify_all()
 
         # rpicam-vid 显式处理 SIGINT，并执行正常停止流程。
         if process.poll() is None:
@@ -212,16 +231,22 @@ class RpicamSource:
                     process.kill()
                     process.wait()
 
-        self._running = False
-
+        thread_error: BaseException | None = None
         if self._reader_thread is not None:
             self._reader_thread.join(timeout=1.0)
+            if self._reader_thread.is_alive():
+                thread_error = TimeoutError(
+                    "rpicam reader thread did not stop within 1.0 seconds."
+                )
 
         if process.stdout is not None:
             process.stdout.close()
 
-        self._reader_thread = None
+        if self._reader_thread is None or not self._reader_thread.is_alive():
+            self._reader_thread = None
         self._process = None
+        if thread_error is not None:
+            raise RuntimeError("rpicam resource shutdown failed.") from thread_error
 
     def _reader_loop(self) -> None:
         assert self._process is not None
@@ -246,6 +271,8 @@ class RpicamSource:
 
                 with self._condition:
                     # 直接覆盖旧帧，不让视觉延迟积累。
+                    # _read_exact 每帧分配新 bytearray；read() 离开锁后
+                    # 依赖该缓冲不再被后台线程修改，不能改成复用缓冲。
                     self._latest_yuv = frame
                     self._latest_timestamp_ns = time.monotonic_ns()
                     self._latest_sequence = sequence
@@ -290,4 +317,10 @@ class RpicamSource:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
-        self.stop()
+        try:
+            self.stop()
+        except BaseException as cleanup_error:
+            if isinstance(exc, BaseException):
+                exc.add_note(f"rpicam cleanup also failed: {cleanup_error!r}")
+                return
+            raise

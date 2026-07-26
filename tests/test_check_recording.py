@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 
 import numpy as np
 import pytest
@@ -12,6 +13,7 @@ from rescue_vision.data.check_recording import (
     check_requirements,
     inspect_recording,
 )
+import rescue_vision.data.check_recording as check_module
 
 
 def make_recording(tmp_path):
@@ -118,3 +120,20 @@ def test_inspection_rejects_incomplete_or_corrupt_recording(tmp_path) -> None:
     (directory / frame["image_path"]).write_bytes(b"corrupt")
     with pytest.raises(ValueError, match="hash mismatch"):
         inspect_recording(directory)
+
+
+@pytest.mark.parametrize("error", [RuntimeError("decode"), TypeError("sequence")])
+def test_cli_maps_structural_runtime_errors_to_exit_code_2(
+    monkeypatch,
+    tmp_path,
+    error: Exception,
+) -> None:
+    monkeypatch.setattr(check_module, "inspect_recording", lambda *_a, **_k: (_ for _ in ()).throw(error))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["rescue-vision-check-recording", str(tmp_path)],
+    )
+    with pytest.raises(SystemExit) as raised:
+        check_module.main()
+    assert raised.value.code == 2
