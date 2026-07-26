@@ -40,6 +40,8 @@ Example:
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -117,6 +119,24 @@ def parse_args() -> argparse.Namespace:
         default=20.0,
         help="RANSAC inlier threshold for ground homography, in mm.",
     )
+    parser.add_argument(
+        "--maximum-mean-inlier-error-mm",
+        type=float,
+        default=20.0,
+        help="Maximum usable mean inlier error, in mm.",
+    )
+    parser.add_argument(
+        "--maximum-inlier-error-mm",
+        type=float,
+        default=50.0,
+        help="Maximum usable worst inlier error, in mm.",
+    )
+    parser.add_argument(
+        "--maximum-pose-rmse-px",
+        type=float,
+        default=5.0,
+        help="Maximum usable planar-pose reprojection RMSE, in pixels.",
+    )
     parser.add_argument("--bev-x-min-mm", type=float, default=-300.0)
     parser.add_argument("--bev-x-max-mm", type=float, default=2500.0)
     parser.add_argument("--bev-y-min-mm", type=float, default=-1200.0)
@@ -136,9 +156,17 @@ def load_json(path: Path) -> dict[str, Any]:
 
 def save_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False),
+        json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False),
         encoding="utf-8",
     )
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def find_latest_intrinsics() -> Path:
@@ -319,6 +347,7 @@ def collect_correspondences(
 
     result = {
         "image": image_path.name,
+        "image_sha256": file_sha256(image_path),
         "coordinate_frame": {
             "x": "robot_forward",
             "y": "robot_left",
@@ -352,6 +381,27 @@ def load_correspondences(path: Path) -> list[dict[str, Any]]:
             }
         )
     return result
+
+
+def validate_correspondence_source(
+    correspondences_path: Path,
+    image_path: Path,
+) -> None:
+    data = load_json(correspondences_path)
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Correspondences {correspondences_path} lack source image metadata; "
+            "recollect them."
+        )
+    expected_name = data.get("image")
+    expected_hash = data.get("image_sha256")
+    actual_hash = file_sha256(image_path)
+    if expected_name != image_path.name or expected_hash != actual_hash:
+        raise ValueError(
+            f"Correspondences {correspondences_path} were collected from "
+            f"image={expected_name!r}, sha256={expected_hash!r}, but current "
+            f"image is {image_path.name!r}, sha256={actual_hash}; recollect them."
+        )
 
 
 def transform_points(points: np.ndarray, homography: np.ndarray) -> np.ndarray:
@@ -443,20 +493,25 @@ def estimate_planar_pose(
             camera_position_robot[2, 0] > 0.0
             and np.all(camera_points[:, 2] > 0.0)
         )
-        score = pixel_rmse if physically_valid else pixel_rmse + 1e6
-        candidates.append(
-            (
-                score,
+        if physically_valid:
+            candidates.append(
+                (
+                pixel_rmse,
                 rvec,
                 tvec,
                 rotation,
                 camera_position_robot,
+                )
             )
-        )
 
+    if not candidates:
+        raise RuntimeError(
+            "All planar pose candidates are physically invalid: the camera "
+            "must be above the robot ground plane and all calibration points "
+            "must be in front of it."
+        )
     candidates.sort(key=lambda item: item[0])
-    score, rvec, tvec, rotation, camera_position_robot = candidates[0]
-    pixel_rmse = score if score < 1e6 else score - 1e6
+    pixel_rmse, rvec, tvec, rotation, camera_position_robot = candidates[0]
 
     return (
         rvec,
@@ -479,10 +534,22 @@ def pose_ground_homography(
             translation_robot_to_camera.reshape(3),
         )
     )
-    ground_to_image /= ground_to_image[2, 2]
+    ground_scale = float(ground_to_image[2, 2])
+    if not np.isfinite(ground_scale) or abs(ground_scale) < 1e-12:
+        raise ValueError(
+            f"Pose ground homography has invalid normalization scale "
+            f"{ground_scale!r}."
+        )
+    ground_to_image /= ground_scale
 
     image_to_ground = np.linalg.inv(ground_to_image)
-    image_to_ground /= image_to_ground[2, 2]
+    image_scale = float(image_to_ground[2, 2])
+    if not np.isfinite(image_scale) or abs(image_scale) < 1e-12:
+        raise ValueError(
+            f"Pose image homography has invalid normalization scale "
+            f"{image_scale!r}."
+        )
+    image_to_ground /= image_scale
     return ground_to_image, image_to_ground
 
 
@@ -535,9 +602,6 @@ def main() -> None:
     )
 
     session_dir.mkdir(parents=True, exist_ok=True)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    diagnostics_dir = OUTPUT_DIR / "ground_diagnostics"
-    diagnostics_dir.mkdir(parents=True, exist_ok=True)
 
     calibration, intrinsic_data = load_intrinsics(intrinsics_path)
     camera_model = CameraModel(calibration)
@@ -565,6 +629,7 @@ def main() -> None:
             args.display_scale,
         )
     else:
+        validate_correspondence_source(correspondences_path, image_path)
         correspondences = load_correspondences(correspondences_path)
 
     if len(correspondences) < 4:
@@ -645,6 +710,38 @@ def main() -> None:
     )
     image_to_bev = ground_to_bev @ image_to_ground
 
+    inlier_errors = ground_errors_mm[inliers]
+    mean_inlier_error_mm = float(np.mean(inlier_errors))
+    max_inlier_error_mm = float(np.max(inlier_errors))
+    thresholds = {
+        "maximum_mean_inlier_error_mm": float(
+            args.maximum_mean_inlier_error_mm
+        ),
+        "maximum_inlier_error_mm": float(args.maximum_inlier_error_mm),
+        "maximum_pose_rmse_px": float(args.maximum_pose_rmse_px),
+    }
+    if any(
+        not np.isfinite(value) or value <= 0.0
+        for value in thresholds.values()
+    ):
+        raise ValueError(
+            f"Ground mapping quality thresholds must be finite and positive, "
+            f"got {thresholds!r}."
+        )
+    quality_failures = []
+    if mean_inlier_error_mm > thresholds["maximum_mean_inlier_error_mm"]:
+        quality_failures.append("mean_inlier_error_mm")
+    if max_inlier_error_mm > thresholds["maximum_inlier_error_mm"]:
+        quality_failures.append("max_inlier_error_mm")
+    if pose_reprojection_rmse_px > thresholds["maximum_pose_rmse_px"]:
+        quality_failures.append("pose_reprojection_rmse_px")
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    result_dir = OUTPUT_DIR / f"{args.output_name}_{timestamp}"
+    result_dir.mkdir(parents=True, exist_ok=False)
+    diagnostics_dir = result_dir / "diagnostics"
+    diagnostics_dir.mkdir()
+
     bev = cv2.warpPerspective(
         undistorted_image,
         image_to_bev,
@@ -688,10 +785,14 @@ def main() -> None:
             }
         )
 
-    inlier_errors = ground_errors_mm[inliers]
-
     result = {
-        "schema_version": 2,
+        "schema_version": 3,
+        "quality": {
+            "usable": not quality_failures,
+            "physically_valid": True,
+            "thresholds": thresholds,
+            "failures": quality_failures,
+        },
         "coordinate_frames": {
             "robot": {
                 "x": "forward",
@@ -710,6 +811,7 @@ def main() -> None:
         "source": {
             "intrinsics": str(intrinsics_path),
             "ground_image": str(image_path),
+            "ground_image_sha256": file_sha256(image_path),
             "correspondences": str(correspondences_path),
         },
         "intrinsics": {
@@ -725,9 +827,9 @@ def main() -> None:
             "ransac_threshold_mm": float(args.ransac_threshold_mm),
             "inlier_count": int(np.count_nonzero(inliers)),
             "total_count": int(len(inliers)),
-            "mean_inlier_error_mm": float(np.mean(inlier_errors)),
+            "mean_inlier_error_mm": mean_inlier_error_mm,
             "median_inlier_error_mm": float(np.median(inlier_errors)),
-            "max_inlier_error_mm": float(np.max(inlier_errors)),
+            "max_inlier_error_mm": max_inlier_error_mm,
         },
         "extrinsics": {
             "mapping": "p_camera = R_robot_to_camera @ p_robot + t_robot_to_camera",
@@ -742,6 +844,7 @@ def main() -> None:
             "robot_to_camera_4x4": robot_to_camera.tolist(),
             "camera_to_robot_4x4": camera_to_robot.tolist(),
             "pose_reprojection_rmse_px": pose_reprojection_rmse_px,
+            "physically_valid": True,
             "pose_ground_to_image": pose_ground_to_image.tolist(),
             "pose_image_to_ground": pose_image_to_ground.tolist(),
         },
@@ -763,8 +866,8 @@ def main() -> None:
         "points": per_point,
     }
 
-    json_path = OUTPUT_DIR / f"{args.output_name}.json"
-    npz_path = OUTPUT_DIR / f"{args.output_name}.npz"
+    json_path = result_dir / f"{args.output_name}.json"
+    npz_path = result_dir / f"{args.output_name}.npz"
 
     save_json(json_path, result)
     np.savez(

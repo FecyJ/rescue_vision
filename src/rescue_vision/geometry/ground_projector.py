@@ -139,10 +139,20 @@ class GroundProjector:
         """加载地面映射，并拒绝与当前内参不匹配的产物。"""
 
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        if int(data.get("schema_version", -1)) != 2:
+        if int(data.get("schema_version", -1)) != 3:
             raise ValueError(
-                "Ground mapping schema_version must be 2; regenerate it with "
+                "Ground mapping schema_version must be 3; regenerate it with "
                 "the current calibration tool."
+            )
+        quality = data.get("quality")
+        if not isinstance(quality, dict) or quality.get("usable") is not True:
+            raise ValueError(
+                "Ground mapping quality.usable must be true; inspect its "
+                "quality failures and recalibrate."
+            )
+        if quality.get("physically_valid") is not True:
+            raise ValueError(
+                "Ground mapping pose must be marked physically_valid."
             )
 
         image_size = tuple(int(value) for value in data["image_size"])

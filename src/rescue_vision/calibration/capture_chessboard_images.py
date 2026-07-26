@@ -22,10 +22,9 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import cv2
-from libcamera import controls
-from picamera2 import Picamera2
 
 
 CALIBRATION_DIR = Path(__file__).resolve().parent
@@ -84,8 +83,9 @@ def create_session_directory(root: Path) -> Path:
     return session_dir
 
 
-def lock_focus(camera: Picamera2, requested_position: float | None) -> float:
+def lock_focus(camera: Any, requested_position: float | None) -> float:
     """Choose one focus position, then keep the camera in manual focus."""
+    from libcamera import controls
     if requested_position is None:
         print("\nPlace the chessboard near the main working distance.")
         input("Press Enter to run autofocus once...")
@@ -171,6 +171,8 @@ def save_json(path: Path, data: dict) -> None:
 
 
 def main() -> None:
+    from picamera2 import Picamera2
+
     args = parse_args()
     session_dir = create_session_directory(args.output)
     images_dir = session_dir / "images"

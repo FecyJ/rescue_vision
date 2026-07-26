@@ -83,7 +83,8 @@ def test_ground_mapping_rejects_intrinsic_mismatch(tmp_path) -> None:
         new_K=np.eye(3),
     )
     document = {
-        "schema_version": 2,
+        "schema_version": 3,
+        "quality": {"usable": True, "physically_valid": True},
         "image_size": [32, 24],
         "intrinsics": {
             "model_type": "pinhole",
@@ -113,4 +114,10 @@ def test_ground_mapping_rejects_intrinsic_mismatch(tmp_path) -> None:
     document["intrinsics"]["fingerprint_sha256"] = "wrong"
     path.write_text(json.dumps(document), encoding="utf-8")
     with pytest.raises(ValueError, match="fingerprint"):
+        GroundProjector.from_json(path, camera_calibration=calibration)
+
+    document["intrinsics"]["fingerprint_sha256"] = calibration.fingerprint()
+    document["quality"]["usable"] = False
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(ValueError, match="quality.usable"):
         GroundProjector.from_json(path, camera_calibration=calibration)

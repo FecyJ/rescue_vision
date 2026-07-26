@@ -16,14 +16,20 @@ from rescue_vision.geometry.types import RawPixel
 
 
 def calibration(model: CameraModelType) -> CameraCalibration:
-    distortion_size = 4 if model is CameraModelType.FISHEYE else 5
+    distortion = {
+        CameraModelType.PINHOLE: np.array([0.08, -0.03, 0.002, -0.001, 0.01]),
+        CameraModelType.PINHOLE_RATIONAL: np.array(
+            [0.08, -0.03, 0.002, -0.001, 0.01, 0.005, -0.002, 0.001]
+        ),
+        CameraModelType.FISHEYE: np.array([0.04, -0.01, 0.002, -0.0005]),
+    }[model]
     return CameraCalibration(
         model=model,
         image_size=(32, 24),
         K=np.array([[20.0, 0.0, 16.0], [0.0, 20.0, 12.0], [0.0, 0.0, 1.0]]),
-        D=np.zeros(distortion_size),
+        D=distortion,
         new_K=np.array(
-            [[20.0, 0.0, 16.0], [0.0, 20.0, 12.0], [0.0, 0.0, 1.0]]
+            [[18.0, 0.0, 15.0], [0.0, 19.0, 11.0], [0.0, 0.0, 1.0]]
         ),
     )
 
@@ -56,6 +62,16 @@ def test_all_models_undistort_points_and_image(model: CameraModelType) -> None:
     )
     image = np.zeros((24, 32, 3), dtype=np.uint8)
     assert camera.undistort_image(image).shape == image.shape
+
+
+@pytest.mark.parametrize("model", list(CameraModelType))
+def test_undistort_empty_and_single_point(model: CameraModelType) -> None:
+    camera = CameraModel(calibration(model))
+    assert camera.undistort_pixels([]) == []
+    single = camera.undistort_pixel(RawPixel(3.0, 4.0))
+    batch = camera.undistort_pixels([RawPixel(3.0, 4.0)])
+    assert single == batch[0]
+    assert (single.u, single.v) != pytest.approx((3.0, 4.0))
 
 
 def test_calibration_fingerprint_changes_with_model() -> None:

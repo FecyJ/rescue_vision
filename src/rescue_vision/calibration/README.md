@@ -150,20 +150,29 @@ python -m rescue_vision.calibration.calibrate_extrinsics_ground \
 - `Q` / `Esc` 退出；
 - `--recollect` 强制重新选点。
 
-脚本当前输出：
+脚本每次运行创建新的时间戳目录，不覆盖已部署结果：
 
 ```text
-output/ground_mapping.json
-output/ground_mapping.npz
-output/ground_diagnostics/
-├── undistorted_ground_image.png
-├── undistorted_correspondences.png
-└── bev_preview.png
+output/ground_mapping_YYYYMMDD_HHMMSS_ffffff/
+├── ground_mapping.json
+├── ground_mapping.npz
+└── diagnostics/
+    ├── undistorted_ground_image.png
+    ├── undistorted_correspondences.png
+    └── bev_preview.png
 ```
 
 `image_to_ground` 表示去畸变像素到机器人地面毫米坐标。直接单应拟合用于地面点定位；PnP 推导矩阵用于交叉诊断。部署前必须使用未参与拟合的保留点实测地面误差，并复核 BEV 有效范围。
 
-输出 schema v2 同时保存 `model_type` 与内参 SHA-256 指纹。运行时 `GroundProjector.from_json(...)` 会核对图像尺寸、模型和指纹，禁止把不同内参与地面映射混用。基础矩阵往返和 BEV 四角方向已有自动测试；实际安装仍必须使用独立保留点测量地面误差。
+对应点文件绑定原图文件名与 SHA-256；更换或覆盖原图后必须
+`--recollect`。输出 schema v3 同时保存物理有效性、误差门限、
+`quality.usable`、`model_type` 与内参 SHA-256 指纹。默认门限可通过
+`--maximum-mean-inlier-error-mm`、`--maximum-inlier-error-mm` 和
+`--maximum-pose-rmse-px` 显式调整并落盘。运行时
+`GroundProjector.from_json(...)` 会拒绝 `quality.usable=false`、非物理
+有效位姿、错误 schema、图像尺寸、模型或指纹不匹配的产物。
+基础矩阵往返和 BEV 四角方向已有自动测试；实际安装仍必须使用独立保留点
+测量地面误差。
 
 ## 5. 产物管理
 
@@ -186,7 +195,7 @@ geometry:
   intrinsics_enabled: true
   intrinsics_path: ../src/rescue_vision/calibration/output/intrinsics_YYYYMMDD_HHMMSS/selected_calibration.json
   ground_mapping_enabled: true
-  ground_mapping_path: ../src/rescue_vision/calibration/output/ground_mapping.json
+  ground_mapping_path: ../src/rescue_vision/calibration/output/ground_mapping_YYYYMMDD_HHMMSS_ffffff/ground_mapping.json
 ```
 
 从仓库根目录执行一次真实装配检查：
