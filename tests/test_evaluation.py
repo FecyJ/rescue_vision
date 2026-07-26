@@ -54,6 +54,7 @@ def test_report_contains_per_class_confusion_ground_latency_and_failures() -> No
     assert danger["recall"] == pytest.approx(0.5)
     assert report["ground_error_mm"]["mean"] == pytest.approx(5.0)
     assert report["end_to_end_latency_ms"]["p95"] == pytest.approx(50.0)
+    assert report["end_to_end_latency_ms"]["count"] == 1
     assert report["failure_count"] == 3
     assert report["confusion_matrix"]["values"]["blue_danger"]["__missed__"] == 1
     assert report["versions"]["dataset"] == "dataset-a"
@@ -97,6 +98,9 @@ def test_report_keeps_danger_visible_when_dataset_has_no_danger_truth() -> None:
     )
     assert "blue_danger" in report["classes"]
     assert report["per_class"]["blue_danger"]["true_positive"] == 0
+    assert report["per_class"]["blue_danger"]["precision"] is None
+    assert report["per_class"]["blue_danger"]["recall"] is None
+    assert report["per_class"]["blue_danger"]["f1"] is None
     assert report["warnings"][0]["code"] == "danger_class_has_no_ground_truth"
 
 
