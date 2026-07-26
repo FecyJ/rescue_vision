@@ -8,6 +8,7 @@ from rescue_vision.config.runtime import (
     ProcessingConfig,
     RecordingConfig,
     RuntimeGeometry,
+    WorldRuntimeConfig,
     load_runtime_config,
 )
 
@@ -19,5 +20,6 @@ __all__ = [
     "ProcessingConfig",
     "RecordingConfig",
     "RuntimeGeometry",
+    "WorldRuntimeConfig",
     "load_runtime_config",
 ]

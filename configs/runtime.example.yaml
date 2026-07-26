@@ -1,4 +1,4 @@
-schema_version: 3
+schema_version: 4
 
 camera:
   # picamera2 可记录逐帧曝光/增益等元数据；rpicam_vid 是低开销备选。
@@ -24,6 +24,30 @@ recording:
 processing:
   # 超过该观测年龄时，上层必须丢弃或进入保守降级；需由实测继续收敛。
   max_observation_age_ms: 150.0
+
+tracking:
+  confirmation_hits: 2
+  max_association_ground_mm: 250.0
+  min_association_iou: 0.10
+  max_coast_ms: 600.0
+  confidence_decay_per_second: 0.8
+  min_confidence: 0.15
+
+world:
+  max_visual_age_ms: 250.0
+  opponent_max_age_ms: 500.0
+  danger_confirm_threshold: 0.60
+  danger_suspect_threshold: 0.15
+  unknown_suspect_threshold: 0.50
+  # P3 场地区域冻结前保持为空；坐标为 FieldPoint 的 [x_mm, y_mm]。
+  regions: []
+
+mission:
+  match_duration_s: 180.0
+  no_motion_timeout_s: 15.0
+  opponent_contact_timeout_s: 10.0
+  danger_avoid_distance_mm: 500.0
+  target_priority: [orange_injured, black_core, green_supply]
 
 hailo:
   # 模板默认禁用；实际部署值写入不提交的 configs/runtime.yaml。

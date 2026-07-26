@@ -10,10 +10,19 @@ import yaml
 
 from rescue_vision.geometry.camera_model import CameraCalibration, CameraModel
 from rescue_vision.geometry.ground_projector import GroundProjector
+from rescue_vision.geometry.types import FieldPoint
+from rescue_vision.mission import MissionConfig
 from rescue_vision.perception.types import TargetClass
+from rescue_vision.tracking import TrackingConfig
+from rescue_vision.world import (
+    RegionKind,
+    StaticRegion,
+    WorldModel,
+    WorldModelConfig,
+)
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _mapping(value: object, location: str) -> dict[str, Any]:
@@ -104,6 +113,15 @@ class ProcessingConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class WorldRuntimeConfig:
+    model: WorldModelConfig
+    regions: tuple[StaticRegion, ...]
+
+    def build_model(self) -> WorldModel:
+        return WorldModel(self.model, self.regions)
+
+
+@dataclass(frozen=True, slots=True)
 class HailoConfig:
     enabled: bool
     hef_path: Path | None
@@ -158,6 +176,9 @@ class AppConfig:
     geometry: GeometryConfig
     recording: RecordingConfig
     processing: ProcessingConfig
+    tracking: TrackingConfig
+    world: WorldRuntimeConfig
+    mission: MissionConfig
     hailo: HailoConfig
 
     def build_camera_model(self) -> CameraModel | None:
@@ -195,7 +216,7 @@ class AppConfig:
 
 
 def load_runtime_config(path: str | Path) -> AppConfig:
-    """从 YAML 加载 schema v3；缺项和未知字段均视为错误。"""
+    """从 YAML 加载 schema v4；缺项和未知字段均视为错误。"""
 
     config_path = Path(path).expanduser().resolve()
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -208,6 +229,9 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "geometry",
             "recording",
             "processing",
+            "tracking",
+            "world",
+            "mission",
             "hailo",
         },
         "root",
@@ -336,6 +360,246 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "processing.max_observation_age_ms",
             minimum=0.001,
         )
+    )
+
+    tracking_raw = _mapping(
+        _required(root, "tracking", "root"),
+        "tracking",
+    )
+    _reject_unknown(
+        tracking_raw,
+        {
+            "confirmation_hits",
+            "max_association_ground_mm",
+            "min_association_iou",
+            "max_coast_ms",
+            "confidence_decay_per_second",
+            "min_confidence",
+        },
+        "tracking",
+    )
+    tracking = TrackingConfig(
+        confirmation_hits=_positive_int(
+            _required(tracking_raw, "confirmation_hits", "tracking"),
+            "tracking.confirmation_hits",
+        ),
+        max_association_ground_mm=_finite_float(
+            _required(
+                tracking_raw,
+                "max_association_ground_mm",
+                "tracking",
+            ),
+            "tracking.max_association_ground_mm",
+            minimum=0.001,
+        ),
+        min_association_iou=_threshold(
+            _required(tracking_raw, "min_association_iou", "tracking"),
+            "tracking.min_association_iou",
+        ),
+        max_coast_ms=_finite_float(
+            _required(tracking_raw, "max_coast_ms", "tracking"),
+            "tracking.max_coast_ms",
+            minimum=0.001,
+        ),
+        confidence_decay_per_second=_finite_float(
+            _required(
+                tracking_raw,
+                "confidence_decay_per_second",
+                "tracking",
+            ),
+            "tracking.confidence_decay_per_second",
+            minimum=0.001,
+        ),
+        min_confidence=_threshold(
+            _required(tracking_raw, "min_confidence", "tracking"),
+            "tracking.min_confidence",
+        ),
+    )
+
+    world_raw = _mapping(_required(root, "world", "root"), "world")
+    _reject_unknown(
+        world_raw,
+        {
+            "max_visual_age_ms",
+            "opponent_max_age_ms",
+            "danger_confirm_threshold",
+            "danger_suspect_threshold",
+            "unknown_suspect_threshold",
+            "regions",
+        },
+        "world",
+    )
+    world_model = WorldModelConfig(
+        max_visual_age_ms=_finite_float(
+            _required(world_raw, "max_visual_age_ms", "world"),
+            "world.max_visual_age_ms",
+            minimum=0.001,
+        ),
+        opponent_max_age_ms=_finite_float(
+            _required(world_raw, "opponent_max_age_ms", "world"),
+            "world.opponent_max_age_ms",
+            minimum=0.001,
+        ),
+        danger_confirm_threshold=_threshold(
+            _required(
+                world_raw,
+                "danger_confirm_threshold",
+                "world",
+            ),
+            "world.danger_confirm_threshold",
+        ),
+        danger_suspect_threshold=_threshold(
+            _required(
+                world_raw,
+                "danger_suspect_threshold",
+                "world",
+            ),
+            "world.danger_suspect_threshold",
+        ),
+        unknown_suspect_threshold=_threshold(
+            _required(
+                world_raw,
+                "unknown_suspect_threshold",
+                "world",
+            ),
+            "world.unknown_suspect_threshold",
+        ),
+    )
+    regions_value = _required(world_raw, "regions", "world")
+    if not isinstance(regions_value, list):
+        raise ValueError("world.regions must be a list.")
+    regions: list[StaticRegion] = []
+    for index, value in enumerate(regions_value):
+        location = f"world.regions[{index}]"
+        region_raw = _mapping(value, location)
+        _reject_unknown(
+            region_raw,
+            {"region_id", "kind", "polygon_field_mm"},
+            location,
+        )
+        try:
+            kind = RegionKind(
+                _string(
+                    _required(region_raw, "kind", location),
+                    f"{location}.kind",
+                )
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"{location}.kind must be field, own_material, own_injured "
+                "or opponent_safe."
+            ) from exc
+        polygon_value = _required(
+            region_raw,
+            "polygon_field_mm",
+            location,
+        )
+        if not isinstance(polygon_value, list):
+            raise ValueError(f"{location}.polygon_field_mm must be a list.")
+        polygon: list[FieldPoint] = []
+        for point_index, point_value in enumerate(polygon_value):
+            point_location = (
+                f"{location}.polygon_field_mm[{point_index}]"
+            )
+            if not isinstance(point_value, list) or len(point_value) != 2:
+                raise ValueError(f"{point_location} must be [x_mm, y_mm].")
+            polygon.append(
+                FieldPoint(
+                    _finite_float(
+                        point_value[0],
+                        f"{point_location}[0]",
+                        minimum=-float("inf"),
+                    ),
+                    _finite_float(
+                        point_value[1],
+                        f"{point_location}[1]",
+                        minimum=-float("inf"),
+                    ),
+                )
+            )
+        regions.append(
+            StaticRegion(
+                region_id=_string(
+                    _required(region_raw, "region_id", location),
+                    f"{location}.region_id",
+                ),
+                kind=kind,
+                polygon_field=tuple(polygon),
+            )
+        )
+    world = WorldRuntimeConfig(world_model, tuple(regions))
+
+    mission_raw = _mapping(
+        _required(root, "mission", "root"),
+        "mission",
+    )
+    _reject_unknown(
+        mission_raw,
+        {
+            "match_duration_s",
+            "no_motion_timeout_s",
+            "opponent_contact_timeout_s",
+            "danger_avoid_distance_mm",
+            "target_priority",
+        },
+        "mission",
+    )
+    priority_value = _required(
+        mission_raw,
+        "target_priority",
+        "mission",
+    )
+    if not isinstance(priority_value, list):
+        raise ValueError("mission.target_priority must be a list.")
+    try:
+        target_priority = tuple(
+            TargetClass(
+                _string(
+                    value,
+                    f"mission.target_priority[{index}]",
+                )
+            )
+            for index, value in enumerate(priority_value)
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "mission.target_priority values must be green_supply, "
+            "black_core or orange_injured."
+        ) from exc
+    mission = MissionConfig(
+        match_duration_s=_finite_float(
+            _required(mission_raw, "match_duration_s", "mission"),
+            "mission.match_duration_s",
+            minimum=0.001,
+        ),
+        no_motion_timeout_s=_finite_float(
+            _required(
+                mission_raw,
+                "no_motion_timeout_s",
+                "mission",
+            ),
+            "mission.no_motion_timeout_s",
+            minimum=0.001,
+        ),
+        opponent_contact_timeout_s=_finite_float(
+            _required(
+                mission_raw,
+                "opponent_contact_timeout_s",
+                "mission",
+            ),
+            "mission.opponent_contact_timeout_s",
+            minimum=0.001,
+        ),
+        danger_avoid_distance_mm=_finite_float(
+            _required(
+                mission_raw,
+                "danger_avoid_distance_mm",
+                "mission",
+            ),
+            "mission.danger_avoid_distance_mm",
+            minimum=0.001,
+        ),
+        target_priority=target_priority,
     )
 
     hailo_raw = _mapping(_required(root, "hailo", "root"), "hailo")
@@ -480,5 +744,8 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         geometry,
         recording,
         processing,
+        tracking,
+        world,
+        mission,
         hailo,
     )

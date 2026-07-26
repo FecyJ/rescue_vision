@@ -41,7 +41,7 @@ def config_text(
     ground_mapping_enabled: bool = True,
     extra: str = "",
 ) -> str:
-    return f"""schema_version: 3
+    return f"""schema_version: 4
 camera:
   backend: rpicam_vid
   image_size: {image_size}
@@ -57,6 +57,26 @@ recording:
   image_format: png
 processing:
   max_observation_age_ms: 150.0
+tracking:
+  confirmation_hits: 2
+  max_association_ground_mm: 250.0
+  min_association_iou: 0.1
+  max_coast_ms: 600.0
+  confidence_decay_per_second: 0.8
+  min_confidence: 0.15
+world:
+  max_visual_age_ms: 250.0
+  opponent_max_age_ms: 500.0
+  danger_confirm_threshold: 0.6
+  danger_suspect_threshold: 0.15
+  unknown_suspect_threshold: 0.5
+  regions: []
+mission:
+  match_duration_s: 180.0
+  no_motion_timeout_s: 15.0
+  opponent_contact_timeout_s: 10.0
+  danger_avoid_distance_mm: 500.0
+  target_priority: [orange_injured, black_core, green_supply]
 hailo:
   enabled: false
   hef_path: null
@@ -202,4 +222,62 @@ def test_hailo_mapping_must_be_exhaustive(tmp_path) -> None:
     path = tmp_path / "runtime.yaml"
     path.write_text(text, encoding="utf-8")
     with pytest.raises(ValueError, match="exactly match"):
+        load_runtime_config(path)
+
+
+def test_p1_config_builds_algorithms_and_regions(tmp_path) -> None:
+    text = config_text().replace(
+        "  regions: []",
+        """  regions:
+    - region_id: own-material
+      kind: own_material
+      polygon_field_mm:
+        - [0.0, 0.0]
+        - [100.0, 0.0]
+        - [100.0, 100.0]
+        - [0.0, 100.0]""",
+    )
+    path = tmp_path / "runtime.yaml"
+    path.write_text(text, encoding="utf-8")
+
+    config = load_runtime_config(path)
+
+    assert config.tracking.build_tracker().tracks == ()
+    assert config.world.build_model().update(
+        timestamp_ns=0,
+        visual_timestamp_ns=0,
+        tracks=[],
+    ).regions[0].region_id == "own-material"
+    assert config.mission.build_state_machine().phase.value == "wait_start"
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "message"),
+    [
+        (
+            "  min_association_iou: 0.1",
+            "  min_association_iou: 1.1",
+            "min_association_iou",
+        ),
+        (
+            "  danger_suspect_threshold: 0.15",
+            "  danger_suspect_threshold: 0.7",
+            "must not exceed",
+        ),
+        (
+            "  target_priority: [orange_injured, black_core, green_supply]",
+            "  target_priority: [green_supply]",
+            "target_priority",
+        ),
+    ],
+)
+def test_p1_config_rejects_invalid_values(
+    tmp_path,
+    old: str,
+    new: str,
+    message: str,
+) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(config_text().replace(old, new), encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
         load_runtime_config(path)

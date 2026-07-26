@@ -7,6 +7,8 @@
 仓库尚未实现最终应用入口，下面是后续主循环应采用的装配方式。配置只在启动时加载一次，具体相机、内参、地面映射、模型和阈值都来自本机的 `configs/runtime.yaml`：
 
 ```python
+from time import monotonic_ns
+
 from rescue_vision.camera.picamera2_source import Picamera2Source
 from rescue_vision.camera.rpicam_source import RpicamSource
 from rescue_vision.config import load_runtime_config
@@ -42,6 +44,10 @@ detector = TargetPoseDetector(
     max_observation_age_ms=config.processing.max_observation_age_ms,
     ground_projector=geometry.ground_projector,
 )
+tracker = config.tracking.build_tracker()
+world_model = config.world.build_model()
+mission = config.mission.build_state_machine()
+mission.start(monotonic_ns())
 
 with source, detector:
     while True:
@@ -49,16 +55,25 @@ with source, detector:
         undistorted_bgr = geometry.camera_model.undistort_image(
             raw_frame.image_bgr
         )
-        observations = detector.detect(raw_frame, undistorted_bgr)
+        detection_result = detector.detect_realtime(
+            raw_frame,
+            undistorted_bgr,
+        )
+        tracks = tracker.update(
+            raw_frame.timestamp_ns,
+            detection_result.observations,
+        )
+        snapshot = world_model.update(
+            timestamp_ns=monotonic_ns(),
+            visual_timestamp_ns=raw_frame.timestamp_ns,
+            tracks=tracks,
+            # P4 定位接入前不传 robot/target FieldPoint，
+            # 世界模型会保留明确的不确定性。
+        )
 
-        # 后续跟踪、定位和任务状态机只消费 observations，
-        # 不应重新解释模型输出或复制标定矩阵。
-        for observation in observations:
-            print(
-                observation.target_class.value,
-                observation.ground_point,
-                observation.quality,
-            )
+        # 真实接触、交付和电控安全适配器尚未实现；应用入口完成后，
+        # 在这里把它们组成 TransportStatus/SafetySignals/DeliveryEvidence，
+        # 再调用 mission.step(snapshot, ...) 输出不可被规划器覆盖的抽象动作。
 ```
 
 `ground_mapping_enabled: false` 时仍可运行图像检测，但 `observation.ground_point` 为 `None`。相机、Hailo 和窗口都必须通过上下文管理或 `try/finally` 释放。
@@ -71,6 +86,9 @@ with source, detector:
 | [`camera`](camera/README.md) | `FrameSource`、`CameraFrame`、`Picamera2Source`、`RecordingSource` | 产生带时间和序号的最新帧 |
 | [`geometry`](geometry/README.md) | `CameraModel`、`GroundProjector`、显式坐标类型 | 去畸变及像素/地面/BEV 转换 |
 | [`perception`](perception/README.md) | `InferenceBackend`、`TargetPoseDetector`、`TargetObservation` | 模型结果转任务目标观测 |
+| [`tracking`](tracking/README.md) | `MultiTargetTracker`、`TrackedTarget`、`TrackStatus` | 时间关联、遮挡和轨迹生命周期 |
+| [`world`](world/README.md) | `WorldModel`、`WorldSnapshot`、`HazardState` | 区域、动态目标、对手占据和不确定性 |
+| [`mission`](mission/README.md) | `MissionStateMachine`、`replay_mission()`、`MissionDecision` | 规则、安全降级和抽象动作 |
 | [`calibration`](calibration/README.md) | 三个 `python -m` 标定命令 | 生成内参与地面映射产物 |
 | [`data`](data/README.md) | `inspect_recording()`、`build_dataset_records()`、`split_records()` | 采集验收、清单和防泄漏划分 |
 | [`evaluation`](evaluation/README.md) | `observations_to_evaluation_records()`、`evaluate_records()` | 目标匹配适配和离线指标 |
@@ -83,4 +101,4 @@ with source, detector:
 - 原始像素使用 `RawPixel`，去畸变像素使用 `UndistortedPixel`，只有后者能交给 `GroundProjector`。
 - 检测器只产生 `TargetObservation`，不持有跟踪、定位、世界模型或规则状态。
 - 实时循环只处理最新帧；录制、显示、日志和通信使用有界旁路。
-- 当前正式任务目标模型、跟踪、定位、世界模型、任务状态机、通信和最终应用入口尚未完成。
+- 当前正式任务目标模型、定位、区域/对手感知、真实接触与交付证据、规划、通信和最终应用入口尚未完成。
