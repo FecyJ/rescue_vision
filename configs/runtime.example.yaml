@@ -1,4 +1,4 @@
-schema_version: 4
+schema_version: 5
 
 camera:
   # picamera2 可记录逐帧曝光/增益等元数据；rpicam_vid 是低开销备选。
@@ -24,6 +24,19 @@ recording:
 processing:
   # 超过该观测年龄时，上层必须丢弃或进入保守降级；需由实测继续收敛。
   max_observation_age_ms: 150.0
+
+uart:
+  # 本地实际设备名写入不提交的 runtime.yaml；禁用时不会导入或打开串口。
+  enabled: false
+  device: null
+  # 当前 STM32 电控协议为 115200 8N1、CRLF 结尾。
+  baudrate: 115200
+  read_timeout_ms: 100.0
+  write_timeout_ms: 100.0
+  # UART 后台读取只写入有界队列；溢出视为通信故障，不静默丢报文。
+  receive_queue_capacity: 256
+  # 为后续同链路增加 IMU 遥测保留空间；具体报文仍由协议层定义。
+  max_line_bytes: 512
 
 tracking:
   confirmation_hits: 2

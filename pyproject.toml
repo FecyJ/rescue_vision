@@ -6,6 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "rescue-vision"
 version = "0.1.0"
 requires-python = ">=3.10"
+dependencies = [
+  "PyYAML>=6,<7",
+  "pyserial>=3.5,<4",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10"]

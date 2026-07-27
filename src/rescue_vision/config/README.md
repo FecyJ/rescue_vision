@@ -1,6 +1,6 @@
 # `config`：运行配置与对象装配
 
-本包是运行参数的唯一入口。`load_runtime_config()` 加载 schema v4 YAML，拒绝缺失字段、未知字段、错误类型和不一致资产；相对路径以 YAML 所在目录为基准。
+本包是运行参数的唯一入口。`load_runtime_config()` 加载 schema v5 YAML，拒绝缺失字段、未知字段、错误类型和不一致资产；相对路径以 YAML 所在目录为基准。
 
 本机运行统一读取不提交的 `configs/runtime.yaml`。`configs/runtime.example.yaml` 只用于创建新配置：
 
@@ -15,6 +15,7 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `load_runtime_config(path)` | 严格读取一次 YAML | 返回不可变 `AppConfig` |
 | `AppConfig.build_camera_model()` | 按内参开关创建 `CameraModel` | 内参关闭时返回 `None` |
 | `AppConfig.build_geometry()` | 创建相机模型和可选地面映射 | 内参关闭时返回 `None`；只有内参时 projector 为 `None` |
+| `UartConfig.build_channel()` | 创建协议无关 UART 行通道 | UART 关闭时返回 `None`；创建时尚不打开设备 |
 | `HailoConfig.build_backend()` | 校验模型资产并创建 Hailo 后端 | Hailo 关闭时返回 `None` |
 | `HailoConfig.model_class_mapping()` | 把模型 class ID 映射为 `TargetClass` | 直接传给 `TargetPoseDetector` |
 | `TrackingConfig.build_tracker()` | 创建一轮使用的多目标跟踪器 | 初始无轨迹 |
@@ -29,6 +30,7 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `GeometryConfig` | 内参与地面映射各自的开关和路径 |
 | `RecordingConfig` | `queue_capacity`、`image_format` |
 | `ProcessingConfig` | `max_observation_age_ms` |
+| `UartConfig` | 设备名、波特率、读写超时、有界接收容量和最大行长度 |
 | `TrackingConfig` | 关联、确认、滑行、衰减和删除阈值 |
 | `WorldRuntimeConfig` | `WorldModelConfig` 与 `StaticRegion` 集合 |
 | `MissionConfig` | 比赛计时、安全超时、避让距离和目标优先级 |
@@ -41,6 +43,9 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 from rescue_vision.config import load_runtime_config
 
 config = load_runtime_config("configs/runtime.yaml")
+
+# 设备名和通信参数只来自运行配置；build_channel() 尚不打开设备。
+uart_channel = config.uart.build_channel()
 
 # build_geometry() 会同时检查运行分辨率、标定可用性、
 # 相机模型和地面映射中的内参指纹。
@@ -102,11 +107,31 @@ geometry:
 `semantic_threshold` 决定是否保留模型类别，低于它时保守降级为
 `unknown`。`k0_threshold` 独立控制地面接触点是否可用。
 
+## UART 装配
+
+```yaml
+uart:
+  enabled: true
+  device: /dev/serial0
+  baudrate: 115200
+  read_timeout_ms: 100.0
+  write_timeout_ms: 100.0
+  receive_queue_capacity: 256
+  max_line_bytes: 512
+```
+
+`build_channel()` 返回协议无关的 `UartLineChannel`；进入上下文时才导入
+PySerial 并打开设备。电机命令、轮速和未来 IMU 报文由后续协议层解释，
+不能把类别前缀或字段数塞进运行配置。完整生命周期和故障语义见
+[`communication` README](../communication/README.md)。
+
 ## schema 与路径
 
-- 当前运行配置为 schema v4。
-- schema v3 升级到 v4 时必须增加完整的 `tracking`、`world` 和
-  `mission` 段；不会静默套用比赛安全默认值。
+- 当前运行配置为 schema v5。
+- schema v4 升级到 v5 时必须增加完整的 `uart` 段；不会静默猜测设备名
+  或打开串口。UART 尚未使用时设置 `enabled: false`、`device: null`。
+- schema v3 升级时还必须增加完整的 `tracking`、`world` 和 `mission`
+  段；不会静默套用比赛安全默认值。
 - 更旧 schema 的 `geometry.enabled` 不会被静默兼容，应拆成两个独立开关。
 - 位于 `configs/` 的 YAML 指向仓库根目录资产时通常以 `../` 开头。
 - 路径、类别、阈值和模型哈希只在配置中维护，不在业务模块再次硬编码。

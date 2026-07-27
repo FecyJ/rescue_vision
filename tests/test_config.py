@@ -42,7 +42,7 @@ def config_text(
     ground_mapping_enabled: bool = True,
     extra: str = "",
 ) -> str:
-    return f"""schema_version: 4
+    return f"""schema_version: 5
 camera:
   backend: rpicam_vid
   image_size: {image_size}
@@ -58,6 +58,14 @@ recording:
   image_format: png
 processing:
   max_observation_age_ms: 150.0
+uart:
+  enabled: false
+  device: null
+  baudrate: 115200
+  read_timeout_ms: 100.0
+  write_timeout_ms: 100.0
+  receive_queue_capacity: 256
+  max_line_bytes: 512
 tracking:
   confirmation_hits: 2
   max_association_ground_mm: 250.0
@@ -249,7 +257,41 @@ def test_runtime_example_matches_strict_schema() -> None:
         Path(__file__).resolve().parents[1] / "configs" / "runtime.example.yaml"
     )
     config = load_runtime_config(example)
-    assert config.schema_version == 4
+    assert config.schema_version == 5
+
+
+def test_uart_config_builds_channel_without_opening_device(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text().replace(
+            "  enabled: false\n  device: null\n  baudrate: 115200",
+            "  enabled: true\n  device: /dev/serial0\n  baudrate: 57600",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(path)
+    channel = config.uart.build_channel()
+
+    assert channel is not None
+    assert channel.device == "/dev/serial0"
+    assert channel.baudrate == 57600
+    assert not channel.started
+
+
+def test_enabled_uart_requires_device(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text().replace(
+            "uart:\n  enabled: false",
+            "uart:\n  enabled: true",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="requires uart.device"):
+        load_runtime_config(path)
 
 
 def test_p1_config_builds_algorithms_and_regions(tmp_path) -> None:

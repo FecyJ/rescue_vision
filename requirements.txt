@@ -2,3 +2,4 @@
 # Target: Raspberry Pi OS Trixie, Python 3.13
 
 PyYAML==6.0.3
+pyserial==3.5

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
@@ -21,8 +21,11 @@ from rescue_vision.world import (
     WorldModelConfig,
 )
 
+if TYPE_CHECKING:
+    from rescue_vision.communication import UartLineChannel
 
-SCHEMA_VERSION = 4
+
+SCHEMA_VERSION = 5
 
 
 def _mapping(value: object, location: str) -> dict[str, Any]:
@@ -113,6 +116,34 @@ class ProcessingConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class UartConfig:
+    enabled: bool
+    device: str | None
+    baudrate: int
+    read_timeout_ms: float
+    write_timeout_ms: float
+    receive_queue_capacity: int
+    max_line_bytes: int
+
+    def build_channel(self) -> UartLineChannel | None:
+        """按配置创建协议无关 UART 行通道；禁用时返回 ``None``。"""
+
+        if not self.enabled:
+            return None
+        assert self.device is not None
+        from rescue_vision.communication import UartLineChannel
+
+        return UartLineChannel(
+            device=self.device,
+            baudrate=self.baudrate,
+            read_timeout_s=self.read_timeout_ms / 1000.0,
+            write_timeout_s=self.write_timeout_ms / 1000.0,
+            receive_queue_capacity=self.receive_queue_capacity,
+            max_line_bytes=self.max_line_bytes,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class WorldRuntimeConfig:
     model: WorldModelConfig
     regions: tuple[StaticRegion, ...]
@@ -177,6 +208,7 @@ class AppConfig:
     geometry: GeometryConfig
     recording: RecordingConfig
     processing: ProcessingConfig
+    uart: UartConfig
     tracking: TrackingConfig
     world: WorldRuntimeConfig
     mission: MissionConfig
@@ -217,7 +249,7 @@ class AppConfig:
 
 
 def load_runtime_config(path: str | Path) -> AppConfig:
-    """从 YAML 加载 schema v4；缺项和未知字段均视为错误。"""
+    """从 YAML 加载 schema v5；缺项和未知字段均视为错误。"""
 
     config_path = Path(path).expanduser().resolve()
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -230,6 +262,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "geometry",
             "recording",
             "processing",
+            "uart",
             "tracking",
             "world",
             "mission",
@@ -361,6 +394,58 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "processing.max_observation_age_ms",
             minimum=0.001,
         )
+    )
+
+    uart_raw = _mapping(_required(root, "uart", "root"), "uart")
+    _reject_unknown(
+        uart_raw,
+        {
+            "enabled",
+            "device",
+            "baudrate",
+            "read_timeout_ms",
+            "write_timeout_ms",
+            "receive_queue_capacity",
+            "max_line_bytes",
+        },
+        "uart",
+    )
+    uart_enabled = _required(uart_raw, "enabled", "uart")
+    if not isinstance(uart_enabled, bool):
+        raise ValueError("uart.enabled must be a boolean.")
+    uart_device_raw = _required(uart_raw, "device", "uart")
+    uart_device = (
+        None
+        if uart_device_raw is None
+        else _string(uart_device_raw, "uart.device")
+    )
+    if uart_enabled and uart_device is None:
+        raise ValueError("Enabled UART requires uart.device.")
+    uart = UartConfig(
+        enabled=uart_enabled,
+        device=uart_device,
+        baudrate=_positive_int(
+            _required(uart_raw, "baudrate", "uart"),
+            "uart.baudrate",
+        ),
+        read_timeout_ms=_finite_float(
+            _required(uart_raw, "read_timeout_ms", "uart"),
+            "uart.read_timeout_ms",
+            minimum=0.001,
+        ),
+        write_timeout_ms=_finite_float(
+            _required(uart_raw, "write_timeout_ms", "uart"),
+            "uart.write_timeout_ms",
+            minimum=0.001,
+        ),
+        receive_queue_capacity=_positive_int(
+            _required(uart_raw, "receive_queue_capacity", "uart"),
+            "uart.receive_queue_capacity",
+        ),
+        max_line_bytes=_positive_int(
+            _required(uart_raw, "max_line_bytes", "uart"),
+            "uart.max_line_bytes",
+        ),
     )
 
     tracking_raw = _mapping(
@@ -758,6 +843,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         geometry,
         recording,
         processing,
+        uart,
         tracking,
         world,
         mission,
