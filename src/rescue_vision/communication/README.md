@@ -205,9 +205,9 @@ Python 示例反推线级兼容规则。协议支持任意扩展 topic、二进�
 有限标量 attributes。TCP 帧只提供长度边界、严格 header 和线路序号，不
 提供认证、加密或防篡改；这是为降低现场部署复杂度而有意采用的边界。
 
-## 最小接收检查
+## 最小客户端连接检查
 
-电脑侧 `runtime.yaml` 设置 `remote.role: client` 和树莓派地址后运行：
+树莓派侧 `runtime.yaml` 设置 `remote.role: server` 后运行：
 
 ```bash
 python manual_tests/remote_link.py \
@@ -215,10 +215,12 @@ python manual_tests/remote_link.py \
   --timeout-seconds 10
 ```
 
-脚本只接收并打印第一条 observation，然后退出；它不发送 ACK、不限定 topic，
-也不执行“首条必须为会话状态”的正式客户端检查。因此它只用于确认最基本的
-地址、端口和接收链路，不能作为会话协议、图传吞吐、控制失联停车或比赛
-网络合规的验收证据。
+脚本监听并接受一个电脑端客户端，连接后先发送协议要求的最小会话状态，
+随后持续打印收到的 control。会话状态有意声明所有业务 capability 为 false，
+所以遵循协议的正式客户端应连接成功但保持控制禁用。只验证连接时可保持
+`observe_only`；使用自制底层客户端检查 control 帧时设置 `debug_control`。
+脚本不执行电机命令，也不提供视频、车辆或采集状态，因此不能作为完整功能、
+图传吞吐、控制失联停车或比赛网络合规的验收证据。
 
 ## 当前边界
 
