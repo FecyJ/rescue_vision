@@ -17,7 +17,7 @@
 | `ReceivedUartLine` | 一条完整原始行 | `received_timestamp_ns` 为树莓派接收完成时的单调时钟 |
 | `UartLineFramer` | 对任意字节分块执行 CRLF/LF 分帧 | 不解码、不按报文前缀分类 |
 | `UartReceiveOverflowError` | 有界接收队列溢出 | 通道进入显式故障，不静默丢弃旧遥测或命令回复 |
-| `RemoteTcpServer` / `connect_remote_client()` | 树莓派监听与电脑主动连接 | 连接前双向证明持有同一预共享密钥 |
+| `RemoteTcpServer` / `connect_remote_client()` | 树莓派服务端与仓库内参考客户端 | 参考客户端只用于互操作测试；独立电脑端按线级协议实现 |
 | `RemoteMessageConnection` | 双向控制/观察消息 | 控制可靠且溢出报错；观察队列丢旧保新 |
 | `ReceivedRemoteMessage` | 认证后的 topic、属性和二进制载荷 | 分别保留发送时间与本机接收单调时间 |
 | `DebugMotionCommand` | 调试运动意图 | 死手、有效期、速度/转速及可选显式参考系目标朝向 |
@@ -96,9 +96,11 @@ remote:
   max_payload_bytes: 2097152
 ```
 
-电脑使用另一份本机 `runtime.yaml`，把 `role` 改为 `client`、`host` 改成
-树莓派地址。两端引用内容相同、至少 32 字节且不提交 Git 的密钥文件；例如
-可在受控主机上生成 64 位十六进制内容：
+本仓库双机人工检查使用另一份本机 `runtime.yaml`，把 `role` 改为
+`client`、`host` 改成树莓派地址。正式电脑端是独立项目，不读取此配置或
+导入本包，只需在自己的配置中使用相同地址、端口和密钥。两端引用内容相同、
+至少 32 字节且不提交 Git 的密钥文件；例如可在受控主机上生成 64 位
+十六进制内容：
 
 ```bash
 umask 077
@@ -200,5 +202,6 @@ python manual_tests/remote_link.py \
 当前没有小车命令编码、遥测 dataclass、IMU schema、心跳、看门狗、急停
 恢复、电脑操控界面、远程意图到底盘的适配或运动脚本。实时视频和地图只
 预留通道，尚无编码/渲染入口。它们属于 P1 后续阶段，不得把本模块描述为
-已完成远程驾驶、图传应用或整车控制。电脑端 PyQt、手柄控制、采集交互和
-验收顺序见[电脑端客户端交接](../../../docs/电脑端客户端交接.md)。
+已完成远程驾驶、图传应用或整车控制。独立电脑端不得导入本包；线级握手、
+帧格式、控制 schema 和跨项目验收见
+[电脑端通信协议交接](../../../docs/电脑端通信协议.md)。

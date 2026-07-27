@@ -17,7 +17,7 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `AppConfig.build_geometry()` | 创建相机模型和可选地面映射 | 内参关闭时返回 `None`；只有内参时 projector 为 `None` |
 | `UartConfig.build_channel()` | 创建协议无关 UART 行通道 | UART 关闭时返回 `None`；创建时尚不打开设备 |
 | `RemoteConfig.build_server()` | 创建树莓派认证 TCP 服务端 | 远程关闭时返回 `None`；创建时尚不监听 |
-| `RemoteConfig.connect_client()` | 电脑侧建立认证 TCP 连接 | 有网络副作用；返回连接后仍需进入上下文 |
+| `RemoteConfig.connect_client()` | 仓库内参考客户端建立认证连接 | 只用于互操作/人工检查；独立电脑端不得依赖 |
 | `HailoConfig.build_backend()` | 校验模型资产并创建 Hailo 后端 | Hailo 关闭时返回 `None` |
 | `HailoConfig.model_class_mapping()` | 把模型 class ID 映射为 `TargetClass` | 直接传给 `TargetPoseDetector` |
 | `TrackingConfig.build_tracker()` | 创建一轮使用的多目标跟踪器 | 初始无轨迹 |
@@ -130,7 +130,9 @@ PySerial 并打开设备。电机命令、轮速和未来 IMU 报文由后续协
 
 ## 远程通信装配
 
-`remote.role: server` 用于树莓派监听，`client` 用于电脑主动连接。
+`remote.role: server` 用于树莓派监听，`client` 只用于本仓库参考客户端和
+双机人工检查。独立电脑端维护自己的配置和协议实现，不读取本仓库 YAML 或
+导入 Python 包。
 `authentication_key_path` 只保存本机密钥路径，不把密钥内容写入 YAML、
 日志或 Git。`access_mode` 只有：
 
@@ -138,8 +140,10 @@ PySerial 并打开设备。电机命令、轮速和未来 IMU 报文由后续协
 - `debug_control`：预留运动和录制控制，只用于赛外采集和调试。
 
 完整配置、消息 topic、资源生命周期和双机检查见
-[`communication` README](../communication/README.md)。`build_server()` 不打开
-网络；`connect_client()` 会立即连接并完成认证，因此只能在应用装配层调用。
+[`communication` README](../communication/README.md) 和
+[电脑端通信协议](../../../docs/电脑端通信协议.md)。`build_server()` 不打开
+网络；`connect_client()` 会立即连接并完成认证，因此只能在本仓库参考工具
+的装配层调用。
 
 ## schema 与路径
 
