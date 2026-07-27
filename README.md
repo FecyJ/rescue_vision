@@ -39,6 +39,7 @@ python -m pytest
 | 相机已经接好，准备采集数据 | [数据采集手册](docs/数据采集工具使用.md) |
 | 采集棋盘、求内参或地面映射 | [标定说明](src/rescue_vision/calibration/README.md) |
 | 标注或部署四类目标模型 | [Pose 模型约定](docs/Pose视觉模型约定.md) |
+| 实现电脑端 PyQt/手柄采集客户端 | [电脑端客户端交接](docs/电脑端客户端交接.md) |
 | 开发新模块 | [项目结构](docs/项目结构.md) → [后续优先级](docs/后续优先级.md) |
 | 理解比赛类别和安全规则 | [赛题约束与视觉需求](docs/赛题约束与视觉需求.md) |
 | 查数据或评测 JSONL 格式 | [数据集与评测 schema](docs/数据集与评测.md) |
