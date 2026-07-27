@@ -12,6 +12,7 @@
 - `hailo_pose.py`：从实际 `runtime.yaml` 加载 YOLO Pose 部署包，检查单张去畸变图像的 K0 观测。
 - `dataset_perception.py`：按 schema v2 数据清单批量运行 Hailo，覆盖式写出保留 UNKNOWN、质量信息和模型身份的观测 JSONL。
 - `camera_undistort_perception.py`：按实际 `runtime.yaml` 连续执行相机、去畸变、Hailo Pose、K0/地面点叠加预览，按 `Q/Esc` 退出；偶发过期帧会标红并丢弃，不会终止预览。
+- `remote_link.py --config PATH`：在树莓派 server 与电脑 client 间往返一条认证观察消息；不发送运动控制，用于检查地址、端口、密钥和基本延迟。
 
 运行前先执行 `python -m pip install -e .`，并确保系统包和显示环境可用。
 

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
+from rescue_vision.communication.remote import RemoteAccessMode, RemoteRole
 from rescue_vision.geometry.camera_model import CameraCalibration, CameraModel
 from rescue_vision.geometry.ground_projector import GroundProjector
 from rescue_vision.geometry.types import FieldPoint
@@ -22,10 +23,15 @@ from rescue_vision.world import (
 )
 
 if TYPE_CHECKING:
-    from rescue_vision.communication import UartLineChannel
+    from rescue_vision.communication import (
+        RemoteConnectionOptions,
+        RemoteMessageConnection,
+        RemoteTcpServer,
+        UartLineChannel,
+    )
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def _mapping(value: object, location: str) -> dict[str, Any]:
@@ -144,6 +150,85 @@ class UartConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RemoteConfig:
+    enabled: bool
+    role: RemoteRole
+    host: str
+    port: int
+    access_mode: RemoteAccessMode
+    authentication_key_path: Path | None
+    handshake_timeout_ms: float
+    io_timeout_ms: float
+    control_queue_capacity: int
+    observation_queue_capacity: int
+    max_header_bytes: int
+    max_payload_bytes: int
+
+    def _connection_options(self) -> RemoteConnectionOptions:
+        from rescue_vision.communication import RemoteConnectionOptions
+
+        return RemoteConnectionOptions(
+            io_timeout_s=self.io_timeout_ms / 1000.0,
+            control_queue_capacity=self.control_queue_capacity,
+            observation_queue_capacity=self.observation_queue_capacity,
+            max_header_bytes=self.max_header_bytes,
+            max_payload_bytes=self.max_payload_bytes,
+        )
+
+    def build_server(self) -> RemoteTcpServer | None:
+        """创建但不打开树莓派 TCP 监听端点；禁用时返回 ``None``。"""
+
+        if not self.enabled:
+            return None
+        if self.role is not RemoteRole.SERVER:
+            raise RuntimeError(
+                "remote.role must be 'server' to build a server endpoint."
+            )
+        assert self.authentication_key_path is not None
+        from rescue_vision.communication import (
+            RemoteTcpServer,
+            load_remote_authentication_key,
+        )
+
+        return RemoteTcpServer(
+            host=self.host,
+            port=self.port,
+            authentication_key=load_remote_authentication_key(
+                self.authentication_key_path
+            ),
+            handshake_timeout_s=self.handshake_timeout_ms / 1000.0,
+            access_mode=self.access_mode,
+            connection_options=self._connection_options(),
+        )
+
+    def connect_client(self) -> RemoteMessageConnection | None:
+        """电脑侧主动建立认证连接；禁用时返回 ``None``。"""
+
+        if not self.enabled:
+            return None
+        if self.role is not RemoteRole.CLIENT:
+            raise RuntimeError(
+                "remote.role must be 'client' to connect a client endpoint."
+            )
+        assert self.authentication_key_path is not None
+        from rescue_vision.communication import (
+            connect_remote_client,
+            load_remote_authentication_key,
+        )
+
+        return connect_remote_client(
+            host=self.host,
+            port=self.port,
+            authentication_key=load_remote_authentication_key(
+                self.authentication_key_path
+            ),
+            handshake_timeout_s=self.handshake_timeout_ms / 1000.0,
+            access_mode=self.access_mode,
+            connection_options=self._connection_options(),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class WorldRuntimeConfig:
     model: WorldModelConfig
     regions: tuple[StaticRegion, ...]
@@ -209,6 +294,7 @@ class AppConfig:
     recording: RecordingConfig
     processing: ProcessingConfig
     uart: UartConfig
+    remote: RemoteConfig
     tracking: TrackingConfig
     world: WorldRuntimeConfig
     mission: MissionConfig
@@ -249,7 +335,7 @@ class AppConfig:
 
 
 def load_runtime_config(path: str | Path) -> AppConfig:
-    """从 YAML 加载 schema v5；缺项和未知字段均视为错误。"""
+    """从 YAML 加载 schema v6；缺项和未知字段均视为错误。"""
 
     config_path = Path(path).expanduser().resolve()
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -263,6 +349,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "recording",
             "processing",
             "uart",
+            "remote",
             "tracking",
             "world",
             "mission",
@@ -445,6 +532,91 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         max_line_bytes=_positive_int(
             _required(uart_raw, "max_line_bytes", "uart"),
             "uart.max_line_bytes",
+        ),
+    )
+
+    remote_raw = _mapping(_required(root, "remote", "root"), "remote")
+    _reject_unknown(
+        remote_raw,
+        {
+            "enabled",
+            "role",
+            "host",
+            "port",
+            "access_mode",
+            "authentication_key_path",
+            "handshake_timeout_ms",
+            "io_timeout_ms",
+            "control_queue_capacity",
+            "observation_queue_capacity",
+            "max_header_bytes",
+            "max_payload_bytes",
+        },
+        "remote",
+    )
+    remote_enabled = _required(remote_raw, "enabled", "remote")
+    if not isinstance(remote_enabled, bool):
+        raise ValueError("remote.enabled must be a boolean.")
+    try:
+        remote_role = RemoteRole(_required(remote_raw, "role", "remote"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("remote.role must be 'server' or 'client'.") from exc
+    try:
+        remote_access_mode = RemoteAccessMode(
+            _required(remote_raw, "access_mode", "remote")
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "remote.access_mode must be 'observe_only' or 'debug_control'."
+        ) from exc
+    remote_key_path = _path_or_none(
+        _required(remote_raw, "authentication_key_path", "remote"),
+        base_dir,
+        "remote.authentication_key_path",
+    )
+    if remote_enabled and remote_key_path is None:
+        raise ValueError(
+            "Enabled remote communication requires "
+            "remote.authentication_key_path."
+        )
+    remote_port = _positive_int(
+        _required(remote_raw, "port", "remote"),
+        "remote.port",
+    )
+    if remote_port > 65_535:
+        raise ValueError("remote.port must be <= 65535.")
+    remote = RemoteConfig(
+        enabled=remote_enabled,
+        role=remote_role,
+        host=_string(_required(remote_raw, "host", "remote"), "remote.host"),
+        port=remote_port,
+        access_mode=remote_access_mode,
+        authentication_key_path=remote_key_path,
+        handshake_timeout_ms=_finite_float(
+            _required(remote_raw, "handshake_timeout_ms", "remote"),
+            "remote.handshake_timeout_ms",
+            minimum=0.001,
+        ),
+        io_timeout_ms=_finite_float(
+            _required(remote_raw, "io_timeout_ms", "remote"),
+            "remote.io_timeout_ms",
+            minimum=0.001,
+        ),
+        control_queue_capacity=_positive_int(
+            _required(remote_raw, "control_queue_capacity", "remote"),
+            "remote.control_queue_capacity",
+        ),
+        observation_queue_capacity=_positive_int(
+            _required(remote_raw, "observation_queue_capacity", "remote"),
+            "remote.observation_queue_capacity",
+        ),
+        max_header_bytes=_positive_int(
+            _required(remote_raw, "max_header_bytes", "remote"),
+            "remote.max_header_bytes",
+        ),
+        max_payload_bytes=_positive_int(
+            _required(remote_raw, "max_payload_bytes", "remote"),
+            "remote.max_payload_bytes",
         ),
     )
 
@@ -844,6 +1016,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         recording,
         processing,
         uart,
+        remote,
         tracking,
         world,
         mission,

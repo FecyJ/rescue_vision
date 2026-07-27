@@ -1,5 +1,31 @@
 """协议无关的有界通信通道。"""
 
+from rescue_vision.communication.remote import (
+    ReceivedRemoteMessage,
+    RemoteAccessMode,
+    RemoteAuthenticationError,
+    RemoteConnectionOptions,
+    RemoteDisconnectedError,
+    RemoteError,
+    RemoteMessageCodec,
+    RemoteMessageConnection,
+    RemotePolicyError,
+    RemoteProtocolError,
+    RemoteQueueOverflowError,
+    RemoteRole,
+    RemoteStream,
+    RemoteTcpServer,
+    connect_remote_client,
+    load_remote_authentication_key,
+)
+from rescue_vision.communication.remote_messages import (
+    CaptureAction,
+    DebugCaptureCommand,
+    DebugMotionCommand,
+    HeadingReference,
+    MotionControlMode,
+    RemoteTopic,
+)
 from rescue_vision.communication.uart import (
     ReceivedUartLine,
     UartError,
@@ -10,10 +36,32 @@ from rescue_vision.communication.uart import (
 )
 
 __all__ = [
+    "CaptureAction",
+    "DebugCaptureCommand",
+    "DebugMotionCommand",
+    "HeadingReference",
+    "MotionControlMode",
+    "ReceivedRemoteMessage",
     "ReceivedUartLine",
+    "RemoteAccessMode",
+    "RemoteAuthenticationError",
+    "RemoteConnectionOptions",
+    "RemoteDisconnectedError",
+    "RemoteError",
+    "RemoteMessageCodec",
+    "RemoteMessageConnection",
+    "RemotePolicyError",
+    "RemoteProtocolError",
+    "RemoteQueueOverflowError",
+    "RemoteRole",
+    "RemoteStream",
+    "RemoteTcpServer",
+    "RemoteTopic",
     "UartError",
     "UartLineChannel",
     "UartLineFramer",
     "UartLineTooLongError",
     "UartReceiveOverflowError",
+    "connect_remote_client",
+    "load_remote_authentication_key",
 ]

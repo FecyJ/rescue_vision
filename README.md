@@ -2,7 +2,7 @@
 
 2027 工创赛“智能救援”赛项的上位机视觉工程，目标平台为 Raspberry Pi 5、Hailo-8L 和 Camera Module 3 NoIR Wide。
 
-当前已完成相机、标定与地面几何、严格配置、录制回放、数据集工具、离线评测、协议无关 UART 行通道、统一目标观测、Hailo YOLO Pose 后端，以及可用合成事件运行的目标跟踪、最小世界模型和规则状态机；尚未完成正式四类目标模型、定位、区域/对手感知、规划、小车协议与控制、真实接触/交付证据适配和应用入口。这不是可直接参赛的完整程序。
+当前已完成相机、标定与地面几何、严格配置、录制回放、数据集工具、离线评测、协议无关 UART、认证远程消息通道、统一目标观测、Hailo YOLO Pose 后端，以及可用合成事件运行的目标跟踪、最小世界模型和规则状态机；尚未完成正式四类目标模型、定位、区域/对手感知、规划、小车协议与控制、远程驾驶/图传应用、真实接触/交付证据适配和应用入口。这不是可直接参赛的完整程序。
 
 ## 快速上手
 
@@ -53,8 +53,8 @@ python -m pytest
 | [`camera`](src/rescue_vision/camera/README.md) | 已实现 | 真机最新帧、离线回放和有界异步记录 |
 | [`calibration`](src/rescue_vision/calibration/README.md) | 已实现 | 棋盘采集、三模型内参比较和地面映射 |
 | [`geometry`](src/rescue_vision/geometry/README.md) | 已实现 | 去畸变、显式坐标类型、地面与 BEV 转换 |
-| [`config`](src/rescue_vision/config/README.md) | 已实现 | schema v5 配置、UART/几何/模型身份和纯逻辑算法装配 |
-| [`communication`](src/rescue_vision/communication/README.md) | 已实现基础设施 | 协议无关 UART 行分帧、有界接收、时间戳和资源生命周期 |
+| [`config`](src/rescue_vision/config/README.md) | 已实现 | schema v6 配置、UART/远程端点/几何/模型和算法装配 |
+| [`communication`](src/rescue_vision/communication/README.md) | 已实现基础设施 | UART、认证远程消息、控制/观察权限和有界队列 |
 | [`data`](src/rescue_vision/data/README.md) | 已实现 | 记录检查、清单生成和按会话防泄漏划分 |
 | [`evaluation`](src/rescue_vision/evaluation/README.md) | 已实现 | 分类、地面误差、时延和失败样例报告 |
 | [`perception`](src/rescue_vision/perception/README.md) | 已实现基础设施 | 四类目标契约、K0 投影、假后端和 Hailo 后端；正式模型待训练 |
@@ -78,7 +78,7 @@ FrameSource → CameraFrame → CameraModel → TargetPoseDetector
                                                     ↓
                               MissionStateMachine / AbstractAction
                                                     ↓
-                                  定位/规划/通信（未实现）
+                              定位/规划/小车协议与应用（未实现）
 ```
 
 - 像素必须区分 `RawPixel` 与 `UndistortedPixel`；地面点使用 `GroundPoint`，单位 mm。

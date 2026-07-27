@@ -1,4 +1,4 @@
-schema_version: 5
+schema_version: 6
 
 camera:
   # picamera2 可记录逐帧曝光/增益等元数据；rpicam_vid 是低开销备选。
@@ -37,6 +37,25 @@ uart:
   receive_queue_capacity: 256
   # 为后续同链路增加 IMU 遥测保留空间；具体报文仍由协议层定义。
   max_line_bytes: 512
+
+remote:
+  # 树莓派通常为 server；电脑调试端可使用单独 runtime.yaml 配成 client。
+  enabled: false
+  role: server
+  host: 0.0.0.0
+  port: 8765
+  # 比赛运行配置必须保持 observe_only；debug_control 只用于赛外采集/调试。
+  access_mode: observe_only
+  # 指向本机不提交的至少 32 字节密钥文件；启用远程通信时必填。
+  authentication_key_path: null
+  handshake_timeout_ms: 2000.0
+  io_timeout_ms: 100.0
+  # 控制消息不能静默丢弃；观察消息队列则丢旧保新。
+  control_queue_capacity: 32
+  observation_queue_capacity: 2
+  max_header_bytes: 4096
+  # 默认容纳单帧 JPEG/地图快照；仍需按实际分辨率和网络验证。
+  max_payload_bytes: 2097152
 
 tracking:
   confirmation_hits: 2

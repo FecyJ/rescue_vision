@@ -84,7 +84,7 @@ with source, detector:
 | --- | --- | --- |
 | [`config`](config/README.md) | `load_runtime_config()`、`AppConfig.build_geometry()`、`HailoConfig.build_backend()` | 启动时严格加载和装配 |
 | [`camera`](camera/README.md) | `FrameSource`、`CameraFrame`、`Picamera2Source`、`RecordingSource` | 产生带时间和序号的最新帧 |
-| [`communication`](communication/README.md) | `UartLineChannel`、`ReceivedUartLine`、`UartLineFramer` | 协议无关 UART 收发、行分帧和有界接收 |
+| [`communication`](communication/README.md) | `UartLineChannel`、`RemoteMessageConnection`、`DebugMotionCommand` | UART 与认证远程控制/观察消息基础 |
 | [`geometry`](geometry/README.md) | `CameraModel`、`GroundProjector`、显式坐标类型 | 去畸变及像素/地面/BEV 转换 |
 | [`perception`](perception/README.md) | `InferenceBackend`、`TargetPoseDetector`、`TargetObservation` | 模型结果转任务目标观测 |
 | [`tracking`](tracking/README.md) | `MultiTargetTracker`、`TrackedTarget`、`TrackStatus` | 时间关联、遮挡和轨迹生命周期 |
@@ -102,4 +102,4 @@ with source, detector:
 - 原始像素使用 `RawPixel`，去畸变像素使用 `UndistortedPixel`，只有后者能交给 `GroundProjector`。
 - 检测器只产生 `TargetObservation`，不持有跟踪、定位、世界模型或规则状态。
 - 实时循环只处理最新帧；录制、显示、日志和通信使用有界旁路。
-- 当前正式任务目标模型、定位、区域/对手感知、真实接触与交付证据、规划、小车协议与控制和最终应用入口尚未完成；`communication` 只提供协议无关 UART 基础。
+- 当前正式任务目标模型、定位、区域/对手感知、真实接触与交付证据、规划、小车协议与控制、远程驾驶/图传应用和最终应用入口尚未完成；`communication` 只提供 UART 与远程消息基础。

@@ -42,7 +42,7 @@ def config_text(
     ground_mapping_enabled: bool = True,
     extra: str = "",
 ) -> str:
-    return f"""schema_version: 5
+    return f"""schema_version: 6
 camera:
   backend: rpicam_vid
   image_size: {image_size}
@@ -66,6 +66,19 @@ uart:
   write_timeout_ms: 100.0
   receive_queue_capacity: 256
   max_line_bytes: 512
+remote:
+  enabled: false
+  role: server
+  host: 0.0.0.0
+  port: 8765
+  access_mode: observe_only
+  authentication_key_path: null
+  handshake_timeout_ms: 2000.0
+  io_timeout_ms: 100.0
+  control_queue_capacity: 32
+  observation_queue_capacity: 2
+  max_header_bytes: 4096
+  max_payload_bytes: 2097152
 tracking:
   confirmation_hits: 2
   max_association_ground_mm: 250.0
@@ -257,7 +270,7 @@ def test_runtime_example_matches_strict_schema() -> None:
         Path(__file__).resolve().parents[1] / "configs" / "runtime.example.yaml"
     )
     config = load_runtime_config(example)
-    assert config.schema_version == 5
+    assert config.schema_version == 6
 
 
 def test_uart_config_builds_channel_without_opening_device(tmp_path) -> None:
@@ -291,6 +304,61 @@ def test_enabled_uart_requires_device(tmp_path) -> None:
     )
 
     with pytest.raises(ValueError, match="requires uart.device"):
+        load_runtime_config(path)
+
+
+def test_remote_server_config_loads_key_without_opening_network(tmp_path) -> None:
+    key_path = tmp_path / "remote.key"
+    key_path.write_text("ab" * 32, encoding="ascii")
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text()
+        .replace(
+            "remote:\n  enabled: false",
+            "remote:\n  enabled: true",
+        )
+        .replace(
+            "  authentication_key_path: null",
+            "  authentication_key_path: remote.key",
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(path)
+    server = config.remote.build_server()
+
+    assert server is not None
+    assert server.host == "0.0.0.0"
+    assert server.port == 8765
+    assert not server.started
+    assert config.remote.access_mode.value == "observe_only"
+
+
+def test_enabled_remote_requires_authentication_key_path(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text().replace(
+            "remote:\n  enabled: false",
+            "remote:\n  enabled: true",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="authentication_key_path"):
+        load_runtime_config(path)
+
+
+def test_remote_access_mode_is_strict(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text().replace(
+            "  access_mode: observe_only",
+            "  access_mode: competition_control",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="access_mode"):
         load_runtime_config(path)
 
 

@@ -1,6 +1,6 @@
 # `config`：运行配置与对象装配
 
-本包是运行参数的唯一入口。`load_runtime_config()` 加载 schema v5 YAML，拒绝缺失字段、未知字段、错误类型和不一致资产；相对路径以 YAML 所在目录为基准。
+本包是运行参数的唯一入口。`load_runtime_config()` 加载 schema v6 YAML，拒绝缺失字段、未知字段、错误类型和不一致资产；相对路径以 YAML 所在目录为基准。
 
 本机运行统一读取不提交的 `configs/runtime.yaml`。`configs/runtime.example.yaml` 只用于创建新配置：
 
@@ -16,6 +16,8 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `AppConfig.build_camera_model()` | 按内参开关创建 `CameraModel` | 内参关闭时返回 `None` |
 | `AppConfig.build_geometry()` | 创建相机模型和可选地面映射 | 内参关闭时返回 `None`；只有内参时 projector 为 `None` |
 | `UartConfig.build_channel()` | 创建协议无关 UART 行通道 | UART 关闭时返回 `None`；创建时尚不打开设备 |
+| `RemoteConfig.build_server()` | 创建树莓派认证 TCP 服务端 | 远程关闭时返回 `None`；创建时尚不监听 |
+| `RemoteConfig.connect_client()` | 电脑侧建立认证 TCP 连接 | 有网络副作用；返回连接后仍需进入上下文 |
 | `HailoConfig.build_backend()` | 校验模型资产并创建 Hailo 后端 | Hailo 关闭时返回 `None` |
 | `HailoConfig.model_class_mapping()` | 把模型 class ID 映射为 `TargetClass` | 直接传给 `TargetPoseDetector` |
 | `TrackingConfig.build_tracker()` | 创建一轮使用的多目标跟踪器 | 初始无轨迹 |
@@ -31,6 +33,7 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `RecordingConfig` | `queue_capacity`、`image_format` |
 | `ProcessingConfig` | `max_observation_age_ms` |
 | `UartConfig` | 设备名、波特率、读写超时、有界接收容量和最大行长度 |
+| `RemoteConfig` | 服务端/客户端、观察/调试权限、密钥路径、网络超时和有界队列 |
 | `TrackingConfig` | 关联、确认、滑行、衰减和删除阈值 |
 | `WorldRuntimeConfig` | `WorldModelConfig` 与 `StaticRegion` 集合 |
 | `MissionConfig` | 比赛计时、安全超时、避让距离和目标优先级 |
@@ -125,10 +128,25 @@ PySerial 并打开设备。电机命令、轮速和未来 IMU 报文由后续协
 不能把类别前缀或字段数塞进运行配置。完整生命周期和故障语义见
 [`communication` README](../communication/README.md)。
 
+## 远程通信装配
+
+`remote.role: server` 用于树莓派监听，`client` 用于电脑主动连接。
+`authentication_key_path` 只保存本机密钥路径，不把密钥内容写入 YAML、
+日志或 Git。`access_mode` 只有：
+
+- `observe_only`：禁止电脑提交控制，适用于正式比赛图传/地图观察；
+- `debug_control`：预留运动和录制控制，只用于赛外采集和调试。
+
+完整配置、消息 topic、资源生命周期和双机检查见
+[`communication` README](../communication/README.md)。`build_server()` 不打开
+网络；`connect_client()` 会立即连接并完成认证，因此只能在应用装配层调用。
+
 ## schema 与路径
 
-- 当前运行配置为 schema v5。
-- schema v4 升级到 v5 时必须增加完整的 `uart` 段；不会静默猜测设备名
+- 当前运行配置为 schema v6。
+- schema v5 升级到 v6 时必须增加完整的 `remote` 段；不会静默开放网络或
+  远程控制。未使用时设置 `enabled: false`、`access_mode: observe_only`。
+- schema v4 升级时还必须增加完整的 `uart` 段；不会静默猜测设备名
   或打开串口。UART 尚未使用时设置 `enabled: false`、`device: null`。
 - schema v3 升级时还必须增加完整的 `tracking`、`world` 和 `mission`
   段；不会静默套用比赛安全默认值。
