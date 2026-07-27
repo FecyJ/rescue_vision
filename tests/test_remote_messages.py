@@ -69,7 +69,7 @@ def test_debug_motion_reserves_target_heading_but_requires_explicit_mode() -> No
         )
 
 
-def test_deadman_release_can_only_request_stop() -> None:
+def test_deadman_disabled_can_only_request_stop() -> None:
     stop = DebugMotionCommand(
         command_id="stop-001",
         issued_timestamp_ns=0,
@@ -81,7 +81,7 @@ def test_deadman_release_can_only_request_stop() -> None:
     )
 
     assert DebugMotionCommand.from_payload(stop.to_payload()) == stop
-    with pytest.raises(ValueError, match="without deadman"):
+    with pytest.raises(ValueError, match="deadman disabled"):
         DebugMotionCommand(
             command_id="unsafe",
             issued_timestamp_ns=0,

@@ -117,7 +117,7 @@ def _require_schema_version(
 
 @dataclass(frozen=True, slots=True)
 class DebugMotionCommand:
-    """调试用车体运动意图；真正限速和执行属于后续底盘控制层。"""
+    """调试用车体运动意图；deadman 字段承载切换式使能的当前状态。"""
 
     SCHEMA_VERSION: ClassVar[int] = 1
 
@@ -211,8 +211,8 @@ class DebugMotionCommand:
             or self.heading_reference is not None
         ):
             raise ValueError(
-                "A command without deadman must request zero twist and no "
-                "target heading."
+                "A command with deadman disabled must request zero twist "
+                "and no target heading."
             )
 
     def to_payload(self) -> bytes:

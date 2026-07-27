@@ -20,7 +20,7 @@
 | `RemoteTcpServer` / `connect_remote_client()` | 树莓派服务端与仓库内参考客户端 | 参考客户端只用于互操作测试；独立电脑端按线级协议实现 |
 | `RemoteMessageConnection` | 双向控制/观察消息 | 控制和关键状态可靠；视频/地图/车辆快照丢旧保新 |
 | `ReceivedRemoteMessage` | 校验后的 topic、属性和二进制载荷 | 分别保留发送时间与本机接收单调时间 |
-| `DebugMotionCommand` | 调试运动意图 | 死手、有效期、速度/转速及可选显式参考系目标朝向 |
+| `DebugMotionCommand` | 调试运动意图 | 切换式死手当前状态、有效期、速度/转速及可选显式参考系目标朝向 |
 | `DebugCaptureCommand` | 调试录制意图 | 开始、停止、抓拍、事件标记；不能指定车端路径 |
 | `RemoteSessionStatus` | 会话权限、真实能力、限值和发布周期 | TCP 连接后的首条业务消息；周期发布 |
 | `VideoFrameAttributes` / `MapSnapshotAttributes` | JPEG/PNG 二进制观察元数据 | 严格尺寸、坐标、标定和场地映射 |
@@ -191,7 +191,9 @@ def serve_observations(
 假装已经能执行目标朝向；在相应证据源完成前只能接受 `TWIST`。
 电脑和树莓派的单调时钟不可直接比较；`issued_timestamp_ns` 只用于电脑侧
 追踪，车端从 `ReceivedRemoteMessage.received_timestamp_ns` 开始计算
-`valid_for_ms`。命令过期、序号重复或死手撤销时必须进入停车路径。
+`valid_for_ms`。命令过期、序号重复或死手切到 OFF 时必须进入停车路径。
+`deadman_enabled` 传输的是客户端切换后的当前状态，而不是手柄按键是否正被
+按住；切换边沿识别、故障强制复位和禁止自动恢复由独立客户端实现。
 
 录制控制不携带本地输出路径。车端必须从运行配置决定记录根目录，并继续
 使用现有 `FrameRecorder` 的不覆盖和完整性规则。远程输入的 tags 仍要经过
