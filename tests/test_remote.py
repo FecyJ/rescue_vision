@@ -3,18 +3,14 @@ from __future__ import annotations
 import socket
 import threading
 import time
-from pathlib import Path
 
 import pytest
 
-import rescue_vision.communication.remote as remote_transport
 from rescue_vision.communication import (
     DebugMotionCommand,
     MotionControlMode,
     RemoteAccessMode,
-    RemoteAuthenticationError,
     RemoteConnectionOptions,
-    RemoteDisconnectedError,
     RemoteMessageCodec,
     RemoteMessageConnection,
     RemotePolicyError,
@@ -22,11 +18,8 @@ from rescue_vision.communication import (
     RemoteQueueOverflowError,
     RemoteStream,
     RemoteTopic,
-    load_remote_authentication_key,
+    connect_remote_client,
 )
-
-
-KEY = b"k" * 32
 
 
 def options(
@@ -118,45 +111,15 @@ def memory_socket_pair() -> tuple[MemorySocket, MemorySocket]:
     return left, right
 
 
-def authenticated_memory_pair() -> tuple[
-    MemorySocket,
-    MemorySocket,
-    remote_transport._SessionKeys,
-]:
-    server_socket, client_socket = memory_socket_pair()
-    server_result: list[remote_transport._SessionKeys | BaseException] = []
-
-    def authenticate_server() -> None:
-        try:
-            server_result.append(
-                remote_transport._server_handshake(server_socket, KEY)
-            )
-        except BaseException as exc:
-            server_result.append(exc)
-
-    thread = threading.Thread(target=authenticate_server)
-    thread.start()
-    client_keys = remote_transport._client_handshake(client_socket, KEY)
-    thread.join(timeout=1.0)
-    assert not thread.is_alive()
-    assert len(server_result) == 1
-    if isinstance(server_result[0], BaseException):
-        raise server_result[0]
-    assert server_result[0] == client_keys
-    return server_socket, client_socket, client_keys
-
-
 def connected_pair(
     access_mode: RemoteAccessMode,
     *,
     robot_mode: RemoteAccessMode | None = None,
 ) -> tuple[RemoteMessageConnection, RemoteMessageConnection]:
-    robot_socket, computer_socket, session_keys = authenticated_memory_pair()
+    robot_socket, computer_socket = memory_socket_pair()
     actual_robot_mode = robot_mode or access_mode
     robot = RemoteMessageConnection(
         robot_socket,
-        outbound_session_key=session_keys.server_to_client,
-        inbound_session_key=session_keys.client_to_server,
         io_timeout_s=0.05,
         control_queue_capacity=4,
         observation_queue_capacity=2,
@@ -169,8 +132,6 @@ def connected_pair(
     )
     computer = RemoteMessageConnection(
         computer_socket,
-        outbound_session_key=session_keys.client_to_server,
-        inbound_session_key=session_keys.server_to_client,
         io_timeout_s=0.05,
         control_queue_capacity=4,
         observation_queue_capacity=2,
@@ -193,14 +154,12 @@ def wait_until(predicate, *, timeout: float = 1.0) -> None:
     pytest.fail("condition was not reached before timeout")
 
 
-def test_codec_handles_fragmentation_binary_payload_and_integrity() -> None:
+def test_codec_handles_fragmentation_binary_payload_and_bad_magic() -> None:
     encoder = RemoteMessageCodec(
-        session_key=KEY,
         max_header_bytes=4096,
         max_payload_bytes=1024,
     )
     decoder = RemoteMessageCodec(
-        session_key=KEY,
         max_header_bytes=4096,
         max_payload_bytes=1024,
     )
@@ -221,37 +180,43 @@ def test_codec_handles_fragmentation_binary_payload_and_integrity() -> None:
     assert decoded.payload == b"\xff\xd8image\xff\xd9"
 
     tampered = bytearray(frame)
-    tampered[-33] ^= 1
-    with pytest.raises(RemoteAuthenticationError, match="integrity"):
+    tampered[0] ^= 1
+    with pytest.raises(RemoteProtocolError, match="magic"):
         RemoteMessageCodec(
-            session_key=KEY,
             max_header_bytes=4096,
             max_payload_bytes=1024,
         ).feed(bytes(tampered))
 
 
-def test_handshake_rejects_peer_with_different_key() -> None:
-    server_socket, client_socket = memory_socket_pair()
-    server_errors: list[BaseException] = []
+def test_codec_matches_v2_fixed_frame_vector() -> None:
+    codec = RemoteMessageCodec(
+        max_header_bytes=4096,
+        max_payload_bytes=1024,
+    )
+    frame = codec.encode(
+        stream=RemoteStream.CONTROL,
+        topic=RemoteTopic.DEBUG_MOTION.value,
+        content_type="application/json",
+        sequence=0,
+        sender_timestamp_ns=123456789,
+        attributes={},
+        payload=b"{}\n",
+    )
+    expected_header = (
+        b'{"attributes":{},"content_type":"application/json",'
+        b'"schema_version":2,"sender_timestamp_ns":123456789,'
+        b'"sequence":0,"stream":"control",'
+        b'"topic":"control/debug/motion"}'
+    )
 
-    def authenticate_server() -> None:
-        try:
-            remote_transport._server_handshake(server_socket, KEY)
-        except BaseException as exc:
-            server_errors.append(exc)
-            server_socket.close()
-
-    thread = threading.Thread(target=authenticate_server)
-    thread.start()
-    with pytest.raises(RemoteDisconnectedError):
-        remote_transport._client_handshake(client_socket, b"x" * 32)
-    thread.join(timeout=1.0)
-
-    assert len(server_errors) == 1
-    assert isinstance(server_errors[0], RemoteAuthenticationError)
+    assert len(expected_header) == 165
+    assert frame[:12].hex() == "52564d32000000a500000003"
+    assert frame == bytes.fromhex("52564d32000000a500000003") + (
+        expected_header + b"{}\n"
+    )
 
 
-def test_authenticated_debug_connection_carries_control_and_observation() -> None:
+def test_debug_connection_carries_control_and_observation() -> None:
     robot, computer = connected_pair(RemoteAccessMode.DEBUG_CONTROL)
     robot.start()
     computer.start()
@@ -292,6 +257,34 @@ def test_authenticated_debug_connection_carries_control_and_observation() -> Non
         robot.stop()
 
 
+def test_tcp_client_connects_without_application_handshake(monkeypatch) -> None:
+    client_socket, server_socket = memory_socket_pair()
+    connection_arguments: list[tuple[tuple[str, int], float]] = []
+
+    def fake_create_connection(
+        address: tuple[str, int],
+        timeout: float,
+    ) -> MemorySocket:
+        connection_arguments.append((address, timeout))
+        return client_socket
+
+    monkeypatch.setattr(socket, "create_connection", fake_create_connection)
+    client = connect_remote_client(
+        host="robot.local",
+        port=8765,
+        connect_timeout_s=1.25,
+        access_mode=RemoteAccessMode.OBSERVE_ONLY,
+        connection_options=options(),
+    )
+    client.start()
+    try:
+        assert connection_arguments == [(("robot.local", 8765), 1.25)]
+        assert server_socket.buffer == b""
+    finally:
+        client.stop()
+        server_socket.close()
+
+
 def test_observe_only_client_cannot_submit_control() -> None:
     robot, computer = connected_pair(RemoteAccessMode.OBSERVE_ONLY)
     robot.start()
@@ -326,8 +319,6 @@ def test_observation_receive_queue_drops_old_and_keeps_latest() -> None:
     left, right = memory_socket_pair()
     receiver = RemoteMessageConnection(
         left,
-        outbound_session_key=KEY,
-        inbound_session_key=KEY,
         io_timeout_s=0.05,
         control_queue_capacity=2,
         observation_queue_capacity=1,
@@ -337,7 +328,6 @@ def test_observation_receive_queue_drops_old_and_keeps_latest() -> None:
         allow_outbound_control=False,
     )
     encoder = RemoteMessageCodec(
-        session_key=KEY,
         max_header_bytes=4096,
         max_payload_bytes=1024,
     )
@@ -369,8 +359,6 @@ def test_codec_rejects_sequence_gap_at_connection_layer() -> None:
     left, right = memory_socket_pair()
     receiver = RemoteMessageConnection(
         left,
-        outbound_session_key=KEY,
-        inbound_session_key=KEY,
         io_timeout_s=0.05,
         control_queue_capacity=2,
         observation_queue_capacity=2,
@@ -380,7 +368,6 @@ def test_codec_rejects_sequence_gap_at_connection_layer() -> None:
         allow_outbound_control=False,
     )
     encoder = RemoteMessageCodec(
-        session_key=KEY,
         max_header_bytes=4096,
         max_payload_bytes=1024,
     )
@@ -411,8 +398,6 @@ def test_outbound_control_queue_never_silently_drops_commands() -> None:
     peer.peer = sender_socket
     sender = RemoteMessageConnection(
         sender_socket,
-        outbound_session_key=KEY,
-        inbound_session_key=KEY,
         io_timeout_s=0.05,
         control_queue_capacity=1,
         observation_queue_capacity=1,
@@ -442,8 +427,6 @@ def test_outbound_observation_queue_drops_old_and_keeps_latest() -> None:
     peer.peer = sender_socket
     sender = RemoteMessageConnection(
         sender_socket,
-        outbound_session_key=KEY,
-        inbound_session_key=KEY,
         io_timeout_s=0.05,
         control_queue_capacity=1,
         observation_queue_capacity=1,
@@ -474,8 +457,6 @@ def test_outbound_reliable_observation_never_silently_drops() -> None:
     peer.peer = sender_socket
     sender = RemoteMessageConnection(
         sender_socket,
-        outbound_session_key=KEY,
-        inbound_session_key=KEY,
         io_timeout_s=0.05,
         control_queue_capacity=1,
         observation_queue_capacity=1,
@@ -505,16 +486,3 @@ def test_outbound_reliable_observation_never_silently_drops() -> None:
         wait_until(lambda: sender.sent_messages == 2)
         sender.stop()
         peer.close()
-
-
-def test_authentication_key_file_accepts_hex_and_rejects_short(
-    tmp_path: Path,
-) -> None:
-    hex_key = tmp_path / "remote.key"
-    hex_key.write_text("ab" * 32 + "\n", encoding="ascii")
-    short_key = tmp_path / "short.key"
-    short_key.write_bytes(b"short")
-
-    assert load_remote_authentication_key(hex_key) == bytes.fromhex("ab" * 32)
-    with pytest.raises(ValueError, match="at least 32"):
-        load_remote_authentication_key(short_key)

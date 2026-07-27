@@ -1,12 +1,9 @@
-"""带认证、完整性校验和有界队列的远程 TCP 消息通道。"""
+"""带长度分帧、严格序号和有界队列的远程 TCP 消息通道。"""
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import queue
-import secrets
 import socket
 import struct
 import threading
@@ -14,29 +11,19 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Protocol, TypeAlias, runtime_checkable
 
 
-PROTOCOL_SCHEMA_VERSION = 1
-_FRAME_MAGIC = b"RVM1"
+PROTOCOL_SCHEMA_VERSION = 2
+_FRAME_MAGIC = b"RVM2"
 _FRAME_PREFIX = struct.Struct("!4sII")
-_AUTH_TAG_BYTES = hashlib.sha256().digest_size
-_CLIENT_HELLO_MAGIC = b"RVC1"
-_SERVER_HELLO_MAGIC = b"RVS1"
-_HANDSHAKE_PART_BYTES = 32
-_HANDSHAKE_PACKET_BYTES = 4 + _HANDSHAKE_PART_BYTES * 2
 
 RemoteAttributeValue: TypeAlias = str | int | float | bool | None
 
 
 class RemoteError(RuntimeError):
     """远程连接无法继续可靠工作。"""
-
-
-class RemoteAuthenticationError(RemoteError):
-    """远端未能证明持有相同预共享密钥。"""
 
 
 class RemoteProtocolError(RemoteError):
@@ -150,27 +137,9 @@ def _validate_attributes(
     return validated
 
 
-def load_remote_authentication_key(path: str | Path) -> bytes:
-    """读取至少 32 字节的原始密钥或 64 位十六进制密钥文件。"""
-
-    key_path = Path(path).expanduser().resolve()
-    payload = key_path.read_bytes().strip()
-    if len(payload) == 64:
-        try:
-            payload = bytes.fromhex(payload.decode("ascii"))
-        except (UnicodeDecodeError, ValueError):
-            pass
-    if len(payload) < 32:
-        raise ValueError(
-            f"Remote authentication key {key_path} must contain at least "
-            "32 bytes or 64 hexadecimal characters."
-        )
-    return payload
-
-
 @dataclass(frozen=True, slots=True)
 class ReceivedRemoteMessage:
-    """一个经认证且完整的远程消息。"""
+    """一个通过结构校验和序号校验的远程消息。"""
 
     stream: RemoteStream
     topic: str
@@ -216,18 +185,14 @@ class _DecodedRemoteMessage:
 
 
 class RemoteMessageCodec:
-    """增量编码/解码带 HMAC-SHA256 完整性标签的二进制消息帧。"""
+    """增量编码/解码带长度前缀的 TCP 二进制消息帧。"""
 
     def __init__(
         self,
         *,
-        session_key: bytes,
         max_header_bytes: int,
         max_payload_bytes: int,
     ) -> None:
-        if not isinstance(session_key, bytes) or len(session_key) < 32:
-            raise ValueError("session_key must contain at least 32 bytes.")
-        self._session_key = session_key
         self.max_header_bytes = _positive_int(
             max_header_bytes,
             "max_header_bytes",
@@ -288,13 +253,7 @@ class RemoteMessageCodec:
                 f"{self.max_header_bytes}."
             )
         prefix = _FRAME_PREFIX.pack(_FRAME_MAGIC, len(header), len(payload))
-        authenticated = prefix + header + payload
-        tag = hmac.new(
-            self._session_key,
-            authenticated,
-            hashlib.sha256,
-        ).digest()
-        return authenticated + tag
+        return prefix + header + payload
 
     def feed(self, chunk: bytes) -> tuple[_DecodedRemoteMessage, ...]:
         if not isinstance(chunk, bytes) or not chunk:
@@ -323,23 +282,11 @@ class RemoteMessageCodec:
                 _FRAME_PREFIX.size
                 + header_length
                 + payload_length
-                + _AUTH_TAG_BYTES
             )
             if len(self._buffer) < total_length:
                 break
             frame = bytes(self._buffer[:total_length])
             del self._buffer[:total_length]
-            authenticated = frame[:-_AUTH_TAG_BYTES]
-            actual_tag = frame[-_AUTH_TAG_BYTES:]
-            expected_tag = hmac.new(
-                self._session_key,
-                authenticated,
-                hashlib.sha256,
-            ).digest()
-            if not hmac.compare_digest(actual_tag, expected_tag):
-                raise RemoteAuthenticationError(
-                    "Remote frame integrity check failed."
-                )
             header_start = _FRAME_PREFIX.size
             header_end = header_start + header_length
             header_payload = frame[header_start:header_end]
@@ -411,104 +358,6 @@ class RemoteMessageCodec:
 
 
 @dataclass(frozen=True, slots=True)
-class _SessionKeys:
-    client_to_server: bytes
-    server_to_client: bytes
-
-
-def _derive_session_keys(
-    authentication_key: bytes,
-    client_nonce: bytes,
-    server_nonce: bytes,
-) -> _SessionKeys:
-    session_material = hmac.new(
-        authentication_key,
-        b"session\0" + client_nonce + server_nonce,
-        hashlib.sha256,
-    ).digest()
-    return _SessionKeys(
-        client_to_server=hmac.new(
-            session_material,
-            b"client-to-server",
-            hashlib.sha256,
-        ).digest(),
-        server_to_client=hmac.new(
-            session_material,
-            b"server-to-client",
-            hashlib.sha256,
-        ).digest(),
-    )
-
-
-def _recv_exact(connection: _ConnectedSocket, size: int) -> bytes:
-    result = bytearray()
-    while len(result) < size:
-        chunk = connection.recv(size - len(result))
-        if not chunk:
-            raise RemoteDisconnectedError(
-                "Remote peer disconnected during authentication."
-            )
-        result.extend(chunk)
-    return bytes(result)
-
-
-def _client_handshake(
-    connection: _ConnectedSocket,
-    authentication_key: bytes,
-) -> _SessionKeys:
-    client_nonce = secrets.token_bytes(_HANDSHAKE_PART_BYTES)
-    client_proof = hmac.new(
-        authentication_key,
-        b"client\0" + client_nonce,
-        hashlib.sha256,
-    ).digest()
-    connection.sendall(_CLIENT_HELLO_MAGIC + client_nonce + client_proof)
-    response = _recv_exact(connection, _HANDSHAKE_PACKET_BYTES)
-    if response[:4] != _SERVER_HELLO_MAGIC:
-        raise RemoteAuthenticationError("Invalid server authentication reply.")
-    server_nonce = response[4 : 4 + _HANDSHAKE_PART_BYTES]
-    actual_proof = response[4 + _HANDSHAKE_PART_BYTES :]
-    expected_proof = hmac.new(
-        authentication_key,
-        b"server\0" + client_nonce + server_nonce,
-        hashlib.sha256,
-    ).digest()
-    if not hmac.compare_digest(actual_proof, expected_proof):
-        raise RemoteAuthenticationError(
-            "Server did not prove possession of the authentication key."
-        )
-    return _derive_session_keys(authentication_key, client_nonce, server_nonce)
-
-
-def _server_handshake(
-    connection: _ConnectedSocket,
-    authentication_key: bytes,
-) -> _SessionKeys:
-    request = _recv_exact(connection, _HANDSHAKE_PACKET_BYTES)
-    if request[:4] != _CLIENT_HELLO_MAGIC:
-        raise RemoteAuthenticationError("Invalid client authentication hello.")
-    client_nonce = request[4 : 4 + _HANDSHAKE_PART_BYTES]
-    actual_proof = request[4 + _HANDSHAKE_PART_BYTES :]
-    expected_proof = hmac.new(
-        authentication_key,
-        b"client\0" + client_nonce,
-        hashlib.sha256,
-    ).digest()
-    if not hmac.compare_digest(actual_proof, expected_proof):
-        raise RemoteAuthenticationError(
-            "Client did not prove possession of the authentication key."
-        )
-    server_nonce = secrets.token_bytes(_HANDSHAKE_PART_BYTES)
-    server_proof = hmac.new(
-        authentication_key,
-        b"server\0" + client_nonce + server_nonce,
-        hashlib.sha256,
-    ).digest()
-    connection.sendall(_SERVER_HELLO_MAGIC + server_nonce + server_proof)
-    return _derive_session_keys(authentication_key, client_nonce, server_nonce)
-
-
-@dataclass(frozen=True, slots=True)
 class _OutboundRemoteMessage:
     stream: RemoteStream
     topic: str
@@ -519,14 +368,12 @@ class _OutboundRemoteMessage:
 
 
 class RemoteMessageConnection:
-    """一个认证 TCP 连接上的双向控制/观察消息通道。"""
+    """一个 TCP 连接上的双向控制/观察消息通道。"""
 
     def __init__(
         self,
         connection: _ConnectedSocket,
         *,
-        outbound_session_key: bytes,
-        inbound_session_key: bytes,
         io_timeout_s: float,
         control_queue_capacity: int,
         observation_queue_capacity: int,
@@ -562,12 +409,10 @@ class RemoteMessageConnection:
         self._socket = connection
         self._socket.settimeout(self.io_timeout_s)
         self._encoder = RemoteMessageCodec(
-            session_key=outbound_session_key,
             max_header_bytes=max_header_bytes,
             max_payload_bytes=max_payload_bytes,
         )
         self._decoder = RemoteMessageCodec(
-            session_key=inbound_session_key,
             max_header_bytes=max_header_bytes,
             max_payload_bytes=max_payload_bytes,
         )
@@ -1000,15 +845,13 @@ class RemoteConnectionOptions:
 
 
 class RemoteTcpServer:
-    """树莓派侧单监听端点；每次 accept 返回一个认证消息连接。"""
+    """树莓派侧单监听端点；每次 accept 返回一个消息连接。"""
 
     def __init__(
         self,
         *,
         host: str,
         port: int,
-        authentication_key: bytes,
-        handshake_timeout_s: float,
         access_mode: RemoteAccessMode,
         connection_options: RemoteConnectionOptions,
     ) -> None:
@@ -1019,18 +862,9 @@ class RemoteTcpServer:
             or not 0 <= port <= 65_535
         ):
             raise ValueError(f"port must be in [0, 65535], got {port!r}.")
-        if not isinstance(authentication_key, bytes) or len(authentication_key) < 32:
-            raise ValueError(
-                "authentication_key must contain at least 32 bytes."
-            )
         if not isinstance(access_mode, RemoteAccessMode):
             raise ValueError("access_mode must be RemoteAccessMode.")
         self.port = port
-        self.authentication_key = authentication_key
-        self.handshake_timeout_s = _finite_positive_float(
-            handshake_timeout_s,
-            "handshake_timeout_s",
-        )
         self.access_mode = access_mode
         self.connection_options = connection_options
         self._listener: socket.socket | None = None
@@ -1079,15 +913,8 @@ class RemoteTcpServer:
             except socket.timeout:
                 continue
         try:
-            connection.settimeout(self.handshake_timeout_s)
-            session_keys = _server_handshake(
-                connection,
-                self.authentication_key,
-            )
             return RemoteMessageConnection(
                 connection,
-                outbound_session_key=session_keys.server_to_client,
-                inbound_session_key=session_keys.client_to_server,
                 io_timeout_s=self.connection_options.io_timeout_s,
                 control_queue_capacity=(
                     self.connection_options.control_queue_capacity
@@ -1125,12 +952,11 @@ def connect_remote_client(
     *,
     host: str,
     port: int,
-    authentication_key: bytes,
-    handshake_timeout_s: float,
+    connect_timeout_s: float,
     access_mode: RemoteAccessMode,
     connection_options: RemoteConnectionOptions,
 ) -> RemoteMessageConnection:
-    """电脑侧连接树莓派并完成双向预共享密钥认证。"""
+    """电脑侧直接连接树莓派 TCP 服务端。"""
 
     host = _bounded_text(host, "host", 255)
     if (
@@ -1139,25 +965,19 @@ def connect_remote_client(
         or not 1 <= port <= 65_535
     ):
         raise ValueError(f"port must be in [1, 65535], got {port!r}.")
-    if not isinstance(authentication_key, bytes) or len(authentication_key) < 32:
-        raise ValueError("authentication_key must contain at least 32 bytes.")
-    handshake_timeout_s = _finite_positive_float(
-        handshake_timeout_s,
-        "handshake_timeout_s",
+    connect_timeout_s = _finite_positive_float(
+        connect_timeout_s,
+        "connect_timeout_s",
     )
     if not isinstance(access_mode, RemoteAccessMode):
         raise ValueError("access_mode must be RemoteAccessMode.")
     connection = socket.create_connection(
         (host, port),
-        timeout=handshake_timeout_s,
+        timeout=connect_timeout_s,
     )
     try:
-        connection.settimeout(handshake_timeout_s)
-        session_keys = _client_handshake(connection, authentication_key)
         return RemoteMessageConnection(
             connection,
-            outbound_session_key=session_keys.client_to_server,
-            inbound_session_key=session_keys.server_to_client,
             io_timeout_s=connection_options.io_timeout_s,
             control_queue_capacity=connection_options.control_queue_capacity,
             observation_queue_capacity=(

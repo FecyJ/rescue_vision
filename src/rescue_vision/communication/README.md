@@ -1,10 +1,10 @@
-# `communication`：UART 与认证远程消息通道
+# `communication`：UART 与直接 TCP 远程消息通道
 
 本包提供两种协议无关传输基础：
 
 - UART 字节收发、CRLF/LF 行分帧、接收时间戳和有界队列；
-- 电脑与树莓派之间带预共享密钥认证、逐帧完整性校验和有界控制/观察队列
-  的 TCP 消息通道。
+- 电脑与树莓派之间免密直连、带长度分帧和有界控制/观察队列的 TCP 消息
+  通道。
 
 本包不解释电机、舵机、轮速、IMU 或任务规则。当前 Rescue Car 协议适配器
 和把远程调试意图转换为底盘动作的应用层尚未实现。
@@ -19,10 +19,10 @@
 | `UartReceiveOverflowError` | 有界接收队列溢出 | 通道进入显式故障，不静默丢弃旧遥测或命令回复 |
 | `RemoteTcpServer` / `connect_remote_client()` | 树莓派服务端与仓库内参考客户端 | 参考客户端只用于互操作测试；独立电脑端按线级协议实现 |
 | `RemoteMessageConnection` | 双向控制/观察消息 | 控制和关键状态可靠；视频/地图/车辆快照丢旧保新 |
-| `ReceivedRemoteMessage` | 认证后的 topic、属性和二进制载荷 | 分别保留发送时间与本机接收单调时间 |
+| `ReceivedRemoteMessage` | 校验后的 topic、属性和二进制载荷 | 分别保留发送时间与本机接收单调时间 |
 | `DebugMotionCommand` | 调试运动意图 | 死手、有效期、速度/转速及可选显式参考系目标朝向 |
 | `DebugCaptureCommand` | 调试录制意图 | 开始、停止、抓拍、事件标记；不能指定车端路径 |
-| `RemoteSessionStatus` | 会话权限、真实能力、限值和发布周期 | 认证后的首条业务消息；周期发布 |
+| `RemoteSessionStatus` | 会话权限、真实能力、限值和发布周期 | TCP 连接后的首条业务消息；周期发布 |
 | `VideoFrameAttributes` / `MapSnapshotAttributes` | JPEG/PNG 二进制观察元数据 | 严格尺寸、坐标、标定和场地映射 |
 | `VehicleStateObservation` | UART、轮速、朝向和安全状态 | 显式控制就绪、看门狗、急停和命令应用 ID |
 | `CaptureStatusObservation` | 录制状态与最近请求结果 | 区分 accepted/completed/rejected/failed |
@@ -97,8 +97,7 @@ remote:
   host: 0.0.0.0
   port: 8765
   access_mode: observe_only
-  authentication_key_path: /etc/rescue-vision/remote.key
-  handshake_timeout_ms: 2000.0
+  connect_timeout_ms: 2000.0
   io_timeout_ms: 100.0
   control_queue_capacity: 32
   observation_queue_capacity: 2
@@ -108,14 +107,8 @@ remote:
 
 本仓库双机人工检查使用另一份本机 `runtime.yaml`，把 `role` 改为
 `client`、`host` 改成树莓派地址。正式电脑端是独立项目，不读取此配置或
-导入本包，只需在自己的配置中使用相同地址、端口和密钥。两端引用内容相同、
-至少 32 字节且不提交 Git 的密钥文件；例如可在受控主机上生成 64 位
-十六进制内容：
-
-```bash
-umask 077
-openssl rand -hex 32 > /安全位置/remote.key
-```
+导入本包，只需在自己的配置中填写树莓派地址和端口。协议 v2 有意删除 PSK、
+认证握手、HMAC 和密钥文件，赛场连接不需要分发或核对任何密钥。
 
 比赛运行配置必须使用 `observe_only`。此模式在电脑侧禁止提交控制，在
 树莓派侧也会拒绝误配置或恶意客户端发来的控制帧。`debug_control` 只用于
@@ -160,7 +153,7 @@ def serve_observations(
                     continue
                 if first:
                     raise RuntimeError(
-                        "认证后的首条业务消息必须是会话状态"
+                        "TCP 连接后的首条业务消息必须是会话状态"
                     )
                 encoded_jpeg, attributes = observation
                 # 观察队列满时丢旧保新，不反压相机主循环。
@@ -207,14 +200,12 @@ def serve_observations(
 电脑端实现的唯一跨项目依据是
 [电脑端通信协议](../../../docs/电脑端通信协议.md)，不能从本 README 的
 Python 示例反推线级兼容规则。协议支持任意扩展 topic、二进制 payload 和
-有限标量 attributes。TCP 帧
-使用 HMAC-SHA256 防伪造和篡改，并用每次握手的新 nonce 派生相互独立的
-上下行会话密钥；当前不提供内容加密，因此只应运行在团队受控网络或额外
-VPN 内。
+有限标量 attributes。TCP 帧只提供长度边界、严格 header 和线路序号，不
+提供认证、加密或防篡改；这是为降低现场部署复杂度而有意采用的边界。
 
 ## 双机人工验收
 
-两端配置好相同密钥后，先只验证观察链路，不发送运动命令：
+两端配置好地址和端口后，先只验证观察链路，不发送运动命令：
 
 ```bash
 python manual_tests/remote_link.py \
@@ -222,8 +213,8 @@ python manual_tests/remote_link.py \
   --timeout-seconds 10
 ```
 
-先启动树莓派 `server`，再启动电脑 `client`。工具会往返一条认证观察消息，
-用于检查地址、端口、密钥和基本延迟；它不能作为图传吞吐、控制失联停车或
+先启动树莓派 `server`，再启动电脑 `client`。工具会往返一条观察消息，
+用于检查地址、端口和基本延迟；它不能作为图传吞吐、控制失联停车或
 比赛网络合规的验收证据。
 
 ## 当前边界
@@ -232,5 +223,5 @@ python manual_tests/remote_link.py \
 恢复、电脑操控界面、远程意图到底盘的适配或运动脚本。实时视频编码和地图
 渲染入口也尚未实现；现有观察 dataclass 只冻结协议 schema。它们属于 P1
 后续阶段，不得把本模块描述为已完成远程驾驶、图传应用或整车控制。独立
-电脑端不得导入本包；线级握手、帧格式、消息 schema 和跨项目验收见
+电脑端不得导入本包；线级帧格式、消息 schema 和跨项目验收见
 [电脑端通信协议交接](../../../docs/电脑端通信协议.md)。

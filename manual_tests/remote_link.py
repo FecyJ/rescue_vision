@@ -1,4 +1,4 @@
-"""用两台主机验证认证远程观察链路，不发送任何运动控制。"""
+"""用两台主机验证直接 TCP 远程观察链路，不发送任何运动控制。"""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ ACK_TOPIC = "observation/diagnostic/roundtrip_ack"
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Verify authenticated remote observation round-trip without "
+            "Verify direct TCP remote observation round-trip without "
             "sending debug control."
         )
     )
@@ -60,7 +60,7 @@ def main() -> None:
                         f"{acknowledgement.topic!r}."
                     )
                 print(
-                    "Authenticated observation round-trip OK, "
+                    "Direct TCP observation round-trip OK, "
                     f"age_ms={(time.monotonic_ns() - sent_ns) / 1_000_000:.1f}"
                 )
         return
@@ -85,7 +85,7 @@ def main() -> None:
             if time.monotonic() >= deadline:
                 raise TimeoutError("Timed out sending diagnostic acknowledgement.")
             time.sleep(0.01)
-        print("Authenticated observation acknowledgement sent")
+        print("Direct TCP observation acknowledgement sent")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-schema_version: 6
+schema_version: 7
 
 camera:
   # picamera2 可记录逐帧曝光/增益等元数据；rpicam_vid 是低开销备选。
@@ -46,9 +46,8 @@ remote:
   port: 8765
   # 比赛运行配置必须保持 observe_only；debug_control 只用于赛外采集/调试。
   access_mode: observe_only
-  # 指向本机不提交的至少 32 字节密钥文件；启用远程通信时必填。
-  authentication_key_path: null
-  handshake_timeout_ms: 2000.0
+  # 直接连接受控现场局域网，不使用密钥或认证握手。
+  connect_timeout_ms: 2000.0
   io_timeout_ms: 100.0
   # 控制消息不能静默丢弃；观察消息队列则丢旧保新。
   control_queue_capacity: 32

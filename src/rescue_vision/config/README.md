@@ -1,6 +1,6 @@
 # `config`：运行配置与对象装配
 
-本包是运行参数的唯一入口。`load_runtime_config()` 加载 schema v6 YAML，拒绝缺失字段、未知字段、错误类型和不一致资产；相对路径以 YAML 所在目录为基准。
+本包是运行参数的唯一入口。`load_runtime_config()` 加载 schema v7 YAML，拒绝缺失字段、未知字段、错误类型和不一致资产；相对路径以 YAML 所在目录为基准。
 
 本机运行统一读取不提交的 `configs/runtime.yaml`。`configs/runtime.example.yaml` 只用于创建新配置：
 
@@ -16,8 +16,8 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `AppConfig.build_camera_model()` | 按内参开关创建 `CameraModel` | 内参关闭时返回 `None` |
 | `AppConfig.build_geometry()` | 创建相机模型和可选地面映射 | 内参关闭时返回 `None`；只有内参时 projector 为 `None` |
 | `UartConfig.build_channel()` | 创建协议无关 UART 行通道 | UART 关闭时返回 `None`；创建时尚不打开设备 |
-| `RemoteConfig.build_server()` | 创建树莓派认证 TCP 服务端 | 远程关闭时返回 `None`；创建时尚不监听 |
-| `RemoteConfig.connect_client()` | 仓库内参考客户端建立认证连接 | 只用于互操作/人工检查；独立电脑端不得依赖 |
+| `RemoteConfig.build_server()` | 创建树莓派直接 TCP 服务端 | 远程关闭时返回 `None`；创建时尚不监听 |
+| `RemoteConfig.connect_client()` | 仓库内参考客户端建立直接 TCP 连接 | 只用于互操作/人工检查；独立电脑端不得依赖 |
 | `HailoConfig.build_backend()` | 校验模型资产并创建 Hailo 后端 | Hailo 关闭时返回 `None` |
 | `HailoConfig.model_class_mapping()` | 把模型 class ID 映射为 `TargetClass` | 直接传给 `TargetPoseDetector` |
 | `TrackingConfig.build_tracker()` | 创建一轮使用的多目标跟踪器 | 初始无轨迹 |
@@ -33,7 +33,7 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `RecordingConfig` | `queue_capacity`、`image_format` |
 | `ProcessingConfig` | `max_observation_age_ms` |
 | `UartConfig` | 设备名、波特率、读写超时、有界接收容量和最大行长度 |
-| `RemoteConfig` | 服务端/客户端、观察/调试权限、密钥路径、网络超时和有界队列 |
+| `RemoteConfig` | 服务端/客户端、观察/调试权限、连接/IO 超时和有界队列 |
 | `TrackingConfig` | 关联、确认、滑行、衰减和删除阈值 |
 | `WorldRuntimeConfig` | `WorldModelConfig` 与 `StaticRegion` 集合 |
 | `MissionConfig` | 比赛计时、安全超时、避让距离和目标优先级 |
@@ -133,8 +133,8 @@ PySerial 并打开设备。电机命令、轮速和未来 IMU 报文由后续协
 `remote.role: server` 用于树莓派监听，`client` 只用于本仓库参考客户端和
 双机人工检查。独立电脑端维护自己的配置和协议实现，不读取本仓库 YAML 或
 导入 Python 包。
-`authentication_key_path` 只保存本机密钥路径，不把密钥内容写入 YAML、
-日志或 Git。`access_mode` 只有：
+远程协议有意采用 IP 与端口直接连接，不使用 PSK、认证握手、HMAC 或密钥
+文件。`access_mode` 只有：
 
 - `observe_only`：禁止电脑提交控制，适用于正式比赛图传/地图观察；
 - `debug_control`：预留运动和录制控制，只用于赛外采集和调试。
@@ -142,12 +142,15 @@ PySerial 并打开设备。电机命令、轮速和未来 IMU 报文由后续协
 完整配置、消息 topic、资源生命周期和双机检查见
 [`communication` README](../communication/README.md) 和
 [电脑端通信协议](../../../docs/电脑端通信协议.md)。`build_server()` 不打开
-网络；`connect_client()` 会立即连接并完成认证，因此只能在本仓库参考工具
+网络；`connect_client()` 会立即建立 TCP 连接，因此只能在本仓库参考工具
 的装配层调用。
 
 ## schema 与路径
 
-- 当前运行配置为 schema v6。
+- 当前运行配置为 schema v7。
+- schema v6 升级到 v7 时，删除 `authentication_key_path` 和
+  `handshake_timeout_ms`，增加 `connect_timeout_ms`。这是为了降低赛场
+  连接复杂度而有意做出的不兼容简化，不提供旧字段兼容。
 - schema v5 升级到 v6 时必须增加完整的 `remote` 段；不会静默开放网络或
   远程控制。未使用时设置 `enabled: false`、`access_mode: observe_only`。
 - schema v4 升级时还必须增加完整的 `uart` 段；不会静默猜测设备名

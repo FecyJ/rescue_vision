@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     )
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def _mapping(value: object, location: str) -> dict[str, Any]:
@@ -156,8 +156,7 @@ class RemoteConfig:
     host: str
     port: int
     access_mode: RemoteAccessMode
-    authentication_key_path: Path | None
-    handshake_timeout_ms: float
+    connect_timeout_ms: float
     io_timeout_ms: float
     control_queue_capacity: int
     observation_queue_capacity: int
@@ -184,25 +183,17 @@ class RemoteConfig:
             raise RuntimeError(
                 "remote.role must be 'server' to build a server endpoint."
             )
-        assert self.authentication_key_path is not None
-        from rescue_vision.communication import (
-            RemoteTcpServer,
-            load_remote_authentication_key,
-        )
+        from rescue_vision.communication import RemoteTcpServer
 
         return RemoteTcpServer(
             host=self.host,
             port=self.port,
-            authentication_key=load_remote_authentication_key(
-                self.authentication_key_path
-            ),
-            handshake_timeout_s=self.handshake_timeout_ms / 1000.0,
             access_mode=self.access_mode,
             connection_options=self._connection_options(),
         )
 
     def connect_client(self) -> RemoteMessageConnection | None:
-        """电脑侧主动建立认证连接；禁用时返回 ``None``。"""
+        """仓库参考客户端主动建立 TCP 连接；禁用时返回 ``None``。"""
 
         if not self.enabled:
             return None
@@ -210,19 +201,12 @@ class RemoteConfig:
             raise RuntimeError(
                 "remote.role must be 'client' to connect a client endpoint."
             )
-        assert self.authentication_key_path is not None
-        from rescue_vision.communication import (
-            connect_remote_client,
-            load_remote_authentication_key,
-        )
+        from rescue_vision.communication import connect_remote_client
 
         return connect_remote_client(
             host=self.host,
             port=self.port,
-            authentication_key=load_remote_authentication_key(
-                self.authentication_key_path
-            ),
-            handshake_timeout_s=self.handshake_timeout_ms / 1000.0,
+            connect_timeout_s=self.connect_timeout_ms / 1000.0,
             access_mode=self.access_mode,
             connection_options=self._connection_options(),
         )
@@ -335,7 +319,7 @@ class AppConfig:
 
 
 def load_runtime_config(path: str | Path) -> AppConfig:
-    """从 YAML 加载 schema v6；缺项和未知字段均视为错误。"""
+    """从 YAML 加载 schema v7；缺项和未知字段均视为错误。"""
 
     config_path = Path(path).expanduser().resolve()
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -544,8 +528,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "host",
             "port",
             "access_mode",
-            "authentication_key_path",
-            "handshake_timeout_ms",
+            "connect_timeout_ms",
             "io_timeout_ms",
             "control_queue_capacity",
             "observation_queue_capacity",
@@ -569,16 +552,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         raise ValueError(
             "remote.access_mode must be 'observe_only' or 'debug_control'."
         ) from exc
-    remote_key_path = _path_or_none(
-        _required(remote_raw, "authentication_key_path", "remote"),
-        base_dir,
-        "remote.authentication_key_path",
-    )
-    if remote_enabled and remote_key_path is None:
-        raise ValueError(
-            "Enabled remote communication requires "
-            "remote.authentication_key_path."
-        )
     remote_port = _positive_int(
         _required(remote_raw, "port", "remote"),
         "remote.port",
@@ -591,10 +564,9 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         host=_string(_required(remote_raw, "host", "remote"), "remote.host"),
         port=remote_port,
         access_mode=remote_access_mode,
-        authentication_key_path=remote_key_path,
-        handshake_timeout_ms=_finite_float(
-            _required(remote_raw, "handshake_timeout_ms", "remote"),
-            "remote.handshake_timeout_ms",
+        connect_timeout_ms=_finite_float(
+            _required(remote_raw, "connect_timeout_ms", "remote"),
+            "remote.connect_timeout_ms",
             minimum=0.001,
         ),
         io_timeout_ms=_finite_float(

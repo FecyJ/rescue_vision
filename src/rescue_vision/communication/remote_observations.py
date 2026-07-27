@@ -145,7 +145,7 @@ def _encode_json(document: Mapping[str, Any]) -> bytes:
 
 @dataclass(frozen=True, slots=True)
 class RemoteSessionStatus:
-    """认证会话的权限、能力、限制和发布周期。"""
+    """TCP 会话的权限、能力、限制和发布周期。"""
 
     SCHEMA_VERSION: ClassVar[int] = 1
 

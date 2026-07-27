@@ -3,7 +3,6 @@
 from rescue_vision.communication.remote import (
     ReceivedRemoteMessage,
     RemoteAccessMode,
-    RemoteAuthenticationError,
     RemoteConnectionOptions,
     RemoteDisconnectedError,
     RemoteError,
@@ -16,7 +15,6 @@ from rescue_vision.communication.remote import (
     RemoteStream,
     RemoteTcpServer,
     connect_remote_client,
-    load_remote_authentication_key,
 )
 from rescue_vision.communication.remote_messages import (
     CaptureAction,
@@ -64,7 +62,6 @@ __all__ = [
     "ReceivedRemoteMessage",
     "ReceivedUartLine",
     "RemoteAccessMode",
-    "RemoteAuthenticationError",
     "RemoteConnectionOptions",
     "RemoteDisconnectedError",
     "RemoteError",
@@ -89,5 +86,4 @@ __all__ = [
     "VehicleStopReason",
     "VideoFrameAttributes",
     "connect_remote_client",
-    "load_remote_authentication_key",
 ]
