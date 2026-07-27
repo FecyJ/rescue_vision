@@ -467,6 +467,46 @@ def test_outbound_observation_queue_drops_old_and_keeps_latest() -> None:
         peer.close()
 
 
+def test_outbound_reliable_observation_never_silently_drops() -> None:
+    sender_socket = BlockingFirstSendSocket()
+    peer = MemorySocket()
+    sender_socket.peer = peer
+    peer.peer = sender_socket
+    sender = RemoteMessageConnection(
+        sender_socket,
+        outbound_session_key=KEY,
+        inbound_session_key=KEY,
+        io_timeout_s=0.05,
+        control_queue_capacity=1,
+        observation_queue_capacity=1,
+        max_header_bytes=4096,
+        max_payload_bytes=1024,
+        allow_inbound_control=False,
+        allow_outbound_control=False,
+    )
+    sender.start()
+    try:
+        sender.send_reliable_observation(
+            RemoteTopic.SESSION_STATUS.value,
+            b"first",
+        )
+        assert sender_socket.send_entered.wait(timeout=1.0)
+        sender.send_reliable_observation(
+            RemoteTopic.CAPTURE_STATUS.value,
+            b"second",
+        )
+        with pytest.raises(RemoteQueueOverflowError, match="not sent"):
+            sender.send_reliable_observation(
+                RemoteTopic.CAPTURE_STATUS.value,
+                b"third",
+            )
+    finally:
+        sender_socket.release_send.set()
+        wait_until(lambda: sender.sent_messages == 2)
+        sender.stop()
+        peer.close()
+
+
 def test_authentication_key_file_accepts_hex_and_rejects_short(
     tmp_path: Path,
 ) -> None:

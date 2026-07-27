@@ -126,3 +126,10 @@ def test_control_payload_rejects_unknown_schema_fields() -> None:
 
     with pytest.raises(ValueError, match="keys must be exactly"):
         DebugCaptureCommand.from_payload(payload)
+
+    boolean_version = (
+        b'{"schema_version":true,"request_id":"x","issued_timestamp_ns":0,'
+        b'"action":"stop","label":null,"session_tags":{}}'
+    )
+    with pytest.raises(ValueError, match="schema_version"):
+        DebugCaptureCommand.from_payload(boolean_version)

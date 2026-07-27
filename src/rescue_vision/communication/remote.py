@@ -372,7 +372,11 @@ class RemoteMessageCodec:
                 f"Remote frame header keys must be exactly "
                 f"{sorted(expected_keys)}."
             )
-        if header["schema_version"] != PROTOCOL_SCHEMA_VERSION:
+        if (
+            isinstance(header["schema_version"], bool)
+            or not isinstance(header["schema_version"], int)
+            or header["schema_version"] != PROTOCOL_SCHEMA_VERSION
+        ):
             raise RemoteProtocolError(
                 "Unsupported remote protocol schema_version "
                 f"{header['schema_version']!r}."
@@ -569,7 +573,7 @@ class RemoteMessageConnection:
         )
         self.max_payload_bytes = max_payload_bytes
         self._monotonic_ns = monotonic_ns
-        self._outbound_control = queue.Queue[_OutboundRemoteMessage](
+        self._outbound_reliable = queue.Queue[_OutboundRemoteMessage](
             maxsize=self.control_queue_capacity
         )
         self._outbound_observation = queue.Queue[_OutboundRemoteMessage](
@@ -661,7 +665,7 @@ class RemoteMessageConnection:
             sender_timestamp_ns,
         )
         try:
-            self._outbound_control.put_nowait(message)
+            self._outbound_reliable.put_nowait(message)
         except queue.Full as exc:
             raise RemoteQueueOverflowError(
                 "Outbound remote control queue is full; command was not sent."
@@ -696,6 +700,33 @@ class RemoteMessageConnection:
                     self.dropped_outbound_observations += 1
                 except queue.Empty:
                     continue
+
+    def send_reliable_observation(
+        self,
+        topic: str,
+        payload: bytes,
+        *,
+        content_type: str = "application/json",
+        attributes: Mapping[str, RemoteAttributeValue] | None = None,
+        sender_timestamp_ns: int | None = None,
+    ) -> None:
+        """提交不可被视频等最新值观察覆盖的可靠观察消息。"""
+
+        message = self._make_outbound(
+            RemoteStream.OBSERVATION,
+            topic,
+            payload,
+            content_type,
+            attributes,
+            sender_timestamp_ns,
+        )
+        try:
+            self._outbound_reliable.put_nowait(message)
+        except queue.Full as exc:
+            raise RemoteQueueOverflowError(
+                "Outbound reliable remote queue is full; observation was "
+                "not sent."
+            ) from exc
 
     def receive_control(
         self,
@@ -824,7 +855,7 @@ class RemoteMessageConnection:
         try:
             while not self._stop_event.is_set():
                 try:
-                    message = self._outbound_control.get_nowait()
+                    message = self._outbound_reliable.get_nowait()
                 except queue.Empty:
                     try:
                         message = self._outbound_observation.get(timeout=0.05)

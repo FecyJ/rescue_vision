@@ -84,7 +84,7 @@ with source, detector:
 | --- | --- | --- |
 | [`config`](config/README.md) | `load_runtime_config()`、`AppConfig.build_geometry()`、`HailoConfig.build_backend()` | 启动时严格加载和装配 |
 | [`camera`](camera/README.md) | `FrameSource`、`CameraFrame`、`Picamera2Source`、`RecordingSource` | 产生带时间和序号的最新帧 |
-| [`communication`](communication/README.md) | `UartLineChannel`、`RemoteMessageConnection`、`DebugMotionCommand` | UART 与认证远程控制/观察消息基础 |
+| [`communication`](communication/README.md) | `UartLineChannel`、`RemoteMessageConnection`、`DebugMotionCommand`、`RemoteSessionStatus` | UART、认证远程消息与严格观察 schema |
 | [`geometry`](geometry/README.md) | `CameraModel`、`GroundProjector`、显式坐标类型 | 去畸变及像素/地面/BEV 转换 |
 | [`perception`](perception/README.md) | `InferenceBackend`、`TargetPoseDetector`、`TargetObservation` | 模型结果转任务目标观测 |
 | [`tracking`](tracking/README.md) | `MultiTargetTracker`、`TrackedTarget`、`TrackStatus` | 时间关联、遮挡和轨迹生命周期 |

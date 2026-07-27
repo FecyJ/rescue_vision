@@ -11,10 +11,11 @@ from typing import Any, ClassVar, Mapping
 
 
 class RemoteTopic(str, Enum):
-    """预留的控制与观察 topic；传输层仍允许扩展自定义 topic。"""
+    """稳定控制与观察 topic；传输层仍允许扩展自定义 topic。"""
 
     DEBUG_MOTION = "control/debug/motion"
     DEBUG_CAPTURE = "control/debug/capture"
+    SESSION_STATUS = "observation/session/status"
     VIDEO_FRAME = "observation/video/frame"
     MAP_SNAPSHOT = "observation/map/snapshot"
     VEHICLE_STATE = "observation/vehicle/state"
@@ -96,6 +97,21 @@ def _require_exact_keys(
         raise ValueError(
             f"{location} keys must be exactly {sorted(expected)}, "
             f"got {sorted(actual)}."
+        )
+
+
+def _require_schema_version(
+    value: object,
+    expected: int,
+    location: str,
+) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value != expected
+    ):
+        raise ValueError(
+            f"Unsupported {location} schema_version {value!r}."
         )
 
 
@@ -246,11 +262,11 @@ class DebugMotionCommand:
             },
             "DebugMotionCommand",
         )
-        if document["schema_version"] != cls.SCHEMA_VERSION:
-            raise ValueError(
-                "Unsupported DebugMotionCommand schema_version "
-                f"{document['schema_version']!r}."
-            )
+        _require_schema_version(
+            document["schema_version"],
+            cls.SCHEMA_VERSION,
+            "DebugMotionCommand",
+        )
         try:
             control_mode = MotionControlMode(document["control_mode"])
         except (TypeError, ValueError) as exc:
@@ -367,11 +383,11 @@ class DebugCaptureCommand:
             },
             "DebugCaptureCommand",
         )
-        if document["schema_version"] != cls.SCHEMA_VERSION:
-            raise ValueError(
-                "Unsupported DebugCaptureCommand schema_version "
-                f"{document['schema_version']!r}."
-            )
+        _require_schema_version(
+            document["schema_version"],
+            cls.SCHEMA_VERSION,
+            "DebugCaptureCommand",
+        )
         try:
             action = CaptureAction(document["action"])
         except (TypeError, ValueError) as exc:
