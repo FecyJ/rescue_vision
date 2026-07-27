@@ -13,6 +13,8 @@
 - `dataset_perception.py`：按 schema v2 数据清单批量运行 Hailo，覆盖式写出保留 UNKNOWN、质量信息和模型身份的观测 JSONL。
 - `camera_undistort_perception.py`：按实际 `runtime.yaml` 连续执行相机、去畸变、Hailo Pose、K0/地面点叠加预览，按 `Q/Esc` 退出；偶发过期帧会标红并丢弃，不会终止预览。
 - `remote_link.py --config PATH`：在树莓派侧以 `remote.role: server` 监听电脑端客户端，连接后发送协议要求的最小会话状态，并持续打印收到的 control；该状态有意声明所有业务能力不可用，所以正式客户端应保持控制禁用。仅验证连接可使用 `observe_only`；用自制底层客户端检查 control 帧时使用 `debug_control`。
+- `remote_video.py --config PATH`：发送真实相机的最新 JPEG 帧和周期会话状态，不接收或执行控制。
+- `remote_capture.py --config PATH --output-root DIR`：在 `debug_control` 下发送实时 JPEG/采集状态，并执行录制、停止、抓拍和事件标记；电脑端不能指定车端路径。
 
 运行前先执行 `python -m pip install -e .`，并确保系统包和显示环境可用。
 
@@ -62,3 +64,46 @@ PY
 ```
 
 输出包含 `['CPUExecutionProvider']` 表示 ONNX 后处理会话已创建。该噪声来自系统依赖层；不要在项目代码中全局重定向 `stderr`，否则会同时吞掉真正的相机和推理错误。
+
+## 最小图传检查
+
+树莓派侧可保持 `remote.access_mode: observe_only`：
+
+```bash
+python manual_tests/remote_video.py \
+  --config configs/runtime.yaml \
+  --timeout-seconds 30 \
+  --video-fps 10 \
+  --jpeg-quality 80
+```
+
+脚本先启动配置中的真实相机，客户端连接后首条发送会话状态，再按
+`observation/video/frame` 发送最新 JPEG。若单帧超过
+`remote.max_payload_bytes` 会明确失败；应降低 JPEG quality、相机分辨率或
+合理提高双方一致的 payload 上限，不能静默截断。
+
+## 最小远程采集检查
+
+仅在赛外调试配置中设置 `remote.access_mode: debug_control`：
+
+```bash
+python manual_tests/remote_capture.py \
+  --config configs/runtime.yaml \
+  --output-root /data/rescue-targets/remote_test \
+  --timeout-seconds 30
+```
+
+脚本声明 `video_stream`、`capture_control` 和 `capture_status` 可用，接收
+`control/debug/capture` 后执行：
+
+- `start`：在 `<output-root>/recordings/` 创建新的标准 recording schema v3
+  会话，持续记录经过配置去畸变的帧；
+- `stop`：冲洗队列并完整关闭当前记录；
+- `snapshot`：在 `<output-root>/snapshots/` 保存 JPEG 和同名 JSON 元数据；
+- `mark_event`：录制期间向当前会话的 `events.jsonl` 追加事件。
+
+每个请求先发布 `accepted`，执行完成后发布
+`completed` / `rejected` / `failed`。相同 `request_id` 只重发原终态，不会
+重复创建文件。`--output-root` 是树莓派本地测试参数，不在线上传输；电脑端
+仍不得提交路径。脚本退出时会关闭相机和尚未结束的记录。它是单客户端人工
+联调入口，不是正式比赛应用，也不提供运动控制或自动重连。
