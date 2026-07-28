@@ -240,6 +240,32 @@ def test_remote_twist_executes_and_expiry_uses_receive_clock() -> None:
     assert channel.sent[-1] == b"b0,0"
 
 
+def test_remote_zero_twist_uses_soft_brake_and_clears_deadline() -> None:
+    channel = FakeCarChannel()
+    executor = RemoteMotionExecutor(
+        MotionController(channel, limits()),
+        monotonic_ns=lambda: 1_050_000_000,
+    )
+    executor.execute(remote_message(twist_command()))
+
+    stopped = executor.execute(
+        remote_message(
+            twist_command(
+                linear_velocity_m_s=0.0,
+                angular_velocity_rad_s=0.0,
+            ),
+            received_timestamp_ns=1_060_000_000,
+        ),
+        now_ns=1_070_000_000,
+    )
+
+    assert stopped.result is RemoteMotionResult.APPLIED
+    assert stopped.linear_velocity_m_s == 0.0
+    assert stopped.angular_velocity_rad_s == 0.0
+    assert executor.active_deadline_ns is None
+    assert channel.sent == [b"m0.1,0.3", b"b0,0"]
+
+
 def test_remote_deadman_off_and_already_expired_commands_stop() -> None:
     channel = FakeCarChannel()
     executor = RemoteMotionExecutor(MotionController(channel, limits()))

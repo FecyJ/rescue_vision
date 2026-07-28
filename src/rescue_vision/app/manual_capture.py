@@ -493,7 +493,13 @@ class VehicleState:
         self.last_received_command_id = outcome.command_id
         if outcome.result is RemoteMotionResult.APPLIED:
             self.last_applied_command_id = outcome.command_id
-            self.motion_state = VehicleMotionState.MOVING
+            if (
+                outcome.linear_velocity_m_s == 0.0
+                and outcome.angular_velocity_rad_s == 0.0
+            ):
+                self.motion_state = VehicleMotionState.BRAKING
+            else:
+                self.motion_state = VehicleMotionState.MOVING
             self.stop_reason = VehicleStopReason.NONE
         elif outcome.result is RemoteMotionResult.STOPPED_DEADMAN:
             self.motion_state = VehicleMotionState.BRAKING

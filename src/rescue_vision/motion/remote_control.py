@@ -120,10 +120,18 @@ class RemoteMotionExecutor:
                     "target_heading is unavailable until localization or IMU "
                     "provides its declared heading reference."
                 )
-            self.controller.drive(
-                command.linear_velocity_m_s,
-                command.angular_velocity_rad_s,
+            zero_twist = (
+                command.linear_velocity_m_s == 0.0
+                and command.angular_velocity_rad_s == 0.0
             )
+            if zero_twist:
+                # 手柄回中应使用固件减速度斜坡，不能用 m0,0 瞬间清零目标。
+                self.controller.soft_brake()
+            else:
+                self.controller.drive(
+                    command.linear_velocity_m_s,
+                    command.angular_velocity_rad_s,
+                )
         except BaseException as exc:
             try:
                 self.stop()
@@ -135,7 +143,7 @@ class RemoteMotionExecutor:
                 raise
             raise RemoteMotionError("Invalid remote motion command.") from exc
 
-        self._active_deadline_ns = deadline_ns
+        self._active_deadline_ns = None if zero_twist else deadline_ns
         return ExecutedRemoteMotion(
             command.command_id,
             RemoteMotionResult.APPLIED,

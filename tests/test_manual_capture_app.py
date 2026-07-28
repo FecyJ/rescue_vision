@@ -34,7 +34,13 @@ from rescue_vision.communication import (
     VehicleStateObservation,
 )
 from rescue_vision.data.check_recording import inspect_recording
-from rescue_vision.motion import MotionController, MotionLimits, RemoteMotionExecutor
+from rescue_vision.motion import (
+    ExecutedRemoteMotion,
+    MotionController,
+    MotionLimits,
+    RemoteMotionExecutor,
+    RemoteMotionResult,
+)
 
 
 class FakeSource:
@@ -383,6 +389,28 @@ def test_manual_capture_rejects_competition_observe_only_mode() -> None:
 def test_vehicle_state_cannot_claim_unverified_firmware_watchdog() -> None:
     with pytest.raises(ValueError, match="fresh CarSafetyStatus"):
         VehicleState(safety_mode=VehicleSafetyMode.FIRMWARE_WATCHDOG)
+
+
+def test_vehicle_state_reports_zero_twist_as_braking() -> None:
+    vehicle = VehicleState(
+        safety_mode=VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP
+    )
+    vehicle.on_motion(
+        ExecutedRemoteMotion(
+            command_id="centered-1",
+            result=RemoteMotionResult.APPLIED,
+            received_timestamp_ns=10,
+            deadline_timestamp_ns=210,
+            deadman_enabled=True,
+            linear_velocity_m_s=0.0,
+            angular_velocity_rad_s=0.0,
+        )
+    )
+
+    observation = vehicle.observation()
+    assert observation.motion_state.value == "braking"
+    assert observation.stop_reason.value == "none"
+    assert observation.last_applied_motion_command_id == "centered-1"
 
 
 def test_manual_capture_requires_explicit_physical_stop_acknowledgement() -> None:
