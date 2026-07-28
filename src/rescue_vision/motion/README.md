@@ -25,7 +25,7 @@
 | `drain_messages()` | 无 | 非阻塞排空当前 UART 回传 |
 | `RemoteMotionExecutor.execute()` | `ReceivedRemoteMessage` | 校验远程运动消息后执行 |
 | `RemoteMotionExecutor.check_timeout()` | 可选本机单调时间 ns | 到期时停车，返回是否触发 |
-| `run_remote_motion()` | 远程接收器、执行器、退出回调 | 持续收命令、排空回传并在退出时停车 |
+| `run_remote_motion()` | 远程接收器、执行器、退出回调 | 持续收命令、排空回传、分派其他 control，并在退出时停车 |
 
 机器人坐标系沿用项目约定：`x` 向前、`y` 向左、`z` 向上。左右轮速度正值
 均表示前进；车体角速度逆时针为正：
@@ -209,6 +209,11 @@ with channel:
 `execute()` 只接受 `control/debug/motion`、`application/json`、空 attributes
 和 `TWIST`。非法、超限或不支持的命令会先尝试柔和停车，再抛出
 `RemoteMotionError`。
+
+跨模块应用可通过 `on_other_control` 把同一连接中的采集命令交给采集状态机，
+通过 `on_cycle` 执行短时、非阻塞的相机旁路工作；`on_motion_executed` 和
+`on_motion_timeout` 用于发布车辆状态。这些钩子任一抛出异常都会进入同一
+停车路径，不得在回调中执行无界等待。
 
 ## 8. 持续执行一个远程调试会话
 

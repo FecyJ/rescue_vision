@@ -460,24 +460,24 @@ python manual_tests/remote_link.py \
   --timeout-seconds 10
 ```
 
-真实相机图传和远程采集分别使用：
+真实相机图传检查和受监督手动采集分别使用：
 
 ```bash
 python manual_tests/remote_video.py \
   --config configs/runtime.yaml \
   --timeout-seconds 30
 
-python manual_tests/remote_capture.py \
+rescue-vision-manual-capture \
   --config configs/runtime.yaml \
   --output-root /data/rescue-targets/remote_test \
-  --timeout-seconds 30
+  --accept-timeout-seconds 30
 ```
 
-这些脚本是单链路真机人工验收入口，不是正式发布器或应用入口，也不提供运动
-控制或自动重连。
+`remote_video.py` 只是单链路人工检查。`rescue-vision-manual-capture` 是
+赛外单客户端手动驾驶与采集入口，提供运动控制但不自动重连，也不是比赛应用。
 
 ## 当前边界
 
-当前没有正式应用使用的会话/车辆/采集状态发布器、心跳调度、STM32 看门狗、
-急停恢复、电脑操控界面或运动脚本。地图渲染入口也尚未实现。现有观察
-dataclass 只冻结协议 schema，人工测试脚本不能视为正式远程驾驶或图传应用。
+当前手动采集入口已有会话/车辆/采集状态发布和周期调度；仍没有 STM32
+看门狗、急停恢复、电脑操控界面、运动脚本、地图渲染或比赛发布器。该赛外
+入口不能视为正式比赛远程驾驶应用。

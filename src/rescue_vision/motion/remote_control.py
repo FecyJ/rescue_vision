@@ -197,25 +197,41 @@ def run_remote_motion(
     *,
     stop_requested: Callable[[], bool],
     on_car_message: Callable[[ParsedCarMessage], None] | None = None,
+    on_motion_executed: Callable[[ExecutedRemoteMotion], None] | None = None,
+    on_motion_timeout: Callable[[], None] | None = None,
+    on_other_control: Callable[[ReceivedRemoteMessage], None] | None = None,
+    on_cycle: Callable[[], None] | None = None,
     poll_interval_s: float = 0.05,
 ) -> None:
-    """循环执行远程运动并排空 UART 回传。"""
+    """循环执行远程运动，并为应用装配层提供有界的同线程钩子。"""
 
     if not 0.0 < poll_interval_s <= 0.1:
         raise ValueError("poll_interval_s must be in (0, 0.1].")
     try:
         while not stop_requested():
-            executor.check_timeout()
+            if executor.check_timeout() and on_motion_timeout is not None:
+                on_motion_timeout()
             for car_message in executor.controller.drain_messages():
                 if on_car_message is not None:
                     on_car_message(car_message)
+            if on_cycle is not None:
+                on_cycle()
             try:
                 message = receiver.receive_control(
                     timeout=executor.next_wait_s(poll_interval_s)
                 )
             except TimeoutError:
                 continue
-            executor.execute(message)
+            if message.topic == RemoteTopic.DEBUG_MOTION.value:
+                outcome = executor.execute(message)
+                if on_motion_executed is not None:
+                    on_motion_executed(outcome)
+            elif on_other_control is not None:
+                on_other_control(message)
+            else:
+                raise RemoteMotionError(
+                    f"Unexpected remote control topic {message.topic!r}."
+                )
     except BaseException as exc:
         try:
             executor.stop()

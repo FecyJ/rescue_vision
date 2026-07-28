@@ -306,3 +306,29 @@ def test_remote_loop_drains_uart_and_stops_on_exit() -> None:
     assert len(car_messages) == 1
     assert isinstance(car_messages[0], CarTelemetry)
     assert channel.sent == [b"m0.1,0.3", b"b0,0"]
+
+
+def test_remote_loop_routes_other_controls_without_bypassing_stop() -> None:
+    channel = FakeCarChannel()
+    executor = RemoteMotionExecutor(MotionController(channel, limits()))
+    capture_message = remote_message(
+        twist_command(),
+        topic=RemoteTopic.DEBUG_CAPTURE.value,
+    )
+    routed: list[ReceivedRemoteMessage] = []
+    polls = 0
+
+    def stop_requested() -> bool:
+        nonlocal polls
+        polls += 1
+        return polls > 1
+
+    run_remote_motion(
+        FakeRemoteReceiver(iter([capture_message])),
+        executor,
+        stop_requested=stop_requested,
+        on_other_control=routed.append,
+    )
+
+    assert routed == [capture_message]
+    assert channel.sent == [b"b0,0"]

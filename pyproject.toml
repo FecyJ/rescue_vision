@@ -18,6 +18,7 @@ dev = ["pytest>=8,<10"]
 rescue-vision-evaluate = "rescue_vision.evaluation.cli:main"
 rescue-vision-check-recording = "rescue_vision.data.check_recording:main"
 rescue-vision-manifest = "rescue_vision.data.build_manifest:main"
+rescue-vision-manual-capture = "rescue_vision.app.manual_capture:main"
 rescue-vision-record = "rescue_vision.camera.record_cli:main"
 rescue-vision-split = "rescue_vision.data.split_manifest:main"
 

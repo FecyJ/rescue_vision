@@ -2,7 +2,7 @@
 
 2027 工创赛“智能救援”赛项的上位机视觉工程，目标平台为 Raspberry Pi 5、Hailo-8L 和 Camera Module 3 NoIR Wide。
 
-当前已完成相机、标定与地面几何、严格配置、录制回放、数据集工具、离线评测、协议无关 UART、直接 TCP 远程消息通道、Rescue Car v2.0 运动控制与远程调试指令执行、统一目标观测、Hailo YOLO Pose 后端，以及可用合成事件运行的目标跟踪、最小世界模型和规则状态机；尚未完成正式四类目标模型、定位、区域/对手感知、规划、远程驾驶/图传应用、固件失联看门狗闭环、真实接触/交付证据适配和应用入口。这不是可直接参赛的完整程序。
+当前已完成相机、标定与地面几何、严格配置、录制回放、数据集工具、离线评测、协议无关 UART、直接 TCP 远程消息通道、Rescue Car v2.0 运动控制、受监督手动驾驶采集入口、统一目标观测、Hailo YOLO Pose 后端，以及可用合成事件运行的目标跟踪、最小世界模型和规则状态机；尚未完成正式四类目标模型、定位、区域/对手感知、规划、脚本运动采集、固件失联看门狗闭环、真实接触/交付证据适配和比赛应用入口。这不是可直接参赛的完整程序。
 
 ## 快速上手
 
@@ -57,13 +57,14 @@ python -m pytest
 | [`config`](src/rescue_vision/config/README.md) | 已实现 | schema v8 配置、UART/远程/motion/几何/模型和算法装配 |
 | [`communication`](src/rescue_vision/communication/README.md) | 已实现基础设施 | UART、直接 TCP 远程消息、独立客户端严格 schema 和有界队列；发布器待接入 |
 | [`motion`](src/rescue_vision/motion/README.md) | 已实现基础设施 | 差速运动函数、Rescue Car 电控协议解析、远程调试执行和车端超时停车 |
+| [`app`](src/rescue_vision/app/README.md) | 已实现手动采集入口 | 赛外受监督驾驶、图传、采集控制与状态装配；比赛入口待实现 |
 | [`data`](src/rescue_vision/data/README.md) | 已实现 | 记录检查、清单生成和按会话防泄漏划分 |
 | [`evaluation`](src/rescue_vision/evaluation/README.md) | 已实现 | 分类、地面误差、时延和失败样例报告 |
 | [`perception`](src/rescue_vision/perception/README.md) | 已实现基础设施 | 四类目标契约、K0 投影、假后端和 Hailo 后端；正式模型待训练 |
 | [`tracking`](src/rescue_vision/tracking/README.md) | 已实现纯逻辑 | 时间关联、轨迹确认、短时遮挡、衰减和删除 |
 | [`world`](src/rescue_vision/world/README.md) | 已实现纯逻辑 | 静态区域、动态目标、危险状态、对手占据和不确定性 |
 | [`mission`](src/rescue_vision/mission/README.md) | 已实现纯逻辑 | 首次/容量/伤员/危险规则、安全降级和抽象动作 |
-| 定位至应用主链路 | 未实现 | 定位、真实区域/接触证据、规划、正式动作到运动控制的适配和应用入口待完成 |
+| 定位至比赛应用主链路 | 未实现 | 定位、真实区域/接触证据、规划、正式动作到运动控制的适配和比赛入口待完成 |
 
 各包常用 API、命令和实际对接示例见 [`src/rescue_vision/README.md`](src/rescue_vision/README.md)。
 
@@ -101,6 +102,7 @@ RemoteMessageConnection → DebugMotionCommand → RemoteMotionExecutor
 | `rescue-vision-record` | 录制可回放相机会话 |
 | `rescue-vision-check-recording` | 检查单次采集的完整性、帧率、丢帧和元数据 |
 | `rescue-vision-manifest` | 记录目录转严格数据清单 |
+| `rescue-vision-manual-capture` | 受监督手动驾驶与车载运动采集 |
 | `rescue-vision-split` | 按 `recording_id` 整组划分 |
 | `rescue-vision-evaluate` | 生成离线评测报告 |
 

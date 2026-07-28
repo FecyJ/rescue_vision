@@ -5,8 +5,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from manual_tests.remote_camera_support import RemoteCameraPipeline
-from manual_tests.remote_capture import CaptureTestSession
+from rescue_vision.app.manual_capture import CameraPipeline, CaptureSession
 from rescue_vision.camera.frame import CameraFrame
 from rescue_vision.communication import (
     CaptureAction,
@@ -41,16 +40,16 @@ def test_capture_session_executes_artifacts_and_deduplicates_requests(
         camera=SimpleNamespace(image_size=(4, 3)),
         recording=SimpleNamespace(queue_capacity=2, image_format="jpg"),
     )
-    pipeline = RemoteCameraPipeline(
+    pipeline = CameraPipeline(
         source=SimpleNamespace(),
         camera_model=None,
         coordinate_system=ImageCoordinateSystem.RAW_PIXEL,
         intrinsics_fingerprint_sha256=None,
     )
-    session = CaptureTestSession(
+    session = CaptureSession(
         output_root=tmp_path,
-        config_path=config_path,
         config=config,
+        config_snapshot={"schema_version": 8},
         pipeline=pipeline,
     )
     frame = CameraFrame(
@@ -106,15 +105,15 @@ def test_capture_session_executes_artifacts_and_deduplicates_requests(
 def test_capture_session_rejects_state_conflicts(tmp_path) -> None:
     config_path = tmp_path / "runtime.yaml"
     config_path.write_text("schema_version: 8\n", encoding="utf-8")
-    session = CaptureTestSession(
+    session = CaptureSession(
         output_root=tmp_path,
-        config_path=config_path,
         config=SimpleNamespace(
             schema_version=8,
             camera=SimpleNamespace(image_size=(2, 2)),
             recording=SimpleNamespace(queue_capacity=1, image_format="png"),
         ),
-        pipeline=RemoteCameraPipeline(
+        config_snapshot={"schema_version": 8},
+        pipeline=CameraPipeline(
             source=SimpleNamespace(),
             camera_model=None,
             coordinate_system=ImageCoordinateSystem.RAW_PIXEL,

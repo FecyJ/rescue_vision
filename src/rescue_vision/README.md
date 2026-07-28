@@ -4,7 +4,8 @@
 
 ## 1. 加载运行配置和共享资产
 
-仓库尚未实现最终应用入口，下面是后续主循环应采用的分段装配方式。配置只在
+仓库尚未实现比赛应用入口；赛外手动采集已有独立入口。下面是后续比赛主循环
+应采用的分段装配方式。配置只在
 启动时加载一次，具体相机、标定、模型和阈值都来自本机
 `configs/runtime.yaml`：
 
@@ -111,6 +112,7 @@ with source, detector:
 
 | 子包 | 常用入口 | 对接责任 |
 | --- | --- | --- |
+| [`app`](app/README.md) | `run_manual_capture_session()`、`rescue-vision-manual-capture` | 赛外受监督手动驾驶和车载采集装配 |
 | [`config`](config/README.md) | `load_runtime_config()`、`AppConfig.build_geometry()`、`HailoConfig.build_backend()` | 启动时严格加载和装配 |
 | [`camera`](camera/README.md) | `FrameSource`、`CameraFrame`、`Picamera2Source`、`RecordingSource` | 产生带时间和序号的最新帧 |
 | [`communication`](communication/README.md) | `UartLineChannel`、`RemoteMessageConnection`、`DebugMotionCommand`、`RemoteSessionStatus` | UART、直接 TCP 远程消息与严格观察 schema |
@@ -132,4 +134,4 @@ with source, detector:
 - 原始像素使用 `RawPixel`，去畸变像素使用 `UndistortedPixel`，只有后者能交给 `GroundProjector`。
 - 检测器只产生 `TargetObservation`，不持有跟踪、定位、世界模型或规则状态。
 - 实时循环只处理最新帧；录制、显示、日志和通信使用有界旁路。
-- 当前正式任务目标模型、定位、区域/对手感知、真实接触与交付证据、规划、正式任务动作到运动控制的适配、远程驾驶/图传应用和最终应用入口尚未完成。`motion` 只提供赛外受监督运动与远程调试执行，不能替代固件失联看门狗。
+- 当前正式任务目标模型、定位、区域/对手感知、真实接触与交付证据、规划、正式任务动作到运动控制的适配和比赛应用入口尚未完成。`app` 的远程驾驶/图传只用于赛外受监督采集，不能替代固件失联看门狗。
