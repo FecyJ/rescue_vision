@@ -157,6 +157,7 @@ def test_parse_car_replies_telemetry_and_unknown_prefix() -> None:
     ok = parse_car_line(ReceivedUartLine(4, 6_000, b"OK m=0.20,0.20"))
     error = parse_car_line(ReceivedUartLine(5, 7_000, b"ERR: unknown cmd 'z'"))
     unknown = parse_car_line(ReceivedUartLine(6, 8_000, b"imu,1,2,3"))
+    binary = parse_car_line(ReceivedUartLine(7, 9_000, b"\xff\x00\x80"))
 
     assert isinstance(telemetry, CarTelemetry)
     assert telemetry.controller_timestamp_ms == 12_345
@@ -165,6 +166,7 @@ def test_parse_car_replies_telemetry_and_unknown_prefix() -> None:
     assert ok == CarCommandReply(4, 6_000, True, "m=0.20,0.20")
     assert error == CarCommandReply(5, 7_000, False, "unknown cmd 'z'")
     assert unknown == UnknownCarMessage(6, 8_000, b"imu,1,2,3")
+    assert binary == UnknownCarMessage(7, 9_000, b"\xff\x00\x80")
 
 
 def test_parse_versioned_car_safety_status() -> None:
@@ -209,7 +211,6 @@ def test_parse_versioned_car_safety_status() -> None:
         b"s1,1,0,1,0,10,running",
         b"s1,1,300,1,0,10,future_reason",
         b"s1,1,300,1,0,10",
-        b"\xff",
     ],
 )
 def test_parse_car_line_rejects_malformed_known_messages(payload: bytes) -> None:
@@ -312,8 +313,9 @@ def test_remote_validity_limit_is_enforced_without_using_sender_clock() -> None:
 def test_remote_loop_drains_uart_and_stops_on_exit() -> None:
     channel = FakeCarChannel(
         [
+            ReceivedUartLine(0, 9, b"\xff\x00\x80"),
             ReceivedUartLine(
-                0,
+                1,
                 10,
                 b"t1,0.1,0.1,0.1,0.1,90,90",
             )
@@ -340,8 +342,20 @@ def test_remote_loop_drains_uart_and_stops_on_exit() -> None:
         poll_interval_s=0.01,
     )
 
-    assert len(car_messages) == 1
-    assert isinstance(car_messages[0], CarTelemetry)
+    assert car_messages == [
+        UnknownCarMessage(0, 9, b"\xff\x00\x80"),
+        CarTelemetry(
+            uart_sequence=1,
+            received_timestamp_ns=10,
+            controller_timestamp_ms=1,
+            actual_left_m_s=0.1,
+            actual_right_m_s=0.1,
+            target_left_m_s=0.1,
+            target_right_m_s=0.1,
+            servo_left_deg=90,
+            servo_right_deg=90,
+        ),
+    ]
     assert channel.sent == [b"m0.1,0.3", b"b0,0"]
 
 

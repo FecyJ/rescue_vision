@@ -215,8 +215,14 @@ def parse_car_line(line: ReceivedUartLine) -> ParsedCarMessage:
         )
     try:
         text = line.payload.decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise ValueError("Car UART line must contain ASCII bytes.") from exc
+    except UnicodeDecodeError:
+        # 串口噪声、调试输出或尚未支持的二进制扩展不能使受监督控制循环退出。
+        # 原始 bytes 会由运动日志以十六进制保存，供现场追查。
+        return UnknownCarMessage(
+            line.sequence,
+            line.received_timestamp_ns,
+            line.payload,
+        )
 
     if text == "OK" or text.startswith("OK "):
         return CarCommandReply(
