@@ -29,9 +29,10 @@ if TYPE_CHECKING:
         RemoteTcpServer,
         UartLineChannel,
     )
+    from rescue_vision.motion import MotionController, RemoteMotionExecutor
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def _mapping(value: object, location: str) -> dict[str, Any]:
@@ -213,6 +214,56 @@ class RemoteConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class MotionRuntimeConfig:
+    enabled: bool
+    wheel_track_m: float | None
+    max_linear_velocity_m_s: float
+    max_angular_velocity_rad_s: float
+    max_wheel_velocity_m_s: float
+    max_remote_command_valid_for_ms: int
+
+    def build_controller(
+        self,
+        channel: UartLineChannel | None,
+    ) -> MotionController | None:
+        """按配置创建运动控制器；不会创建或打开 UART。"""
+
+        if not self.enabled:
+            return None
+        if channel is None:
+            raise RuntimeError("Enabled motion requires an enabled UART channel.")
+        assert self.wheel_track_m is not None
+        from rescue_vision.motion import MotionController, MotionLimits
+
+        return MotionController(
+            channel,
+            MotionLimits(
+                wheel_track_m=self.wheel_track_m,
+                max_linear_velocity_m_s=self.max_linear_velocity_m_s,
+                max_angular_velocity_rad_s=self.max_angular_velocity_rad_s,
+                max_wheel_velocity_m_s=self.max_wheel_velocity_m_s,
+                max_remote_command_valid_for_ms=(
+                    self.max_remote_command_valid_for_ms
+                ),
+            ),
+        )
+
+    def build_remote_executor(
+        self,
+        controller: MotionController | None,
+    ) -> RemoteMotionExecutor | None:
+        """为已装配的控制器创建远程调试执行器。"""
+
+        if not self.enabled:
+            return None
+        if controller is None:
+            raise RuntimeError("Enabled motion requires a motion controller.")
+        from rescue_vision.motion import RemoteMotionExecutor
+
+        return RemoteMotionExecutor(controller)
+
+
+@dataclass(frozen=True, slots=True)
 class WorldRuntimeConfig:
     model: WorldModelConfig
     regions: tuple[StaticRegion, ...]
@@ -279,6 +330,7 @@ class AppConfig:
     processing: ProcessingConfig
     uart: UartConfig
     remote: RemoteConfig
+    motion: MotionRuntimeConfig
     tracking: TrackingConfig
     world: WorldRuntimeConfig
     mission: MissionConfig
@@ -319,7 +371,7 @@ class AppConfig:
 
 
 def load_runtime_config(path: str | Path) -> AppConfig:
-    """从 YAML 加载 schema v7；缺项和未知字段均视为错误。"""
+    """从 YAML 加载 schema v8；缺项和未知字段均视为错误。"""
 
     config_path = Path(path).expanduser().resolve()
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -334,6 +386,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "processing",
             "uart",
             "remote",
+            "motion",
             "tracking",
             "world",
             "mission",
@@ -590,6 +643,81 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             _required(remote_raw, "max_payload_bytes", "remote"),
             "remote.max_payload_bytes",
         ),
+    )
+
+    motion_raw = _mapping(_required(root, "motion", "root"), "motion")
+    _reject_unknown(
+        motion_raw,
+        {
+            "enabled",
+            "wheel_track_m",
+            "max_linear_velocity_m_s",
+            "max_angular_velocity_rad_s",
+            "max_wheel_velocity_m_s",
+            "max_remote_command_valid_for_ms",
+        },
+        "motion",
+    )
+    motion_enabled = _required(motion_raw, "enabled", "motion")
+    if not isinstance(motion_enabled, bool):
+        raise ValueError("motion.enabled must be a boolean.")
+    wheel_track_raw = _required(motion_raw, "wheel_track_m", "motion")
+    wheel_track_m = (
+        None
+        if wheel_track_raw is None
+        else _finite_float(
+            wheel_track_raw,
+            "motion.wheel_track_m",
+            minimum=0.001,
+        )
+    )
+    if motion_enabled and wheel_track_m is None:
+        raise ValueError("Enabled motion requires motion.wheel_track_m.")
+    if motion_enabled and not uart.enabled:
+        raise ValueError("Enabled motion requires uart.enabled=true.")
+    max_remote_validity = _positive_int(
+        _required(
+            motion_raw,
+            "max_remote_command_valid_for_ms",
+            "motion",
+        ),
+        "motion.max_remote_command_valid_for_ms",
+    )
+    if max_remote_validity > 5_000:
+        raise ValueError(
+            "motion.max_remote_command_valid_for_ms must be <= 5000."
+        )
+    motion = MotionRuntimeConfig(
+        enabled=motion_enabled,
+        wheel_track_m=wheel_track_m,
+        max_linear_velocity_m_s=_finite_float(
+            _required(
+                motion_raw,
+                "max_linear_velocity_m_s",
+                "motion",
+            ),
+            "motion.max_linear_velocity_m_s",
+            minimum=0.001,
+        ),
+        max_angular_velocity_rad_s=_finite_float(
+            _required(
+                motion_raw,
+                "max_angular_velocity_rad_s",
+                "motion",
+            ),
+            "motion.max_angular_velocity_rad_s",
+            minimum=0.001,
+        ),
+        max_wheel_velocity_m_s=_finite_float(
+            _required(
+                motion_raw,
+                "max_wheel_velocity_m_s",
+                "motion",
+            ),
+            "motion.max_wheel_velocity_m_s",
+            minimum=0.001,
+        ),
+        max_remote_command_valid_for_ms=max_remote_validity,
     )
 
     tracking_raw = _mapping(
@@ -989,6 +1117,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         processing,
         uart,
         remote,
+        motion,
         tracking,
         world,
         mission,

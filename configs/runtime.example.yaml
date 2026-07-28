@@ -1,4 +1,4 @@
-schema_version: 7
+schema_version: 8
 
 camera:
   # picamera2 可记录逐帧曝光/增益等元数据；rpicam_vid 是低开销备选。
@@ -55,6 +55,16 @@ remote:
   max_header_bytes: 4096
   # 默认容纳单帧 JPEG/地图快照；仍需按实际分辨率和网络验证。
   max_payload_bytes: 2097152
+
+motion:
+  # 未测得真实轮距前保持禁用；启用还要求 uart.enabled=true。
+  enabled: false
+  wheel_track_m: null
+  # 以下是赛外调试的车端硬上限，远程请求超限会停车并报错，不会静默截断。
+  max_linear_velocity_m_s: 0.25
+  max_angular_velocity_rad_s: 1.0
+  max_wheel_velocity_m_s: 0.30
+  max_remote_command_valid_for_ms: 500
 
 tracking:
   confirmation_hits: 2

@@ -1,0 +1,308 @@
+from __future__ import annotations
+
+from collections.abc import Iterator
+
+import pytest
+
+from rescue_vision.communication import (
+    DebugMotionCommand,
+    HeadingReference,
+    MotionControlMode,
+    ReceivedRemoteMessage,
+    ReceivedUartLine,
+    RemoteStream,
+    RemoteTopic,
+)
+from rescue_vision.motion import (
+    CarCommandReply,
+    CarTelemetry,
+    MotionController,
+    MotionLimits,
+    RemoteMotionError,
+    RemoteMotionExecutor,
+    RemoteMotionResult,
+    UnknownCarMessage,
+    parse_car_line,
+    run_remote_motion,
+)
+
+
+class FakeCarChannel:
+    def __init__(self, received: list[ReceivedUartLine] | None = None) -> None:
+        self.sent: list[bytes] = []
+        self.received = list(received or [])
+
+    def send_line(self, payload: bytes) -> None:
+        self.sent.append(payload)
+
+    def receive_line(self, timeout: float | None = None) -> ReceivedUartLine:
+        del timeout
+        if not self.received:
+            raise TimeoutError
+        return self.received.pop(0)
+
+
+class FakeRemoteReceiver:
+    def __init__(self, messages: Iterator[ReceivedRemoteMessage]) -> None:
+        self._messages = messages
+
+    def receive_control(
+        self,
+        timeout: float | None = None,
+    ) -> ReceivedRemoteMessage:
+        del timeout
+        try:
+            return next(self._messages)
+        except StopIteration as exc:
+            raise TimeoutError from exc
+
+
+def limits() -> MotionLimits:
+    return MotionLimits(
+        wheel_track_m=0.20,
+        max_linear_velocity_m_s=0.30,
+        max_angular_velocity_rad_s=2.0,
+        max_wheel_velocity_m_s=0.40,
+        max_remote_command_valid_for_ms=500,
+    )
+
+
+def remote_message(
+    command: DebugMotionCommand,
+    *,
+    received_timestamp_ns: int = 1_000_000_000,
+    topic: str = RemoteTopic.DEBUG_MOTION.value,
+) -> ReceivedRemoteMessage:
+    return ReceivedRemoteMessage(
+        stream=RemoteStream.CONTROL,
+        topic=topic,
+        content_type="application/json",
+        sequence=0,
+        sender_timestamp_ns=123,
+        received_timestamp_ns=received_timestamp_ns,
+        attributes={},
+        payload=command.to_payload(),
+    )
+
+
+def twist_command(
+    *,
+    deadman_enabled: bool = True,
+    linear_velocity_m_s: float = 0.2,
+    angular_velocity_rad_s: float = 1.0,
+    valid_for_ms: int = 200,
+) -> DebugMotionCommand:
+    return DebugMotionCommand(
+        command_id="drive-1",
+        issued_timestamp_ns=123,
+        valid_for_ms=valid_for_ms,
+        deadman_enabled=deadman_enabled,
+        control_mode=MotionControlMode.TWIST,
+        linear_velocity_m_s=linear_velocity_m_s,
+        angular_velocity_rad_s=angular_velocity_rad_s,
+    )
+
+
+def test_motion_functions_encode_differential_drive_and_stops() -> None:
+    channel = FakeCarChannel()
+    controller = MotionController(channel, limits())
+
+    controller.drive(0.2, 1.0)
+    controller.forward(0.1)
+    controller.backward(0.1)
+    controller.turn_left(1.0)
+    controller.turn_right(1.0)
+    controller.soft_brake()
+    controller.emergency_stop()
+    controller.query_state()
+
+    assert channel.sent == [
+        b"m0.1,0.3",
+        b"m0.1,0.1",
+        b"m-0.1,-0.1",
+        b"m-0.1,0.1",
+        b"m0.1,-0.1",
+        b"b0,0",
+        b"e",
+        b"v",
+    ]
+
+
+def test_motion_limits_reject_instead_of_clamping() -> None:
+    channel = FakeCarChannel()
+    controller = MotionController(channel, limits())
+
+    with pytest.raises(ValueError, match="linear_velocity"):
+        controller.drive(0.31, 0.0)
+    with pytest.raises(ValueError, match="angular_velocity"):
+        controller.drive(0.0, 2.1)
+    with pytest.raises(ValueError, match="Wheel velocity"):
+        controller.drive(0.30, 2.0)
+    with pytest.raises(ValueError, match="must be >= 0"):
+        controller.forward(-0.1)
+
+    assert channel.sent == []
+
+
+def test_parse_car_replies_telemetry_and_unknown_prefix() -> None:
+    telemetry = parse_car_line(
+        ReceivedUartLine(
+            3,
+            5_000,
+            b"t12345,0.19,0.20,0.20,0.20,90,45",
+        )
+    )
+    ok = parse_car_line(ReceivedUartLine(4, 6_000, b"OK m=0.20,0.20"))
+    error = parse_car_line(ReceivedUartLine(5, 7_000, b"ERR: unknown cmd 'z'"))
+    unknown = parse_car_line(ReceivedUartLine(6, 8_000, b"imu,1,2,3"))
+
+    assert isinstance(telemetry, CarTelemetry)
+    assert telemetry.controller_timestamp_ms == 12_345
+    assert telemetry.actual_left_m_s == pytest.approx(0.19)
+    assert telemetry.servo_right_deg == pytest.approx(45.0)
+    assert ok == CarCommandReply(4, 6_000, True, "m=0.20,0.20")
+    assert error == CarCommandReply(5, 7_000, False, "unknown cmd 'z'")
+    assert unknown == UnknownCarMessage(6, 8_000, b"imu,1,2,3")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"t1,0,0",
+        b"t-1,0,0,0,0,90,90",
+        b"t1,nan,0,0,0,90,90",
+        b"t1,0,0,0,0,181,90",
+        b"\xff",
+    ],
+)
+def test_parse_car_line_rejects_malformed_known_messages(payload: bytes) -> None:
+    with pytest.raises(ValueError):
+        parse_car_line(ReceivedUartLine(0, 0, payload))
+
+
+def test_remote_twist_executes_and_expiry_uses_receive_clock() -> None:
+    channel = FakeCarChannel()
+    executor = RemoteMotionExecutor(
+        MotionController(channel, limits()),
+        monotonic_ns=lambda: 1_050_000_000,
+    )
+
+    result = executor.execute(remote_message(twist_command()))
+
+    assert result.result is RemoteMotionResult.APPLIED
+    assert result.deadline_timestamp_ns == 1_200_000_000
+    assert executor.active_deadline_ns == 1_200_000_000
+    assert channel.sent == [b"m0.1,0.3"]
+    assert not executor.check_timeout(now_ns=1_199_999_999)
+    assert executor.next_wait_s(
+        0.05,
+        now_ns=1_190_000_000,
+    ) == pytest.approx(0.01)
+    assert executor.check_timeout(now_ns=1_200_000_000)
+    assert channel.sent[-1] == b"b0,0"
+
+
+def test_remote_deadman_off_and_already_expired_commands_stop() -> None:
+    channel = FakeCarChannel()
+    executor = RemoteMotionExecutor(MotionController(channel, limits()))
+    stopped = executor.execute(
+        remote_message(
+            twist_command(
+                deadman_enabled=False,
+                linear_velocity_m_s=0.0,
+                angular_velocity_rad_s=0.0,
+            )
+        ),
+        now_ns=1_050_000_000,
+    )
+    expired = executor.execute(
+        remote_message(twist_command()),
+        now_ns=1_200_000_000,
+    )
+
+    assert stopped.result is RemoteMotionResult.STOPPED_DEADMAN
+    assert expired.result is RemoteMotionResult.EXPIRED
+    assert channel.sent == [b"b0,0", b"b0,0"]
+
+
+def test_invalid_remote_commands_stop_before_reporting_error() -> None:
+    channel = FakeCarChannel()
+    executor = RemoteMotionExecutor(MotionController(channel, limits()))
+    target_heading = DebugMotionCommand(
+        command_id="heading",
+        issued_timestamp_ns=0,
+        valid_for_ms=200,
+        deadman_enabled=True,
+        control_mode=MotionControlMode.TARGET_HEADING,
+        linear_velocity_m_s=0.0,
+        angular_velocity_rad_s=0.0,
+        target_heading_rad=1.0,
+        heading_reference=HeadingReference.SESSION_START,
+    )
+
+    with pytest.raises(RemoteMotionError, match="target_heading"):
+        executor.execute(
+            remote_message(target_heading),
+            now_ns=1_050_000_000,
+        )
+    with pytest.raises(RemoteMotionError, match="Invalid"):
+        executor.execute(
+            remote_message(twist_command(linear_velocity_m_s=0.31)),
+            now_ns=1_050_000_000,
+        )
+    with pytest.raises(RemoteMotionError, match="topic"):
+        executor.execute(
+            remote_message(twist_command(), topic="control/debug/capture"),
+            now_ns=1_050_000_000,
+        )
+
+    assert channel.sent == [b"b0,0", b"b0,0", b"b0,0"]
+
+
+def test_remote_validity_limit_is_enforced_without_using_sender_clock() -> None:
+    channel = FakeCarChannel()
+    executor = RemoteMotionExecutor(MotionController(channel, limits()))
+
+    with pytest.raises(RemoteMotionError, match="valid_for_ms"):
+        executor.execute(
+            remote_message(twist_command(valid_for_ms=501)),
+            now_ns=1_000_000_001,
+        )
+
+    assert channel.sent == [b"b0,0"]
+
+
+def test_remote_loop_drains_uart_and_stops_on_exit() -> None:
+    channel = FakeCarChannel(
+        [
+            ReceivedUartLine(
+                0,
+                10,
+                b"t1,0.1,0.1,0.1,0.1,90,90",
+            )
+        ]
+    )
+    executor = RemoteMotionExecutor(
+        MotionController(channel, limits()),
+        monotonic_ns=lambda: 1_000_000_001,
+    )
+    messages = iter([remote_message(twist_command())])
+    polls = 0
+    car_messages: list[object] = []
+
+    def stop_requested() -> bool:
+        nonlocal polls
+        polls += 1
+        return polls > 2
+
+    run_remote_motion(
+        FakeRemoteReceiver(messages),
+        executor,
+        stop_requested=stop_requested,
+        on_car_message=car_messages.append,
+        poll_interval_s=0.01,
+    )
+
+    assert len(car_messages) == 1
+    assert isinstance(car_messages[0], CarTelemetry)
+    assert channel.sent == [b"m0.1,0.3", b"b0,0"]

@@ -42,7 +42,7 @@ def config_text(
     ground_mapping_enabled: bool = True,
     extra: str = "",
 ) -> str:
-    return f"""schema_version: 7
+    return f"""schema_version: 8
 camera:
   backend: rpicam_vid
   image_size: {image_size}
@@ -78,6 +78,13 @@ remote:
   observation_queue_capacity: 2
   max_header_bytes: 4096
   max_payload_bytes: 2097152
+motion:
+  enabled: false
+  wheel_track_m: null
+  max_linear_velocity_m_s: 0.25
+  max_angular_velocity_rad_s: 1.0
+  max_wheel_velocity_m_s: 0.30
+  max_remote_command_valid_for_ms: 500
 tracking:
   confirmation_hits: 2
   max_association_ground_mm: 250.0
@@ -269,7 +276,7 @@ def test_runtime_example_matches_strict_schema() -> None:
         Path(__file__).resolve().parents[1] / "configs" / "runtime.example.yaml"
     )
     config = load_runtime_config(example)
-    assert config.schema_version == 7
+    assert config.schema_version == 8
 
 
 def test_uart_config_builds_channel_without_opening_device(tmp_path) -> None:
@@ -303,6 +310,58 @@ def test_enabled_uart_requires_device(tmp_path) -> None:
     )
 
     with pytest.raises(ValueError, match="requires uart.device"):
+        load_runtime_config(path)
+
+
+def test_motion_config_builds_controller_without_opening_uart(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text()
+        .replace(
+            "uart:\n  enabled: false\n  device: null",
+            "uart:\n  enabled: true\n  device: /dev/serial0",
+        )
+        .replace(
+            "motion:\n  enabled: false\n  wheel_track_m: null",
+            "motion:\n  enabled: true\n  wheel_track_m: 0.2",
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(path)
+    channel = config.uart.build_channel()
+    controller = config.motion.build_controller(channel)
+    executor = config.motion.build_remote_executor(controller)
+
+    assert channel is not None
+    assert not channel.started
+    assert controller is not None
+    assert controller.limits.wheel_track_m == pytest.approx(0.2)
+    assert executor is not None
+    assert executor.controller is controller
+
+
+def test_enabled_motion_requires_uart_and_real_wheel_track(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text().replace(
+            "motion:\n  enabled: false",
+            "motion:\n  enabled: true",
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="wheel_track"):
+        load_runtime_config(path)
+
+    path.write_text(
+        config_text()
+        .replace(
+            "motion:\n  enabled: false\n  wheel_track_m: null",
+            "motion:\n  enabled: true\n  wheel_track_m: 0.2",
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="uart.enabled=true"):
         load_runtime_config(path)
 
 
