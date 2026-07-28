@@ -11,6 +11,7 @@ from rescue_vision.communication import (
     MotionControlMode,
     RemoteAccessMode,
     RemoteConnectionOptions,
+    RemoteDisconnectedError,
     RemoteMessageCodec,
     RemoteMessageConnection,
     RemotePolicyError,
@@ -568,3 +569,33 @@ def test_reliable_session_status_precedes_initial_latest_observations() -> None:
     finally:
         sender.stop()
         peer.close()
+
+
+def test_writer_broken_pipe_is_reported_as_remote_disconnect() -> None:
+    sender_socket = MemorySocket()
+    sender = RemoteMessageConnection(
+        sender_socket,
+        io_timeout_s=0.05,
+        control_queue_capacity=1,
+        observation_queue_capacity=1,
+        max_header_bytes=4096,
+        max_payload_bytes=1024,
+        allow_inbound_control=False,
+        allow_outbound_control=False,
+    )
+    sender.start()
+    try:
+        sender.send_reliable_observation(
+            RemoteTopic.CAPTURE_STATUS.value,
+            b"status",
+        )
+        wait_until(lambda: sender._worker_error is not None)
+
+        with pytest.raises(
+            RemoteDisconnectedError,
+            match="disconnected during TCP I/O",
+        ) as caught:
+            sender.check_health()
+        assert isinstance(caught.value.__cause__, BrokenPipeError)
+    finally:
+        sender.stop()

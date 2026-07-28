@@ -900,6 +900,10 @@ class RemoteMessageConnection:
             return
         if isinstance(self._worker_error, RemoteError):
             raise self._worker_error
+        if isinstance(self._worker_error, OSError):
+            raise RemoteDisconnectedError(
+                "Remote peer disconnected during TCP I/O."
+            ) from self._worker_error
         raise RemoteError("Remote connection worker failed.") from self._worker_error
 
     def _require_healthy(self) -> None:
