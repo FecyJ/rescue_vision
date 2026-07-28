@@ -22,7 +22,7 @@
 | `turn_left()` / `turn_right()` | 非负角速度 rad/s | 原地左转/右转 |
 | `soft_brake()` / `emergency_stop()` | 无 | 固件斜坡制动/紧急停止 |
 | `query_state()` | 无 | 请求固件立即返回状态 |
-| `receive_message()` | 可选等待秒数 | 轮速、安全状态、命令回复或未知回传 |
+| `receive_message()` | 可选等待秒数 | 忽略空行，返回轮速、安全状态、命令回复或未知回传 |
 | `CarSafetyStatus` | `s1` 状态行 | 固件单调时间、看门狗、锁存急停、命令年龄和停车原因 |
 | `drain_messages()` | 无 | 非阻塞排空当前 UART 回传 |
 | `RemoteMotionExecutor.execute()` | `ReceivedRemoteMessage` | 校验远程运动消息后执行 |
@@ -312,9 +312,10 @@ finally:
 - 死手关闭、命令过期、非法 payload、未知控制模式和循环正常退出均进入柔和
   停车；协议或通信异常也会尝试停车并继续抛出原始异常。
 - `drain_messages()` / `run_remote_motion()` 会排空 10 Hz 回传。未知前缀保留
-  为 `UnknownCarMessage`，非 ASCII 原始行也按相同方式保留，不会导致手动
-  采集循环退出或被误判为命令成功；录制期间原始 bytes 以十六进制写入
-  `unknown_uart`。冻结的 `s1` 行解析为 `CarSafetyStatus` 并写入运动日志
+  为 `UnknownCarMessage`，非 ASCII 原始行也按相同方式保留；只有 CR/LF 的
+  空 UART 行没有业务内容，会被忽略。以上情况不会导致手动采集循环退出或被
+  误判为命令成功；录制期间非空原始 bytes 以十六进制写入 `unknown_uart`。
+  冻结的 `s1` 行解析为 `CarSafetyStatus` 并写入运动日志
   schema v2；当前固件尚不产生该状态。`parse_car_line()` 对损坏的已知
   `t...` / `s1...` 报文仍严格抛出 `ValueError`；实时
   `MotionController.receive_message()` 会把单条损坏报文隔离为

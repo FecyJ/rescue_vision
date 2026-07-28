@@ -218,17 +218,30 @@ class MotionController:
         self._channel.send_line(encode_state_query_command())
 
     def receive_message(self, timeout: float | None = None) -> ParsedCarMessage:
-        """接收回传；损坏的单行隔离为未知消息，不中断实时循环。"""
+        """接收回传；忽略空行，并把非空损坏行隔离为未知消息。"""
 
-        line = self._channel.receive_line(timeout=timeout)
-        try:
-            return parse_car_line(line)
-        except ValueError:
-            return UnknownCarMessage(
-                uart_sequence=line.sequence,
-                received_timestamp_ns=line.received_timestamp_ns,
-                payload=line.payload,
-            )
+        deadline_ns: int | None = None
+        wait_s = timeout
+        if timeout is not None:
+            wait_s = _non_negative(timeout, "timeout")
+            deadline_ns = self._now() + round(wait_s * 1_000_000_000)
+        while True:
+            line = self._channel.receive_line(timeout=wait_s)
+            if not line.payload:
+                if deadline_ns is not None:
+                    wait_s = max(
+                        0.0,
+                        (deadline_ns - self._now()) / 1_000_000_000.0,
+                    )
+                continue
+            try:
+                return parse_car_line(line)
+            except ValueError:
+                return UnknownCarMessage(
+                    uart_sequence=line.sequence,
+                    received_timestamp_ns=line.received_timestamp_ns,
+                    payload=line.payload,
+                )
 
     def drain_messages(self) -> tuple[ParsedCarMessage, ...]:
         """非阻塞排空当前回传，防止 10 Hz 遥测挤满 UART 队列。"""

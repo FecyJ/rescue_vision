@@ -234,6 +234,24 @@ def test_parse_car_replies_telemetry_and_unknown_prefix() -> None:
     assert binary == UnknownCarMessage(7, 9_000, b"\xff\x00\x80")
 
 
+def test_controller_ignores_empty_uart_lines_before_valid_message() -> None:
+    channel = FakeCarChannel(
+        [
+            ReceivedUartLine(0, 1_000, b""),
+            ReceivedUartLine(1, 2_000, b""),
+            ReceivedUartLine(2, 3_000, b"OK"),
+        ]
+    )
+    controller = MotionController(channel, limits())
+
+    assert controller.receive_message(timeout=0) == CarCommandReply(
+        uart_sequence=2,
+        received_timestamp_ns=3_000,
+        succeeded=True,
+        detail="",
+    )
+
+
 def test_parse_versioned_car_safety_status() -> None:
     status = parse_car_line(
         ReceivedUartLine(
@@ -409,14 +427,15 @@ def test_remote_validity_limit_is_enforced_without_using_sender_clock() -> None:
 def test_remote_loop_drains_uart_and_stops_on_exit() -> None:
     channel = FakeCarChannel(
         [
-            ReceivedUartLine(0, 9, b"\xff\x00\x80"),
+            ReceivedUartLine(0, 8, b""),
+            ReceivedUartLine(1, 9, b"\xff\x00\x80"),
             ReceivedUartLine(
-                1,
+                2,
                 10,
                 b"t2,0.1,OK m=-0.05,0.1,0.1,90,90",
             ),
             ReceivedUartLine(
-                2,
+                3,
                 11,
                 b"t1,0.1,0.1,0.1,0.1,90,90",
             )
@@ -446,14 +465,14 @@ def test_remote_loop_drains_uart_and_stops_on_exit() -> None:
     )
 
     assert car_messages == [
-        UnknownCarMessage(0, 9, b"\xff\x00\x80"),
+        UnknownCarMessage(1, 9, b"\xff\x00\x80"),
         UnknownCarMessage(
-            1,
+            2,
             10,
             b"t2,0.1,OK m=-0.05,0.1,0.1,90,90",
         ),
         CarTelemetry(
-            uart_sequence=2,
+            uart_sequence=3,
             received_timestamp_ns=11,
             controller_timestamp_ms=1,
             actual_left_m_s=0.1,
