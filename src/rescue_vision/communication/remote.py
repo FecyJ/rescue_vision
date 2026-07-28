@@ -8,6 +8,7 @@ import socket
 import struct
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -367,6 +368,52 @@ class _OutboundRemoteMessage:
     payload: bytes
 
 
+class _LatestByTopicQueue:
+    """有界按 topic 合并队列；同 topic 只保留最新消息。"""
+
+    def __init__(self, *, capacity: int) -> None:
+        self.capacity = _positive_int(capacity, "capacity")
+        self._items: OrderedDict[str, object] = OrderedDict()
+        self._condition = threading.Condition()
+
+    def put_latest(self, topic: str, item: object) -> int:
+        """写入最新值，返回因此丢弃的旧消息数。"""
+
+        dropped = 0
+        with self._condition:
+            if topic in self._items:
+                self._items[topic] = item
+                dropped = 1
+            else:
+                if len(self._items) >= self.capacity:
+                    self._items.popitem(last=False)
+                    dropped = 1
+                self._items[topic] = item
+            self._condition.notify()
+        return dropped
+
+    def get_nowait(self) -> object:
+        with self._condition:
+            if not self._items:
+                raise queue.Empty
+            _topic, item = self._items.popitem(last=False)
+            return item
+
+    def get(self, timeout: float | None = None) -> object:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._condition:
+            while not self._items:
+                if deadline is None:
+                    self._condition.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise queue.Empty
+                self._condition.wait(remaining)
+            _topic, item = self._items.popitem(last=False)
+            return item
+
+
 class RemoteMessageConnection:
     """一个 TCP 连接上的双向控制/观察消息通道。"""
 
@@ -421,14 +468,14 @@ class RemoteMessageConnection:
         self._outbound_reliable = queue.Queue[_OutboundRemoteMessage](
             maxsize=self.control_queue_capacity
         )
-        self._outbound_observation = queue.Queue[_OutboundRemoteMessage](
-            maxsize=self.observation_queue_capacity
+        self._outbound_observation = _LatestByTopicQueue(
+            capacity=self.observation_queue_capacity
         )
         self._inbound_control = queue.Queue[ReceivedRemoteMessage](
             maxsize=self.control_queue_capacity
         )
-        self._inbound_observation = queue.Queue[ReceivedRemoteMessage](
-            maxsize=self.observation_queue_capacity
+        self._inbound_observation = _LatestByTopicQueue(
+            capacity=self.observation_queue_capacity
         )
         self._stop_event = threading.Event()
         self._error_lock = threading.Lock()
@@ -535,16 +582,9 @@ class RemoteMessageConnection:
             attributes,
             sender_timestamp_ns,
         )
-        while True:
-            try:
-                self._outbound_observation.put_nowait(message)
-                return
-            except queue.Full:
-                try:
-                    self._outbound_observation.get_nowait()
-                    self.dropped_outbound_observations += 1
-                except queue.Empty:
-                    continue
+        self.dropped_outbound_observations += (
+            self._outbound_observation.put_latest(message.topic, message)
+        )
 
     def send_reliable_observation(
         self,
@@ -583,9 +623,8 @@ class RemoteMessageConnection:
         self,
         timeout: float | None = None,
     ) -> ReceivedRemoteMessage:
-        return self._receive_from(
+        return self._receive_observation(
             self._inbound_observation,
-            "observation",
             timeout,
         )
 
@@ -703,7 +742,9 @@ class RemoteMessageConnection:
                     message = self._outbound_reliable.get_nowait()
                 except queue.Empty:
                     try:
-                        message = self._outbound_observation.get(timeout=0.05)
+                        queued = self._outbound_observation.get(timeout=0.05)
+                        assert isinstance(queued, _OutboundRemoteMessage)
+                        message = queued
                     except queue.Empty:
                         continue
                 frame = self._encoder.encode(
@@ -735,16 +776,54 @@ class RemoteMessageConnection:
                     "Inbound remote control queue is full."
                 ) from exc
             return
-        while True:
+        self.dropped_inbound_observations += (
+            self._inbound_observation.put_latest(message.topic, message)
+        )
+
+    def _receive_observation(
+        self,
+        target_queue: _LatestByTopicQueue,
+        timeout: float | None,
+    ) -> ReceivedRemoteMessage:
+        self._require_healthy()
+        if timeout is not None and (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not 0 <= float(timeout) < float("inf")
+        ):
+            raise ValueError(f"timeout must be finite and >= 0, got {timeout!r}.")
+        timeout_s = None if timeout is None else float(timeout)
+        if timeout_s == 0:
             try:
-                self._inbound_observation.put_nowait(message)
-                return
-            except queue.Full:
-                try:
-                    self._inbound_observation.get_nowait()
-                    self.dropped_inbound_observations += 1
-                except queue.Empty:
-                    continue
+                item = target_queue.get_nowait()
+            except queue.Empty as exc:
+                self._raise_worker_error()
+                raise TimeoutError(
+                    "No remote observation message is available."
+                ) from exc
+            self._raise_worker_error()
+            assert isinstance(item, ReceivedRemoteMessage)
+            return item
+
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        while True:
+            self._raise_worker_error()
+            if deadline is None:
+                wait_s = 0.05
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "Timed out waiting for remote observation message."
+                    )
+                wait_s = min(remaining, 0.05)
+            try:
+                item = target_queue.get(timeout=wait_s)
+            except queue.Empty:
+                continue
+            self._raise_worker_error()
+            assert isinstance(item, ReceivedRemoteMessage)
+            return item
 
     def _receive_from(
         self,

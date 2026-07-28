@@ -332,3 +332,22 @@ def test_remote_loop_routes_other_controls_without_bypassing_stop() -> None:
 
     assert routed == [capture_message]
     assert channel.sent == [b"b0,0"]
+
+
+def test_remote_loop_uart_receive_fault_stops_before_propagating() -> None:
+    class FaultingCarChannel(FakeCarChannel):
+        def receive_line(self, timeout: float | None = None) -> ReceivedUartLine:
+            del timeout
+            raise RuntimeError("UART receive failed")
+
+    channel = FaultingCarChannel()
+    executor = RemoteMotionExecutor(MotionController(channel, limits()))
+
+    with pytest.raises(RuntimeError, match="UART receive failed"):
+        run_remote_motion(
+            FakeRemoteReceiver(iter(())),
+            executor,
+            stop_requested=lambda: False,
+        )
+
+    assert channel.sent == [b"b0,0"]

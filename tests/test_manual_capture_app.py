@@ -16,6 +16,7 @@ from rescue_vision.app.manual_capture import (
 from rescue_vision.camera.frame import CameraFrame
 from rescue_vision.communication import (
     CaptureAction,
+    CaptureStopReason,
     DebugCaptureCommand,
     DebugMotionCommand,
     ImageCoordinateSystem,
@@ -26,6 +27,8 @@ from rescue_vision.communication import (
     RemoteRole,
     RemoteStream,
     RemoteTopic,
+    VehicleSafetyMode,
+    VehicleStateObservation,
 )
 from rescue_vision.motion import MotionController, MotionLimits, RemoteMotionExecutor
 
@@ -43,6 +46,12 @@ class FakeSource:
 
     def stop(self) -> None:
         pass
+
+
+class FailingSource(FakeSource):
+    def read(self, timeout: float | None = None) -> CameraFrame:
+        del timeout
+        raise OSError("camera failed")
 
 
 class FakeCarChannel:
@@ -175,6 +184,7 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
             status,
             video_fps=10.0,
             jpeg_quality=80,
+            safety_mode=VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP,
         )
 
     assert car.sent[-2:] == [b"m0.1,0.1", b"b0,0"]
@@ -190,6 +200,52 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
         RemoteTopic.CAPTURE_STATUS.value,
         RemoteTopic.VIDEO_FRAME.value,
     }
+    vehicle_payload = next(
+        payload
+        for topic, payload in connection.observations
+        if topic == RemoteTopic.VEHICLE_STATE.value
+    )
+    vehicle_state = VehicleStateObservation.from_payload(vehicle_payload)
+    assert vehicle_state.control_ready
+    assert (
+        vehicle_state.safety_mode
+        is VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP
+    )
+    assert not vehicle_state.watchdog_armed
+
+    second_capture = CaptureSession(
+        output_root=tmp_path,
+        config=config,
+        config_snapshot={"schema_version": 8},
+        pipeline=pipeline,
+    )
+    second_connection = FakeConnection([])
+    with pytest.raises(RemoteDisconnectedError):
+        run_manual_capture_session(
+            second_connection,
+            executor,
+            second_capture,
+            pipeline,
+            build_session_status(
+                config,
+                server_instance_id="test-server",
+                video_fps=10.0,
+            ),
+            video_fps=10.0,
+            jpeg_quality=80,
+            safety_mode=VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP,
+        )
+    second_vehicle_payload = next(
+        payload
+        for topic, payload in second_connection.observations
+        if topic == RemoteTopic.VEHICLE_STATE.value
+    )
+    second_vehicle = VehicleStateObservation.from_payload(
+        second_vehicle_payload
+    )
+    assert second_vehicle.last_received_motion_command_id is None
+    assert second_vehicle.last_applied_motion_command_id is None
+    assert car.sent[-1] == b"b0,0"
 
 
 def test_recording_queue_overflow_faults_capture_and_requires_stop(
@@ -225,12 +281,33 @@ def test_recording_queue_overflow_faults_capture_and_requires_stop(
     )
     assert capture.recorder is not None
     monkeypatch.setattr(capture.recorder, "record", lambda _frame: False)
+    car = FakeCarChannel()
+    executor = RemoteMotionExecutor(
+        MotionController(
+            car,
+            MotionLimits(0.2, 0.25, 1.0, 0.3, 500),
+        )
+    )
 
     with pytest.raises(RuntimeError, match="queue overflowed"):
-        capture.record(pipeline.source.frame)
+        run_manual_capture_session(
+            FakeConnection([]),
+            executor,
+            capture,
+            pipeline,
+            build_session_status(
+                config,
+                server_instance_id="test-server",
+                video_fps=10.0,
+            ),
+            video_fps=10.0,
+            jpeg_quality=80,
+            safety_mode=VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP,
+        )
 
     assert capture.faulted
-    capture.close()
+    assert capture.recorder is None
+    assert car.sent == [b"b0,0"]
 
 
 def test_manual_capture_rejects_competition_observe_only_mode() -> None:
@@ -244,4 +321,74 @@ def test_manual_capture_rejects_competition_observe_only_mode() -> None:
     config.motion.enabled = True
 
     with pytest.raises(RuntimeError, match="server mode|debug_control"):
-        _validate_mode(config, video_fps=10.0)
+        _validate_mode(
+            config,
+            video_fps=10.0,
+            supervised_physical_stop_ready=True,
+        )
+
+
+def test_manual_capture_requires_explicit_physical_stop_acknowledgement() -> None:
+    config = _config()
+    config.remote = SimpleNamespace(
+        enabled=True,
+        role=RemoteRole.SERVER,
+        access_mode=RemoteAccessMode.DEBUG_CONTROL,
+    )
+    config.uart = SimpleNamespace(enabled=True)
+    config.motion.enabled = True
+
+    with pytest.raises(RuntimeError, match="physical emergency stop"):
+        _validate_mode(
+            config,
+            video_fps=10.0,
+            supervised_physical_stop_ready=False,
+        )
+
+
+def test_camera_failure_faults_capture_and_stops_motion(tmp_path) -> None:
+    config = _config()
+    frame = CameraFrame(
+        sequence=0,
+        timestamp_ns=0,
+        image_bgr=np.zeros((3, 4, 3), dtype=np.uint8),
+    )
+    pipeline = CameraPipeline(
+        FailingSource(frame),
+        None,
+        ImageCoordinateSystem.RAW_PIXEL,
+        None,
+    )
+    capture = CaptureSession(
+        output_root=tmp_path,
+        config=config,
+        config_snapshot={"schema_version": 8},
+        pipeline=pipeline,
+    )
+    car = FakeCarChannel()
+    executor = RemoteMotionExecutor(
+        MotionController(
+            car,
+            MotionLimits(0.2, 0.25, 1.0, 0.3, 500),
+        )
+    )
+
+    with pytest.raises(OSError, match="camera failed"):
+        run_manual_capture_session(
+            FakeConnection([]),
+            executor,
+            capture,
+            pipeline,
+            build_session_status(
+                config,
+                server_instance_id="test-server",
+                video_fps=10.0,
+            ),
+            video_fps=10.0,
+            jpeg_quality=80,
+            safety_mode=VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP,
+        )
+
+    assert capture.faulted
+    assert capture.stop_reason is CaptureStopReason.CAMERA_ERROR
+    assert car.sent == [b"b0,0"]

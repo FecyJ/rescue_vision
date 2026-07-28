@@ -450,6 +450,48 @@ def test_outbound_observation_queue_drops_old_and_keeps_latest() -> None:
         peer.close()
 
 
+def test_observation_queue_keeps_latest_value_for_each_topic() -> None:
+    sender_socket = BlockingFirstSendSocket()
+    peer = MemorySocket()
+    sender_socket.peer = peer
+    peer.peer = sender_socket
+    sender = RemoteMessageConnection(
+        sender_socket,
+        io_timeout_s=0.05,
+        control_queue_capacity=1,
+        observation_queue_capacity=2,
+        max_header_bytes=4096,
+        max_payload_bytes=1024,
+        allow_inbound_control=False,
+        allow_outbound_control=False,
+    )
+    sender.start()
+    try:
+        sender.send_observation(RemoteTopic.VIDEO_FRAME.value, b"sent")
+        assert sender_socket.send_entered.wait(timeout=1.0)
+        sender.send_observation(RemoteTopic.VIDEO_FRAME.value, b"stale-video")
+        sender.send_observation(RemoteTopic.VEHICLE_STATE.value, b"vehicle")
+        sender.send_observation(RemoteTopic.VIDEO_FRAME.value, b"latest-video")
+        assert sender.dropped_outbound_observations == 1
+
+        sender_socket.release_send.set()
+        wait_until(lambda: sender.sent_messages == 3)
+        decoder = RemoteMessageCodec(
+            max_header_bytes=4096,
+            max_payload_bytes=1024,
+        )
+        decoded = decoder.feed(bytes(peer.buffer))
+        assert [(item.topic, item.payload) for item in decoded] == [
+            (RemoteTopic.VIDEO_FRAME.value, b"sent"),
+            (RemoteTopic.VIDEO_FRAME.value, b"latest-video"),
+            (RemoteTopic.VEHICLE_STATE.value, b"vehicle"),
+        ]
+    finally:
+        sender_socket.release_send.set()
+        sender.stop()
+        peer.close()
+
+
 def test_outbound_reliable_observation_never_silently_drops() -> None:
     sender_socket = BlockingFirstSendSocket()
     peer = MemorySocket()

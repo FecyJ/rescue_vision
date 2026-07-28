@@ -27,13 +27,13 @@
 | `send_control()` | 提交可靠控制 | 仅 `debug_control` 客户端可用；队列满时失败 |
 | `receive_control()` | 接收控制 | 树莓派 `observe_only` 会在传输层拒绝控制 |
 | `send_reliable_observation()` | 提交会话/采集等关键状态 | 队列满时失败，不静默覆盖 |
-| `send_observation()` | 提交视频、地图、车辆最新值 | 队列满时丢旧保新 |
-| `receive_observation()` | 接收观察消息 | 仓库参考客户端的观察队列同样丢旧保新 |
+| `send_observation()` | 提交视频、地图、车辆最新值 | 按 topic 合并，队列满时丢旧保新 |
+| `receive_observation()` | 接收观察消息 | 仓库参考客户端也按 topic 保留最新值 |
 | `DebugMotionCommand` | 调试运动 JSON schema | 死手、有效期、车体速度和可选目标朝向 |
 | `DebugCaptureCommand` | 调试采集 JSON schema | 开始、停止、抓拍和事件标记 |
 | `RemoteSessionStatus` | 会话权限、能力、限值和周期 | TCP 建立后的首条业务消息 |
 | `VideoFrameAttributes` | JPEG 帧 header attributes | 严格尺寸、坐标系、时间和标定身份 |
-| `VehicleStateObservation` | 车辆观察 JSON schema | UART、轮速、朝向、安全状态和应用命令 ID |
+| `VehicleStateObservation` | 车辆观察 JSON schema v2 | UART、轮速、显式安全模式、朝向和应用命令 ID |
 | `CaptureStatusObservation` | 采集观察 JSON schema | 当前记录状态及最近请求结果 |
 
 ## 1. 从运行配置装配 UART
@@ -279,7 +279,8 @@ remote_connection.send_observation(
 ```
 
 这里的 `frame` 和 `encoded_jpeg` 由尚待实现的正式车端发布器提供。
-`send_observation()` 非阻塞提交；观察队列满时丢弃旧值，避免网络反压相机
+`send_observation()` 非阻塞提交；同 topic 新值覆盖旧值，容量不足时再丢弃
+最早等待的其他 topic，避免网络反压相机
 实时路径。地图和车辆最新状态使用相同入口。
 
 会话状态、采集状态等不可被覆盖的关键消息应使用
@@ -442,7 +443,8 @@ Python 包；其唯一跨项目依据是
   使通道进入故障，不会静默丢弃命令回复或遥测。
 - `send_control()` 和 `send_reliable_observation()` 共用可靠优先队列，满时
   抛出 `RemoteQueueOverflowError`。
-- `send_observation()` 的发送队列以及参考客户端的观察接收队列均丢旧保新。
+- `send_observation()` 的发送队列以及参考客户端的观察接收队列均按 topic
+  合并并丢旧保新；高频视频不会覆盖仍有槽位的最新车辆状态。
   独立客户端应按 topic 分开保存关键状态和大流量图像。
 - `observe_only` 在电脑侧禁止发送控制，在树莓派侧拒绝入站控制。
 - TCP 帧提供长度边界、严格 header 和线路序号，但不提供认证、加密或防篡改。
@@ -470,11 +472,13 @@ python manual_tests/remote_video.py \
 rescue-vision-manual-capture \
   --config configs/runtime.yaml \
   --output-root /data/rescue-targets/remote_test \
+  --supervised-physical-stop-ready \
   --accept-timeout-seconds 30
 ```
 
 `remote_video.py` 只是单链路人工检查。`rescue-vision-manual-capture` 是
-赛外单客户端手动驾驶与采集入口，提供运动控制但不自动重连，也不是比赛应用。
+赛外单客户端手动驾驶与采集入口；断线停车后可接受客户端新建的连接，但车端
+不主动重连或恢复使能，也不是比赛应用。
 
 ## 当前边界
 

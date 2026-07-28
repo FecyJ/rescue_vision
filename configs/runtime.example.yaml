@@ -49,7 +49,7 @@ remote:
   # 直接连接受控现场局域网，不使用密钥或认证握手。
   connect_timeout_ms: 2000.0
   io_timeout_ms: 100.0
-  # 控制消息不能静默丢弃；观察消息队列则丢旧保新。
+  # 控制消息不能静默丢弃；观察消息按 topic 合并并丢旧保新。
   control_queue_capacity: 32
   observation_queue_capacity: 2
   max_header_bytes: 4096

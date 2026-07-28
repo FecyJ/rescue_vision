@@ -13,6 +13,7 @@ remote server，并将 `remote.access_mode` 明确设为 `debug_control`：
 rescue-vision-manual-capture \
   --config configs/runtime.yaml \
   --output-root /data/rescue-targets/manual \
+  --supervised-physical-stop-ready \
   --video-fps 10
 ```
 
@@ -27,10 +28,12 @@ rescue-vision-manual-capture \
 
 ## 安全边界
 
-当前固件协议没有可验证的看门狗和急停锁存状态，因此车辆状态会如实发布
-`watchdog_armed=false`、`control_ready=false`。在固件闭环完成并真机验收
-前，只允许架空轮，或具备物理急停且人员全程监督的低速采集；不得把该入口
-用于比赛运行。重新连接不会复用旧 TCP 会话或旧死手使能，操作者必须重新
-发送显式使能命令。
+当前固件协议没有可验证的看门狗和急停锁存状态。命令因此默认拒绝启动；只有
+物理急停已就绪且操作员会全程监督时，才可显式传入
+`--supervised-physical-stop-ready`。此时车辆状态如实发布
+`safety_mode=supervised_physical_stop`、`watchdog_armed=false` 和
+`control_ready=true`，使合规客户端能在持续警告下发送低速命令，而不会把
+临时监督条件伪装成固件保护。在固件闭环和真机验收前不得用于比赛运行。
+重新连接不会复用旧 TCP 会话或旧死手使能，操作者必须重新发送显式使能命令。
 
 脚本运动模式不属于本入口，已后调到手动采集和固件安全闭环之后。

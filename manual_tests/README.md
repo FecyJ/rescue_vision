@@ -90,6 +90,7 @@ python manual_tests/remote_video.py \
 rescue-vision-manual-capture \
   --config configs/runtime.yaml \
   --output-root /data/rescue-targets/remote_test \
+  --supervised-physical-stop-ready \
   --accept-timeout-seconds 30
 ```
 
@@ -106,4 +107,5 @@ rescue-vision-manual-capture \
 `completed` / `rejected` / `failed`。相同 `request_id` 只重发原终态，不会
 重复创建文件。`--output-root` 是树莓派本地测试参数，不在线上传输；电脑端
 仍不得提交路径。入口退出时先停车，再关闭尚未结束的记录、相机和通信资源。
-它是单客户端赛外入口，不是正式比赛应用，也不自动重连或恢复死手使能。
+它是同时只服务一个客户端的赛外入口，不是正式比赛应用。断线会先停车并关闭
+当前记录，随后可接受一个新连接；车端不会主动重连，也不会恢复旧死手使能。

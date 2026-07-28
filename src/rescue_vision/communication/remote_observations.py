@@ -43,6 +43,12 @@ class VehicleMotionState(str, Enum):
     UNKNOWN = "unknown"
 
 
+class VehicleSafetyMode(str, Enum):
+    FIRMWARE_WATCHDOG = "firmware_watchdog"
+    SUPERVISED_PHYSICAL_STOP = "supervised_physical_stop"
+    UNAVAILABLE = "unavailable"
+
+
 class VehicleStopReason(str, Enum):
     NONE = "none"
     DEADMAN_RELEASE = "deadman_release"
@@ -622,11 +628,12 @@ class MapSnapshotAttributes:
 class VehicleStateObservation:
     """车端 UART、运动、安全和朝向状态快照。"""
 
-    SCHEMA_VERSION: ClassVar[int] = 1
+    SCHEMA_VERSION: ClassVar[int] = 2
 
     state_sequence: int
     timestamp_ns: int
     control_ready: bool
+    safety_mode: VehicleSafetyMode
     uart_connected: bool
     watchdog_armed: bool
     emergency_stop_latched: bool
@@ -652,6 +659,8 @@ class VehicleStateObservation:
             "emergency_stop_latched",
         ):
             _boolean(getattr(self, name), name)
+        if not isinstance(self.safety_mode, VehicleSafetyMode):
+            raise ValueError("safety_mode must be VehicleSafetyMode.")
         if not isinstance(self.motion_state, VehicleMotionState):
             raise ValueError("motion_state must be VehicleMotionState.")
         if not isinstance(self.stop_reason, VehicleStopReason):
@@ -698,14 +707,28 @@ class VehicleStateObservation:
                 name,
                 _optional_identifier(getattr(self, name), name),
             )
+        if (
+            self.safety_mode is VehicleSafetyMode.FIRMWARE_WATCHDOG
+            and not self.watchdog_armed
+        ):
+            raise ValueError(
+                "firmware_watchdog safety mode requires watchdog_armed=true."
+            )
+        if (
+            self.safety_mode is not VehicleSafetyMode.FIRMWARE_WATCHDOG
+            and self.watchdog_armed
+        ):
+            raise ValueError(
+                "watchdog_armed=true requires firmware_watchdog safety mode."
+            )
         if self.control_ready and (
             not self.uart_connected
-            or not self.watchdog_armed
+            or self.safety_mode is VehicleSafetyMode.UNAVAILABLE
             or self.emergency_stop_latched
         ):
             raise ValueError(
-                "control_ready requires UART, armed watchdog and no latched "
-                "emergency stop."
+                "control_ready requires UART, an available safety mode and no "
+                "latched emergency stop."
             )
         if self.motion_state is VehicleMotionState.EMERGENCY_STOPPED and (
             not self.emergency_stop_latched
@@ -727,6 +750,7 @@ class VehicleStateObservation:
                 "state_sequence": self.state_sequence,
                 "timestamp_ns": self.timestamp_ns,
                 "control_ready": self.control_ready,
+                "safety_mode": self.safety_mode.value,
                 "uart_connected": self.uart_connected,
                 "watchdog_armed": self.watchdog_armed,
                 "emergency_stop_latched": self.emergency_stop_latched,
@@ -760,6 +784,7 @@ class VehicleStateObservation:
             "state_sequence",
             "timestamp_ns",
             "control_ready",
+            "safety_mode",
             "uart_connected",
             "watchdog_armed",
             "emergency_stop_latched",
@@ -786,6 +811,11 @@ class VehicleStateObservation:
             state_sequence=document["state_sequence"],
             timestamp_ns=document["timestamp_ns"],
             control_ready=document["control_ready"],
+            safety_mode=_enum_value(
+                VehicleSafetyMode,
+                document["safety_mode"],
+                "safety_mode",
+            ),
             uart_connected=document["uart_connected"],
             watchdog_armed=document["watchdog_armed"],
             emergency_stop_latched=document["emergency_stop_latched"],

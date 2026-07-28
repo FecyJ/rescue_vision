@@ -31,12 +31,15 @@ from rescue_vision.communication import (
     ImageCoordinateSystem,
     ReceivedRemoteMessage,
     RemoteAccessMode,
+    RemoteDisconnectedError,
     RemoteMessageConnection,
     RemoteRole,
     RemoteSessionStatus,
     RemoteStream,
+    RemoteTcpServer,
     RemoteTopic,
     VehicleMotionState,
+    VehicleSafetyMode,
     VehicleStateObservation,
     VehicleStopReason,
     VideoFrameAttributes,
@@ -394,11 +397,16 @@ class CaptureSession:
 class VehicleState:
     """把运动执行结果和最新轮速遥测汇总为协议观察。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, safety_mode: VehicleSafetyMode) -> None:
+        if safety_mode is VehicleSafetyMode.UNAVAILABLE:
+            raise ValueError(
+                "Manual driving requires an available vehicle safety mode."
+            )
+        self.safety_mode = safety_mode
         self.sequence = 0
         self.telemetry: CarTelemetry | None = None
         self.motion_state = VehicleMotionState.STOPPED
-        self.stop_reason = VehicleStopReason.APPLICATION_SHUTDOWN
+        self.stop_reason = VehicleStopReason.DEADMAN_RELEASE
         self.last_received_command_id: str | None = None
         self.last_applied_command_id: str | None = None
 
@@ -428,10 +436,12 @@ class VehicleState:
         observation = VehicleStateObservation(
             state_sequence=self.sequence,
             timestamp_ns=time.monotonic_ns(),
-            # 当前固件协议没有可验证的看门狗/急停状态，因此不得宣称 ready。
-            control_ready=False,
+            control_ready=True,
+            safety_mode=self.safety_mode,
             uart_connected=True,
-            watchdog_armed=False,
+            watchdog_armed=(
+                self.safety_mode is VehicleSafetyMode.FIRMWARE_WATCHDOG
+            ),
             emergency_stop_latched=False,
             motion_state=self.motion_state,
             stop_reason=self.stop_reason,
@@ -473,6 +483,7 @@ class ManualCaptureRuntime:
         video_fps: float,
         jpeg_quality: int,
         stop_requested: Callable[[], bool],
+        safety_mode: VehicleSafetyMode,
     ) -> None:
         self.connection = connection
         self.executor = executor
@@ -482,7 +493,7 @@ class ManualCaptureRuntime:
         self.video_period_ns = int(1_000_000_000 / video_fps)
         self.jpeg_quality = jpeg_quality
         self.stop_requested = stop_requested
-        self.vehicle = VehicleState()
+        self.vehicle = VehicleState(safety_mode=safety_mode)
         self.latest_frame: CameraFrame | None = None
         self.last_camera_frame_ns = time.monotonic_ns()
         self.next_video_ns = 0
@@ -675,6 +686,7 @@ def run_manual_capture_session(
     video_fps: float,
     jpeg_quality: int,
     stop_requested: Callable[[], bool] = lambda: False,
+    safety_mode: VehicleSafetyMode = VehicleSafetyMode.UNAVAILABLE,
 ) -> None:
     runtime = ManualCaptureRuntime(
         connection=connection,
@@ -685,6 +697,7 @@ def run_manual_capture_session(
         video_fps=video_fps,
         jpeg_quality=jpeg_quality,
         stop_requested=stop_requested,
+        safety_mode=safety_mode,
     )
     try:
         runtime.run()
@@ -731,13 +744,42 @@ def _artifact_id(prefix: str) -> str:
     return f"{prefix}-{timestamp}-{uuid.uuid4().hex[:8]}"
 
 
-def _validate_mode(config: AppConfig, *, video_fps: float) -> None:
+def _accept_with_shutdown(
+    server: RemoteTcpServer,
+    *,
+    timeout_s: float,
+    stop_requested: Callable[[], bool],
+) -> RemoteMessageConnection | None:
+    deadline = time.monotonic() + timeout_s
+    while not stop_requested():
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
+            raise TimeoutError("Timed out waiting for remote TCP client.")
+        try:
+            return server.accept(timeout=min(0.5, remaining_s))
+        except TimeoutError:
+            continue
+    return None
+
+
+def _validate_mode(
+    config: AppConfig,
+    *,
+    video_fps: float,
+    supervised_physical_stop_ready: bool,
+) -> None:
     if not config.remote.enabled or config.remote.role is not RemoteRole.SERVER:
         raise RuntimeError("Manual capture requires remote server mode.")
     if config.remote.access_mode is not RemoteAccessMode.DEBUG_CONTROL:
         raise RuntimeError("Manual capture requires remote debug_control mode.")
     if not config.uart.enabled or not config.motion.enabled:
         raise RuntimeError("Manual capture requires enabled UART and motion.")
+    if not supervised_physical_stop_ready:
+        raise RuntimeError(
+            "Current firmware watchdog state is unavailable; pass "
+            "--supervised-physical-stop-ready only after a physical emergency "
+            "stop is ready and an operator will supervise the full session."
+        )
     if video_fps > config.camera.fps:
         raise RuntimeError("--video-fps must not exceed camera.fps.")
 
@@ -751,6 +793,14 @@ def main() -> None:
     parser.add_argument("--accept-timeout-seconds", type=float, default=30.0)
     parser.add_argument("--video-fps", type=float, default=10.0)
     parser.add_argument("--jpeg-quality", type=int, default=80)
+    parser.add_argument(
+        "--supervised-physical-stop-ready",
+        action="store_true",
+        help=(
+            "Acknowledge that a physical emergency stop and continuous human "
+            "supervision are ready while the firmware watchdog is unavailable."
+        ),
+    )
     args = parser.parse_args()
     if args.accept_timeout_seconds <= 0:
         parser.error("--accept-timeout-seconds must be positive")
@@ -762,7 +812,11 @@ def main() -> None:
     config_path = args.config.expanduser().resolve()
     output_root = args.output_root.expanduser().resolve()
     config = load_runtime_config(config_path)
-    _validate_mode(config, video_fps=args.video_fps)
+    _validate_mode(
+        config,
+        video_fps=args.video_fps,
+        supervised_physical_stop_ready=args.supervised_physical_stop_ready,
+    )
     output_root.mkdir(parents=True, exist_ok=True)
     config_snapshot = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
@@ -774,17 +828,7 @@ def main() -> None:
     assert channel is not None
     assert executor is not None
     pipeline = build_camera_pipeline(config)
-    capture = CaptureSession(
-        output_root=output_root,
-        config=config,
-        config_snapshot=config_snapshot,
-        pipeline=pipeline,
-    )
-    status = build_session_status(
-        config,
-        server_instance_id=f"manual-capture-{uuid.uuid4()}",
-        video_fps=args.video_fps,
-    )
+    server_instance_id = f"manual-capture-{uuid.uuid4()}"
     shutdown_requested = threading.Event()
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     signal.signal(
@@ -796,33 +840,55 @@ def main() -> None:
         with server, channel:
             pipeline.source.start()
             try:
-                connection = server.accept(timeout=args.accept_timeout_seconds)
-                with connection:
+                while not shutdown_requested.is_set():
+                    connection = _accept_with_shutdown(
+                        server,
+                        timeout_s=args.accept_timeout_seconds,
+                        stop_requested=shutdown_requested.is_set,
+                    )
+                    if connection is None:
+                        break
+                    capture = CaptureSession(
+                        output_root=output_root,
+                        config=config,
+                        config_snapshot=config_snapshot,
+                        pipeline=pipeline,
+                    )
+                    status = build_session_status(
+                        config,
+                        server_instance_id=server_instance_id,
+                        video_fps=args.video_fps,
+                    )
                     try:
-                        run_manual_capture_session(
-                            connection,
-                            executor,
-                            capture,
-                            pipeline,
-                            status,
-                            video_fps=args.video_fps,
-                            jpeg_quality=args.jpeg_quality,
-                            stop_requested=shutdown_requested.is_set,
-                        )
+                        with connection:
+                            run_manual_capture_session(
+                                connection,
+                                executor,
+                                capture,
+                                pipeline,
+                                status,
+                                video_fps=args.video_fps,
+                                jpeg_quality=args.jpeg_quality,
+                                stop_requested=shutdown_requested.is_set,
+                                safety_mode=(
+                                    VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP
+                                ),
+                            )
+                    except RemoteDisconnectedError:
+                        # 新连接会创建全新的状态和命令期限，不继承死手使能。
+                        continue
                     except KeyboardInterrupt:
-                        pass
+                        break
                     except BaseException:
-                        capture.fail(CaptureStopReason.UNKNOWN)
+                        if not capture.faulted:
+                            capture.fail(CaptureStopReason.UNKNOWN)
                         raise
             finally:
                 # run_remote_motion 已先停车；这里重复停车覆盖连接前/装配期异常。
                 try:
                     executor.stop()
                 finally:
-                    try:
-                        capture.close()
-                    finally:
-                        pipeline.source.stop()
+                    pipeline.source.stop()
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
 
