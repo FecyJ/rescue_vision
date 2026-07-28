@@ -14,21 +14,15 @@
 
 ## 完整工作流速览
 
-```bash
-# 1. 采集棋盘图
-python -m rescue_vision.calibration.capture_chessboard_images \
-  --lens-position 1.0 --target 50
+1. 固定相机、分辨率、裁剪和焦点后采集棋盘图；
+2. 用这批图片比较三种模型并选择内参；
+3. 固定最终安装位姿并准备地面对应点；
+4. 使用前一步内参求解地面映射；
+5. 验收产物后再写入 `configs/runtime.yaml`。
 
-# 2. 比较三种模型并选择内参
-python -m rescue_vision.calibration.calibrate_intrinsics \
-  --square-size-mm 15.0 --folds 5
-
-# 3. 相机最终固定并准备地面点后，求解地面映射
-python -m rescue_vision.calibration.calibrate_extrinsics_ground \
-  --intrinsics src/rescue_vision/calibration/output/内参目录/selected_calibration.json
-```
-
-前两步只依赖相机和棋盘；第三步必须等相机安装姿态固定，并准备 `ground_image.png` 与 `ground_points.json`。不要把不同焦点、分辨率或安装条件的产物混用。
+每一步的实际命令在下文独立代码段给出，并承接上一步产物。前两步只依赖相机
+和棋盘；地面映射必须等相机安装姿态固定，并准备 `ground_image.png` 与
+`ground_points.json`。不要把不同焦点、分辨率或安装条件的产物混用。
 
 ## 固定条件
 
@@ -186,7 +180,7 @@ output/ground_mapping_YYYYMMDD_HHMMSS_ffffff/
 
 如果这些元数据无法对应，宁可重新标定，也不要混用两次标定产物。
 
-## 接入 `configs/runtime.yaml`
+## 6. 接入 `configs/runtime.yaml`
 
 内参验收后先启用去畸变；地面映射完成并通过保留点验证后再单独启用：
 

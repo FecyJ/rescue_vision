@@ -2,7 +2,7 @@
 
 本包集中实现智能救援初赛规则、安全优先级和任务阶段。详细状态、规则矩阵和回放要求见[规则状态机设计](../../../docs/规则状态机设计.md)；本页说明调用接口。
 
-## 公共入口
+## 常用类和函数
 
 | 入口 | 作用 |
 | --- | --- |
@@ -17,24 +17,32 @@
 | `MissionDecision` | 复合状态、抽象动作、目标 ID 和终止原因 |
 | `MissionProgress` | 已验证交付和错区/对方区/出场计数 |
 
-## 生产对接形态
+## 1. 从运行配置装配并开始一轮
 
-状态机不读取相机或串口。应用层应把接触监测、电控健康和区域验证结果转换为显式输入：
+状态机不读取相机或串口。先从运行配置创建一轮独立状态机，并用应用的单调
+启动时间开始：
 
 ```python
+from time import monotonic_ns
+
 from rescue_vision.config import load_runtime_config
-from rescue_vision.mission import (
-    DeliveryEvidence,
-    SafetySignals,
-    TransportStatus,
-)
 
 config = load_runtime_config("configs/runtime.yaml")
 mission = config.mission.build_state_machine()
-mission.start(start_timestamp_ns)
+mission.start(monotonic_ns())
+```
 
-# 以下值由后续接触/机构、电控健康和区域验证适配器提供；
-# 所有时间必须与 WorldSnapshot 使用同一 monotonic 时钟。
+后续片段继续复用该 `mission`；所有输入时间必须来自同一树莓派单调时钟，
+一轮中不能重复 `start()`。
+
+## 2. 构造转运和安全证据
+
+以下领域值由接触机构、电控健康和区域验证适配器提供，时间必须与
+`WorldSnapshot` 使用同一单调时钟：
+
+```python
+from rescue_vision.mission import SafetySignals, TransportStatus
+
 transport = TransportStatus(
     engaged_track_ids=engaged_track_ids,
     contact_started_ns=contact_started_ns,
@@ -49,7 +57,14 @@ safety = SafetySignals(
     target_carried_on_robot=target_carried_on_robot,
     external_stop_requested=external_stop_requested,
 )
+```
 
+## 3. 推进一步并消费抽象动作
+
+`snapshot` 来自当前世界模型；`delivery_evidence_or_none` 只在出现新的交付
+边界事件时非空：
+
+```python
 # 没有新交付边界事件时传 None；不要每帧伪造 delivery_id。
 decision = mission.step(
     snapshot,
@@ -67,7 +82,7 @@ publish_abstract_action(
 
 机械和电控尚未完成，因此上述适配器变量目前只能由合成回放或未来真实提供者给出；状态机本身及其契约已经可独立运行。
 
-## 交付证据
+## 4. 构造交付证据
 
 ```python
 from rescue_vision.mission import DeliveryDestination, DeliveryEvidence
@@ -86,7 +101,7 @@ evidence = DeliveryEvidence(
 `track_ids` 必须来自 `WorldSnapshot`。当前仍在接触时，交付集合必须与
 `TransportStatus.engaged_track_ids` 一致；不一致会进入安全保持。
 
-## 离线事件回放
+## 5. 离线事件回放
 
 ```python
 from rescue_vision.mission import MissionReplayStep, replay_mission
@@ -109,7 +124,13 @@ decisions = replay_mission(
 回放不访问相机、模型、底盘或系统时间；同一配置和事件序列必须产生相同决策序列。事件持久化 schema 尚未冻结，当前调用方保存构成
 `MissionReplayStep` 的领域字段即可，不应使用 `pickle` 作为长期格式。
 
-## 状态、动作和恢复
+## 6. 状态、动作和恢复
+
+一轮已经终止后，开始下一轮前显式复位：
+
+```python
+mission.reset()
+```
 
 任务阶段 `MissionPhase` 保存首个普通物资约束；`ActivityState` 保存搜索、接近、推动、验证、避让或停止。动作只有：
 

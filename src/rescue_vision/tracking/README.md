@@ -2,7 +2,7 @@
 
 本包把同一单调时间轴上的 `TargetObservation` 关联为带稳定 `track_id` 的 `TrackedTarget`。它负责短时遮挡、置信衰减和过期删除，不创建相机、不运行模型，也不解释交付规则。
 
-## 公共入口
+## 常用类和函数
 
 | 入口 | 输入 | 输出与生命周期 |
 | --- | --- | --- |
@@ -12,14 +12,24 @@
 | `TrackedTarget` | 只读跟踪状态 | 供世界模型消费，不应由下游修改 |
 | `TrackStatus` | `TENTATIVE`、`CONFIRMED`、`COASTING` | 区分未确认、稳定和短时遮挡 |
 
-## 实时对接
+## 1. 从运行配置装配
 
 ```python
 from rescue_vision.config import load_runtime_config
 
 config = load_runtime_config("configs/runtime.yaml")
 tracker = config.tracking.build_tracker()
+```
 
+`tracker` 应在一轮开始时创建一次。后续片段继续复用它，不在逐帧循环中重新
+构造。
+
+## 2. 用一帧观测更新跟踪
+
+`raw_frame` 和 `detection_result` 来自同一次
+`TargetPoseDetector.detect_realtime()` 调用：
+
+```python
 # detection_result 来自 TargetPoseDetector.detect_realtime()。
 # 即使本帧没有目标，也必须用本帧 capture timestamp 更新一次，
 # 这样遮挡计时和置信衰减才沿真实采集时间推进。
@@ -27,13 +37,25 @@ tracks = tracker.update(
     raw_frame.timestamp_ns,
     detection_result.observations,
 )
+```
 
+## 3. 消费当前轨迹
+
+以下片段承接前文 `tracks`：
+
+```python
 for track in tracks:
     if track.status.value != "confirmed":
         # tentative/coasting 仍进入世界模型保留不确定性，
         # 但不能直接成为高收益动作目标。
         continue
     print(track.track_id, track.target_class, track.ground_point)
+```
+
+新一轮开始前显式清空上一轮状态：
+
+```python
+tracker.reset()
 ```
 
 一批非空观测必须来自同一帧，且每个

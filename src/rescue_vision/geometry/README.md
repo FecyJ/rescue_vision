@@ -26,7 +26,7 @@
 | `BevPixel(u, v)` | 图像上方为机器人前方，左侧为机器人左方 |
 | `FieldPoint(x, y)` | 场地全局点；仅在全局坐标定义明确的模块中使用 |
 
-## 从运行配置装配
+## 1. 从运行配置装配
 
 实际运行优先通过 `configs/runtime.yaml` 构建对象，而不是在业务代码中写标定路径：
 
@@ -42,19 +42,17 @@ camera_model = geometry.camera_model
 ground_projector = geometry.ground_projector
 ```
 
-配置装配会检查运行分辨率、标定可用性、相机模型以及地面映射中的内参指纹。只有内参时 `ground_projector` 合法地为 `None`。
+配置装配会检查运行分辨率、标定可用性、相机模型以及地面映射中的内参指纹。
+只有内参时 `ground_projector` 合法地为 `None`。下文继续复用这里创建的
+`config`、`geometry`、`camera_model` 和 `ground_projector`。
 
-## 一帧图像的典型处理
+## 2. 去畸变一帧图像
+
+以下片段承接前文配置，但 `raw_frame` 由相机 `FrameSource.read()` 产生。
+示例单独展示相机生命周期，离开 `with source` 后帧数据仍可读取：
 
 ```python
 from rescue_vision.camera.picamera2_source import Picamera2Source
-from rescue_vision.config import load_runtime_config
-
-config = load_runtime_config("configs/runtime.yaml")
-geometry = config.build_geometry()
-if geometry is None:
-    raise RuntimeError("需要有效内参")
-
 with Picamera2Source(
     image_size=config.camera.image_size,
     fps=config.camera.fps,
@@ -74,24 +72,23 @@ if geometry.ground_projector is not None:
 
 不要把去畸变图重新包装成“新的采集帧”并生成新时间戳。下游观测必须继续携带原 `CameraFrame.sequence` 和 `timestamp_ns`。
 
-## 投影 K0 或其他少量地面点
+## 3. 投影 K0 或其他少量地面点
+
+以下片段使用前文的 `ground_projector`，并承接感知模块产生的
+`observation`。它的 `K0` 已位于全尺寸 `UndistortedPixel`：
 
 ```python
-from rescue_vision.geometry.types import UndistortedPixel
-
-projector = geometry.ground_projector
-if projector is None:
+if ground_projector is None:
     raise RuntimeError("runtime.yaml 尚未启用地面映射")
 
-# K0 已由 Pose 后端反映射到全尺寸去畸变图坐标。
-k0 = UndistortedPixel(u=1175.0, v=1012.0)
-ground = projector.pixel_to_ground(k0)
-print(f"前方 {ground.x:.0f} mm，左侧 {ground.y:.0f} mm")
+if observation.k0 is not None:
+    ground = ground_projector.pixel_to_ground(observation.k0)
+    print(f"前方 {ground.x:.0f} mm，左侧 {ground.y:.0f} mm")
 ```
 
 一帧有多个点时使用 `pixels_to_ground()` 批量转换；空序列会返回空列表。少量目标接触点不要先生成 BEV 再查坐标。
 
-## 去畸变边缘填充
+## 4. 检查去畸变边缘填充
 
 `CameraModel.undistort_image()` 保持标定分辨率不变，把无法从原图采样的边缘统一填充为 BGR `(114, 114, 114)`，与 YOLO Letterbox 一致。无效位置仍由 `valid_mask == 0` 表示：
 
@@ -108,7 +105,7 @@ valid_ratio = (
 
 填充值在编码前精确为 `114`。JPEG 解码后边界附近可能因有损压缩略有波动；session 中的 `undistort_fill_value: 114` 描述编码前预处理契约。
 
-## 直接加载产物的适用场景
+## 5. 直接加载产物的适用场景
 
 标定工具、资产检查器等尚未加载运行配置的底层程序可以直接使用：
 

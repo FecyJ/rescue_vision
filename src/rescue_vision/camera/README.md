@@ -19,7 +19,7 @@
 | `undistort_camera_frame()` | 保留帧身份并附加去畸变元数据 | 供自定义录制主循环复用 |
 | `rescue-vision-record` | 配置驱动的正式录制入口 | 自动去畸变并写完整 session |
 
-## 按运行配置创建真机源
+## 1. 从运行配置装配真机源
 
 ```python
 from rescue_vision.camera.picamera2_source import Picamera2Source
@@ -39,14 +39,28 @@ source = source_class(
     fps=config.camera.fps,
     lens_position=config.camera.lens_position,
 )
+```
 
+创建 `source` 时尚未打开相机。后续算法只依赖 `FrameSource`，不需要知道
+当前选择的是 Picamera2 还是 `rpicam-vid`。
+
+## 2. 打开相机并读取最新帧
+
+以下片段承接前文的 `source`。上下文管理器负责异常路径关闭相机：
+
+```python
 with source:
     frame = source.read(timeout=1.0)
     print(frame.sequence, frame.timestamp_ns, frame.image_bgr.shape)
     print(frame.metadata.get("sensor_timestamp_ns"))
 ```
 
-两个真机源都会在后台持续排空输入，只向调用方交付最新完整帧。处理速度不足时可能跳过旧序号，但不会积累越来越陈旧的帧。用 `CameraFrame.age_ns()` 或 `is_stale()` 判断观测是否过期：
+两个真机源都会在后台持续排空输入，只向调用方交付最新完整帧。处理速度不足
+时可能跳过旧序号，但不会积累越来越陈旧的帧。
+
+## 3. 判断帧是否过期
+
+以下片段使用前文读取的 `frame` 和同一份 `config`：
 
 ```python
 import time
@@ -60,7 +74,7 @@ if frame.is_stale(
     print(f"stale frame: {age_ms:.1f} ms")
 ```
 
-## 回放正式记录
+## 4. 回放正式记录
 
 ```python
 from rescue_vision.camera.replay import RecordingSource
@@ -79,7 +93,7 @@ with RecordingSource("recordings/session_001") as source:
 
 `RecordingSource` 会拒绝不支持的 session schema、图片哈希错误、尺寸错误和坐标元数据矛盾。`ImageDirectorySource`、`VideoFileSource` 更适合外部素材导入，不具备记录目录的完整 provenance。
 
-## 正式录制命令
+## 5. 正式录制命令
 
 日常采集应使用命令，而不是自行拼装 `FrameRecorder`：
 
@@ -107,9 +121,11 @@ rescue-vision-record \
 
 `--display` 展示实际交给记录器的画面，预览缩放不改变保存分辨率；按 `Q/Esc` 正常结束并收尾 session。显示可能降低吞吐，性能门禁应另做一次不带 `--display` 的短录。
 
-## 在程序中使用旁路记录器
+## 6. 在程序中使用旁路记录器
 
-只有应用主循环需要同步保留其他状态时才直接使用 `FrameRecorder`。构造参数必须与实际提交图像一致：
+只有应用主循环需要同步保留其他状态时才直接使用 `FrameRecorder`。
+
+### 6.1 加载记录所需配置和内参
 
 ```python
 from pathlib import Path
@@ -117,10 +133,6 @@ from pathlib import Path
 import cv2
 import yaml
 
-from rescue_vision.camera.picamera2_source import Picamera2Source
-from rescue_vision.camera.record_cli import undistort_camera_frame
-from rescue_vision.camera.recording import FrameRecorder
-from rescue_vision.camera.rpicam_source import RpicamSource
 from rescue_vision.config import load_runtime_config
 from rescue_vision.geometry.camera_model import IMAGE_BORDER_FILL_VALUE
 from rescue_vision.versioning import git_version
@@ -130,6 +142,15 @@ config = load_runtime_config(config_path)
 camera_model = config.build_camera_model()
 if camera_model is None:
     raise RuntimeError("任务目标记录需要启用内参")
+```
+
+### 6.2 创建帧源
+
+以下片段承接前文 `config`，只创建对象，尚未打开相机：
+
+```python
+from rescue_vision.camera.picamera2_source import Picamera2Source
+from rescue_vision.camera.rpicam_source import RpicamSource
 
 source_class = (
     Picamera2Source
@@ -141,6 +162,15 @@ source = source_class(
     fps=config.camera.fps,
     lens_position=config.camera.lens_position,
 )
+```
+
+### 6.3 创建记录器
+
+构造参数必须与实际提交图像一致。以下片段继续使用前文的 `config_path`、
+`config` 和 `camera_model`：
+
+```python
+from rescue_vision.camera.recording import FrameRecorder
 
 recorder = FrameRecorder(
     "recordings/session_001",
@@ -169,6 +199,15 @@ recorder = FrameRecorder(
     ),
     undistort_fill_value=IMAGE_BORDER_FILL_VALUE,
 )
+```
+
+### 6.4 去畸变并提交一帧
+
+上下文管理器按异常安全顺序打开和关闭相机、写盘线程。提交帧继续保留原始
+采集序号和时间：
+
+```python
+from rescue_vision.camera.record_cli import undistort_camera_frame
 
 with source, recorder:
     raw_frame = source.read(timeout=1.0)

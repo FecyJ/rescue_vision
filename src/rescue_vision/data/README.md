@@ -26,12 +26,11 @@
 
 原图 session 只用于标定或诊断，不能进入任务目标 manifest。
 
-## 推荐的命令工作流
+## 1. 检查一次正式记录
 
-先使用 `configs/runtime.yaml` 录制，再依次检查、生成清单和划分：
+先使用 `configs/runtime.yaml` 录制，再完整回放并检查一次会话：
 
 ```bash
-# 1. 完整回放并验收一次会话；--display 只用于目视检查。
 rescue-vision-check-recording \
   recordings/session_001 \
   --report reports/session_001.json \
@@ -40,16 +39,26 @@ rescue-vision-check-recording \
   --minimum-fps-ratio 0.80 \
   --require-picamera2-metadata \
   --display
+```
 
-# 2. 把明确列出的合格会话组成一个版本化数据集。
+## 2. 从合格记录生成清单
+
+只有上一步通过的会话才能进入版本化 manifest：
+
+```bash
 rescue-vision-manifest \
   --dataset-root /data/rescue-targets \
   --dataset-version rescue-targets-2026-07-23-v1 \
   --output /data/rescue-targets/manifests/rescue-targets-2026-07-23-v1.jsonl \
   /data/rescue-targets/recordings/session_001 \
   /data/rescue-targets/recordings/session_002
+```
 
-# 3. 同一 recording_id 整组进入同一个集合。
+## 3. 按会话划分数据集
+
+下文输入是前一步生成的 manifest；同一 `recording_id` 整组进入同一集合：
+
+```bash
 rescue-vision-split \
   /data/rescue-targets/manifests/rescue-targets-2026-07-23-v1.jsonl \
   --output /data/rescue-targets/manifests/rescue-targets-2026-07-23-v1.split.jsonl \
@@ -66,18 +75,16 @@ rescue-vision-split \
 1 结束；必须增加独立会话或调整版本后重新划分，不能把空测试集当作可发布结果。
 纯哈希分配在会话少于约 20 个时方差很大，四类各一个会话不构成可靠划分。
 
-## 在程序中组合数据流程
+## 4. 在程序中检查记录
 
 ```python
 from pathlib import Path
 
-from rescue_vision.data.build_manifest import build_dataset_records
 from rescue_vision.data.check_recording import (
     PICAMERA2_METADATA,
     check_requirements,
     inspect_recording,
 )
-from rescue_vision.data.split_manifest import split_records
 
 recording = Path("/data/rescue-targets/recordings/session_001")
 
@@ -93,6 +100,15 @@ failures = check_requirements(
 )
 if failures:
     raise RuntimeError(f"recording rejected: {failures}")
+```
+
+## 5. 在程序中生成和划分记录
+
+以下片段只在前文 `failures` 为空后执行，并继续使用同一个 `recording`：
+
+```python
+from rescue_vision.data.build_manifest import build_dataset_records
+from rescue_vision.data.split_manifest import split_records
 
 records = build_dataset_records(
     [recording],
@@ -107,7 +123,7 @@ split_records_with_name, split_report = split_records(
 
 领域函数返回 Python 对象，不自行写文件；CLI 负责 JSON/JSONL 的读写。这使数据发布脚本可以组合规则，同时让核心校验保持可测试。
 
-## 必需分层标签
+## 6. 必需分层标签
 
 ```text
 lighting, distance, occlusion, motion_blur,

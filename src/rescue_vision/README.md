@@ -2,17 +2,14 @@
 
 本目录包含可导入的运行代码。公共对象从所属子包导入，不在顶层 `rescue_vision` 重导出；调用处应能直接看出相机、几何、感知或数据依赖来自哪个领域。
 
-## 期望的运行装配
+## 1. 加载运行配置和共享资产
 
-仓库尚未实现最终应用入口，下面是后续主循环应采用的装配方式。配置只在启动时加载一次，具体相机、内参、地面映射、模型和阈值都来自本机的 `configs/runtime.yaml`：
+仓库尚未实现最终应用入口，下面是后续主循环应采用的分段装配方式。配置只在
+启动时加载一次，具体相机、标定、模型和阈值都来自本机
+`configs/runtime.yaml`：
 
 ```python
-from time import monotonic_ns
-
-from rescue_vision.camera.picamera2_source import Picamera2Source
-from rescue_vision.camera.rpicam_source import RpicamSource
 from rescue_vision.config import load_runtime_config
-from rescue_vision.perception import TargetPoseDetector
 
 config = load_runtime_config("configs/runtime.yaml")
 geometry = config.build_geometry()
@@ -22,6 +19,15 @@ if geometry is None:
     raise RuntimeError("任务感知必须在 runtime.yaml 中启用内参")
 if backend is None:
     raise RuntimeError("任务感知必须在 runtime.yaml 中启用 Hailo")
+```
+
+## 2. 创建配置选择的相机源
+
+以下片段承接前文 `config`，只创建对象，尚未打开相机：
+
+```python
+from rescue_vision.camera.picamera2_source import Picamera2Source
+from rescue_vision.camera.rpicam_source import RpicamSource
 
 # 领域算法依赖统一帧源；只有这里根据配置选择硬件实现。
 source_class = (
@@ -34,6 +40,14 @@ source = source_class(
     fps=config.camera.fps,
     lens_position=config.camera.lens_position,
 )
+```
+
+## 3. 创建感知和纯逻辑对象
+
+以下片段继续使用前文的 `config`、`geometry` 和 `backend`：
+
+```python
+from rescue_vision.perception import TargetPoseDetector
 
 detector = TargetPoseDetector(
     backend,
@@ -47,7 +61,22 @@ detector = TargetPoseDetector(
 tracker = config.tracking.build_tracker()
 world_model = config.world.build_model()
 mission = config.mission.build_state_machine()
+```
+
+`start_timestamp_ns` 应来自应用统一单调时钟。开始一轮时单独调用：
+
+```python
+from time import monotonic_ns
+
 mission.start(monotonic_ns())
+```
+
+## 4. 运行一帧感知到世界模型的主链路
+
+以下片段复用前文全部对象。相机与 Hailo 后端由上下文管理器释放：
+
+```python
+from time import monotonic_ns
 
 with source, detector:
     while True:

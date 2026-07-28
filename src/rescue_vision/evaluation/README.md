@@ -14,7 +14,7 @@
 
 `observations_to_evaluation_records()` 位于 `perception/evaluation_adapter.py`，因为它理解观测与框；指标计算位于本包。
 
-## 推荐命令
+## 1. 使用命令生成报告
 
 评测流水线应先生成版本化的逐对象 `evaluation.jsonl`，然后执行：
 
@@ -28,16 +28,13 @@ rescue-vision-evaluate \
 
 未传 `--code-version` 时自动记录当前 Git 提交和 dirty 状态。发布报告前应确保工作区状态、模型 HEF 哈希和数据集版本都能追溯。
 
-## 在评测流水线中调用
+## 2. 加载配置和正式评测记录
 
 ```python
 import json
 from pathlib import Path
 
 from rescue_vision.config import load_runtime_config
-from rescue_vision.evaluation import evaluate_records
-from rescue_vision.versioning import git_version
-
 config = load_runtime_config("configs/runtime.yaml")
 if config.hailo.model_version is None:
     raise RuntimeError("runtime.yaml 未声明待评测模型版本")
@@ -48,6 +45,15 @@ records = [
     for line in records_path.read_text(encoding="utf-8").splitlines()
     if line.strip()
 ]
+```
+
+## 3. 计算评测报告
+
+以下片段承接前文的 `config` 和 `records`：
+
+```python
+from rescue_vision.evaluation import evaluate_records
+from rescue_vision.versioning import git_version
 
 report = evaluate_records(
     records,
@@ -55,7 +61,13 @@ report = evaluate_records(
     dataset_version="rescue-targets-2026-07-23-v1",
     code_version=git_version(),
 )
+```
 
+## 4. 写出报告
+
+领域函数只返回 Python 对象；流水线负责把前文 `report` 写成版本化 JSON：
+
+```python
 Path("reports/evaluation-report.json").write_text(
     json.dumps(
         report,
@@ -70,7 +82,7 @@ Path("reports/evaluation-report.json").write_text(
 
 这里读取的是实际评测 JSONL，而不是为调用函数临时构造几条理想记录。数据版本应与生成这些记录时使用的 manifest 一致。
 
-## 从观测生成逐对象记录
+## 5. 从观测生成逐对象记录
 
 以下片段位于已经加载当前 `frame`、`sample_id/sample_tags`、人工 `annotations` 和模型 `observations` 的评测循环中：
 

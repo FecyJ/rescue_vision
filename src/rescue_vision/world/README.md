@@ -2,7 +2,7 @@
 
 本包把 `TrackedTarget`、静态场地区域、可选场地坐标和对手占据整理成不可变 `WorldSnapshot`。它是跟踪与规则状态机之间的唯一世界语义层，不运行检测、不维护比赛得分。
 
-## 公共入口
+## 常用类和函数
 
 | 入口 | 作用 |
 | --- | --- |
@@ -17,7 +17,7 @@
 | `HazardState` | `CLEAR`、`SUSPECTED`、`CONFIRMED` |
 | `WorldUncertainty` | 视觉过期、缺坐标、未确认或对手信息过期等原因 |
 
-## 实时对接
+## 1. 从运行配置装配
 
 ```python
 from time import monotonic_ns
@@ -26,7 +26,15 @@ from rescue_vision.config import load_runtime_config
 
 config = load_runtime_config("configs/runtime.yaml")
 world_model = config.world.build_model()
+```
 
+`world_model` 在进程或一轮生命周期内复用。后续片段继续使用它。
+
+## 2. 用当前证据更新世界快照
+
+`tracks` 来自同帧 tracker 更新。当前没有对手感知提供者，因此显式传空序列：
+
+```python
 # tracks 来自同一帧 tracker.update()。
 # 当前没有定位时，robot_field_point 和 target_field_points 保持缺省；
 # 世界模型会明确标记缺失，而不是伪造 FieldPoint。
@@ -34,9 +42,18 @@ snapshot = world_model.update(
     timestamp_ns=monotonic_ns(),
     visual_timestamp_ns=raw_frame.timestamp_ns,
     tracks=tracks,
-    opponent_occupancies=latest_opponent_occupancies,
+    opponent_occupancies=(),
 )
+```
 
+未来对手感知完成后，只把 `opponent_occupancies=()` 替换为同一时刻的
+`tuple[OpponentOccupancy, ...]`，不改变世界模型接口。
+
+## 3. 消费世界目标
+
+以下片段承接前文 `snapshot`：
+
+```python
 for target in snapshot.targets:
     print(
         target.track_id,
@@ -48,7 +65,7 @@ for target in snapshot.targets:
 
 `timestamp_ns` 是本次世界更新时刻，`visual_timestamp_ns` 是最近有效视觉帧时刻。两者必须来自同一单调时钟。没有检测目标的有效新帧仍应更新 `visual_timestamp_ns`，否则会被误判为视觉中断。
 
-## 静态区域
+## 4. 静态区域
 
 区域从 `runtime.yaml` 加载，顶点使用 `FieldPoint` 的 `[x_mm, y_mm]`：
 
@@ -68,7 +85,7 @@ world:
 允许的 `kind` 为 `field`、`own_material`、`own_injured` 和
 `opponent_safe`。多边形至少三个点、面积非零，边界点视为进入区域。示例坐标仅说明格式，必须在 P3 根据现场红蓝方变换和实测场地替换，不能直接作为比赛地图。
 
-## 危险与不确定性
+## 5. 危险与不确定性
 
 世界模型集中融合跟踪状态和完整类别概率：
 
@@ -88,7 +105,7 @@ world:
 未知 `track_id` 会抛出 `KeyError`。状态机只排除已经明确位于安全区或对手占据
 内的候选，不把缺失定位伪装成区域结论。
 
-## 对手占据生命周期
+## 6. 对手占据生命周期
 
 同一 `opponent_id` 的新占据会替换旧值；没有新观测时保留到
 `opponent_max_age_ms`，随后删除并标记 `STALE_OPPONENT`。占据多边形属于场地坐标，不能把检测框或 `GroundPoint` 直接传入。

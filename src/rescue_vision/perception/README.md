@@ -22,13 +22,10 @@
 
 `FakeInferenceBackend` 只用于无硬件自动测试和上层算法注入，不是部署示例。
 
-## 按运行配置创建检测器
+## 1. 从运行配置加载几何和模型
 
 ```python
-from rescue_vision.camera.picamera2_source import Picamera2Source
-from rescue_vision.camera.rpicam_source import RpicamSource
 from rescue_vision.config import load_runtime_config
-from rescue_vision.perception import TargetPoseDetector
 
 config = load_runtime_config("configs/runtime.yaml")
 geometry = config.build_geometry()
@@ -38,6 +35,16 @@ if geometry is None:
     raise RuntimeError("任务感知需要启用内参")
 if backend is None:
     raise RuntimeError("任务感知需要启用 Hailo")
+```
+
+`geometry` 和 `backend` 都绑定当前运行配置。下文继续复用它们，不在逐帧
+循环中重新加载标定或打开 Hailo。
+
+## 2. 按相机配置创建帧源
+
+```python
+from rescue_vision.camera.picamera2_source import Picamera2Source
+from rescue_vision.camera.rpicam_source import RpicamSource
 
 source_class = (
     Picamera2Source
@@ -49,6 +56,17 @@ source = source_class(
     fps=config.camera.fps,
     lens_position=config.camera.lens_position,
 )
+```
+
+这里只创建 `source`，尚未打开相机。
+
+## 3. 创建检测器
+
+以下片段承接前文的 `config`、`geometry` 和 `backend`。检测器从构造成功
+开始接管 backend 生命周期：
+
+```python
+from rescue_vision.perception import TargetPoseDetector
 
 detector = TargetPoseDetector(
     backend,
@@ -59,7 +77,14 @@ detector = TargetPoseDetector(
     max_observation_age_ms=config.processing.max_observation_age_ms,
     ground_projector=geometry.ground_projector,
 )
+```
 
+## 4. 读取一帧并执行实时检测
+
+以下片段复用前文的 `source`、`detector` 和 `geometry`；两个上下文负责
+关闭相机和 Hailo 后端：
+
+```python
 with source, detector:
     raw_frame = source.read(timeout=1.0)
     undistorted_bgr = geometry.camera_model.undistort_image(
@@ -81,7 +106,7 @@ with source, detector:
 
 若 `ground_mapping_enabled: false`，检测仍正常运行，但所有 `ground_point` 为 `None`。后续定位模块不能把 `None` 当作 `(0, 0)`。
 
-## 读取统一观测
+## 5. 读取统一观测
 
 ```python
 from rescue_vision.perception import ObservationQuality, TargetClass
@@ -122,7 +147,7 @@ for observation in observations:
 | `quality` | 不应被静默丢弃的降级原因 |
 | `model_version` / `model_sha256` | 结果对应的模型身份 |
 
-## 类别与 K0
+## 6. 类别与 K0
 
 | `TargetClass` | 任务语义 |
 | --- | --- |
@@ -134,7 +159,7 @@ for observation in observations:
 
 公共契约只包含 `K0 bottom_contact_anchor`。后端可以读取旧三关键点部署包，但只消费 K0；新部署包使用 `kpt_shape: [1, 3]`。完整标注和导出约定见 [`docs/Pose视觉模型约定.md`](../../../docs/Pose视觉模型约定.md)。
 
-## Hailo 部署包和配置
+## 7. Hailo 部署包和配置
 
 部署包包含：
 
@@ -193,7 +218,7 @@ python manual_tests/camera_undistort_perception.py
 
 窗口中的绿色框为目标框、红点为 K0，启用地面映射后标签会附加机器人地面 `(x, y) mm`。
 
-## 转换为评测输入
+## 8. 转换为评测输入
 
 人工标注与观测准备好后，通过适配器完成类别无关 IoU 一对一匹配。以下片段位于已取得当前 `raw_frame`、`annotations` 和 `observations` 的评测循环中：
 

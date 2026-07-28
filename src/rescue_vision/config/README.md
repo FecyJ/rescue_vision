@@ -43,16 +43,40 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `HailoConfig` | 模型资产、身份、类别映射和阈值 |
 | `RuntimeGeometry` | `camera_model`、可选 `ground_projector` |
 
-## 启动时的典型用法
+## 1. 加载运行配置
 
 ```python
 from rescue_vision.config import load_runtime_config
 
 config = load_runtime_config("configs/runtime.yaml")
+```
 
-# 设备名和通信参数只来自运行配置；build_channel() 尚不打开设备。
+`config` 是不可变 `AppConfig`。进程启动时读取一次，后续各装配片段复用它；
+不要在逐帧循环中反复解析 YAML。
+
+## 2. 装配通信对象
+
+以下片段承接前文 `config`，用于树莓派服务端进程（`remote.role: server`）。
+创建对象不等于打开设备或监听端口：
+
+```python
+# 尚未打开 UART。
 uart_channel = config.uart.build_channel()
 
+# 尚未绑定 TCP 监听端口。
+remote_server = config.remote.build_server()
+
+# motion 复用同一个 UART 通道；禁用时返回 None。
+motion_controller = config.motion.build_controller(uart_channel)
+motion_executor = config.motion.build_remote_executor(motion_controller)
+```
+
+UART/TCP 生命周期和 motion 的停止语义分别见相邻模块 README，不要把
+`build_*()` 的成功返回误认为硬件已经连通。
+
+## 3. 装配几何对象
+
+```python
 # build_geometry() 会同时检查运行分辨率、标定可用性、
 # 相机模型和地面映射中的内参指纹。
 geometry = config.build_geometry()
@@ -61,14 +85,27 @@ if geometry is None:
 
 camera_model = geometry.camera_model
 ground_projector = geometry.ground_projector  # 尚无地面映射时为 None
+```
 
+## 4. 装配 Hailo 后端
+
+只有真正需要推理时才创建 Hailo 设备。以下片段仍承接同一个 `config`：
+
+```python
 # 只有真正需要推理时才创建 Hailo 设备。
 backend = config.hailo.build_backend()
 if backend is None:
     raise RuntimeError("当前功能需要在 runtime.yaml 中启用 Hailo")
 
 class_mapping = config.hailo.model_class_mapping()
+```
 
+`backend` 必须由调用方关闭；正常生产路径通常立即交给
+`TargetPoseDetector`，再由检测器上下文统一释放。
+
+## 5. 装配纯逻辑对象
+
+```python
 # 纯逻辑对象同样只装配一次；每轮结束后显式 reset，
 # 或为下一轮创建新对象，不能在逐帧循环中反复构造。
 tracker = config.tracking.build_tracker()
@@ -76,9 +113,10 @@ world_model = config.world.build_model()
 mission = config.mission.build_state_machine()
 ```
 
-配置对象和已构建对象应在进程生命周期内复用，不能在逐帧循环中重新读取 YAML、重新生成去畸变映射或重复创建 Hailo 设备。
+配置对象和已构建对象应在进程生命周期内复用，不能在逐帧循环中重新读取
+YAML、重新生成去畸变映射或重复创建 Hailo 设备。
 
-## 几何开关组合
+## 6. 几何开关组合
 
 ```yaml
 geometry:
@@ -97,7 +135,7 @@ geometry:
 
 正式四类目标采集和感知必须启用内参。地面映射尚未完成时保持关闭，不应伪造路径或绕过指纹校验。
 
-## Hailo 装配
+## 7. Hailo 装配语义
 
 `hailo.enabled: false` 时，导入配置和运行无硬件测试不会导入 HailoRT。启用后，`build_backend()` 才会：
 
@@ -113,7 +151,7 @@ geometry:
 `semantic_threshold` 决定是否保留模型类别，低于它时保守降级为
 `unknown`。`k0_threshold` 独立控制地面接触点是否可用。
 
-## UART 装配
+## 8. UART 装配语义
 
 ```yaml
 uart:
@@ -131,7 +169,7 @@ PySerial 并打开设备。电机命令、轮速和未来 IMU 报文由后续协
 不能把类别前缀或字段数塞进运行配置。完整生命周期和故障语义见
 [`communication` README](../communication/README.md)。
 
-## 远程通信装配
+## 9. 远程通信装配语义
 
 `remote.role: server` 用于树莓派监听，`client` 只用于本仓库参考客户端和
 双机人工检查。独立电脑端维护自己的配置和协议实现，不读取本仓库 YAML 或

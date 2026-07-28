@@ -1,7 +1,7 @@
 # `motion`：小车运动控制与远程调试执行
 
 本包把车体速度意图转换为 Rescue Car v2.0 双轮速度命令，并执行电脑端传来的
-`control/debug/motion`。它依赖调用方提供的 UART 行通道和远程连接，不创建
+`control/debug/motion`。它依赖调用方注入 UART 行通道和远程连接，不创建
 串口、TCP 服务、定位器或规划器。
 
 电控协议依据本次提供的
@@ -9,21 +9,26 @@
 行结束，`m<L>,<R>` 设置轮速、`b0,0` 柔和停车、`e` 急停，STM32 回传
 `OK`、`ERR` 和 10 Hz `t...` 遥测。
 
-## 公共入口
+## 常用类和函数
 
 | 入口 | 输入 | 输出或语义 |
 | --- | --- | --- |
-| `MotionLimits` | 轮距、车体/车轮速度上限、远程有效期上限 | 所有值在入口严格校验 |
-| `MotionController.drive()` | 前进速度 m/s、逆时针角速度 rad/s | 按双轮差速换算并发送左右轮目标 |
-| `forward()` / `backward()` | 非负速度 m/s | 直行便捷函数 |
-| `turn_left()` / `turn_right()` | 非负角速度 rad/s | 原地转向便捷函数 |
-| `soft_brake()` / `emergency_stop()` | 无 | 分别发送固件柔和制动和急停 |
+| `MotionLimits` | 轮距、车体/车轮速度上限、远程有效期上限 | 创建时严格校验 |
+| `MotionController` | UART 行通道、`MotionLimits` | Rescue Car 运动控制器 |
+| `MotionController.drive()` | 前进速度 m/s、逆时针角速度 rad/s | 差速换算后发送左右轮目标 |
+| `set_wheel_speeds()` | 左右轮速度 m/s | 绕过车体 twist 换算，仍执行轮速限幅校验 |
+| `forward()` / `backward()` | 非负速度 m/s | 直行前进/后退 |
+| `turn_left()` / `turn_right()` | 非负角速度 rad/s | 原地左转/右转 |
+| `soft_brake()` / `emergency_stop()` | 无 | 固件斜坡制动/紧急停止 |
+| `query_state()` | 无 | 请求固件立即返回状态 |
 | `receive_message()` | 可选等待秒数 | `CarTelemetry`、`CarCommandReply` 或 `UnknownCarMessage` |
-| `RemoteMotionExecutor.execute()` | `ReceivedRemoteMessage` | 验证 topic、JSON、死手、有效期和限速后执行 |
-| `run_remote_motion()` | 远程接收器、执行器、退出回调 | 持续收命令、检查超时、排空 UART 回传；退出时停车 |
+| `drain_messages()` | 无 | 非阻塞排空当前 UART 回传 |
+| `RemoteMotionExecutor.execute()` | `ReceivedRemoteMessage` | 校验远程运动消息后执行 |
+| `RemoteMotionExecutor.check_timeout()` | 可选本机单调时间 ns | 到期时停车，返回是否触发 |
+| `run_remote_motion()` | 远程接收器、执行器、退出回调 | 持续收命令、排空回传并在退出时停车 |
 
 机器人坐标系沿用项目约定：`x` 向前、`y` 向左、`z` 向上。左右轮速度正值
-均表示前进；车体角速度逆时针为正。因此差速换算为：
+均表示前进；车体角速度逆时针为正：
 
 ```text
 left  = linear - angular × wheel_track / 2
@@ -33,54 +38,223 @@ right = linear + angular × wheel_track / 2
 超限命令会被拒绝，不会静默截断。`target_heading` 在定位或 IMU 尚未提供其
 显式参考系前也会被拒绝并停车。
 
-## 按运行配置装配
+## 1. 从运行配置装配
 
-先在 `configs/runtime.yaml` 填入实测轮距和调试限速，再显式启用 UART 与
-motion。配置对象只装配资源，不会提前打开串口：
+先在 `configs/runtime.yaml` 填入实测轮距和调试限速，并启用 `uart` 与
+`motion`。所有路径、设备名、机械参数和上限只从这份配置取得：
 
 ```python
 from rescue_vision.config import load_runtime_config
-from rescue_vision.motion import run_remote_motion
 
 config = load_runtime_config("configs/runtime.yaml")
+
+# build_channel() 和 build_controller() 只创建对象，尚未打开串口。
 channel = config.uart.build_channel()
 controller = config.motion.build_controller(channel)
+
+if channel is None or controller is None:
+    raise RuntimeError("必须在 runtime.yaml 中启用 uart 和 motion")
+```
+
+下文的本地运动片段都建立在以上 `channel` 和 `controller` 上。实际应用必须
+用上下文管理器打开 UART；离开上下文前应进入停车路径：
+
+```python
+with channel:
+    try:
+        # 在这里执行下文的 drive、转向、回传处理等片段。
+        ...
+    finally:
+        controller.soft_brake()
+```
+
+`with channel` 负责打开和关闭串口，但关闭串口本身不是停车命令，所以
+`soft_brake()` 必须在 UART 仍然可写时调用。
+
+## 2. 使用 `drive()` 控制车体速度
+
+`drive()` 适合上层规划器、手柄或调试逻辑输出车体 twist。以下片段应放进
+前文 `with channel` 的 `try` 内：
+
+```python
+# 以 0.20 m/s 前进，同时以 0.60 rad/s 向左转弯。
+controller.drive(
+    linear_velocity_m_s=0.20,
+    angular_velocity_rad_s=0.60,
+)
+
+# 右转使用负角速度。
+controller.drive(
+    linear_velocity_m_s=0.15,
+    angular_velocity_rad_s=-0.40,
+)
+```
+
+轮距只参与 twist 到左右轮速的换算。线速度、角速度或换算后的任一轮速度
+超过 `MotionLimits` 时，调用会抛出 `ValueError`，不会把请求悄悄截断。
+
+## 3. 直接设置左右轮速度
+
+已经拥有左右轮目标的底层算法可以直接调用 `set_wheel_speeds()`：
+
+```python
+# 左轮 0.10 m/s、右轮 0.25 m/s，小车向左走弧线。
+controller.set_wheel_speeds(
+    left_m_s=0.10,
+    right_m_s=0.25,
+)
+```
+
+该方法不使用 `wheel_track_m` 做换算，但仍检查
+`max_wheel_velocity_m_s`。上层一般应优先使用 `drive()`，避免多个模块各自
+实现差速公式。
+
+## 4. 前进、后退和原地转向
+
+便捷方法的参数都要求非负；方向由方法名决定：
+
+```python
+controller.forward(speed_m_s=0.15)
+controller.backward(speed_m_s=0.10)
+
+controller.turn_left(angular_velocity_rad_s=0.80)
+controller.turn_right(angular_velocity_rad_s=0.80)
+```
+
+这些调用只发送新的目标，不等待动作完成，也不自行休眠。动作时长和控制周期
+由应用主循环决定。
+
+## 5. 柔和停车和紧急停止
+
+正常结束动作、远程死手关闭或命令超时时使用柔和停车：
+
+```python
+controller.soft_brake()
+```
+
+检测到必须立即制动的整车安全事件时发送固件急停：
+
+```python
+controller.emergency_stop()
+```
+
+`soft_brake()` 发送 `b0,0`，由固件按配置减速度降到零；`emergency_stop()`
+发送 `e`。当前固件的急停是否锁存、如何恢复仍需真机冻结，应用不得假设发送
+下一条速度命令就能安全解除急停。
+
+## 6. 查询并处理电控回传
+
+发送状态查询后，命令回复和主动 10 Hz 遥测可能交错，因此不能假定下一行
+一定是查询回复：
+
+```python
+from rescue_vision.motion import (
+    CarCommandReply,
+    CarTelemetry,
+    UnknownCarMessage,
+)
+
+controller.query_state()
+message = controller.receive_message(timeout=0.5)
+
+if isinstance(message, CarTelemetry):
+    print(
+        message.received_timestamp_ns,
+        message.controller_timestamp_ms,
+        message.actual_left_m_s,
+        message.actual_right_m_s,
+    )
+elif isinstance(message, CarCommandReply):
+    print("OK" if message.succeeded else "ERR", message.detail)
+elif isinstance(message, UnknownCarMessage):
+    # 未来 IMU 等新前缀在显式支持前会保留为原始 bytes。
+    print("unknown car message:", message.payload)
+```
+
+实时循环应持续消费回传。只发送而不接收会使 UART 有界队列最终溢出：
+
+```python
+for message in controller.drain_messages():
+    # 调用方可在这里分发轮速遥测、日志或未来 IMU 消息。
+    print(message)
+```
+
+## 7. 装配远程调试执行器
+
+远程执行复用同一个 `controller` 和同一组限速，不创建第二套运动规则：
+
+```python
 executor = config.motion.build_remote_executor(controller)
+if executor is None:
+    raise RuntimeError("必须在 runtime.yaml 中启用 motion")
+```
 
-if channel is None or controller is None or executor is None:
-    raise RuntimeError("UART 和 motion 必须在调试配置中启用")
+应用已经取得一个通过 `RemoteMessageConnection.receive_control()` 接收的消息
+时，可以执行单条远程运动指令。UART 必须保持打开；示例结束前显式停车：
 
-stop_requested = False
+```python
+with channel:
+    try:
+        received = remote_connection.receive_control(timeout=0.1)
+        outcome = executor.execute(received)
+        print(
+            outcome.command_id,
+            outcome.result.value,
+            outcome.deadline_timestamp_ns,
+        )
+    finally:
+        executor.stop()
+```
 
-def should_stop() -> bool:
-    return stop_requested
+`execute()` 只接受 `control/debug/motion`、`application/json`、空 attributes
+和 `TWIST`。非法、超限或不支持的命令会先尝试柔和停车，再抛出
+`RemoteMotionError`。
 
-def run_debug_motion_session(remote_connection) -> None:
-    # remote_connection 由应用层传入：它已启动，且应用已经按电脑端协议发布
-    # 首条 session/status，并真实提供其中声明的 video/vehicle observation。
-    # 本模块不重复实现这些发布器。调用方拥有并关闭 remote_connection。
+## 8. 持续执行一个远程调试会话
+
+应用层应使用 `run_remote_motion()` 持续收命令、检查有效期并排空 UART
+回传。以下函数建立在前文的 `channel`、`controller` 和 `executor` 上：
+
+```python
+from collections.abc import Callable
+
+from rescue_vision.communication import RemoteMessageConnection
+from rescue_vision.motion import ParsedCarMessage, run_remote_motion
+
+
+def run_debug_motion_session(
+    remote_connection: RemoteMessageConnection,
+    stop_requested: Callable[[], bool],
+) -> None:
+    def publish_or_record(message: ParsedCarMessage) -> None:
+        # 这里接入车辆状态发布器或运动日志；不要阻塞 UART 排空。
+        print(message)
+
     with channel:
         run_remote_motion(
             remote_connection,
             executor,
-            stop_requested=should_stop,
-            # 回调可将 CarTelemetry 转成车辆状态观察或运动日志。
-            on_car_message=lambda message: print(message),
+            stop_requested=stop_requested,
+            on_car_message=publish_or_record,
         )
 ```
+
+这里的 `remote_connection` 必须已经启动，而且应用已经按电脑端协议发送首条
+`observation/session/status`，并真实提供该状态声明的 video/vehicle
+observation。`motion` 不重复实现这些发布器。完整 TCP 生命周期和消息发送
+方式见 [`communication` README](../communication/README.md)。
 
 该循环只应在 `remote.access_mode: debug_control` 的赛外受监督配置中运行。
 比赛配置必须保持 `observe_only`；传输层会拒绝入站控制。
 
-## 生命周期与降级
+## 时间、故障与降级
 
 - `valid_for_ms` 从树莓派完成接收该消息的单调时间开始计算，不比较两台机器
   互不共享零点的 `issued_timestamp_ns`。
 - 死手关闭、命令过期、非法 payload、未知控制模式和循环正常退出均进入柔和
   停车；协议或通信异常也会尝试停车并继续抛出原始异常。
-- `drain_messages()` / `run_remote_motion()` 会排空 10 Hz 回传，避免 UART
-  有界队列因调用方只发送不接收而溢出。未知前缀保持为 `UnknownCarMessage`，
-  不会被误判为命令成功。
+- `drain_messages()` / `run_remote_motion()` 会排空 10 Hz 回传。未知前缀保留
+  为 `UnknownCarMessage`，不会被误判为命令成功。
 - 当前固件资料没有失联看门狗。进程被强杀、树莓派掉电或 UART 物理断开时，
   Python 无法保证停车；只能在架空轮或有物理急停、人员全程监督的环境验证，
   不能把本模块的超时当作固件级失控保护。
