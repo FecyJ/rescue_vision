@@ -295,7 +295,9 @@ remote_connection.send_reliable_observation(
 ```
 
 这里的 `capture_status` 由采集领域适配器提供。可靠队列满时会抛出
-`RemoteQueueOverflowError`，调用方必须进入显式故障处理。
+`RemoteQueueOverflowError`，调用方必须进入显式故障处理。可靠队列和
+最新值队列共享发送唤醒，并优先取可靠消息，保证先提交的首条会话状态不会
+被紧随其后的车辆状态或视频抢先发送。
 
 ## 9. 在树莓派接收和解析调试控制
 

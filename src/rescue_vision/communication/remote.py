@@ -471,6 +471,7 @@ class RemoteMessageConnection:
         self._outbound_observation = _LatestByTopicQueue(
             capacity=self.observation_queue_capacity
         )
+        self._outbound_ready = threading.Event()
         self._inbound_control = queue.Queue[ReceivedRemoteMessage](
             maxsize=self.control_queue_capacity
         )
@@ -562,6 +563,7 @@ class RemoteMessageConnection:
             raise RemoteQueueOverflowError(
                 "Outbound remote control queue is full; command was not sent."
             ) from exc
+        self._outbound_ready.set()
 
     def send_observation(
         self,
@@ -585,6 +587,7 @@ class RemoteMessageConnection:
         self.dropped_outbound_observations += (
             self._outbound_observation.put_latest(message.topic, message)
         )
+        self._outbound_ready.set()
 
     def send_reliable_observation(
         self,
@@ -612,6 +615,7 @@ class RemoteMessageConnection:
                 "Outbound reliable remote queue is full; observation was "
                 "not sent."
             ) from exc
+        self._outbound_ready.set()
 
     def receive_control(
         self,
@@ -632,6 +636,7 @@ class RemoteMessageConnection:
         if not self._started:
             return
         self._stop_event.set()
+        self._outbound_ready.set()
         cleanup_errors: list[tuple[str, BaseException]] = []
         try:
             self._socket.shutdown(socket.SHUT_RDWR)
@@ -736,17 +741,32 @@ class RemoteMessageConnection:
 
     def _writer_loop(self) -> None:
         sequence = 0
+        pending_observation: _OutboundRemoteMessage | None = None
         try:
             while not self._stop_event.is_set():
+                self._outbound_ready.clear()
                 try:
                     message = self._outbound_reliable.get_nowait()
                 except queue.Empty:
+                    if pending_observation is not None:
+                        queued = pending_observation
+                        pending_observation = None
+                    else:
+                        try:
+                            item = self._outbound_observation.get_nowait()
+                            assert isinstance(item, _OutboundRemoteMessage)
+                            queued = item
+                        except queue.Empty:
+                            self._outbound_ready.wait(timeout=0.05)
+                            continue
+                    # 观察出队期间可能刚好提交了可靠消息；发送前再检查一次，
+                    # 避免首条车辆状态越过先提交的会话状态。
                     try:
-                        queued = self._outbound_observation.get(timeout=0.05)
-                        assert isinstance(queued, _OutboundRemoteMessage)
-                        message = queued
+                        message = self._outbound_reliable.get_nowait()
                     except queue.Empty:
-                        continue
+                        message = queued
+                    else:
+                        pending_observation = queued
                 frame = self._encoder.encode(
                     stream=message.stream,
                     topic=message.topic,

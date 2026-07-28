@@ -528,3 +528,43 @@ def test_outbound_reliable_observation_never_silently_drops() -> None:
         wait_until(lambda: sender.sent_messages == 2)
         sender.stop()
         peer.close()
+
+
+def test_reliable_session_status_precedes_initial_latest_observations() -> None:
+    sender_socket, peer = memory_socket_pair()
+    sender = RemoteMessageConnection(
+        sender_socket,
+        io_timeout_s=0.05,
+        control_queue_capacity=2,
+        observation_queue_capacity=2,
+        max_header_bytes=4096,
+        max_payload_bytes=1024,
+        allow_inbound_control=False,
+        allow_outbound_control=False,
+    )
+    sender.start()
+    try:
+        # 覆盖发送线程已经进入空队列等待时的首消息竞态。
+        time.sleep(0.06)
+        sender.send_reliable_observation(
+            RemoteTopic.SESSION_STATUS.value,
+            b"session",
+        )
+        sender.send_observation(
+            RemoteTopic.VEHICLE_STATE.value,
+            b"vehicle",
+        )
+
+        wait_until(lambda: sender.sent_messages == 2)
+        decoder = RemoteMessageCodec(
+            max_header_bytes=4096,
+            max_payload_bytes=1024,
+        )
+        decoded = decoder.feed(bytes(peer.buffer))
+        assert [(message.sequence, message.topic) for message in decoded] == [
+            (0, RemoteTopic.SESSION_STATUS.value),
+            (1, RemoteTopic.VEHICLE_STATE.value),
+        ]
+    finally:
+        sender.stop()
+        peer.close()
