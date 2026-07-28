@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from enum import Enum
 from typing import Protocol
 
 from rescue_vision.communication import ReceivedUartLine
@@ -113,6 +114,60 @@ class CarTelemetry:
                 raise ValueError(f"{name} must be in [0, 180], got {angle!r}.")
 
 
+class CarStopReason(str, Enum):
+    """STM32 安全状态报告的当前停车/运行原因。"""
+
+    STARTUP = "startup"
+    RUNNING = "running"
+    SOFT_BRAKE = "soft_brake"
+    WATCHDOG_TIMEOUT = "watchdog_timeout"
+    EMERGENCY_STOP = "emergency_stop"
+
+
+@dataclass(frozen=True, slots=True)
+class CarSafetyStatus:
+    """版本化 ``s1`` 安全状态；所有时间均来自 STM32 单调时钟。"""
+
+    uart_sequence: int
+    received_timestamp_ns: int
+    controller_timestamp_ms: int
+    watchdog_timeout_ms: int
+    watchdog_armed: bool
+    emergency_stop_latched: bool
+    last_motion_command_age_ms: int | None
+    stop_reason: CarStopReason
+
+    def __post_init__(self) -> None:
+        for name in (
+            "uart_sequence",
+            "received_timestamp_ns",
+            "controller_timestamp_ms",
+        ):
+            _non_negative_int(getattr(self, name), name)
+        if (
+            isinstance(self.watchdog_timeout_ms, bool)
+            or not isinstance(self.watchdog_timeout_ms, int)
+            or self.watchdog_timeout_ms <= 0
+        ):
+            raise ValueError(
+                "watchdog_timeout_ms must be a positive integer, "
+                f"got {self.watchdog_timeout_ms!r}."
+            )
+        for name in ("watchdog_armed", "emergency_stop_latched"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be a boolean.")
+        if self.last_motion_command_age_ms is not None:
+            _non_negative_int(
+                self.last_motion_command_age_ms,
+                "last_motion_command_age_ms",
+            )
+        if not isinstance(self.stop_reason, CarStopReason):
+            raise ValueError(
+                "stop_reason must be a CarStopReason, "
+                f"got {self.stop_reason!r}."
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class CarCommandReply:
     """STM32 对一条命令的成功或错误回复。"""
@@ -146,7 +201,9 @@ class UnknownCarMessage:
             raise ValueError("payload must be non-empty bytes.")
 
 
-ParsedCarMessage = CarTelemetry | CarCommandReply | UnknownCarMessage
+ParsedCarMessage = (
+    CarTelemetry | CarSafetyStatus | CarCommandReply | UnknownCarMessage
+)
 
 
 def parse_car_line(line: ReceivedUartLine) -> ParsedCarMessage:
@@ -175,6 +232,8 @@ def parse_car_line(line: ReceivedUartLine) -> ParsedCarMessage:
             False,
             text[3:].lstrip(": "),
         )
+    if text.startswith("s1,"):
+        return _parse_safety_status(line, text)
     if not text.startswith("t"):
         return UnknownCarMessage(
             line.sequence,
@@ -216,4 +275,62 @@ def parse_car_line(line: ReceivedUartLine) -> ParsedCarMessage:
         target_right_m_s=values[3],
         servo_left_deg=values[4],
         servo_right_deg=values[5],
+    )
+
+
+def _parse_safety_status(
+    line: ReceivedUartLine,
+    text: str,
+) -> CarSafetyStatus:
+    fields = text.split(",")
+    if len(fields) != 7:
+        raise ValueError(
+            "Car safety status s1 must contain six values, "
+            f"got {len(fields) - 1} in {text!r}."
+        )
+    integer_names = (
+        "controller_timestamp_ms",
+        "watchdog_timeout_ms",
+        "watchdog_armed",
+        "emergency_stop_latched",
+        "last_motion_command_age_ms",
+    )
+    parsed: list[int] = []
+    for name, value in zip(integer_names, fields[1:6], strict=True):
+        try:
+            parsed.append(int(value))
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid {name} in car safety status {text!r}."
+            ) from exc
+    controller_timestamp_ms, watchdog_timeout_ms, armed, latched, age = parsed
+    if controller_timestamp_ms < 0:
+        raise ValueError("controller_timestamp_ms must be non-negative.")
+    if watchdog_timeout_ms <= 0:
+        raise ValueError("watchdog_timeout_ms must be positive.")
+    if armed not in (0, 1):
+        raise ValueError("watchdog_armed must be encoded as 0 or 1.")
+    if latched not in (0, 1):
+        raise ValueError(
+            "emergency_stop_latched must be encoded as 0 or 1."
+        )
+    if age < -1:
+        raise ValueError(
+            "last_motion_command_age_ms must be -1 or non-negative."
+        )
+    try:
+        stop_reason = CarStopReason(fields[6])
+    except ValueError as exc:
+        raise ValueError(
+            f"Unsupported stop_reason in car safety status {text!r}."
+        ) from exc
+    return CarSafetyStatus(
+        uart_sequence=line.sequence,
+        received_timestamp_ns=line.received_timestamp_ns,
+        controller_timestamp_ms=controller_timestamp_ms,
+        watchdog_timeout_ms=watchdog_timeout_ms,
+        watchdog_armed=bool(armed),
+        emergency_stop_latched=bool(latched),
+        last_motion_command_age_ms=None if age == -1 else age,
+        stop_reason=stop_reason,
     )

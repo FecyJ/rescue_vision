@@ -471,9 +471,11 @@ class VehicleState:
     """把运动执行结果和最新轮速遥测汇总为协议观察。"""
 
     def __init__(self, *, safety_mode: VehicleSafetyMode) -> None:
-        if safety_mode is VehicleSafetyMode.UNAVAILABLE:
+        if safety_mode is not VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP:
             raise ValueError(
-                "Manual driving requires an available vehicle safety mode."
+                "Manual capture currently requires "
+                "supervised_physical_stop; firmware_watchdog needs fresh "
+                "CarSafetyStatus gating before it can be selected."
             )
         self.safety_mode = safety_mode
         self.sequence = 0

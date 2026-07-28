@@ -3,6 +3,8 @@
 from rescue_vision.motion.controller import MotionController, MotionLimits
 from rescue_vision.motion.protocol import (
     CarCommandReply,
+    CarSafetyStatus,
+    CarStopReason,
     CarTelemetry,
     ParsedCarMessage,
     UnknownCarMessage,
@@ -17,6 +19,7 @@ from rescue_vision.motion.remote_control import (
 )
 from rescue_vision.motion.recording import (
     MANUAL_MOTION_LOG_FILENAME,
+    MANUAL_MOTION_LOG_SCHEMA_VERSION,
     MANUAL_MOTION_STREAM_NAME,
     ManualMotionLogWriter,
     inspect_manual_motion_log,
@@ -24,11 +27,14 @@ from rescue_vision.motion.recording import (
 
 __all__ = [
     "CarCommandReply",
+    "CarSafetyStatus",
+    "CarStopReason",
     "CarTelemetry",
     "ExecutedRemoteMotion",
     "MotionController",
     "MotionLimits",
     "MANUAL_MOTION_LOG_FILENAME",
+    "MANUAL_MOTION_LOG_SCHEMA_VERSION",
     "MANUAL_MOTION_STREAM_NAME",
     "ManualMotionLogWriter",
     "ParsedCarMessage",

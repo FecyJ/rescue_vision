@@ -15,6 +15,8 @@ from rescue_vision.communication import (
 )
 from rescue_vision.motion import (
     CarCommandReply,
+    CarSafetyStatus,
+    CarStopReason,
     CarTelemetry,
     MotionController,
     MotionLimits,
@@ -165,6 +167,36 @@ def test_parse_car_replies_telemetry_and_unknown_prefix() -> None:
     assert unknown == UnknownCarMessage(6, 8_000, b"imu,1,2,3")
 
 
+def test_parse_versioned_car_safety_status() -> None:
+    status = parse_car_line(
+        ReceivedUartLine(
+            7,
+            9_000,
+            b"s1,12350,300,1,0,25,running",
+        )
+    )
+    startup = parse_car_line(
+        ReceivedUartLine(
+            8,
+            10_000,
+            b"s1,10,300,1,0,-1,startup",
+        )
+    )
+
+    assert status == CarSafetyStatus(
+        uart_sequence=7,
+        received_timestamp_ns=9_000,
+        controller_timestamp_ms=12_350,
+        watchdog_timeout_ms=300,
+        watchdog_armed=True,
+        emergency_stop_latched=False,
+        last_motion_command_age_ms=25,
+        stop_reason=CarStopReason.RUNNING,
+    )
+    assert isinstance(startup, CarSafetyStatus)
+    assert startup.last_motion_command_age_ms is None
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -172,6 +204,11 @@ def test_parse_car_replies_telemetry_and_unknown_prefix() -> None:
         b"t-1,0,0,0,0,90,90",
         b"t1,nan,0,0,0,90,90",
         b"t1,0,0,0,0,181,90",
+        b"s1,1,300,2,0,10,running",
+        b"s1,1,300,1,0,-2,running",
+        b"s1,1,0,1,0,10,running",
+        b"s1,1,300,1,0,10,future_reason",
+        b"s1,1,300,1,0,10",
         b"\xff",
     ],
 )

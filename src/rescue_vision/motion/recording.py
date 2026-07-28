@@ -9,6 +9,7 @@ from typing import Any, TextIO
 
 from rescue_vision.motion.protocol import (
     CarCommandReply,
+    CarSafetyStatus,
     CarTelemetry,
     ParsedCarMessage,
     UnknownCarMessage,
@@ -18,7 +19,7 @@ from rescue_vision.motion.remote_control import ExecutedRemoteMotion
 
 MANUAL_MOTION_STREAM_NAME = "manual_motion"
 MANUAL_MOTION_LOG_FILENAME = "motion.jsonl"
-MANUAL_MOTION_LOG_SCHEMA_VERSION = 1
+MANUAL_MOTION_LOG_SCHEMA_VERSION = 2
 
 _EVENT_KEYS = {
     "stream_started": set(),
@@ -41,6 +42,15 @@ _EVENT_KEYS = {
         "target_right_m_s",
         "servo_left_deg",
         "servo_right_deg",
+    },
+    "safety_status": {
+        "uart_sequence",
+        "controller_timestamp_ms",
+        "watchdog_timeout_ms",
+        "watchdog_armed",
+        "emergency_stop_latched",
+        "last_motion_command_age_ms",
+        "stop_reason",
     },
     "command_reply": {"uart_sequence", "succeeded", "detail"},
     "unknown_uart": {"uart_sequence", "payload_hex"},
@@ -118,6 +128,18 @@ class ManualMotionLogWriter:
                 target_right_m_s=message.target_right_m_s,
                 servo_left_deg=message.servo_left_deg,
                 servo_right_deg=message.servo_right_deg,
+            )
+        elif isinstance(message, CarSafetyStatus):
+            self._write(
+                "safety_status",
+                message.received_timestamp_ns,
+                uart_sequence=message.uart_sequence,
+                controller_timestamp_ms=message.controller_timestamp_ms,
+                watchdog_timeout_ms=message.watchdog_timeout_ms,
+                watchdog_armed=message.watchdog_armed,
+                emergency_stop_latched=message.emergency_stop_latched,
+                last_motion_command_age_ms=message.last_motion_command_age_ms,
+                stop_reason=message.stop_reason.value,
             )
         elif isinstance(message, CarCommandReply):
             self._write(
@@ -263,6 +285,7 @@ def _validate_event_fields(
         "deadline_timestamp_ns",
         "uart_sequence",
         "controller_timestamp_ms",
+        "watchdog_timeout_ms",
     ):
         if name in record:
             _non_negative_integer(record[name], f"{location}.{name}")
@@ -278,7 +301,13 @@ def _validate_event_fields(
     ):
         if name in record:
             _finite_number(record[name], f"{location}.{name}")
-    for name in ("command_id", "result", "payload_hex", "reason"):
+    for name in (
+        "command_id",
+        "result",
+        "payload_hex",
+        "reason",
+        "stop_reason",
+    ):
         if name in record and (
             not isinstance(record[name], str) or not record[name]
         ):
@@ -291,6 +320,13 @@ def _validate_event_fields(
         raise ValueError(f"{location}.deadman_enabled must be a boolean.")
     if "succeeded" in record and not isinstance(record["succeeded"], bool):
         raise ValueError(f"{location}.succeeded must be a boolean.")
+    for name in ("watchdog_armed", "emergency_stop_latched"):
+        if name in record and not isinstance(record[name], bool):
+            raise ValueError(f"{location}.{name} must be a boolean.")
+    if "last_motion_command_age_ms" in record:
+        age = record["last_motion_command_age_ms"]
+        if age is not None:
+            _non_negative_integer(age, f"{location}.last_motion_command_age_ms")
     if (
         event_type == "motion_command"
         and record["result"] not in _MOTION_RESULTS
@@ -323,6 +359,19 @@ def _validate_event_fields(
         for name in ("servo_left_deg", "servo_right_deg"):
             if not 0.0 <= float(record[name]) <= 180.0:
                 raise ValueError(f"{location}.{name} must be in [0, 180].")
+    if event_type == "safety_status":
+        if int(record["watchdog_timeout_ms"]) <= 0:
+            raise ValueError(
+                f"{location}.watchdog_timeout_ms must be positive."
+            )
+        if record["stop_reason"] not in {
+            "startup",
+            "running",
+            "soft_brake",
+            "watchdog_timeout",
+            "emergency_stop",
+        }:
+            raise ValueError(f"{location}.stop_reason is not supported.")
 
 
 def _non_negative_integer(value: object, location: str) -> int:

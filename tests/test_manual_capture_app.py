@@ -10,6 +10,7 @@ import pytest
 from rescue_vision.app.manual_capture import (
     CameraPipeline,
     CaptureSession,
+    VehicleState,
     _validate_mode,
     build_session_status,
     run_manual_capture_session,
@@ -377,6 +378,11 @@ def test_manual_capture_rejects_competition_observe_only_mode() -> None:
             video_fps=10.0,
             supervised_physical_stop_ready=True,
         )
+
+
+def test_vehicle_state_cannot_claim_unverified_firmware_watchdog() -> None:
+    with pytest.raises(ValueError, match="fresh CarSafetyStatus"):
+        VehicleState(safety_mode=VehicleSafetyMode.FIRMWARE_WATCHDOG)
 
 
 def test_manual_capture_requires_explicit_physical_stop_acknowledgement() -> None:

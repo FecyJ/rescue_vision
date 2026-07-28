@@ -14,6 +14,7 @@ from typing import Any
 import cv2
 
 from rescue_vision.camera.frame import CameraFrame
+from rescue_vision.motion.recording import MANUAL_MOTION_LOG_SCHEMA_VERSION
 
 
 _STOP = object()
@@ -308,7 +309,7 @@ class FrameRecorder:
             "time_base": "application_monotonic_ns",
             "auxiliary_streams": {
                 name: {
-                    "schema_version": 1,
+                    "schema_version": MANUAL_MOTION_LOG_SCHEMA_VERSION,
                     "path": relative_path,
                     "time_base": "application_monotonic_ns",
                 }

@@ -17,6 +17,7 @@ from rescue_vision.camera.viewer import OpenCvFrameViewer, playback_delay_ms
 from rescue_vision.geometry.camera_model import IMAGE_BORDER_FILL_VALUE
 from rescue_vision.motion.recording import (
     MANUAL_MOTION_LOG_FILENAME,
+    MANUAL_MOTION_LOG_SCHEMA_VERSION,
     MANUAL_MOTION_STREAM_NAME,
     inspect_manual_motion_log,
 )
@@ -253,9 +254,10 @@ def _inspect_auxiliary_streams(
             raise ValueError(
                 f"Auxiliary stream {name!r} descriptor has invalid keys."
             )
-        if descriptor["schema_version"] != 1:
+        if descriptor["schema_version"] != MANUAL_MOTION_LOG_SCHEMA_VERSION:
             raise ValueError(
-                f"Auxiliary stream {name!r} schema_version must be 1."
+                f"Auxiliary stream {name!r} schema_version must be "
+                f"{MANUAL_MOTION_LOG_SCHEMA_VERSION}."
             )
         if descriptor["path"] != MANUAL_MOTION_LOG_FILENAME:
             raise ValueError(

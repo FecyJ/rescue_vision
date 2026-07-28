@@ -21,7 +21,8 @@
 | `turn_left()` / `turn_right()` | 非负角速度 rad/s | 原地左转/右转 |
 | `soft_brake()` / `emergency_stop()` | 无 | 固件斜坡制动/紧急停止 |
 | `query_state()` | 无 | 请求固件立即返回状态 |
-| `receive_message()` | 可选等待秒数 | `CarTelemetry`、`CarCommandReply` 或 `UnknownCarMessage` |
+| `receive_message()` | 可选等待秒数 | 轮速、安全状态、命令回复或未知回传 |
+| `CarSafetyStatus` | `s1` 状态行 | 固件单调时间、看门狗、锁存急停、命令年龄和停车原因 |
 | `drain_messages()` | 无 | 非阻塞排空当前 UART 回传 |
 | `RemoteMotionExecutor.execute()` | `ReceivedRemoteMessage` | 校验远程运动消息后执行 |
 | `RemoteMotionExecutor.check_timeout()` | 可选本机单调时间 ns | 到期时停车，返回是否触发 |
@@ -152,6 +153,7 @@ controller.emergency_stop()
 ```python
 from rescue_vision.motion import (
     CarCommandReply,
+    CarSafetyStatus,
     CarTelemetry,
     UnknownCarMessage,
 )
@@ -165,6 +167,14 @@ if isinstance(message, CarTelemetry):
         message.controller_timestamp_ms,
         message.actual_left_m_s,
         message.actual_right_m_s,
+    )
+elif isinstance(message, CarSafetyStatus):
+    # 只有新鲜且 watchdog_armed=True 的 s1 状态才能作为固件保护证据。
+    print(
+        message.watchdog_timeout_ms,
+        message.watchdog_armed,
+        message.emergency_stop_latched,
+        message.stop_reason.value,
     )
 elif isinstance(message, CarCommandReply):
     print("OK" if message.succeeded else "ERR", message.detail)
@@ -285,7 +295,8 @@ finally:
 - 死手关闭、命令过期、非法 payload、未知控制模式和循环正常退出均进入柔和
   停车；协议或通信异常也会尝试停车并继续抛出原始异常。
 - `drain_messages()` / `run_remote_motion()` 会排空 10 Hz 回传。未知前缀保留
-  为 `UnknownCarMessage`，不会被误判为命令成功。
+  为 `UnknownCarMessage`，不会被误判为命令成功。冻结的 `s1` 行解析为
+  `CarSafetyStatus` 并写入运动日志 schema v2；当前固件尚不产生该状态。
 - 当前固件资料没有失联看门狗。进程被强杀、树莓派掉电或 UART 物理断开时，
   Python 无法保证停车；只能在架空轮或有物理急停、人员全程监督的环境验证，
   不能把本模块的超时当作固件级失控保护。

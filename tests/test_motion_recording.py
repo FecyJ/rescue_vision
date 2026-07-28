@@ -6,6 +6,8 @@ import pytest
 
 from rescue_vision.motion import (
     CarCommandReply,
+    CarSafetyStatus,
+    CarStopReason,
     CarTelemetry,
     ExecutedRemoteMotion,
     ManualMotionLogWriter,
@@ -48,7 +50,19 @@ def test_manual_motion_log_round_trip_preserves_monotonic_time_sources(
     writer.record_car_message(
         CarCommandReply(4, 130, True, "m=0.12,0.08")
     )
-    writer.record_car_message(UnknownCarMessage(5, 140, b"imu,1,2,3"))
+    writer.record_car_message(
+        CarSafetyStatus(
+            uart_sequence=5,
+            received_timestamp_ns=135,
+            controller_timestamp_ms=65,
+            watchdog_timeout_ms=300,
+            watchdog_armed=True,
+            emergency_stop_latched=False,
+            last_motion_command_age_ms=15,
+            stop_reason=CarStopReason.RUNNING,
+        )
+    )
+    writer.record_car_message(UnknownCarMessage(6, 140, b"imu,1,2,3"))
     writer.record_timeout(command_id="drive-1", timestamp_ns=210)
     writer.record_safety_stop(
         reason="application_shutdown",
@@ -58,7 +72,7 @@ def test_manual_motion_log_round_trip_preserves_monotonic_time_sources(
 
     report = inspect_manual_motion_log(path)
 
-    assert report["event_count"] == 8
+    assert report["event_count"] == 9
     assert report["first_timestamp_ns"] == 100
     assert report["last_timestamp_ns"] == 230
     assert report["event_counts"] == {
@@ -66,6 +80,7 @@ def test_manual_motion_log_round_trip_preserves_monotonic_time_sources(
         "motion_command": 1,
         "motion_timeout": 1,
         "safety_stop": 1,
+        "safety_status": 1,
         "stream_finished": 1,
         "stream_started": 1,
         "unknown_uart": 1,
@@ -77,7 +92,8 @@ def test_manual_motion_log_round_trip_preserves_monotonic_time_sources(
     ]
     assert events[1]["timestamp_ns"] == 110
     assert events[2]["timestamp_ns"] == 120
-    assert events[4]["payload_hex"] == b"imu,1,2,3".hex()
+    assert events[4]["stop_reason"] == "running"
+    assert events[5]["payload_hex"] == b"imu,1,2,3".hex()
 
 
 def test_manual_motion_log_rejects_sequence_and_truncation(tmp_path) -> None:
