@@ -343,6 +343,11 @@ def test_remote_loop_drains_uart_and_stops_on_exit() -> None:
             ReceivedUartLine(
                 1,
                 10,
+                b"t2,0.1,OK m=-0.05,0.1,0.1,90,90",
+            ),
+            ReceivedUartLine(
+                2,
+                11,
                 b"t1,0.1,0.1,0.1,0.1,90,90",
             )
         ]
@@ -370,9 +375,14 @@ def test_remote_loop_drains_uart_and_stops_on_exit() -> None:
 
     assert car_messages == [
         UnknownCarMessage(0, 9, b"\xff\x00\x80"),
+        UnknownCarMessage(
+            1,
+            10,
+            b"t2,0.1,OK m=-0.05,0.1,0.1,90,90",
+        ),
         CarTelemetry(
-            uart_sequence=1,
-            received_timestamp_ns=10,
+            uart_sequence=2,
+            received_timestamp_ns=11,
             controller_timestamp_ms=1,
             actual_left_m_s=0.1,
             actual_right_m_s=0.1,

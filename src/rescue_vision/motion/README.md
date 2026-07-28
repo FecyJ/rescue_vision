@@ -301,8 +301,11 @@ finally:
   为 `UnknownCarMessage`，非 ASCII 原始行也按相同方式保留，不会导致手动
   采集循环退出或被误判为命令成功；录制期间原始 bytes 以十六进制写入
   `unknown_uart`。冻结的 `s1` 行解析为 `CarSafetyStatus` 并写入运动日志
-  schema v2；当前固件尚不产生该状态。已识别的 `t...` / `s1...` 报文若
-  字段损坏仍是协议错误，会进入停车故障路径。
+  schema v2；当前固件尚不产生该状态。`parse_car_line()` 对损坏的已知
+  `t...` / `s1...` 报文仍严格抛出 `ValueError`；实时
+  `MotionController.receive_message()` 会把单条损坏报文隔离为
+  `UnknownCarMessage`，防止固件遥测和 `OK` 输出交错时终止采集。后续正常
+  报文仍会继续解析。
 - 当前固件资料没有失联看门狗。进程被强杀、树莓派掉电或 UART 物理断开时，
   Python 无法保证停车；只能在架空轮或有物理急停、人员全程监督的环境验证，
   不能把本模块的超时当作固件级失控保护。

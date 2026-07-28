@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from rescue_vision.motion.protocol import (
     CarLineChannel,
     ParsedCarMessage,
+    UnknownCarMessage,
     encode_emergency_stop_command,
     encode_soft_brake_command,
     encode_state_query_command,
@@ -164,9 +165,17 @@ class MotionController:
         self._channel.send_line(encode_state_query_command())
 
     def receive_message(self, timeout: float | None = None) -> ParsedCarMessage:
-        """接收并解析一条命令回复、遥测或扩展消息。"""
+        """接收回传；损坏的单行隔离为未知消息，不中断实时循环。"""
 
-        return parse_car_line(self._channel.receive_line(timeout=timeout))
+        line = self._channel.receive_line(timeout=timeout)
+        try:
+            return parse_car_line(line)
+        except ValueError:
+            return UnknownCarMessage(
+                uart_sequence=line.sequence,
+                received_timestamp_ns=line.received_timestamp_ns,
+                payload=line.payload,
+            )
 
     def drain_messages(self) -> tuple[ParsedCarMessage, ...]:
         """非阻塞排空当前回传，防止 10 Hz 遥测挤满 UART 队列。"""
