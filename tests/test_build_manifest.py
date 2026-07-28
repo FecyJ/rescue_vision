@@ -10,6 +10,11 @@ from rescue_vision.camera.record_cli import parse_tags
 from rescue_vision.data.build_manifest import build_dataset_records
 from rescue_vision.data.split_manifest import REQUIRED_TAGS
 from rescue_vision.camera.recording import FrameRecorder
+from rescue_vision.motion import (
+    MANUAL_MOTION_LOG_FILENAME,
+    MANUAL_MOTION_STREAM_NAME,
+    ManualMotionLogWriter,
+)
 
 
 INTRINSICS_FINGERPRINT = "a" * 64
@@ -57,6 +62,48 @@ def test_recording_builds_verified_dataset_manifest(tmp_path) -> None:
     assert record["schema_version"] == 2
     assert record["tags"] == dict(sorted(tags.items()))
     assert not str(record["image_path"]).startswith("/")
+
+
+def test_manifest_validates_manual_motion_stream_time_coverage(tmp_path) -> None:
+    recording = tmp_path / "manual-recording"
+    recorder = FrameRecorder(
+        recording,
+        image_size=(8, 6),
+        config_snapshot={"schema_version": 8},
+        versions={"code": "abc"},
+        session_tags={name: "known" for name in REQUIRED_TAGS},
+        image_coordinate_system="undistorted_pixel",
+        intrinsics_fingerprint_sha256=INTRINSICS_FINGERPRINT,
+        valid_pixel_ratio=0.95,
+        undistort_fill_value=114,
+        recording_kind="supervised_manual_motion",
+        auxiliary_streams={
+            MANUAL_MOTION_STREAM_NAME: MANUAL_MOTION_LOG_FILENAME
+        },
+    )
+    recorder.start()
+    motion_log = ManualMotionLogWriter(
+        recording / MANUAL_MOTION_LOG_FILENAME
+    )
+    motion_log.start(timestamp_ns=10)
+    assert recorder.record(
+        CameraFrame(
+            sequence=0,
+            timestamp_ns=20,
+            image_bgr=np.zeros((6, 8, 3), dtype=np.uint8),
+        )
+    )
+    motion_log.stop(timestamp_ns=30)
+    recorder.stop()
+
+    records = build_dataset_records(
+        [recording],
+        dataset_root=tmp_path,
+        dataset_version="manual-v1",
+    )
+
+    assert len(records) == 1
+    assert records[0]["timestamp_ns"] == 20
 
 
 def test_manifest_rejects_missing_session_tags(tmp_path) -> None:

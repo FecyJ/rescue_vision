@@ -67,7 +67,9 @@ def test_recorder_roundtrip_is_deterministic(tmp_path) -> None:
     assert np.array_equal(repeated.image_bgr, first.image_bgr)
 
     session_document = json.loads((session / "session.json").read_text())
-    assert session_document["schema_version"] == 3
+    assert session_document["schema_version"] == 4
+    assert session_document["recording_kind"] == "camera"
+    assert session_document["auxiliary_streams"] == {}
     assert session_document["image_coordinate_system"] == "raw_pixel"
     assert session_document["intrinsics_fingerprint_sha256"] is None
     assert session_document["undistort_fill_value"] is None
@@ -106,6 +108,30 @@ def test_recorder_queue_full_does_not_block(tmp_path, monkeypatch) -> None:
         (tmp_path / "recording" / "session.json").read_text(encoding="utf-8")
     )
     assert session["completed"] is False
+
+
+def test_recording_source_accepts_legacy_session_v3(tmp_path) -> None:
+    directory = tmp_path / "legacy-v3"
+    recorder = FrameRecorder(
+        directory,
+        image_size=(8, 6),
+        config_snapshot={"schema_version": 1},
+        versions={"code": "abc"},
+    )
+    recorder.start()
+    assert recorder.record(frame(0, 10))
+    recorder.stop()
+    session_path = directory / "session.json"
+    session = json.loads(session_path.read_text(encoding="utf-8"))
+    session["schema_version"] = 3
+    session.pop("recording_kind")
+    session.pop("auxiliary_streams")
+    session_path.write_text(json.dumps(session), encoding="utf-8")
+
+    with RecordingSource(directory) as source:
+        replayed = source.read()
+
+    assert replayed.sequence == 0
 
 
 def test_recorder_stop_does_not_block_after_worker_death_with_full_queue(

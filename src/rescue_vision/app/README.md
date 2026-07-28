@@ -20,7 +20,9 @@ rescue-vision-manual-capture \
 入口创建但不复制相机参数、运动限值或协议规则。连接后发送会话、视频、车辆
 和采集状态，并同时接收 `control/debug/motion` 与
 `control/debug/capture`。运动命令继续由 `RemoteMotionExecutor` 校验死手、
-有效期和限速；采集命令可独立开始/停止标准 recording schema v3 会话。
+有效期和限速；采集命令可独立开始/停止标准 recording schema v4 会话。
+手动会话的 `motion.jsonl` 逐条保存运动执行结果、轮速遥测、未知 UART
+扩展报文和停车原因；这些事件与图像帧统一使用树莓派应用单调时间。
 
 录像写盘队列满、写盘失败、相机异常、UART 异常、远程断线、非法控制或应用
 退出都会离开统一运动循环，并在 UART 尚可写时先发送柔和制动。断电、

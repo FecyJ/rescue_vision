@@ -26,6 +26,8 @@
 | `RemoteMotionExecutor.execute()` | `ReceivedRemoteMessage` | 校验远程运动消息后执行 |
 | `RemoteMotionExecutor.check_timeout()` | 可选本机单调时间 ns | 到期时停车，返回是否触发 |
 | `run_remote_motion()` | 远程接收器、执行器、退出回调 | 持续收命令、排空回传、分派其他 control，并在退出时停车 |
+| `ManualMotionLogWriter` | recording 内的 `motion.jsonl` | 顺序写入手动命令、轮速、UART 扩展和停车事件 |
+| `inspect_manual_motion_log()` | `motion.jsonl` 路径 | 严格校验 schema、事件序号和时间范围摘要 |
 
 机器人坐标系沿用项目约定：`x` 向前、`y` 向左、`z` 向上。左右轮速度正值
 均表示前进；车体角速度逆时针为正：
@@ -253,6 +255,30 @@ observation。`motion` 不重复实现这些发布器。完整 TCP 生命周期�
 比赛配置必须保持 `observe_only`；传输层会拒绝入站控制。
 
 ## 时间、故障与降级
+
+手动采集应用会在 recording 有效期间创建 `ManualMotionLogWriter`，并把
+`run_remote_motion()` 的执行结果、超时回调和 UART 回传写入同一单调时间轴。
+调用方不应另建第二份运动日志；完整目录由
+`rescue-vision-check-recording` 一并检查。直接使用 writer 时必须严格分开
+启动、写入和关闭：
+
+```python
+from time import monotonic_ns
+
+from rescue_vision.motion import ManualMotionLogWriter
+
+motion_log = ManualMotionLogWriter(recording_directory / "motion.jsonl")
+motion_log.start(timestamp_ns=monotonic_ns())
+try:
+    # outcome 来自前文 RemoteMotionExecutor.execute()。
+    motion_log.record_motion(outcome)
+finally:
+    motion_log.stop(timestamp_ns=monotonic_ns())
+```
+
+这里的 `recording_directory` 由上游 recording 会话产生；正式手动采集优先
+直接运行 `rescue-vision-manual-capture`，由应用保证它和 session v4
+`auxiliary_streams` 声明一致。脚本动作段和计划身份不由本 writer 猜测。
 
 - `valid_for_ms` 从树莓派完成接收该消息的单调时间开始计算，不比较两台机器
   互不共享零点的 `issued_timestamp_ns`。

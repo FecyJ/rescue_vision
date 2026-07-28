@@ -38,6 +38,7 @@ from rescue_vision.communication import (
     RemoteStream,
     RemoteTcpServer,
     RemoteTopic,
+    UartError,
     VehicleMotionState,
     VehicleSafetyMode,
     VehicleStateObservation,
@@ -55,6 +56,9 @@ from rescue_vision.motion import (
     CarTelemetry,
     ExecutedRemoteMotion,
     MotionController,
+    MANUAL_MOTION_LOG_FILENAME,
+    MANUAL_MOTION_STREAM_NAME,
+    ManualMotionLogWriter,
     ParsedCarMessage,
     RemoteMotionExecutor,
     RemoteMotionResult,
@@ -108,6 +112,7 @@ class CaptureSession:
         self.config_snapshot = config_snapshot
         self.pipeline = pipeline
         self.recorder: FrameRecorder | None = None
+        self.motion_log: ManualMotionLogWriter | None = None
         self.recording_id: str | None = None
         self.recording_directory: Path | None = None
         self.status_sequence = 0
@@ -231,10 +236,7 @@ class CaptureSession:
         self.recording_directory = None
         if not self.faulted:
             self.stop_reason = CaptureStopReason.APPLICATION_SHUTDOWN
-        try:
-            recorder.stop()
-        finally:
-            self._remember_counts(recorder)
+        self._close_recording_resources(recorder)
 
     def _start(self, command: DebugCaptureCommand) -> CaptureOutcome:
         if self.recorder is not None:
@@ -271,9 +273,28 @@ class CaptureSession:
             undistort_fill_value=(
                 IMAGE_BORDER_FILL_VALUE if camera_model is not None else None
             ),
+            auxiliary_streams={
+                MANUAL_MOTION_STREAM_NAME: MANUAL_MOTION_LOG_FILENAME
+            },
+            recording_kind="supervised_manual_motion",
         )
         recorder.start()
+        motion_log = ManualMotionLogWriter(
+            directory / MANUAL_MOTION_LOG_FILENAME
+        )
+        try:
+            motion_log.start(timestamp_ns=time.monotonic_ns())
+        except BaseException as exc:
+            try:
+                recorder.stop()
+            except BaseException as cleanup_error:
+                exc.add_note(
+                    "Frame recorder cleanup after motion log start failure "
+                    f"also failed: {cleanup_error!r}"
+                )
+            raise
         self.recorder = recorder
+        self.motion_log = motion_log
         self.recording_id = recording_id
         self.recording_directory = directory
         self.stop_reason = None
@@ -291,13 +312,7 @@ class CaptureSession:
         if recorder is None:
             return self._rejected(command, "no recording is active")
         artifact_id = self.recording_id
-        try:
-            recorder.stop()
-        finally:
-            self._remember_counts(recorder)
-            self.recorder = None
-            self.recording_id = None
-            self.recording_directory = None
+        self._close_recording_resources(recorder)
         self.stop_reason = CaptureStopReason.REQUESTED
         return CaptureOutcome(
             command.action,
@@ -392,6 +407,64 @@ class CaptureSession:
         self.accepted_frames = recorder.accepted_frames
         self.written_frames = recorder.written_frames
         self.dropped_frames = recorder.dropped_frames
+
+    def record_motion(self, outcome: ExecutedRemoteMotion) -> None:
+        if self.motion_log is not None:
+            self.motion_log.record_motion(outcome)
+
+    def record_motion_timeout(
+        self,
+        *,
+        command_id: str,
+        timestamp_ns: int,
+    ) -> None:
+        if self.motion_log is not None:
+            self.motion_log.record_timeout(
+                command_id=command_id,
+                timestamp_ns=timestamp_ns,
+            )
+
+    def record_car_message(self, message: ParsedCarMessage) -> None:
+        if self.motion_log is not None:
+            self.motion_log.record_car_message(message)
+
+    def record_safety_stop(
+        self,
+        *,
+        reason: VehicleStopReason,
+        timestamp_ns: int,
+    ) -> None:
+        if self.motion_log is not None:
+            self.motion_log.record_safety_stop(
+                reason=reason.value,
+                timestamp_ns=timestamp_ns,
+            )
+
+    def _close_recording_resources(self, recorder: FrameRecorder) -> None:
+        motion_log = self.motion_log
+        self.motion_log = None
+        self.recorder = None
+        self.recording_id = None
+        self.recording_directory = None
+        primary_error: BaseException | None = None
+        if motion_log is not None:
+            try:
+                motion_log.stop(timestamp_ns=time.monotonic_ns())
+            except BaseException as exc:
+                primary_error = exc
+        try:
+            recorder.stop()
+        except BaseException as exc:
+            if primary_error is None:
+                primary_error = exc
+            else:
+                primary_error.add_note(
+                    f"Frame recorder cleanup also failed: {exc!r}"
+                )
+        finally:
+            self._remember_counts(recorder)
+        if primary_error is not None:
+            raise primary_error
 
 
 class VehicleState:
@@ -508,13 +581,30 @@ class ManualCaptureRuntime:
             self.connection,
             self.executor,
             stop_requested=self.stop_requested,
-            on_car_message=self.vehicle.on_car_message,
-            on_motion_executed=self.vehicle.on_motion,
-            on_motion_timeout=self.vehicle.on_motion_timeout,
+            on_car_message=self._on_car_message,
+            on_motion_executed=self._on_motion,
+            on_motion_timeout=self._on_motion_timeout,
             on_other_control=self._handle_other_control,
             on_cycle=self._cycle,
             poll_interval_s=0.02,
         )
+
+    def _on_car_message(self, message: ParsedCarMessage) -> None:
+        self.vehicle.on_car_message(message)
+        self.capture.record_car_message(message)
+
+    def _on_motion(self, outcome: ExecutedRemoteMotion) -> None:
+        self.vehicle.on_motion(outcome)
+        self.capture.record_motion(outcome)
+
+    def _on_motion_timeout(self) -> None:
+        command_id = self.vehicle.last_received_command_id
+        self.vehicle.on_motion_timeout()
+        if command_id is not None:
+            self.capture.record_motion_timeout(
+                command_id=command_id,
+                timestamp_ns=time.monotonic_ns(),
+            )
 
     def _cycle(self) -> None:
         try:
@@ -701,8 +791,37 @@ def run_manual_capture_session(
     )
     try:
         runtime.run()
-    finally:
-        capture.close()
+    except BaseException as exc:
+        if isinstance(exc, RemoteDisconnectedError):
+            stop_reason = VehicleStopReason.REMOTE_DISCONNECTED
+        elif isinstance(exc, UartError):
+            stop_reason = VehicleStopReason.UART_FAULT
+        elif capture.stop_reason is CaptureStopReason.CAMERA_ERROR:
+            stop_reason = VehicleStopReason.CAMERA_FAULT
+        else:
+            stop_reason = VehicleStopReason.UNKNOWN
+        try:
+            capture.record_safety_stop(
+                reason=stop_reason,
+                timestamp_ns=time.monotonic_ns(),
+            )
+        except BaseException as log_error:
+            exc.add_note(f"Safety stop logging also failed: {log_error!r}")
+        try:
+            capture.close()
+        except BaseException as cleanup_error:
+            exc.add_note(
+                f"Capture session cleanup also failed: {cleanup_error!r}"
+            )
+        raise
+    else:
+        try:
+            capture.record_safety_stop(
+                reason=VehicleStopReason.APPLICATION_SHUTDOWN,
+                timestamp_ns=time.monotonic_ns(),
+            )
+        finally:
+            capture.close()
 
 
 def _send_video_frame(

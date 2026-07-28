@@ -15,6 +15,11 @@ from rescue_vision.camera.frame import CameraFrame
 from rescue_vision.camera.replay import RecordingSource
 from rescue_vision.camera.viewer import OpenCvFrameViewer, playback_delay_ms
 from rescue_vision.geometry.camera_model import IMAGE_BORDER_FILL_VALUE
+from rescue_vision.motion.recording import (
+    MANUAL_MOTION_LOG_FILENAME,
+    MANUAL_MOTION_STREAM_NAME,
+    inspect_manual_motion_log,
+)
 
 
 PICAMERA2_METADATA = (
@@ -53,8 +58,34 @@ def inspect_recording(
 
     directory = Path(session_directory).expanduser().resolve()
     session = _load_object(directory / "session.json")
-    if session.get("schema_version") != 3:
-        raise ValueError("Recording session schema_version must be 3.")
+    session_schema_version = session.get("schema_version")
+    if session_schema_version not in {3, 4}:
+        raise ValueError("Recording session schema_version must be 3 or 4.")
+    auxiliary_streams = (
+        session.get("auxiliary_streams")
+        if session_schema_version == 4
+        else {}
+    )
+    if not isinstance(auxiliary_streams, dict):
+        raise ValueError("Recording auxiliary_streams must be a mapping.")
+    recording_kind = (
+        session.get("recording_kind")
+        if session_schema_version == 4
+        else "camera"
+    )
+    if recording_kind not in {"camera", "supervised_manual_motion"}:
+        raise ValueError("Recording recording_kind is invalid.")
+    if recording_kind == "supervised_manual_motion" and set(
+        auxiliary_streams
+    ) != {MANUAL_MOTION_STREAM_NAME}:
+        raise ValueError(
+            "supervised_manual_motion recording requires exactly the "
+            "manual_motion auxiliary stream."
+        )
+    auxiliary_reports = _inspect_auxiliary_streams(
+        directory,
+        auxiliary_streams,
+    )
     if session.get("completed") is not True:
         raise ValueError(f"Recording is not marked completed: {directory}.")
 
@@ -121,6 +152,21 @@ def inspect_recording(
         for previous, current in zip(timestamps_ns, timestamps_ns[1:])
     ):
         raise ValueError("Recorded frame timestamps must be strictly increasing.")
+    manual_motion_report = auxiliary_reports.get(
+        MANUAL_MOTION_STREAM_NAME
+    )
+    if isinstance(manual_motion_report, dict):
+        motion_first_ns = int(manual_motion_report["first_timestamp_ns"])
+        motion_last_ns = int(manual_motion_report["last_timestamp_ns"])
+        if (
+            motion_first_ns > timestamps_ns[0]
+            or motion_last_ns < timestamps_ns[-1]
+        ):
+            raise ValueError(
+                "Manual motion log time range must cover the recorded frame "
+                "time range."
+            )
+        manual_motion_report["covers_frame_time_range"] = True
 
     elapsed_seconds = (
         (timestamps_ns[-1] - timestamps_ns[0]) / 1_000_000_000
@@ -147,6 +193,7 @@ def inspect_recording(
     return {
         "schema_version": 1,
         "recording_id": session.get("recording_id"),
+        "recording_kind": recording_kind,
         "session_directory": str(directory),
         "image_size": session.get("image_size"),
         "image_format": session.get("image_format"),
@@ -156,6 +203,8 @@ def inspect_recording(
         ),
         "valid_pixel_ratio": session.get("valid_pixel_ratio"),
         "undistort_fill_value": session.get("undistort_fill_value"),
+        "auxiliary_streams": auxiliary_streams,
+        "auxiliary_stream_reports": auxiliary_reports,
         "configured_fps": configured_fps,
         "frame_count": frame_count,
         "first_sequence": sequences[0],
@@ -186,6 +235,41 @@ def inspect_recording(
             "stddev_max": max(luma_standard_deviations),
         },
     }
+
+
+def _inspect_auxiliary_streams(
+    directory: Path,
+    streams: dict[str, Any],
+) -> dict[str, object]:
+    reports: dict[str, object] = {}
+    for name, descriptor in streams.items():
+        if name != MANUAL_MOTION_STREAM_NAME:
+            raise ValueError(f"Unknown recording auxiliary stream {name!r}.")
+        if not isinstance(descriptor, dict) or set(descriptor) != {
+            "schema_version",
+            "path",
+            "time_base",
+        }:
+            raise ValueError(
+                f"Auxiliary stream {name!r} descriptor has invalid keys."
+            )
+        if descriptor["schema_version"] != 1:
+            raise ValueError(
+                f"Auxiliary stream {name!r} schema_version must be 1."
+            )
+        if descriptor["path"] != MANUAL_MOTION_LOG_FILENAME:
+            raise ValueError(
+                f"Auxiliary stream {name!r} path must be "
+                f"{MANUAL_MOTION_LOG_FILENAME!r}."
+            )
+        if descriptor["time_base"] != "application_monotonic_ns":
+            raise ValueError(
+                f"Auxiliary stream {name!r} has unsupported time_base."
+            )
+        reports[name] = inspect_manual_motion_log(
+            directory / MANUAL_MOTION_LOG_FILENAME
+        )
+    return reports
 
 
 def check_requirements(

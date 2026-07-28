@@ -187,8 +187,25 @@ class RecordingSource(_FiniteSource):
         session = json.loads(
             (self.session_directory / "session.json").read_text(encoding="utf-8")
         )
-        if session.get("schema_version") != 3:
-            raise ValueError("Recording session schema_version must be 3.")
+        schema_version = session.get("schema_version")
+        if schema_version not in {3, 4}:
+            raise ValueError(
+                "Recording session schema_version must be 3 or 4."
+            )
+        if schema_version == 4 and not isinstance(
+            session.get("auxiliary_streams"), dict
+        ):
+            raise ValueError(
+                "Recording session schema v4 auxiliary_streams must be a "
+                "mapping."
+            )
+        if schema_version == 4 and session.get("recording_kind") not in {
+            "camera",
+            "supervised_manual_motion",
+        }:
+            raise ValueError(
+                "Recording session schema v4 recording_kind is invalid."
+            )
         image_size = session.get("image_size")
         if not isinstance(image_size, list) or len(image_size) != 2:
             raise ValueError("Recording session image_size must be [width, height].")

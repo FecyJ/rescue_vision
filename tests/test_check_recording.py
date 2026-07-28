@@ -45,6 +45,7 @@ def test_inspection_replays_hashes_and_reports_capture_health(tmp_path) -> None:
     report = inspect_recording(make_recording(tmp_path))
 
     assert report["frame_count"] == 3
+    assert report["recording_kind"] == "camera"
     assert report["image_coordinate_system"] == "raw_pixel"
     assert report["effective_fps"] == pytest.approx(20.0)
     assert report["drop_ratio"] == 0.0

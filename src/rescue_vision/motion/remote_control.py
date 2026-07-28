@@ -42,6 +42,9 @@ class ExecutedRemoteMotion:
     result: RemoteMotionResult
     received_timestamp_ns: int
     deadline_timestamp_ns: int
+    deadman_enabled: bool
+    linear_velocity_m_s: float
+    angular_velocity_rad_s: float
 
 
 class RemoteMotionExecutor:
@@ -97,6 +100,9 @@ class RemoteMotionExecutor:
                     RemoteMotionResult.EXPIRED,
                     message.received_timestamp_ns,
                     deadline_ns,
+                    command.deadman_enabled,
+                    command.linear_velocity_m_s,
+                    command.angular_velocity_rad_s,
                 )
             if not command.deadman_enabled:
                 self.stop()
@@ -105,6 +111,9 @@ class RemoteMotionExecutor:
                     RemoteMotionResult.STOPPED_DEADMAN,
                     message.received_timestamp_ns,
                     deadline_ns,
+                    command.deadman_enabled,
+                    command.linear_velocity_m_s,
+                    command.angular_velocity_rad_s,
                 )
             if command.control_mode is not MotionControlMode.TWIST:
                 raise RemoteMotionError(
@@ -132,6 +141,9 @@ class RemoteMotionExecutor:
             RemoteMotionResult.APPLIED,
             message.received_timestamp_ns,
             deadline_ns,
+            command.deadman_enabled,
+            command.linear_velocity_m_s,
+            command.angular_velocity_rad_s,
         )
 
     def check_timeout(self, *, now_ns: int | None = None) -> bool:

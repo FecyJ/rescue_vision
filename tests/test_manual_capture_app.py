@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from types import SimpleNamespace
 
@@ -22,6 +23,7 @@ from rescue_vision.communication import (
     ImageCoordinateSystem,
     MotionControlMode,
     ReceivedRemoteMessage,
+    ReceivedUartLine,
     RemoteAccessMode,
     RemoteDisconnectedError,
     RemoteRole,
@@ -30,16 +32,25 @@ from rescue_vision.communication import (
     VehicleSafetyMode,
     VehicleStateObservation,
 )
+from rescue_vision.data.check_recording import inspect_recording
 from rescue_vision.motion import MotionController, MotionLimits, RemoteMotionExecutor
 
 
 class FakeSource:
     def __init__(self, frame: CameraFrame) -> None:
         self.frame = frame
+        self.read_count = 0
 
     def read(self, timeout: float | None = None) -> CameraFrame:
         del timeout
-        return self.frame
+        result = CameraFrame(
+            sequence=self.frame.sequence + self.read_count,
+            timestamp_ns=time.monotonic_ns(),
+            image_bgr=self.frame.image_bgr,
+            metadata=self.frame.metadata,
+        )
+        self.read_count += 1
+        return result
 
     def start(self) -> None:
         pass
@@ -63,6 +74,29 @@ class FakeCarChannel:
 
     def receive_line(self, timeout: float | None = None):
         del timeout
+        raise TimeoutError
+
+
+class TelemetryAfterMotionChannel(FakeCarChannel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.telemetry_sent = False
+
+    def receive_line(
+        self,
+        timeout: float | None = None,
+    ) -> ReceivedUartLine:
+        del timeout
+        if (
+            not self.telemetry_sent
+            and any(payload.startswith(b"m") for payload in self.sent)
+        ):
+            self.telemetry_sent = True
+            return ReceivedUartLine(
+                sequence=0,
+                received_timestamp_ns=time.monotonic_ns(),
+                payload=b"t1,0.1,0.1,0.1,0.1,90,90",
+            )
         raise TimeoutError
 
 
@@ -162,7 +196,7 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
             _received(RemoteTopic.DEBUG_MOTION, motion.to_payload(), 1),
         ]
     )
-    car = FakeCarChannel()
+    car = TelemetryAfterMotionChannel()
     executor = RemoteMotionExecutor(
         MotionController(
             car,
@@ -192,6 +226,23 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
     assert len(recordings) == 1
     assert capture.recorder is None
     assert capture.stop_reason is not None
+    recording_report = inspect_recording(recordings[0])
+    motion_report = recording_report["auxiliary_stream_reports"][
+        "manual_motion"
+    ]
+    assert motion_report["event_counts"]["motion_command"] == 1
+    assert motion_report["event_counts"]["wheel_telemetry"] == 1
+    assert motion_report["event_counts"]["safety_stop"] == 1
+    assert motion_report["covers_frame_time_range"] is True
+    session_path = recordings[0] / "session.json"
+    session_document = json.loads(session_path.read_text(encoding="utf-8"))
+    session_document["auxiliary_streams"] = {}
+    session_path.write_text(
+        json.dumps(session_document),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="requires exactly"):
+        inspect_recording(recordings[0])
     assert {
         topic for topic, _payload in connection.observations
     } >= {

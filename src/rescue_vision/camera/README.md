@@ -116,7 +116,7 @@ rescue-vision-record \
 
 1. 按 `camera.backend` 创建真机源；
 2. 在 `intrinsics_enabled: true` 时用 `CameraModel` 去畸变；
-3. 写入 session schema v3、内参指纹、有效像素比例和填充值；
+3. 写入 session schema v4、内参指纹、有效像素比例、填充值和辅助流声明；
 4. 使用 `FrameRecorder` 异步编码，正常关闭相机、线程和窗口。
 
 `--display` 展示实际交给记录器的画面，预览缩放不改变保存分辨率；按 `Q/Esc` 正常结束并收尾 session。显示可能降低吞吐，性能门禁应另做一次不带 `--display` 的短录。

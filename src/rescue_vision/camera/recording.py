@@ -18,6 +18,8 @@ from rescue_vision.camera.frame import CameraFrame
 
 _STOP = object()
 IMAGE_COORDINATE_SYSTEMS = {"raw_pixel", "undistorted_pixel"}
+RECORDING_SCHEMA_VERSION = 4
+RECORDING_KINDS = {"camera", "supervised_manual_motion"}
 
 
 class FrameRecorder:
@@ -37,6 +39,8 @@ class FrameRecorder:
         intrinsics_fingerprint_sha256: str | None = None,
         valid_pixel_ratio: float | None = None,
         undistort_fill_value: int | None = None,
+        auxiliary_streams: Mapping[str, str] | None = None,
+        recording_kind: str = "camera",
     ) -> None:
         if len(image_size) != 2 or any(value <= 0 for value in image_size):
             raise ValueError(f"image_size must be positive, got {image_size}.")
@@ -110,6 +114,38 @@ class FrameRecorder:
         self.intrinsics_fingerprint_sha256 = intrinsics_fingerprint_sha256
         self.valid_pixel_ratio = valid_pixel_ratio
         self.undistort_fill_value = undistort_fill_value
+        self.auxiliary_streams = dict(auxiliary_streams or {})
+        if not all(
+            isinstance(name, str)
+            and name
+            and name.replace("_", "").isalnum()
+            and isinstance(relative_path, str)
+            and relative_path
+            and Path(relative_path).name == relative_path
+            for name, relative_path in self.auxiliary_streams.items()
+        ):
+            raise ValueError(
+                "auxiliary_streams must map non-empty identifiers to relative "
+                "filenames without directories."
+            )
+        if recording_kind not in RECORDING_KINDS:
+            raise ValueError(
+                "recording_kind must be 'camera' or "
+                "'supervised_manual_motion'."
+            )
+        self.recording_kind = recording_kind
+        if recording_kind == "camera" and self.auxiliary_streams:
+            raise ValueError(
+                "camera recording cannot declare auxiliary streams."
+            )
+        if recording_kind == "supervised_manual_motion" and (
+            self.auxiliary_streams
+            != {"manual_motion": "motion.jsonl"}
+        ):
+            raise ValueError(
+                "supervised_manual_motion recording requires exactly the "
+                "manual_motion auxiliary stream."
+            )
         self._queue: queue.Queue[CameraFrame | object] = queue.Queue(queue_capacity)
         self._thread: threading.Thread | None = None
         self._worker_error: BaseException | None = None
@@ -253,8 +289,9 @@ class FrameRecorder:
 
     def _write_session(self, *, completed: bool) -> None:
         document = {
-            "schema_version": 3,
+            "schema_version": RECORDING_SCHEMA_VERSION,
             "recording_id": self.session_directory.name,
+            "recording_kind": self.recording_kind,
             "created_at": self._created_at,
             "completed_at": (
                 datetime.now(timezone.utc).isoformat() if completed else None
@@ -269,6 +306,16 @@ class FrameRecorder:
             "valid_pixel_ratio": self.valid_pixel_ratio,
             "undistort_fill_value": self.undistort_fill_value,
             "time_base": "application_monotonic_ns",
+            "auxiliary_streams": {
+                name: {
+                    "schema_version": 1,
+                    "path": relative_path,
+                    "time_base": "application_monotonic_ns",
+                }
+                for name, relative_path in sorted(
+                    self.auxiliary_streams.items()
+                )
+            },
             "config": self.config_snapshot,
             "versions": self.versions,
             "tags": self.session_tags,

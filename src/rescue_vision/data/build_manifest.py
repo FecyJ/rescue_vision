@@ -10,6 +10,11 @@ from typing import Any
 
 from rescue_vision.data.split_manifest import REQUIRED_TAGS
 from rescue_vision.geometry.camera_model import IMAGE_BORDER_FILL_VALUE
+from rescue_vision.motion.recording import (
+    MANUAL_MOTION_LOG_FILENAME,
+    MANUAL_MOTION_STREAM_NAME,
+    inspect_manual_motion_log,
+)
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -44,8 +49,43 @@ def build_dataset_records(
     for directory_value in recording_directories:
         directory = directory_value.expanduser().resolve()
         session = _load_json(directory / "session.json")
-        if session.get("schema_version") != 3:
-            raise ValueError(f"{directory}: session schema_version must be 3.")
+        if session.get("schema_version") not in {3, 4}:
+            raise ValueError(
+                f"{directory}: session schema_version must be 3 or 4."
+            )
+        motion_report: dict[str, object] | None = None
+        if session.get("schema_version") == 4:
+            recording_kind = session.get("recording_kind")
+            auxiliary_streams = session.get("auxiliary_streams")
+            if recording_kind not in {
+                "camera",
+                "supervised_manual_motion",
+            } or not isinstance(auxiliary_streams, dict):
+                raise ValueError(
+                    f"{directory}: invalid recording_kind/auxiliary_streams."
+                )
+            if recording_kind == "camera" and auxiliary_streams:
+                raise ValueError(
+                    f"{directory}: camera recording cannot declare auxiliary "
+                    "streams."
+                )
+            if recording_kind == "supervised_manual_motion":
+                descriptor = auxiliary_streams.get(
+                    MANUAL_MOTION_STREAM_NAME
+                )
+                if set(auxiliary_streams) != {
+                    MANUAL_MOTION_STREAM_NAME
+                } or descriptor != {
+                    "schema_version": 1,
+                    "path": MANUAL_MOTION_LOG_FILENAME,
+                    "time_base": "application_monotonic_ns",
+                }:
+                    raise ValueError(
+                        f"{directory}: invalid manual_motion stream."
+                    )
+                motion_report = inspect_manual_motion_log(
+                    directory / MANUAL_MOTION_LOG_FILENAME
+                )
         if session.get("completed") is not True:
             raise ValueError(f"{directory}: recording is not marked completed.")
         if session.get("image_coordinate_system") != "undistorted_pixel":
@@ -114,6 +154,7 @@ def build_dataset_records(
         frame_count = 0
         previous_sequence = -1
         previous_timestamp_ns = -1
+        first_timestamp_ns: int | None = None
         for line_number, line in enumerate(frame_lines, start=1):
             if not line.strip():
                 continue
@@ -142,6 +183,8 @@ def build_dataset_records(
                 )
             previous_sequence = sequence
             previous_timestamp_ns = timestamp_ns
+            if first_timestamp_ns is None:
+                first_timestamp_ns = timestamp_ns
             image_path = directory / str(frame.get("image_path"))
             expected_hash = frame.get("image_sha256")
             if not isinstance(expected_hash, str) or len(expected_hash) != 64:
@@ -186,6 +229,18 @@ def build_dataset_records(
                     "tags": {name: tags[name] for name in sorted(REQUIRED_TAGS)},
                 }
             )
+        if motion_report is not None:
+            assert first_timestamp_ns is not None
+            if (
+                int(motion_report["first_timestamp_ns"])
+                > first_timestamp_ns
+                or int(motion_report["last_timestamp_ns"])
+                < previous_timestamp_ns
+            ):
+                raise ValueError(
+                    f"{directory}: manual motion log does not cover frame "
+                    "timestamps."
+                )
         statistics = session.get("statistics")
         if not isinstance(statistics, dict):
             raise ValueError(f"{directory}: session statistics must be a mapping.")

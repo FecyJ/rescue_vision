@@ -97,8 +97,8 @@ rescue-vision-manual-capture \
 入口同时声明 `motion_control`、`video_stream`、`vehicle_state`、
 `capture_control` 和 `capture_status`，并接收手动运动与采集命令。采集操作：
 
-- `start`：在 `<output-root>/recordings/` 创建新的标准 recording schema v3
-  会话，持续记录经过配置去畸变的帧；
+- `start`：在 `<output-root>/recordings/` 创建新的标准 recording schema v4
+  会话，持续记录经过配置去畸变的帧及 `motion.jsonl`；
 - `stop`：冲洗队列并完整关闭当前记录；
 - `snapshot`：在 `<output-root>/snapshots/` 保存 JPEG 和同名 JSON 元数据；
 - `mark_event`：录制期间向当前会话的 `events.jsonl` 追加事件。

@@ -22,6 +22,8 @@
 - 坐标系为 `undistorted_pixel`；
 - 有内参指纹、`valid_pixel_ratio` 和 `undistort_fill_value: 114`；
 - 包含全部必需分层标签；
+- `supervised_manual_motion` 会话包含完整 `manual_motion` 辅助流，且其单调
+  时间范围覆盖全部图像；
 - 默认逐图验证 SHA-256。
 
 原图 session 只用于标定或诊断，不能进入任务目标 manifest。
