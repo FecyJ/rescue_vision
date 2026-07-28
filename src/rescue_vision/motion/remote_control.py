@@ -229,7 +229,10 @@ def run_remote_motion(
         raise ValueError("poll_interval_s must be in (0, 0.1].")
     try:
         while not stop_requested():
-            if executor.check_timeout() and on_motion_timeout is not None:
+            timed_out = executor.check_timeout()
+            if not timed_out:
+                executor.controller.update()
+            if timed_out and on_motion_timeout is not None:
                 on_motion_timeout()
             for car_message in executor.controller.drain_messages():
                 if on_car_message is not None:

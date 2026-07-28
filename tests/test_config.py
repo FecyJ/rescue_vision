@@ -42,7 +42,7 @@ def config_text(
     ground_mapping_enabled: bool = True,
     extra: str = "",
 ) -> str:
-    return f"""schema_version: 8
+    return f"""schema_version: 9
 camera:
   backend: rpicam_vid
   image_size: {image_size}
@@ -84,6 +84,7 @@ motion:
   max_linear_velocity_m_s: 0.25
   max_angular_velocity_rad_s: 1.0
   max_wheel_velocity_m_s: 0.30
+  max_wheel_acceleration_m_s2: 0.50
   max_remote_command_valid_for_ms: 500
 tracking:
   confirmation_hits: 2
@@ -276,7 +277,7 @@ def test_runtime_example_matches_strict_schema() -> None:
         Path(__file__).resolve().parents[1] / "configs" / "runtime.example.yaml"
     )
     config = load_runtime_config(example)
-    assert config.schema_version == 8
+    assert config.schema_version == 9
 
 
 def test_uart_config_builds_channel_without_opening_device(tmp_path) -> None:
@@ -337,8 +338,23 @@ def test_motion_config_builds_controller_without_opening_uart(tmp_path) -> None:
     assert not channel.started
     assert controller is not None
     assert controller.limits.wheel_track_m == pytest.approx(0.2)
+    assert controller.limits.max_wheel_acceleration_m_s2 == pytest.approx(0.5)
     assert executor is not None
     assert executor.controller is controller
+
+
+def test_motion_acceleration_limit_must_be_positive(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text().replace(
+            "  max_wheel_acceleration_m_s2: 0.50",
+            "  max_wheel_acceleration_m_s2: 0.0",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="max_wheel_acceleration_m_s2"):
+        load_runtime_config(path)
 
 
 def test_enabled_motion_requires_uart_and_real_wheel_track(tmp_path) -> None:

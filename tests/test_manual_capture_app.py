@@ -150,7 +150,7 @@ def _received(topic: RemoteTopic, payload: bytes, sequence: int):
 
 def _config() -> SimpleNamespace:
     return SimpleNamespace(
-        schema_version=8,
+        schema_version=9,
         camera=SimpleNamespace(image_size=(4, 3), fps=20),
         recording=SimpleNamespace(queue_capacity=8, image_format="png"),
         remote=SimpleNamespace(access_mode=RemoteAccessMode.DEBUG_CONTROL),
@@ -180,7 +180,7 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
     capture = CaptureSession(
         output_root=tmp_path,
         config=config,
-        config_snapshot={"schema_version": 8},
+        config_snapshot={"schema_version": 9},
         pipeline=pipeline,
     )
     start = DebugCaptureCommand(
@@ -207,7 +207,7 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
     executor = RemoteMotionExecutor(
         MotionController(
             car,
-            MotionLimits(0.2, 0.25, 1.0, 0.3, 500),
+            MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 500),
         )
     )
     status = build_session_status(
@@ -228,7 +228,14 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
             safety_mode=VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP,
         )
 
-    assert car.sent[-2:] == [b"m0.1,0.1", b"b0,0"]
+    assert len(car.sent) >= 2
+    assert car.sent[-2].startswith(b"m")
+    limited_left, limited_right = (
+        float(value) for value in car.sent[-2][1:].split(b",")
+    )
+    assert 0.0 < limited_left < 0.1
+    assert limited_right == pytest.approx(limited_left)
+    assert car.sent[-1] == b"b0,0"
     recordings = list((tmp_path / "recordings").iterdir())
     assert len(recordings) == 1
     assert capture.recorder is None
@@ -274,7 +281,7 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
     second_capture = CaptureSession(
         output_root=tmp_path,
         config=config,
-        config_snapshot={"schema_version": 8},
+        config_snapshot={"schema_version": 9},
         pipeline=pipeline,
     )
     second_connection = FakeConnection([])
@@ -326,7 +333,7 @@ def test_recording_queue_overflow_faults_capture_and_requires_stop(
     capture = CaptureSession(
         output_root=tmp_path,
         config=config,
-        config_snapshot={"schema_version": 8},
+        config_snapshot={"schema_version": 9},
         pipeline=pipeline,
     )
     capture.execute(
@@ -343,7 +350,7 @@ def test_recording_queue_overflow_faults_capture_and_requires_stop(
     executor = RemoteMotionExecutor(
         MotionController(
             car,
-            MotionLimits(0.2, 0.25, 1.0, 0.3, 500),
+            MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 500),
         )
     )
 
@@ -447,14 +454,14 @@ def test_camera_failure_faults_capture_and_stops_motion(tmp_path) -> None:
     capture = CaptureSession(
         output_root=tmp_path,
         config=config,
-        config_snapshot={"schema_version": 8},
+        config_snapshot={"schema_version": 9},
         pipeline=pipeline,
     )
     car = FakeCarChannel()
     executor = RemoteMotionExecutor(
         MotionController(
             car,
-            MotionLimits(0.2, 0.25, 1.0, 0.3, 500),
+            MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 500),
         )
     )
 

@@ -59,12 +59,24 @@ class FakeRemoteReceiver:
             raise TimeoutError from exc
 
 
+class FakeClock:
+    def __init__(self, timestamp_ns: int = 0) -> None:
+        self.timestamp_ns = timestamp_ns
+
+    def __call__(self) -> int:
+        return self.timestamp_ns
+
+    def advance(self, seconds: float) -> None:
+        self.timestamp_ns += round(seconds * 1_000_000_000)
+
+
 def limits() -> MotionLimits:
     return MotionLimits(
         wheel_track_m=0.20,
         max_linear_velocity_m_s=0.30,
         max_angular_velocity_rad_s=2.0,
         max_wheel_velocity_m_s=0.40,
+        max_wheel_acceleration_m_s2=0.50,
         max_remote_command_valid_for_ms=500,
     )
 
@@ -107,13 +119,24 @@ def twist_command(
 
 def test_motion_functions_encode_differential_drive_and_stops() -> None:
     channel = FakeCarChannel()
-    controller = MotionController(channel, limits())
+    clock = FakeClock()
+    controller = MotionController(channel, limits(), monotonic_ns=clock)
 
     controller.drive(0.2, 1.0)
+    clock.advance(1.0)
+    assert controller.update()
     controller.forward(0.1)
+    clock.advance(1.0)
+    assert controller.update()
     controller.backward(0.1)
+    clock.advance(1.0)
+    assert controller.update()
     controller.turn_left(1.0)
+    clock.advance(1.0)
+    assert controller.update()
     controller.turn_right(1.0)
+    clock.advance(1.0)
+    assert controller.update()
     controller.soft_brake()
     controller.emergency_stop()
     controller.query_state()
@@ -128,6 +151,48 @@ def test_motion_functions_encode_differential_drive_and_stops() -> None:
         b"e",
         b"v",
     ]
+
+
+def test_wheel_targets_are_slew_limited_across_acceleration_and_reversal() -> None:
+    channel = FakeCarChannel()
+    clock = FakeClock()
+    controller = MotionController(channel, limits(), monotonic_ns=clock)
+
+    clock.advance(10.0)
+    controller.set_wheel_speeds(0.30, -0.30)
+    assert controller.target_wheel_speeds_m_s == pytest.approx((0.30, -0.30))
+    assert not controller.update()
+
+    clock.advance(0.1)
+    assert controller.update()
+    assert controller.commanded_wheel_speeds_m_s == pytest.approx((0.05, -0.05))
+
+    controller.set_wheel_speeds(-0.30, 0.30)
+    clock.advance(0.1)
+    assert controller.update()
+    assert controller.commanded_wheel_speeds_m_s == pytest.approx((0.0, 0.0))
+
+    clock.advance(0.1)
+    assert controller.update()
+    assert controller.commanded_wheel_speeds_m_s == pytest.approx((-0.05, 0.05))
+    assert channel.sent == [b"m0.05,-0.05", b"m0,0", b"m-0.05,0.05"]
+
+
+def test_soft_brake_clears_pending_acceleration_target() -> None:
+    channel = FakeCarChannel()
+    clock = FakeClock()
+    controller = MotionController(channel, limits(), monotonic_ns=clock)
+    controller.forward(0.30)
+    clock.advance(0.1)
+    controller.update()
+
+    controller.soft_brake()
+    clock.advance(1.0)
+
+    assert not controller.update()
+    assert controller.target_wheel_speeds_m_s == (0.0, 0.0)
+    assert controller.commanded_wheel_speeds_m_s == (0.0, 0.0)
+    assert channel.sent == [b"m0.05,0.05", b"b0,0"]
 
 
 def test_motion_limits_reject_instead_of_clamping() -> None:
@@ -220,8 +285,10 @@ def test_parse_car_line_rejects_malformed_known_messages(payload: bytes) -> None
 
 def test_remote_twist_executes_and_expiry_uses_receive_clock() -> None:
     channel = FakeCarChannel()
+    clock = FakeClock()
+    controller = MotionController(channel, limits(), monotonic_ns=clock)
     executor = RemoteMotionExecutor(
-        MotionController(channel, limits()),
+        controller,
         monotonic_ns=lambda: 1_050_000_000,
     )
 
@@ -230,14 +297,17 @@ def test_remote_twist_executes_and_expiry_uses_receive_clock() -> None:
     assert result.result is RemoteMotionResult.APPLIED
     assert result.deadline_timestamp_ns == 1_200_000_000
     assert executor.active_deadline_ns == 1_200_000_000
-    assert channel.sent == [b"m0.1,0.3"]
+    assert channel.sent == []
+    clock.advance(0.2)
+    assert controller.update()
+    assert channel.sent == [b"m0.1,0.1"]
     assert not executor.check_timeout(now_ns=1_199_999_999)
     assert executor.next_wait_s(
         0.05,
         now_ns=1_190_000_000,
     ) == pytest.approx(0.01)
     assert executor.check_timeout(now_ns=1_200_000_000)
-    assert channel.sent[-1] == b"b0,0"
+    assert channel.sent == [b"m0.1,0.1", b"b0,0"]
 
 
 def test_remote_zero_twist_uses_soft_brake_and_clears_deadline() -> None:
@@ -263,7 +333,7 @@ def test_remote_zero_twist_uses_soft_brake_and_clears_deadline() -> None:
     assert stopped.linear_velocity_m_s == 0.0
     assert stopped.angular_velocity_rad_s == 0.0
     assert executor.active_deadline_ns is None
-    assert channel.sent == [b"m0.1,0.3", b"b0,0"]
+    assert channel.sent == [b"b0,0"]
 
 
 def test_remote_deadman_off_and_already_expired_commands_stop() -> None:
@@ -352,21 +422,23 @@ def test_remote_loop_drains_uart_and_stops_on_exit() -> None:
             )
         ]
     )
+    clock = FakeClock()
     executor = RemoteMotionExecutor(
-        MotionController(channel, limits()),
+        MotionController(channel, limits(), monotonic_ns=clock),
         monotonic_ns=lambda: 1_000_000_001,
     )
-    messages = iter([remote_message(twist_command())])
+
     polls = 0
     car_messages: list[object] = []
 
     def stop_requested() -> bool:
         nonlocal polls
         polls += 1
+        clock.advance(0.1)
         return polls > 2
 
     run_remote_motion(
-        FakeRemoteReceiver(messages),
+        FakeRemoteReceiver(iter([remote_message(twist_command())])),
         executor,
         stop_requested=stop_requested,
         on_car_message=car_messages.append,
@@ -392,7 +464,7 @@ def test_remote_loop_drains_uart_and_stops_on_exit() -> None:
             servo_right_deg=90,
         ),
     ]
-    assert channel.sent == [b"m0.1,0.3", b"b0,0"]
+    assert channel.sent == [b"m0.05,0.05", b"b0,0"]
 
 
 def test_remote_loop_routes_other_controls_without_bypassing_stop() -> None:

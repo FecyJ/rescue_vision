@@ -1,6 +1,6 @@
 # `config`：运行配置与对象装配
 
-本包是运行参数的唯一入口。`load_runtime_config()` 加载 schema v8 YAML，拒绝缺失字段、未知字段、错误类型和不一致资产；相对路径以 YAML 所在目录为基准。
+本包是运行参数的唯一入口。`load_runtime_config()` 加载 schema v9 YAML，拒绝缺失字段、未知字段、错误类型和不一致资产；相对路径以 YAML 所在目录为基准。
 
 本机运行统一读取不提交的 `configs/runtime.yaml`。`configs/runtime.example.yaml` 只用于创建新配置：
 
@@ -36,7 +36,7 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `ProcessingConfig` | `max_observation_age_ms` |
 | `UartConfig` | 设备名、波特率、读写超时、有界接收容量和最大行长度 |
 | `RemoteConfig` | 服务端/客户端、观察/调试权限、连接/IO 超时和有界队列 |
-| `MotionRuntimeConfig` | 实测轮距、车体/车轮速度上限和远程命令有效期上限 |
+| `MotionRuntimeConfig` | 实测轮距、车体/车轮速度上限、单轮加速度上限和远程命令有效期上限 |
 | `TrackingConfig` | 关联、确认、滑行、衰减和删除阈值 |
 | `WorldRuntimeConfig` | `WorldModelConfig` 与 `StaticRegion` 集合 |
 | `MissionConfig` | 比赛计时、安全超时、避让距离和目标优先级 |
@@ -188,7 +188,10 @@ PySerial 并打开设备。电机命令、轮速和未来 IMU 报文由后续协
 
 ## schema 与路径
 
-- 当前运行配置为 schema v8。
+- 当前运行配置为 schema v9。
+- schema v8 升级到 v9 时，`motion` 段必须增加正有限数
+  `max_wheel_acceleration_m_s2`。示例值 `0.50` 表示单轮目标速度每秒最多
+  变化 0.50 m/s；控制器不会静默使用旧配置或猜测真车安全加速度。
 - schema v7 升级到 v8 时必须增加完整的 `motion` 段；默认关闭且轮距为
   `null`，不会猜测机械尺寸、打开 UART 或接受远程运动。
 - schema v6 升级到 v7 时，删除 `authentication_key_path` 和

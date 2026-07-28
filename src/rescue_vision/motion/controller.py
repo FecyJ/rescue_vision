@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from rescue_vision.motion.protocol import (
@@ -45,6 +47,7 @@ class MotionLimits:
     max_linear_velocity_m_s: float
     max_angular_velocity_rad_s: float
     max_wheel_velocity_m_s: float
+    max_wheel_acceleration_m_s2: float
     max_remote_command_valid_for_ms: int
 
     def __post_init__(self) -> None:
@@ -53,6 +56,7 @@ class MotionLimits:
             "max_linear_velocity_m_s",
             "max_angular_velocity_rad_s",
             "max_wheel_velocity_m_s",
+            "max_wheel_acceleration_m_s2",
         ):
             object.__setattr__(
                 self,
@@ -77,18 +81,38 @@ class MotionController:
         self,
         channel: CarLineChannel,
         limits: MotionLimits,
+        *,
+        monotonic_ns: Callable[[], int] = time.monotonic_ns,
     ) -> None:
         if not isinstance(limits, MotionLimits):
             raise TypeError("limits must be MotionLimits.")
+        if not callable(monotonic_ns):
+            raise TypeError("monotonic_ns must be callable.")
         self._channel = channel
         self.limits = limits
+        self._monotonic_ns = monotonic_ns
+        self._target_wheel_speeds_m_s = (0.0, 0.0)
+        self._commanded_wheel_speeds_m_s = (0.0, 0.0)
+        self._last_acceleration_update_ns = self._now()
+
+    @property
+    def target_wheel_speeds_m_s(self) -> tuple[float, float]:
+        """返回最近请求的左右轮目标速度。"""
+
+        return self._target_wheel_speeds_m_s
+
+    @property
+    def commanded_wheel_speeds_m_s(self) -> tuple[float, float]:
+        """返回加速度限制后最近下发的左右轮速度。"""
+
+        return self._commanded_wheel_speeds_m_s
 
     def set_wheel_speeds(
         self,
         left_m_s: float,
         right_m_s: float,
     ) -> None:
-        """立即设置左右轮速度。正值前进，单位 m/s。"""
+        """设置左右轮目标速度；实际下发由 :meth:`update` 渐进逼近。"""
 
         left = _finite(left_m_s, "left_m_s")
         right = _finite(right_m_s, "right_m_s")
@@ -98,7 +122,34 @@ class MotionController:
                 "Wheel velocity exceeds configured limit "
                 f"{maximum} m/s: left={left}, right={right}."
             )
-        self._channel.send_line(encode_wheel_speed_command(left, right))
+        # 先按旧目标结算到“新目标生效”的时刻，避免把此前的静止空闲时间
+        # 错算成新目标可用的加速时间。
+        self.update()
+        self._target_wheel_speeds_m_s = (left, right)
+
+    def update(self, *, now_ns: int | None = None) -> bool:
+        """按单轮最大加速度推进目标并下发；有新命令时返回 ``True``。"""
+
+        current_ns = self._now(now_ns)
+        if current_ns < self._last_acceleration_update_ns:
+            raise ValueError(
+                "now_ns must not precede the previous acceleration update: "
+                f"{current_ns} < {self._last_acceleration_update_ns}."
+            )
+        elapsed_s = (
+            current_ns - self._last_acceleration_update_ns
+        ) / 1_000_000_000.0
+        maximum_delta = self.limits.max_wheel_acceleration_m_s2 * elapsed_s
+        previous_left, previous_right = self._commanded_wheel_speeds_m_s
+        target_left, target_right = self._target_wheel_speeds_m_s
+        next_left = _move_toward(previous_left, target_left, maximum_delta)
+        next_right = _move_toward(previous_right, target_right, maximum_delta)
+        self._last_acceleration_update_ns = current_ns
+        if next_left == previous_left and next_right == previous_right:
+            return False
+        self._channel.send_line(encode_wheel_speed_command(next_left, next_right))
+        self._commanded_wheel_speeds_m_s = (next_left, next_right)
+        return True
 
     def drive(
         self,
@@ -153,11 +204,13 @@ class MotionController:
         """按固件减速度斜坡制动到静止。"""
 
         self._channel.send_line(encode_soft_brake_command())
+        self._reset_acceleration_state()
 
     def emergency_stop(self) -> None:
         """触发固件急停。"""
 
         self._channel.send_line(encode_emergency_stop_command())
+        self._reset_acceleration_state()
 
     def query_state(self) -> None:
         """请求固件立即返回当前状态。"""
@@ -187,9 +240,30 @@ class MotionController:
             except TimeoutError:
                 return tuple(messages)
 
+    def _reset_acceleration_state(self) -> None:
+        self._target_wheel_speeds_m_s = (0.0, 0.0)
+        self._commanded_wheel_speeds_m_s = (0.0, 0.0)
+        self._last_acceleration_update_ns = self._now()
+
+    def _now(self, value: int | None = None) -> int:
+        current = self._monotonic_ns() if value is None else value
+        if isinstance(current, bool) or not isinstance(current, int) or current < 0:
+            raise ValueError(
+                f"now_ns must be a non-negative integer, got {current!r}."
+            )
+        return current
+
 
 def _non_negative(value: object, location: str) -> float:
     converted = _finite(value, location)
     if converted < 0.0:
         raise ValueError(f"{location} must be >= 0, got {converted!r}.")
     return converted
+
+
+def _move_toward(current: float, target: float, maximum_delta: float) -> float:
+    if target > current:
+        return min(target, current + maximum_delta)
+    if target < current:
+        return max(target, current - maximum_delta)
+    return current

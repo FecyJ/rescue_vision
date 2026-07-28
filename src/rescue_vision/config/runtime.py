@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from rescue_vision.motion import MotionController, RemoteMotionExecutor
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 def _mapping(value: object, location: str) -> dict[str, Any]:
@@ -220,6 +220,7 @@ class MotionRuntimeConfig:
     max_linear_velocity_m_s: float
     max_angular_velocity_rad_s: float
     max_wheel_velocity_m_s: float
+    max_wheel_acceleration_m_s2: float
     max_remote_command_valid_for_ms: int
 
     def build_controller(
@@ -242,6 +243,9 @@ class MotionRuntimeConfig:
                 max_linear_velocity_m_s=self.max_linear_velocity_m_s,
                 max_angular_velocity_rad_s=self.max_angular_velocity_rad_s,
                 max_wheel_velocity_m_s=self.max_wheel_velocity_m_s,
+                max_wheel_acceleration_m_s2=(
+                    self.max_wheel_acceleration_m_s2
+                ),
                 max_remote_command_valid_for_ms=(
                     self.max_remote_command_valid_for_ms
                 ),
@@ -371,7 +375,7 @@ class AppConfig:
 
 
 def load_runtime_config(path: str | Path) -> AppConfig:
-    """从 YAML 加载 schema v8；缺项和未知字段均视为错误。"""
+    """从 YAML 加载 schema v9；缺项和未知字段均视为错误。"""
 
     config_path = Path(path).expanduser().resolve()
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -654,6 +658,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "max_linear_velocity_m_s",
             "max_angular_velocity_rad_s",
             "max_wheel_velocity_m_s",
+            "max_wheel_acceleration_m_s2",
             "max_remote_command_valid_for_ms",
         },
         "motion",
@@ -715,6 +720,15 @@ def load_runtime_config(path: str | Path) -> AppConfig:
                 "motion",
             ),
             "motion.max_wheel_velocity_m_s",
+            minimum=0.001,
+        ),
+        max_wheel_acceleration_m_s2=_finite_float(
+            _required(
+                motion_raw,
+                "max_wheel_acceleration_m_s2",
+                "motion",
+            ),
+            "motion.max_wheel_acceleration_m_s2",
             minimum=0.001,
         ),
         max_remote_command_valid_for_ms=max_remote_validity,

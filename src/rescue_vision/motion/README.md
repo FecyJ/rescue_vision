@@ -13,10 +13,11 @@
 
 | 入口 | 输入 | 输出或语义 |
 | --- | --- | --- |
-| `MotionLimits` | 轮距、车体/车轮速度上限、远程有效期上限 | 创建时严格校验 |
+| `MotionLimits` | 轮距、车体/车轮速度与单轮加速度上限、远程有效期上限 | 创建时严格校验 |
 | `MotionController` | UART 行通道、`MotionLimits` | Rescue Car 运动控制器 |
-| `MotionController.drive()` | 前进速度 m/s、逆时针角速度 rad/s | 差速换算后发送左右轮目标 |
+| `MotionController.drive()` | 前进速度 m/s、逆时针角速度 rad/s | 差速换算后设置左右轮目标 |
 | `set_wheel_speeds()` | 左右轮速度 m/s | 绕过车体 twist 换算，仍执行轮速限幅校验 |
+| `update()` | 可选本机单调时间 ns | 按单轮最大加速度推进并下发目标；返回是否发送 |
 | `forward()` / `backward()` | 非负速度 m/s | 直行前进/后退 |
 | `turn_left()` / `turn_right()` | 非负角速度 rad/s | 原地左转/右转 |
 | `soft_brake()` / `emergency_stop()` | 无 | 固件斜坡制动/紧急停止 |
@@ -38,8 +39,10 @@ left  = linear - angular × wheel_track / 2
 right = linear + angular × wheel_track / 2
 ```
 
-超限命令会被拒绝，不会静默截断。`target_heading` 在定位或 IMU 尚未提供其
-显式参考系前也会被拒绝并停车。
+超限命令会被拒绝，不会静默截断。合法目标则由
+`max_wheel_acceleration_m_s2` 限制每个轮子的速度变化率；这同时限制直线
+加速和转向跳变。`target_heading` 在定位或 IMU 尚未提供其显式参考系前也会
+被拒绝并停车。
 
 ## 1. 从运行配置装配
 
@@ -76,7 +79,8 @@ with channel:
 
 ## 2. 使用 `drive()` 控制车体速度
 
-`drive()` 适合上层规划器、手柄或调试逻辑输出车体 twist。以下片段应放进
+`drive()` 适合上层规划器、手柄或调试逻辑输出车体 twist。它只更新目标，
+实时循环必须持续调用 `update()` 才会按配置斜率渐进下发。以下片段应放进
 前文 `with channel` 的 `try` 内：
 
 ```python
@@ -85,16 +89,22 @@ controller.drive(
     linear_velocity_m_s=0.20,
     angular_velocity_rad_s=0.60,
 )
+controller.update()
 
 # 右转使用负角速度。
 controller.drive(
     linear_velocity_m_s=0.15,
     angular_velocity_rad_s=-0.40,
 )
+controller.update()
 ```
 
 轮距只参与 twist 到左右轮速的换算。线速度、角速度或换算后的任一轮速度
 超过 `MotionLimits` 时，调用会抛出 `ValueError`，不会把请求悄悄截断。
+每次 `update()` 使用树莓派本机单调时间计算允许的最大轮速增量；时钟倒退会
+被拒绝。`run_remote_motion()` 已在每轮循环自动调用它，手动采集应用不需要
+另建定时器。其他直接调用方应以不超过 100 ms 的有界周期调用 `update()`，
+否则目标只会停留在最近一次实际下发值。
 远程手柄执行器对死手开启且线速度、角速度同时回到零的命令不调用
 `drive(0, 0)`；它改用 `soft_brake()` 发送 `b0,0`，由固件按减速度斜坡
 停车，并清除上一条非零命令期限。
@@ -109,11 +119,13 @@ controller.set_wheel_speeds(
     left_m_s=0.10,
     right_m_s=0.25,
 )
+controller.update()
 ```
 
 该方法不使用 `wheel_track_m` 做换算，但仍检查
-`max_wheel_velocity_m_s`。上层一般应优先使用 `drive()`，避免多个模块各自
-实现差速公式。
+`max_wheel_velocity_m_s`，并和 `drive()` 共用
+`max_wheel_acceleration_m_s2` 与 `update()`。上层一般应优先使用
+`drive()`，避免多个模块各自实现差速公式。
 
 ## 4. 前进、后退和原地转向
 
@@ -127,8 +139,8 @@ controller.turn_left(angular_velocity_rad_s=0.80)
 controller.turn_right(angular_velocity_rad_s=0.80)
 ```
 
-这些调用只发送新的目标，不等待动作完成，也不自行休眠。动作时长和控制周期
-由应用主循环决定。
+这些调用只设置新的目标，不等待动作完成，也不自行休眠。动作时长和
+`update()` 控制周期由应用主循环决定。
 
 ## 5. 柔和停车和紧急停止
 
@@ -295,6 +307,8 @@ finally:
 
 - `valid_for_ms` 从树莓派完成接收该消息的单调时间开始计算，不比较两台机器
   互不共享零点的 `issued_timestamp_ns`。
+- 远程 twist 的 payload 和电脑端协议不变；最大加速度是车端 schema v9
+  运行配置，不由客户端逐条指定，避免绕过统一安全上限。
 - 死手关闭、命令过期、非法 payload、未知控制模式和循环正常退出均进入柔和
   停车；协议或通信异常也会尝试停车并继续抛出原始异常。
 - `drain_messages()` / `run_remote_motion()` 会排空 10 Hz 回传。未知前缀保留

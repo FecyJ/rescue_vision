@@ -54,9 +54,9 @@ python -m pytest
 | [`camera`](src/rescue_vision/camera/README.md) | 已实现 | 真机最新帧、离线回放和有界异步记录 |
 | [`calibration`](src/rescue_vision/calibration/README.md) | 已实现 | 棋盘采集、三模型内参比较和地面映射 |
 | [`geometry`](src/rescue_vision/geometry/README.md) | 已实现 | 去畸变、显式坐标类型、地面与 BEV 转换 |
-| [`config`](src/rescue_vision/config/README.md) | 已实现 | schema v8 配置、UART/远程/motion/几何/模型和算法装配 |
+| [`config`](src/rescue_vision/config/README.md) | 已实现 | schema v9 配置、UART/远程/motion/几何/模型和算法装配 |
 | [`communication`](src/rescue_vision/communication/README.md) | 已实现基础设施 | UART、直接 TCP 远程消息、独立客户端严格 schema 和有界队列；发布器待接入 |
-| [`motion`](src/rescue_vision/motion/README.md) | 已实现基础设施 | 差速运动函数、Rescue Car 电控协议解析、远程调试执行和车端超时停车 |
+| [`motion`](src/rescue_vision/motion/README.md) | 已实现基础设施 | 差速运动、单轮加速度限制、Rescue Car 电控协议解析、远程调试执行和车端超时停车 |
 | [`app`](src/rescue_vision/app/README.md) | 已实现手动采集入口 | 赛外受监督驾驶、图传、采集控制与状态装配；比赛入口待实现 |
 | [`data`](src/rescue_vision/data/README.md) | 已实现 | 记录检查、清单生成和按会话防泄漏划分 |
 | [`evaluation`](src/rescue_vision/evaluation/README.md) | 已实现 | 分类、地面误差、时延和失败样例报告 |
