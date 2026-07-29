@@ -873,17 +873,22 @@ def _artifact_id(prefix: str) -> str:
 
 def _accept_with_shutdown(
     server: RemoteTcpServer,
+    controller: MotionController,
     *,
     timeout_s: float,
     stop_requested: Callable[[], bool],
 ) -> RemoteMessageConnection | None:
     deadline = time.monotonic() + timeout_s
     while not stop_requested():
+        # STM32 continuously publishes 10 Hz telemetry, including while no
+        # remote client is connected.  Keep the UART's bounded queue healthy
+        # instead of leaving it unconsumed for the whole accept timeout.
+        controller.drain_messages()
         remaining_s = deadline - time.monotonic()
         if remaining_s <= 0:
-            raise TimeoutError("Timed out waiting for remote TCP client.")
+            return None
         try:
-            return server.accept(timeout=min(0.5, remaining_s))
+            return server.accept(timeout=min(0.1, remaining_s))
         except TimeoutError:
             continue
     return None
@@ -970,6 +975,7 @@ def main() -> None:
                 while not shutdown_requested.is_set():
                     connection = _accept_with_shutdown(
                         server,
+                        controller,
                         timeout_s=args.accept_timeout_seconds,
                         stop_requested=shutdown_requested.is_set,
                     )

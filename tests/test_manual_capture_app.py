@@ -7,10 +7,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import rescue_vision.app.manual_capture as manual_capture_module
 from rescue_vision.app.manual_capture import (
     CameraPipeline,
     CaptureSession,
     VehicleState,
+    _accept_with_shutdown,
     _validate_mode,
     build_session_status,
     run_manual_capture_session,
@@ -135,6 +137,29 @@ class FakeConnection:
         self.observations.append((topic, payload))
 
 
+class PollingServer:
+    def __init__(self, connection: object, *, timeouts_before_connection: int) -> None:
+        self.connection = connection
+        self.timeouts_before_connection = timeouts_before_connection
+        self.accept_timeouts: list[float] = []
+
+    def accept(self, timeout: float | None = None) -> object:
+        assert timeout is not None
+        self.accept_timeouts.append(timeout)
+        if len(self.accept_timeouts) <= self.timeouts_before_connection:
+            raise TimeoutError
+        return self.connection
+
+
+class CountingDrainController:
+    def __init__(self) -> None:
+        self.drain_count = 0
+
+    def drain_messages(self) -> tuple[object, ...]:
+        self.drain_count += 1
+        return ()
+
+
 def _received(topic: RemoteTopic, payload: bytes, sequence: int):
     return ReceivedRemoteMessage(
         stream=RemoteStream.CONTROL,
@@ -160,6 +185,45 @@ def _config() -> SimpleNamespace:
             max_remote_command_valid_for_ms=500,
         ),
     )
+
+
+def test_accept_wait_drains_uart_between_tcp_polls() -> None:
+    connection = object()
+    server = PollingServer(connection, timeouts_before_connection=2)
+    controller = CountingDrainController()
+
+    accepted = _accept_with_shutdown(
+        server,  # type: ignore[arg-type]
+        controller,  # type: ignore[arg-type]
+        timeout_s=1.0,
+        stop_requested=lambda: False,
+    )
+
+    assert accepted is connection
+    assert controller.drain_count == 3
+    assert server.accept_timeouts == [0.1, 0.1, 0.1]
+
+
+def test_accept_timeout_is_a_clean_stop(monkeypatch) -> None:
+    moments = iter((10.0, 11.0))
+    monkeypatch.setattr(
+        manual_capture_module.time,
+        "monotonic",
+        lambda: next(moments),
+    )
+    server = PollingServer(object(), timeouts_before_connection=0)
+    controller = CountingDrainController()
+
+    accepted = _accept_with_shutdown(
+        server,  # type: ignore[arg-type]
+        controller,  # type: ignore[arg-type]
+        timeout_s=0.5,
+        stop_requested=lambda: False,
+    )
+
+    assert accepted is None
+    assert controller.drain_count == 1
+    assert server.accept_timeouts == []
 
 
 def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
