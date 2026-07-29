@@ -287,10 +287,16 @@ def main() -> None:
                 if args.already_undistorted
                 else camera_model.undistort_image(input_image)
             )
+            valid_mask = (
+                camera_model.valid_mask
+                if camera_model is not None
+                else np.full(image.shape[:2], 255, dtype=np.uint8)
+            )
             capture_timestamp_ns = monotonic_ns()
             result = detector.detect(
                 CameraFrame(sequence, capture_timestamp_ns, image),
                 image,
+                valid_mask=valid_mask,
             )
             output.write(
                 json.dumps(_record(result), ensure_ascii=False, allow_nan=False)

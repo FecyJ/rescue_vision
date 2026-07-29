@@ -80,6 +80,10 @@ def frame(image: np.ndarray, *, timestamp_ns: int = 1_000_000) -> CameraFrame:
     return CameraFrame(7, timestamp_ns, image)
 
 
+def valid_mask(image: np.ndarray) -> np.ndarray:
+    return np.full(image.shape[:2], 255, dtype=np.uint8)
+
+
 def safe_zone_scene(*, include_purple: bool = True) -> np.ndarray:
     image = np.full((400, 400, 3), 255, dtype=np.uint8)
     cv2.rectangle(image, (100, 50), (300, 150), bgr(3), thickness=-1)
@@ -100,6 +104,7 @@ def test_safe_zone_uses_approach_frame_and_keeps_physical_color() -> None:
     result = detector.detect(
         frame(image),
         image,
+        valid_mask=valid_mask(image),
         result_timestamp_ns=1_100_000,
     )
 
@@ -132,7 +137,12 @@ def test_safe_zone_does_not_invent_sides_without_entrance_evidence() -> None:
         ground_projector=projector(),
     )
 
-    result = detector.detect(frame(image), image, result_timestamp_ns=1_100_000)
+    result = detector.detect(
+        frame(image),
+        image,
+        valid_mask=valid_mask(image),
+        result_timestamp_ns=1_100_000,
+    )
 
     observation = result.safe_zones[0]
     assert observation.entrance is None
@@ -148,7 +158,12 @@ def test_safe_zone_without_projector_keeps_pixel_observation_only() -> None:
         max_observation_age_ms=100.0,
     )
 
-    result = detector.detect(frame(image), image, result_timestamp_ns=1_100_000)
+    result = detector.detect(
+        frame(image),
+        image,
+        valid_mask=valid_mask(image),
+        result_timestamp_ns=1_100_000,
+    )
 
     observation = result.safe_zones[0]
     assert observation.polygon_ground is None
@@ -166,7 +181,12 @@ def test_start_zone_is_unlabelled_region_with_ground_corners() -> None:
         ground_projector=projector(),
     )
 
-    result = detector.detect(frame(image), image, result_timestamp_ns=1_100_000)
+    result = detector.detect(
+        frame(image),
+        image,
+        valid_mask=valid_mask(image),
+        result_timestamp_ns=1_100_000,
+    )
 
     assert len(result.start_zones) == 1
     observation = result.start_zones[0]
@@ -187,7 +207,12 @@ def test_center_cross_recovers_two_dashed_perpendicular_axes() -> None:
         ground_projector=projector(),
     )
 
-    result = detector.detect(frame(image), image, result_timestamp_ns=1_100_000)
+    result = detector.detect(
+        frame(image),
+        image,
+        valid_mask=valid_mask(image),
+        result_timestamp_ns=1_100_000,
+    )
 
     assert result.center_cross is not None
     assert len(result.center_cross.axes) == 2
@@ -205,7 +230,12 @@ def test_single_long_marking_is_only_partial_center_evidence() -> None:
         ground_projector=projector(),
     )
 
-    result = detector.detect(frame(image), image, result_timestamp_ns=1_100_000)
+    result = detector.detect(
+        frame(image),
+        image,
+        valid_mask=valid_mask(image),
+        result_timestamp_ns=1_100_000,
+    )
 
     assert result.center_cross is not None
     assert len(result.center_cross.axes) == 1
@@ -223,7 +253,12 @@ def test_solid_perpendicular_lines_are_not_center_cross() -> None:
         ground_projector=projector(),
     )
 
-    result = detector.detect(frame(image), image, result_timestamp_ns=1_100_000)
+    result = detector.detect(
+        frame(image),
+        image,
+        valid_mask=valid_mask(image),
+        result_timestamp_ns=1_100_000,
+    )
 
     assert result.center_cross is None
 
@@ -238,7 +273,12 @@ def test_boundary_candidates_are_explicitly_low_confidence_and_bounded() -> None
         ground_projector=projector(),
     )
 
-    result = detector.detect(frame(image), image, result_timestamp_ns=1_100_000)
+    result = detector.detect(
+        frame(image),
+        image,
+        valid_mask=valid_mask(image),
+        result_timestamp_ns=1_100_000,
+    )
 
     assert 1 <= len(result.boundary_features) <= 3
     assert any(
@@ -249,6 +289,26 @@ def test_boundary_candidates_are_explicitly_low_confidence_and_bounded() -> None
         FieldFeatureQuality.LOW_CONFIDENCE_BOUNDARY in item.quality
         for item in result.boundary_features
     )
+
+
+def test_undistortion_fill_boundary_is_not_reported_as_a_field_feature() -> None:
+    image = np.full((400, 400, 3), 114, dtype=np.uint8)
+    image[40:360, 40:360] = 255
+    mask = np.zeros(image.shape[:2], dtype=np.uint8)
+    mask[40:360, 40:360] = 255
+    detector = FieldFeatureDetector(
+        config(),
+        max_observation_age_ms=100.0,
+    )
+
+    result = detector.detect(
+        frame(image),
+        image,
+        valid_mask=mask,
+        result_timestamp_ns=1_100_000,
+    )
+
+    assert result.boundary_features == ()
 
 
 def test_field_detector_validates_frame_age_and_image_contract() -> None:
@@ -262,11 +322,13 @@ def test_field_detector_validates_frame_age_and_image_contract() -> None:
         detector.detect(
             frame(image, timestamp_ns=1_000_000),
             image,
+            valid_mask=valid_mask(image),
             result_timestamp_ns=3_000_000,
         )
     realtime = detector.detect_realtime(
         frame(image, timestamp_ns=1_000_000),
         image,
+        valid_mask=valid_mask(image),
         result_timestamp_ns=3_000_000,
     )
     assert realtime.stale_dropped
@@ -276,6 +338,28 @@ def test_field_detector_validates_frame_age_and_image_contract() -> None:
         detector.detect(
             frame(image),
             image.astype(np.float32),
+            valid_mask=valid_mask(image),
+            result_timestamp_ns=1_100_000,
+        )
+    with pytest.raises(ValueError, match="matching"):
+        detector.detect(
+            frame(image),
+            image,
+            valid_mask=np.full((39, 40), 255, dtype=np.uint8),
+            result_timestamp_ns=1_100_000,
+        )
+    with pytest.raises(ValueError, match="either 0 or 255"):
+        detector.detect(
+            frame(image),
+            image,
+            valid_mask=np.full(image.shape[:2], 1, dtype=np.uint8),
+            result_timestamp_ns=1_100_000,
+        )
+    with pytest.raises(ValueError, match="at least one valid pixel"):
+        detector.detect(
+            frame(image),
+            image,
+            valid_mask=np.zeros(image.shape[:2], dtype=np.uint8),
             result_timestamp_ns=1_100_000,
         )
 

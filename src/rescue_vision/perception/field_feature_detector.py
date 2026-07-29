@@ -264,7 +264,11 @@ class FieldFeatureDetector:
         self._max_observation_age_ms = converted_age
         self._ground_projector = ground_projector
 
-    def _working_image(self, image_bgr: Uint8Array) -> _WorkingImage:
+    def _working_image(
+        self,
+        image_bgr: Uint8Array,
+        valid_mask: Uint8Array,
+    ) -> _WorkingImage:
         projector = self._ground_projector
         if (
             projector is None
@@ -273,13 +277,12 @@ class FieldFeatureDetector:
         ):
             return _WorkingImage(
                 image_bgr=image_bgr,
-                valid_mask=np.full(image_bgr.shape[:2], 255, dtype=np.uint8),
+                valid_mask=valid_mask,
                 is_bev=False,
             )
         bev = projector.make_bev_image(image_bgr)
-        source_valid = np.full(image_bgr.shape[:2], 255, dtype=np.uint8)
         valid = cv2.warpPerspective(
-            source_valid,
+            valid_mask,
             projector.image_to_bev,
             (projector.bev_config.width, projector.bev_config.height),
             flags=cv2.INTER_NEAREST,
@@ -691,7 +694,14 @@ class FieldFeatureDetector:
             self._config.boundary_canny_low_threshold,
             self._config.boundary_canny_high_threshold,
         )
-        edges[valid_mask == 0] = 0
+        # Canny 会在去畸变填充区与有效图像的交界处产生强边缘。向内收缩两像素
+        # 后再筛边缘，避免把这圈人工边界当作围栏或场角。
+        interior_valid = cv2.erode(
+            valid_mask,
+            np.ones((5, 5), dtype=np.uint8),
+            iterations=1,
+        )
+        edges[interior_valid == 0] = 0
         segments = _hough_segments(
             edges,
             min_length_fraction=self._config.boundary_min_line_length_fraction,
@@ -844,6 +854,7 @@ class FieldFeatureDetector:
         frame: CameraFrame,
         undistorted_image_bgr: Uint8Array,
         *,
+        valid_mask: Uint8Array,
         result_timestamp_ns: int | None = None,
     ) -> FieldFeatureDetectionResult:
         if (
@@ -865,8 +876,22 @@ class FieldFeatureDetector:
             raise ValueError(
                 f"Undistorted image_size {image_size} does not match frame {frame_size}."
             )
+        if (
+            not isinstance(valid_mask, np.ndarray)
+            or valid_mask.dtype != np.uint8
+            or valid_mask.ndim != 2
+            or valid_mask.shape != undistorted_image_bgr.shape[:2]
+        ):
+            raise ValueError(
+                "valid_mask must be uint8 with shape (height, width) matching "
+                "undistorted_image_bgr."
+            )
+        if np.any((valid_mask != 0) & (valid_mask != 255)):
+            raise ValueError("valid_mask values must be either 0 or 255.")
+        if not np.any(valid_mask):
+            raise ValueError("valid_mask must contain at least one valid pixel.")
 
-        working = self._working_image(undistorted_image_bgr)
+        working = self._working_image(undistorted_image_bgr, valid_mask)
         hsv = cv2.cvtColor(working.image_bgr, cv2.COLOR_BGR2HSV)
         masks = {
             "safe_red": _morphology(
@@ -969,6 +994,7 @@ class FieldFeatureDetector:
         frame: CameraFrame,
         undistorted_image_bgr: Uint8Array,
         *,
+        valid_mask: Uint8Array,
         result_timestamp_ns: int | None = None,
     ) -> RealtimeFieldFeatureResult:
         """检测最新帧，并把过期结果转换为显式空结果。"""
@@ -977,6 +1003,7 @@ class FieldFeatureDetector:
             result = self.detect(
                 frame,
                 undistorted_image_bgr,
+                valid_mask=valid_mask,
                 result_timestamp_ns=result_timestamp_ns,
             )
         except StaleObservationError as exc:

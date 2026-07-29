@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import math
+from time import monotonic_ns
 
 import cv2
 import numpy as np
@@ -348,6 +349,28 @@ def test_estimator_can_fit_without_k0_but_marks_the_degradation() -> None:
 
     assert result.center_ground is not None
     assert GroundGeometryQuality.K0_UNAVAILABLE in result.quality
+
+
+def test_estimator_meets_realtime_budget_without_a_frozen_clock() -> None:
+    ground_projector = projector()
+    source = observation(TargetClass.ORANGE_INJURED, ground_projector)
+    capture_timestamp_ns = monotonic_ns()
+    source = replace(
+        source,
+        capture_timestamp_ns=capture_timestamp_ns,
+        result_timestamp_ns=capture_timestamp_ns,
+    )
+    estimator = TargetGroundGeometryEstimator(
+        config(),
+        ground_projector=ground_projector,
+        max_observation_age_ms=150.0,
+    )
+
+    result = estimator.estimate_realtime([source])
+
+    assert not result.stale_dropped
+    assert len(result.estimates) == 1
+    assert result.estimates[0].center_ground is not None
 
 
 def test_estimator_rejects_stale_and_incomplete_geometry() -> None:

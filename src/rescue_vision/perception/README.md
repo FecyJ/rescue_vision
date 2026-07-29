@@ -252,10 +252,11 @@ for estimate in target_geometries:
 - 橘色伤员：可配置长、宽、高的长方体；
 - 黑色核心物资：以正三角形面接地、棱长可配置的正四面体。
 
-估计器在 K0 周围按足迹外接半径搜索 `center_x / center_y / yaw`，把候选三维
-顶点投影回去畸变 ROI，以颜色掩码 IoU、轮廓距离和 K0 到接触边的距离评分，
-再对多个空间上不同的候选细化。正方形盒体朝向按 90° 对称，长方体按 180°，
-正四面体按 120°；对称朝向不会伪装成中心歧义。
+估计器先按粗朝向枚举 K0 可能对应的底面顶点和边中点，并用少量偏移容纳锚点
+误差；随后交替细化中心两轴与朝向，最后只检查局部联合邻域。每个候选仍把
+三维顶点投影回去畸变 ROI，以颜色掩码 IoU、轮廓距离和 K0 到接触边的距离
+评分。这样避免逐点扫描整个足迹外接圆。正方形盒体朝向按 90° 对称，长方体
+按 180°，正四面体按 120°；对称朝向不会伪装成中心歧义。
 
 颜色为 `unknown`、掩码不可用、拟合分数不足、K0 与模型接触边矛盾或候选中心
 分散超过门限时，保留失败分数和质量标记但返回 `center_ground=None`。
@@ -265,7 +266,8 @@ K0 不可用时可从检测框底部建立搜索种子，但会显式附加
 
 形状尺寸和全部拟合门限只在运行配置的
 `perception.target_ground_geometry` 中维护。当前合成投影测试证明坐标、形状
-和降级契约可运行，不证明现场中心误差或树莓派端到端性能。
+和降级契约可运行；真实单调时钟回归会检查默认 150 ms 时效预算。该回归不
+证明现场中心误差或树莓派端到端性能，目标硬件仍需按 P50/P95 观测年龄验收。
 
 ### 7.2 静态场地特征
 
@@ -287,6 +289,7 @@ if field_detector is None:
 realtime_field_result = field_detector.detect_realtime(
     raw_frame,
     undistorted_bgr,
+    valid_mask=geometry.camera_model.valid_mask,
 )
 if realtime_field_result.stale_dropped:
     # 不向定位层传递过期地标。
@@ -300,6 +303,10 @@ for safe_zone in field_result.safe_zones if field_result is not None else ():
         # side 是从场内面向入口时的 approach_left / approach_right。
         print(half.side, half.polygon_ground)
 ```
+
+`valid_mask` 必须与去畸变图同尺寸，直接使用当前 `CameraModel.valid_mask`。
+检测器会在颜色、线段和 BEV 路径中排除无效填充区，防止去畸变填充边界被
+误报为围栏或场角。
 
 启用带 BEV 配置的 `GroundProjector` 时，检测器每帧只生成一次 BEV 并在颜色、
 线段和角点步骤中复用。输出仍保留 `UndistortedPixel`；只有地面上的区域角点、
@@ -346,7 +353,7 @@ model_bundle/
 └── onnx_split_config.json
 ```
 
-路径、模型版本、HEF SHA-256、原始类别顺序、类别映射及后端粗筛来自
+资产路径、原始类别顺序、类别映射及后端粗筛来自
 `hailo`；检测、K0 和 HSV 参数来自 `perception`：
 
 ```yaml

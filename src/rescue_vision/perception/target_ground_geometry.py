@@ -361,7 +361,6 @@ class _Model:
     vertices: FloatArray
     base_vertex_count: int
     yaw_symmetry_rad: float
-    footprint_radius_mm: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -407,10 +406,6 @@ def _target_model(geometry: TargetGeometry) -> _Model:
             vertices=np.vstack((base, top)),
             base_vertex_count=4,
             yaw_symmetry_rad=symmetry,
-            footprint_radius_mm=math.hypot(
-                half_length,
-                half_width,
-            ),
         )
 
     edge = geometry.edge_mm
@@ -431,7 +426,6 @@ def _target_model(geometry: TargetGeometry) -> _Model:
         vertices=np.vstack((base, apex)),
         base_vertex_count=3,
         yaw_symmetry_rad=2.0 * math.pi / 3.0,
-        footprint_radius_mm=base_radius,
     )
 
 
@@ -672,20 +666,6 @@ class TargetGroundGeometryEstimator:
             contact_residual_px=contact_residual,
         )
 
-    def _candidate_centers(
-        self,
-        seed: GroundPoint,
-        radius_mm: float,
-        step_mm: float,
-    ) -> tuple[GroundPoint, ...]:
-        offsets = _symmetric_values(radius_mm, step_mm)
-        return tuple(
-            GroundPoint(seed.x + dx, seed.y + dy)
-            for dx in offsets
-            for dy in offsets
-            if dx * dx + dy * dy <= radius_mm * radius_mm + 1e-9
-        )
-
     def _coarse_candidates(
         self,
         observation: TargetObservation,
@@ -694,25 +674,47 @@ class TargetGroundGeometryEstimator:
         observed_distance: npt.NDArray[np.float32],
         model: _Model,
     ) -> list[_Candidate]:
+        """从 K0/框底锚点的物理接触假设生成稀疏粗候选。
+
+        K0 只可能是可见底面顶点或连续底边中点。直接枚举这些接触假设，
+        比在整个外接圆内逐点扫 ``center_x / center_y / yaw`` 少一个数量级，
+        同时仍由 ``search_radius_margin_mm`` 容纳锚点误差。
+        """
+
         if observation.ground_point is not None:
-            seed = observation.ground_point
+            anchor = observation.ground_point
         else:
             box = observation.box
-            seed = self._ground_projector.pixel_to_ground(
+            anchor = self._ground_projector.pixel_to_ground(
                 UndistortedPixel(
                     (box.x_min + box.x_max) / 2.0,
                     box.y_max,
                 )
             )
-        radius = (
-            model.footprint_radius_mm
-            + self._config.search_radius_margin_mm
+
+        uncovered_margin = max(
+            0.0,
+            self._config.search_radius_margin_mm
+            - self._config.refine_center_radius_mm,
         )
-        centers = self._candidate_centers(
-            seed,
-            radius,
-            self._config.coarse_center_step_mm,
-        )
+        if uncovered_margin <= 1e-9:
+            correction_centers = (GroundPoint(0.0, 0.0),)
+        else:
+            diagonal = uncovered_margin / math.sqrt(2.0)
+            correction_centers = tuple(
+                GroundPoint(dx, dy)
+                for dx, dy in (
+                    (0.0, 0.0),
+                    (uncovered_margin, 0.0),
+                    (-uncovered_margin, 0.0),
+                    (0.0, uncovered_margin),
+                    (0.0, -uncovered_margin),
+                    (diagonal, diagonal),
+                    (diagonal, -diagonal),
+                    (-diagonal, diagonal),
+                    (-diagonal, -diagonal),
+                )
+            )
         yaw_step = math.radians(self._config.coarse_yaw_step_deg)
         yaws = _range_values(
             0.0,
@@ -720,20 +722,81 @@ class TargetGroundGeometryEstimator:
             yaw_step,
         )
         candidates: list[_Candidate] = []
-        for center in centers:
-            for yaw in yaws:
-                candidate = self._score_candidate(
-                    observation,
-                    observed_mask,
-                    observed_area,
-                    observed_distance,
-                    model,
-                    center,
-                    yaw,
+        seen: set[tuple[float, float, float]] = set()
+        base_xy = model.vertices[: model.base_vertex_count, :2]
+        contact_xy = np.vstack(
+            (
+                base_xy,
+                (base_xy + np.roll(base_xy, -1, axis=0)) / 2.0,
+            )
+        )
+        for yaw in yaws:
+            cosine = math.cos(yaw)
+            sine = math.sin(yaw)
+            rotation = np.asarray(
+                ((cosine, -sine), (sine, cosine)),
+                dtype=np.float64,
+            )
+            rotated_contacts = contact_xy @ rotation.T
+            for contact_x, contact_y in rotated_contacts:
+                nominal = GroundPoint(
+                    anchor.x - float(contact_x),
+                    anchor.y - float(contact_y),
                 )
-                if candidate is not None:
-                    candidates.append(candidate)
+                for correction in correction_centers:
+                    center = GroundPoint(
+                        nominal.x + correction.x,
+                        nominal.y + correction.y,
+                    )
+                    key = (
+                        round(center.x, 9),
+                        round(center.y, 9),
+                        round(yaw % model.yaw_symmetry_rad, 12),
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidate = self._score_candidate(
+                        observation,
+                        observed_mask,
+                        observed_area,
+                        observed_distance,
+                        model,
+                        center,
+                        yaw,
+                    )
+                    if candidate is not None:
+                        candidates.append(candidate)
         return candidates
+
+    def _score_refined_candidate(
+        self,
+        observation: TargetObservation,
+        observed_mask: Uint8Array,
+        observed_area: int,
+        observed_distance: npt.NDArray[np.float32],
+        model: _Model,
+        center: GroundPoint,
+        yaw_rad: float,
+        coarse: _Candidate,
+    ) -> _Candidate | None:
+        if (
+            math.hypot(
+                center.x - coarse.center.x,
+                center.y - coarse.center.y,
+            )
+            > self._config.refine_center_radius_mm + 1e-9
+        ):
+            return None
+        return self._score_candidate(
+            observation,
+            observed_mask,
+            observed_area,
+            observed_distance,
+            model,
+            center,
+            yaw_rad,
+        )
 
     def _refined_candidates(
         self,
@@ -744,34 +807,82 @@ class TargetGroundGeometryEstimator:
         model: _Model,
         coarse: _Candidate,
     ) -> list[_Candidate]:
+        """先分别收敛中心和朝向，再做一个最小联合邻域搜索。"""
+
+        candidates: list[_Candidate] = [coarse]
         center_offsets = _symmetric_values(
             self._config.refine_center_radius_mm,
             self._config.refine_center_step_mm,
         )
+        best_center = coarse
+        for axis in (0, 1, 0, 1):
+            axis_candidates: list[_Candidate] = []
+            for offset in center_offsets:
+                dx = offset if axis == 0 else 0.0
+                dy = offset if axis == 1 else 0.0
+                center = GroundPoint(
+                    best_center.center.x + dx,
+                    best_center.center.y + dy,
+                )
+                candidate = self._score_refined_candidate(
+                    observation,
+                    observed_mask,
+                    observed_area,
+                    observed_distance,
+                    model,
+                    center,
+                    coarse.yaw_rad,
+                    coarse,
+                )
+                if candidate is not None:
+                    axis_candidates.append(candidate)
+            candidates.extend(axis_candidates)
+            if axis_candidates:
+                best_center = max(
+                    axis_candidates,
+                    key=lambda item: item.score,
+                )
+
         yaw_radius = math.radians(self._config.refine_yaw_radius_deg)
         yaw_step = math.radians(self._config.refine_yaw_step_deg)
         yaw_offsets = _range_values(-yaw_radius, yaw_radius, yaw_step)
-        candidates: list[_Candidate] = []
-        for dx in center_offsets:
-            for dy in center_offsets:
-                if (
-                    dx * dx + dy * dy
-                    > self._config.refine_center_radius_mm**2 + 1e-9
-                ):
-                    continue
+        yaw_candidates: list[_Candidate] = []
+        for yaw_offset in yaw_offsets:
+            candidate = self._score_refined_candidate(
+                observation,
+                observed_mask,
+                observed_area,
+                observed_distance,
+                model,
+                best_center.center,
+                coarse.yaw_rad + yaw_offset,
+                coarse,
+            )
+            if candidate is not None:
+                yaw_candidates.append(candidate)
+        candidates.extend(yaw_candidates)
+        best_yaw = max(
+            yaw_candidates or [best_center],
+            key=lambda item: item.score,
+        )
+
+        center_step = self._config.refine_center_step_mm
+        for dx in (-center_step, 0.0, center_step):
+            for dy in (-center_step, 0.0, center_step):
                 center = GroundPoint(
-                    coarse.center.x + dx,
-                    coarse.center.y + dy,
+                    best_yaw.center.x + dx,
+                    best_yaw.center.y + dy,
                 )
-                for yaw_offset in yaw_offsets:
-                    candidate = self._score_candidate(
+                for yaw_offset in (-yaw_step, 0.0, yaw_step):
+                    candidate = self._score_refined_candidate(
                         observation,
                         observed_mask,
                         observed_area,
                         observed_distance,
                         model,
                         center,
-                        coarse.yaw_rad + yaw_offset,
+                        best_yaw.yaw_rad + yaw_offset,
+                        coarse,
                     )
                     if candidate is not None:
                         candidates.append(candidate)

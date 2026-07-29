@@ -107,7 +107,11 @@ with source, detector:
             else None
         )
         field_realtime_result = (
-            field_detector.detect_realtime(raw_frame, undistorted_bgr)
+            field_detector.detect_realtime(
+                raw_frame,
+                undistorted_bgr,
+                valid_mask=geometry.camera_model.valid_mask,
+            )
             if field_detector is not None
             else None
         )
