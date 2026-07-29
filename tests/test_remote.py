@@ -205,14 +205,13 @@ def test_codec_matches_v2_fixed_frame_vector() -> None:
     )
     expected_header = (
         b'{"attributes":{},"content_type":"application/json",'
-        b'"schema_version":2,"sender_timestamp_ns":123456789,'
-        b'"sequence":0,"stream":"control",'
+        b'"sender_timestamp_ns":123456789,"sequence":0,"stream":"control",'
         b'"topic":"control/debug/motion"}'
     )
 
-    assert len(expected_header) == 165
-    assert frame[:12].hex() == "52564d32000000a500000003"
-    assert frame == bytes.fromhex("52564d32000000a500000003") + (
+    assert len(expected_header) == 146
+    assert frame[:12].hex() == "52564d210000009200000003"
+    assert frame == bytes.fromhex("52564d210000009200000003") + (
         expected_header + b"{}\n"
     )
 

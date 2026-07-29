@@ -29,6 +29,7 @@ def test_ground_calibration_loads_all_intrinsic_models(
     tmp_path, model: str, distortion: list[int]
 ) -> None:
     document = {
+        "calibration_id": "test",
         "model_type": model,
         "image_size": [32, 24],
         "camera_matrix": np.eye(3).tolist(),
@@ -45,6 +46,7 @@ def test_ground_calibration_loads_all_intrinsic_models(
 
 def test_ground_calibration_rejects_unusable_intrinsics(tmp_path) -> None:
     document = {
+        "calibration_id": "test",
         "model_type": "pinhole",
         "image_size": [32, 24],
         "camera_matrix": np.eye(3).tolist(),
@@ -121,21 +123,21 @@ def test_pose_homography_rejects_zero_normalization_scale() -> None:
         )
 
 
-def test_correspondences_are_bound_to_image_hash(tmp_path) -> None:
+def test_correspondences_are_bound_to_image_name_and_size(tmp_path) -> None:
     image = tmp_path / "ground.png"
-    image.write_bytes(b"first")
+    cv2.imwrite(str(image), np.zeros((6, 8, 3), dtype=np.uint8))
     correspondences = tmp_path / "correspondences.json"
     correspondences.write_text(
         json.dumps(
             {
                 "image": image.name,
-                "image_sha256": ground_module.file_sha256(image),
+                "image_size": [8, 6],
                 "points": [],
             }
         ),
         encoding="utf-8",
     )
     validate_correspondence_source(correspondences, image)
-    image.write_bytes(b"second")
+    cv2.imwrite(str(image), np.zeros((7, 8, 3), dtype=np.uint8))
     with pytest.raises(ValueError, match="recollect"):
         validate_correspondence_source(correspondences, image)

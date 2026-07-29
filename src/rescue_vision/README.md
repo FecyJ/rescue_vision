@@ -126,7 +126,6 @@ with source, detector:
 | [`data`](data/README.md) | `inspect_recording()`、`build_dataset_records()`、`split_records()` | 采集验收、清单和防泄漏划分 |
 | [`evaluation`](evaluation/README.md) | `observations_to_evaluation_records()`、`evaluate_records()` | 目标匹配适配和离线指标 |
 
-`versioning.py` 提供 `git_version()`，用于把当前提交及 dirty 状态写入记录和评测产物，不单独建立子包。
 
 ## 对接不变量
 

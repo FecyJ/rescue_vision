@@ -88,7 +88,6 @@ def test_manual_motion_log_round_trip_preserves_monotonic_time_sources(
 
     report = inspect_manual_motion_log(path)
 
-    assert report["schema_version"] == 4
     assert report["event_count"] == 11
     assert report["first_timestamp_ns"] == 100
     assert report["last_timestamp_ns"] == 230

@@ -1,4 +1,4 @@
-"""手动运动/夹爪命令、UART 遥测与停车原因的版本化记录流。"""
+"""手动运动/夹爪命令、UART 遥测与停车原因记录流。"""
 
 from __future__ import annotations
 
@@ -22,7 +22,6 @@ from rescue_vision.motion.remote_control import (
 
 MANUAL_MOTION_STREAM_NAME = "manual_motion"
 MANUAL_MOTION_LOG_FILENAME = "motion.jsonl"
-MANUAL_MOTION_LOG_SCHEMA_VERSION = 4
 
 _EVENT_KEYS = {
     "stream_started": set(),
@@ -68,7 +67,6 @@ _EVENT_KEYS = {
     "safety_stop": {"reason"},
 }
 _COMMON_KEYS = {
-    "schema_version",
     "log_sequence",
     "event_type",
     "timestamp_ns",
@@ -219,7 +217,6 @@ class ManualMotionLogWriter:
             raise RuntimeError("Manual motion log is not started.")
         _non_negative_integer(timestamp_ns, "timestamp_ns")
         record = {
-            "schema_version": MANUAL_MOTION_LOG_SCHEMA_VERSION,
             "log_sequence": self._sequence,
             "event_type": event_type,
             "timestamp_ns": timestamp_ns,
@@ -275,11 +272,6 @@ def inspect_manual_motion_log(path: str | Path) -> dict[str, object]:
                 f"{resolved}:{line_number}: keys must be exactly "
                 f"{sorted(expected)}."
             )
-        if record["schema_version"] != MANUAL_MOTION_LOG_SCHEMA_VERSION:
-            raise ValueError(
-                f"{resolved}:{line_number}: schema_version must be "
-                f"{MANUAL_MOTION_LOG_SCHEMA_VERSION}."
-            )
         if record["log_sequence"] != line_number - 1:
             raise ValueError(
                 f"{resolved}:{line_number}: log_sequence must be "
@@ -301,7 +293,6 @@ def inspect_manual_motion_log(path: str | Path) -> dict[str, object]:
     if json.loads(lines[-1])["event_type"] != "stream_finished":
         raise ValueError("Manual motion log must end with stream_finished.")
     return {
-        "schema_version": MANUAL_MOTION_LOG_SCHEMA_VERSION,
         "event_count": len(lines),
         "event_counts": dict(sorted(counts.items())),
         "first_timestamp_ns": min(timestamps_ns),

@@ -10,7 +10,8 @@
 - `picamera_minimal.py`：直接使用 Picamera2 的最小检查。
 - `geometry_projection.py`：使用本地测试图片人工检查 BEV 和点投影。
 - `hailo_pose.py`：从实际 `runtime.yaml` 加载 YOLO Pose 部署包，检查单张去畸变图像的 K0 观测。
-- `dataset_perception.py`：按 schema v2 数据清单批量运行 Hailo，覆盖式写出保留 UNKNOWN、质量信息和模型身份的观测 JSONL。
+- `dataset_perception.py`：按数据清单批量运行 Hailo，覆盖式写出保留 UNKNOWN
+  和质量信息的观测 JSONL。
 - `camera_undistort_perception.py`：按实际 `runtime.yaml` 连续执行相机、去畸变、Hailo Pose、K0/地面点叠加预览，按 `Q/Esc` 退出；偶发过期帧会标红并丢弃，不会终止预览。
 - `remote_link.py --config PATH`：在树莓派侧以 `remote.role: server` 监听电脑端客户端，连接后发送协议要求的最小会话状态，并持续打印收到的 control；该状态有意声明所有业务能力不可用，所以正式客户端应保持控制禁用。仅验证连接可使用 `observe_only`；用自制底层客户端检查 control 帧时使用 `debug_control`。
 - `remote_video.py --config PATH`：发送真实相机的最新 JPEG 帧和周期会话状态，不接收或执行控制。
@@ -18,7 +19,11 @@
 
 运行前先执行 `python -m pip install -e .`，并确保系统包和显示环境可用。
 
-数据采集不另建重复的硬件脚本：用 `rescue-vision-record --frames 200 --display` 执行真机短录，再用 `rescue-vision-check-recording RECORDING --display` 可视化回放并完成哈希、帧率、丢帧和元数据验收。完整步骤见 [`docs/数据采集工具使用.md`](../docs/数据采集工具使用.md)。
+数据采集不另建重复的硬件脚本：用
+`rescue-vision-record --frames 200 --display` 执行真机短录，再用
+`rescue-vision-check-recording RECORDING --display` 可视化回放并完成图片
+解码、帧率、丢帧和元数据验收。完整步骤见
+[`docs/数据采集工具使用.md`](../docs/数据采集工具使用.md)。
 
 ## 相机、去畸变和 Hailo 联调
 
@@ -98,7 +103,7 @@ rescue-vision-manual-capture \
 `capture_control` 和 `capture_status`；只有运行配置完成并启用机械标定时才
 声明 `gripper_control`。它接收手动运动、持续夹爪扳机状态与采集命令。采集操作：
 
-- `start`：在 `<output-root>/recordings/` 创建新的标准 recording schema v4
+- `start`：在 `<output-root>/recordings/` 创建新的标准 recording
   会话，持续记录经过配置去畸变的帧及 `motion.jsonl`；
 - `stop`：冲洗队列并完整关闭当前记录；
 - `snapshot`：在 `<output-root>/snapshots/` 保存 JPEG 和同名 JSON 元数据；

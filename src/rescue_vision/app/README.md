@@ -38,7 +38,7 @@ rescue-vision-manual-capture \
 `RemoteMotionExecutor` 校验死手、有效期和限速；夹爪命令由
 `RemoteGripperExecutor` 校验有效期和布尔扳机状态，再按配置机械端点与
 全行程时间渐进下发；采集命令可独立
-开始/停止标准 recording schema v4 会话。手动会话的 `motion.jsonl` 逐条
+开始/停止统一 recording 会话。手动会话的 `motion.jsonl` 逐条
 保存运动/夹爪执行结果、轮速与舵机遥测、未知 UART 扩展报文和停车原因；
 这些事件与图像帧统一使用树莓派应用单调时间。
 等待首个客户端及断线重连期间，入口仍以有界周期排空 STM32 主动遥测，避免

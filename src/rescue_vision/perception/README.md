@@ -145,7 +145,6 @@ for observation in observations:
 | `k0` / `k0_confidence` | 目标与地面的接触锚点及置信度 |
 | `ground_point` | 可选机器人地面系毫米坐标 |
 | `quality` | 不应被静默丢弃的降级原因 |
-| `model_version` / `model_sha256` | 结果对应的模型身份 |
 
 ## 6. 类别与 K0
 
@@ -178,8 +177,6 @@ hailo:
   hef_path: ../models/target_pose/model.hef
   postprocess_onnx_path: ../models/target_pose/postprocess.onnx
   output_mapping_path: ../models/target_pose/onnx_split_config.json
-  model_version: target-pose-v2
-  hef_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   raw_classes: [green_supply, black_core, orange_injured, blue_danger]
   class_mapping:
     green_supply: green_supply

@@ -8,36 +8,26 @@
 | --- | --- |
 | `TargetAnnotation` | 当前 sample 的人工类别、框和可选地面真值 |
 | `observations_to_evaluation_records()` | 按框 IoU 将 `TargetObservation` 与 `TargetAnnotation` 一对一匹配 |
-| `evaluate_records()` | 校验 schema v1 逐对象记录并计算完整报告 |
+| `evaluate_records()` | 校验逐对象记录并计算完整报告 |
 | `rescue-vision-evaluate` | 从 JSONL 读取记录并写 JSON 报告 |
-| `git_version()` | CLI 未指定代码版本时记录当前提交和 dirty 状态 |
 
 `observations_to_evaluation_records()` 位于 `perception/evaluation_adapter.py`，因为它理解观测与框；指标计算位于本包。
 
 ## 1. 使用命令生成报告
 
-评测流水线应先生成版本化的逐对象 `evaluation.jsonl`，然后执行：
+评测流水线应先生成逐对象 `evaluation.jsonl`，然后执行：
 
 ```bash
 rescue-vision-evaluate \
   reports/evaluation.jsonl \
-  --output reports/evaluation-report.json \
-  --model-version target-pose-v2 \
-  --dataset-version rescue-targets-2026-07-23-v1
+  --output reports/evaluation-report.json
 ```
-
-未传 `--code-version` 时自动记录当前 Git 提交和 dirty 状态。发布报告前应确保工作区状态、模型 HEF 哈希和数据集版本都能追溯。
 
 ## 2. 加载配置和正式评测记录
 
 ```python
 import json
 from pathlib import Path
-
-from rescue_vision.config import load_runtime_config
-config = load_runtime_config("configs/runtime.yaml")
-if config.hailo.model_version is None:
-    raise RuntimeError("runtime.yaml 未声明待评测模型版本")
 
 records_path = Path("reports/evaluation.jsonl")
 records = [
@@ -49,23 +39,17 @@ records = [
 
 ## 3. 计算评测报告
 
-以下片段承接前文的 `config` 和 `records`：
+以下片段承接前文的 `records`：
 
 ```python
 from rescue_vision.evaluation import evaluate_records
-from rescue_vision.versioning import git_version
 
-report = evaluate_records(
-    records,
-    model_version=config.hailo.model_version,
-    dataset_version="rescue-targets-2026-07-23-v1",
-    code_version=git_version(),
-)
+report = evaluate_records(records)
 ```
 
 ## 4. 写出报告
 
-领域函数只返回 Python 对象；流水线负责把前文 `report` 写成版本化 JSON：
+领域函数只返回 Python 对象；流水线负责把前文 `report` 写成 JSON：
 
 ```python
 Path("reports/evaluation-report.json").write_text(
@@ -80,7 +64,7 @@ Path("reports/evaluation-report.json").write_text(
 )
 ```
 
-这里读取的是实际评测 JSONL，而不是为调用函数临时构造几条理想记录。数据版本应与生成这些记录时使用的 manifest 一致。
+这里读取的是实际评测 JSONL，而不是为调用函数临时构造几条理想记录。
 
 ## 5. 从观测生成逐对象记录
 
@@ -112,7 +96,9 @@ evaluation_records = observations_to_evaluation_records(
 )
 ```
 
-调用方必须保证全部观测属于同一帧。无预测时，适配器为每个真值生成漏检；无真值但有预测时生成误检。若正式评测需要比“类别无关 IoU 贪心匹配”更复杂的关联规则，应修改适配器并版本化，而不是在报告阶段暗中改匹配。
+调用方必须保证全部观测属于同一帧。无预测时，适配器为每个真值生成漏检；
+无真值但有预测时生成误检。若正式评测需要比“类别无关 IoU 贪心匹配”更复杂
+的关联规则，应显式修改适配器和测试，而不是在报告阶段暗中改匹配。
 
 ## 输入与输出语义
 

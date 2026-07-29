@@ -22,9 +22,6 @@ from rescue_vision.geometry.camera_model import (
     IMAGE_BORDER_FILL_VALUE,
     CameraModel,
 )
-from rescue_vision.versioning import git_version
-
-
 def parse_tags(values: list[str]) -> dict[str, str]:
     tags = {name: "unknown" for name in REQUIRED_TAGS}
     for value in values:
@@ -127,9 +124,7 @@ def undistort_camera_frame(
 
     metadata = dict(frame.metadata)
     metadata["image_coordinate_system"] = "undistorted_pixel"
-    metadata["intrinsics_fingerprint_sha256"] = (
-        camera_model.calibration.fingerprint()
-    )
+    metadata["calibration_id"] = camera_model.calibration.calibration_id
     metadata["undistort_fill_value"] = IMAGE_BORDER_FILL_VALUE
     return CameraFrame(
         sequence=frame.sequence,
@@ -200,19 +195,14 @@ def main() -> None:
         args.output,
         image_size=config.camera.image_size,
         config_snapshot=config_snapshot,
-        versions={
-            "code": git_version(),
-            "config_schema": str(config.schema_version),
-            "opencv": cv2.__version__,
-        },
         session_tags=session_tags,
         queue_capacity=config.recording.queue_capacity,
         image_format=config.recording.image_format,
         image_coordinate_system=(
             "undistorted_pixel" if camera_model is not None else "raw_pixel"
         ),
-        intrinsics_fingerprint_sha256=(
-            camera_model.calibration.fingerprint()
+        calibration_id=(
+            camera_model.calibration.calibration_id
             if camera_model is not None
             else None
         ),

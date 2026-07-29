@@ -6,25 +6,25 @@
 
 | 入口 | 用途 |
 | --- | --- |
-| `inspect_recording()` | 完整回放、验证哈希和统计采集健康信息 |
+| `inspect_recording()` | 完整回放并统计采集健康信息 |
 | `check_requirements()` | 按最小帧数、FPS、丢帧和元数据门限给出失败原因 |
 | `PICAMERA2_METADATA` | 正式 Picamera2 会话要求的逐帧元数据名 |
 | `build_dataset_records()` | 把一个或多个合格 session 转为数据清单记录 |
 | `split_records()` | 按 `recording_id` 确定性分配 train/validation/test |
 | `assign_split(group_id, *, seed, train_ratio, validation_ratio)` | 查询单个会话在给定 seed 和比例下的分区 |
 | `rescue-vision-check-recording` | 单会话验收及可选回放 |
-| `rescue-vision-manifest` | 生成 schema v2 数据集 JSONL |
+| `rescue-vision-manifest` | 生成数据集 JSONL |
 | `rescue-vision-split` | 写入分区字段并输出分布报告 |
 
 任务数据输入必须满足：
 
 - session 已正常完成且统计与帧清单一致；
 - 坐标系为 `undistorted_pixel`；
-- 有内参指纹、`valid_pixel_ratio` 和 `undistort_fill_value: 114`；
+- 有可读 `calibration_id`、`valid_pixel_ratio` 和 `undistort_fill_value: 114`；
 - 包含全部必需分层标签；
 - `supervised_manual_motion` 会话包含完整 `manual_motion` 辅助流，且其单调
   时间范围覆盖全部图像；
-- 默认逐图验证 SHA-256。
+- 每个图像路径存在且可由后续检查正常解码。
 
 原图 session 只用于标定或诊断，不能进入任务目标 manifest。
 
@@ -45,12 +45,11 @@ rescue-vision-check-recording \
 
 ## 2. 从合格记录生成清单
 
-只有上一步通过的会话才能进入版本化 manifest：
+只有上一步通过的会话才能进入 manifest：
 
 ```bash
 rescue-vision-manifest \
   --dataset-root /data/rescue-targets \
-  --dataset-version rescue-targets-2026-07-23-v1 \
   --output /data/rescue-targets/manifests/rescue-targets-2026-07-23-v1.jsonl \
   /data/rescue-targets/recordings/session_001 \
   /data/rescue-targets/recordings/session_002
@@ -70,12 +69,10 @@ rescue-vision-split \
 
 `--display` 按采集时间回放；`--playback-speed 2` 可二倍速。按 `Q/Esc` 只关闭窗口，剩余帧仍在后台完成校验。
 
-发布数据版本时不能使用 `--skip-image-verification`。该选项只允许在已知资产未变化的本地迭代中临时加速。
-
 划分报告始终显式包含 train/validation/test 的样本数、会话数和实际比例。
 任一集合为空时 `warnings` 会列出 `empty_split`，CLI 在写完报告后以退出码
-1 结束；必须增加独立会话或调整版本后重新划分，不能把空测试集当作可发布结果。
-纯哈希分配在会话少于约 20 个时方差很大，四类各一个会话不构成可靠划分。
+1 结束；必须增加独立会话或调整 seed 后重新划分，不能把空测试集当作可用结果。
+确定性分配在会话少于约 20 个时方差很大，四类各一个会话不构成可靠划分。
 
 ## 4. 在程序中检查记录
 
@@ -115,7 +112,6 @@ from rescue_vision.data.split_manifest import split_records
 records = build_dataset_records(
     [recording],
     dataset_root=Path("/data/rescue-targets"),
-    dataset_version="rescue-targets-2026-07-23-v1",
 )
 split_records_with_name, split_report = split_records(
     records,

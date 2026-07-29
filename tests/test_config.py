@@ -12,6 +12,7 @@ from rescue_vision.geometry.camera_model import CameraCalibration, CameraModelTy
 
 def write_intrinsics(path, *, usable: bool = True) -> CameraCalibration:
     calibration = CameraCalibration(
+        calibration_id="test",
         model=CameraModelType.PINHOLE,
         image_size=(32, 24),
         K=np.eye(3),
@@ -21,7 +22,7 @@ def write_intrinsics(path, *, usable: bool = True) -> CameraCalibration:
     path.write_text(
         json.dumps(
             {
-                "schema_version": 3,
+                "calibration_id": calibration.calibration_id,
                 "model_type": "pinhole",
                 "image_size": [32, 24],
                 "camera_matrix": calibration.K.tolist(),
@@ -42,8 +43,7 @@ def config_text(
     ground_mapping_enabled: bool = True,
     extra: str = "",
 ) -> str:
-    return f"""schema_version: 10
-camera:
+    return f"""camera:
   backend: rpicam_vid
   image_size: {image_size}
   fps: 20
@@ -118,8 +118,6 @@ hailo:
   hef_path: null
   postprocess_onnx_path: null
   output_mapping_path: null
-  model_version: null
-  hef_sha256: null
   raw_classes: []
   class_mapping: {{}}
   backend_score_threshold: 0.01
@@ -135,15 +133,14 @@ def test_strict_config_and_geometry_build(tmp_path) -> None:
     (tmp_path / "ground.json").write_text(
         json.dumps(
             {
-                    "schema_version": 3,
-                    "quality": {
+                "quality": {
                         "usable": True,
                         "physically_valid": True,
-                    },
+                },
                 "image_size": [32, 24],
                 "intrinsics": {
                     "model_type": "pinhole",
-                    "fingerprint_sha256": calibration.fingerprint(),
+                    "calibration_id": calibration.calibration_id,
                 },
                 "image_to_ground": np.eye(3).tolist(),
             }
@@ -232,16 +229,12 @@ def test_hailo_class_mapping_and_relative_paths(tmp_path) -> None:
   hef_path: null
   postprocess_onnx_path: null
   output_mapping_path: null
-  model_version: null
-  hef_sha256: null
   raw_classes: []
   class_mapping: {}""",
         """  enabled: true
   hef_path: bundle/model.hef
   postprocess_onnx_path: bundle/postprocess.onnx
   output_mapping_path: bundle/mapping.json
-  model_version: model-v1
-  hef_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   raw_classes: [raw_a, raw_b]
   class_mapping:
     raw_a: green_supply
@@ -284,7 +277,26 @@ def test_runtime_example_matches_strict_schema() -> None:
         Path(__file__).resolve().parents[1] / "configs" / "runtime.example.yaml"
     )
     config = load_runtime_config(example)
-    assert config.schema_version == 10
+    assert config.hailo.enabled is False
+
+
+def test_optional_sections_use_safe_defaults(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        "camera:\n"
+        "  backend: rpicam_vid\n"
+        "  image_size: [32, 24]\n"
+        "  fps: 20\n"
+        "  lens_position: 1.0\n",
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(path)
+
+    assert not config.uart.enabled
+    assert not config.remote.enabled
+    assert not config.motion.enabled
+    assert not config.hailo.enabled
 
 
 def test_uart_config_builds_channel_without_opening_device(tmp_path) -> None:

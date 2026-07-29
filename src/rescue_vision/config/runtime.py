@@ -1,4 +1,4 @@
-"""版本化运行配置及几何对象装配。"""
+"""运行配置及几何对象装配。"""
 
 from __future__ import annotations
 
@@ -35,9 +35,6 @@ if TYPE_CHECKING:
         RemoteGripperExecutor,
         RemoteMotionExecutor,
     )
-
-
-SCHEMA_VERSION = 10
 
 
 def _mapping(value: object, location: str) -> dict[str, Any]:
@@ -343,8 +340,6 @@ class HailoConfig:
     hef_path: Path | None
     postprocess_onnx_path: Path | None
     output_mapping_path: Path | None
-    model_version: str | None
-    hef_sha256: str | None
     raw_classes: tuple[str, ...]
     class_mapping: tuple[TargetClass, ...]
     backend_score_threshold: float
@@ -361,16 +356,12 @@ class HailoConfig:
         assert self.hef_path is not None
         assert self.postprocess_onnx_path is not None
         assert self.output_mapping_path is not None
-        assert self.model_version is not None
-        assert self.hef_sha256 is not None
         from rescue_vision.perception.hailo_yolo26_pose import HailoYolo26PoseBackend
 
         return HailoYolo26PoseBackend(
             hef_path=self.hef_path,
             postprocess_onnx_path=self.postprocess_onnx_path,
             output_mapping_path=self.output_mapping_path,
-            model_version=self.model_version,
-            model_sha256=self.hef_sha256,
             class_count=len(self.raw_classes),
             max_detections=self.max_detections,
             score_threshold=self.backend_score_threshold,
@@ -388,7 +379,6 @@ class RuntimeGeometry:
 
 @dataclass(frozen=True, slots=True)
 class AppConfig:
-    schema_version: int
     camera: CameraConfig
     geometry: GeometryConfig
     recording: RecordingConfig
@@ -436,7 +426,7 @@ class AppConfig:
 
 
 def load_runtime_config(path: str | Path) -> AppConfig:
-    """从 YAML 加载 schema v10；缺项和未知字段均视为错误。"""
+    """从 YAML 加载运行配置；未知字段和无效值均视为错误。"""
 
     config_path = Path(path).expanduser().resolve()
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -444,7 +434,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     _reject_unknown(
         root,
         {
-            "schema_version",
             "camera",
             "geometry",
             "recording",
@@ -459,13 +448,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         },
         "root",
     )
-
-    schema_version = _required(root, "schema_version", "root")
-    if schema_version != SCHEMA_VERSION:
-        raise ValueError(
-            f"Unsupported config schema_version {schema_version!r}; "
-            f"expected {SCHEMA_VERSION}."
-        )
 
     camera_raw = _mapping(_required(root, "camera", "root"), "camera")
     _reject_unknown(
@@ -496,7 +478,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         ),
     )
 
-    geometry_raw = _mapping(_required(root, "geometry", "root"), "geometry")
+    geometry_raw = _mapping(root.get("geometry", {}), "geometry")
     _reject_unknown(
         geometry_raw,
         {
@@ -507,18 +489,10 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         },
         "geometry",
     )
-    intrinsics_enabled = _required(
-        geometry_raw,
-        "intrinsics_enabled",
-        "geometry",
-    )
+    intrinsics_enabled = geometry_raw.get("intrinsics_enabled", False)
     if not isinstance(intrinsics_enabled, bool):
         raise ValueError("geometry.intrinsics_enabled must be a boolean.")
-    ground_mapping_enabled = _required(
-        geometry_raw,
-        "ground_mapping_enabled",
-        "geometry",
-    )
+    ground_mapping_enabled = geometry_raw.get("ground_mapping_enabled", False)
     if not isinstance(ground_mapping_enabled, bool):
         raise ValueError("geometry.ground_mapping_enabled must be a boolean.")
     base_dir = config_path.parent
@@ -551,21 +525,21 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         ground_mapping_path,
     )
 
-    recording_raw = _mapping(_required(root, "recording", "root"), "recording")
+    recording_raw = _mapping(root.get("recording", {}), "recording")
     _reject_unknown(recording_raw, {"queue_capacity", "image_format"}, "recording")
-    image_format = _required(recording_raw, "image_format", "recording")
+    image_format = recording_raw.get("image_format", "jpg")
     if image_format not in {"png", "jpg"}:
         raise ValueError("recording.image_format must be 'png' or 'jpg'.")
     recording = RecordingConfig(
         queue_capacity=_positive_int(
-            _required(recording_raw, "queue_capacity", "recording"),
+            recording_raw.get("queue_capacity", 8),
             "recording.queue_capacity",
         ),
         image_format=image_format,
     )
 
     processing_raw = _mapping(
-        _required(root, "processing", "root"),
+        root.get("processing", {}),
         "processing",
     )
     _reject_unknown(
@@ -575,17 +549,13 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     )
     processing = ProcessingConfig(
         max_observation_age_ms=_finite_float(
-            _required(
-                processing_raw,
-                "max_observation_age_ms",
-                "processing",
-            ),
+            processing_raw.get("max_observation_age_ms", 150.0),
             "processing.max_observation_age_ms",
             minimum=0.001,
         )
     )
 
-    uart_raw = _mapping(_required(root, "uart", "root"), "uart")
+    uart_raw = _mapping(root.get("uart", {}), "uart")
     _reject_unknown(
         uart_raw,
         {
@@ -599,10 +569,10 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         },
         "uart",
     )
-    uart_enabled = _required(uart_raw, "enabled", "uart")
+    uart_enabled = uart_raw.get("enabled", False)
     if not isinstance(uart_enabled, bool):
         raise ValueError("uart.enabled must be a boolean.")
-    uart_device_raw = _required(uart_raw, "device", "uart")
+    uart_device_raw = uart_raw.get("device")
     uart_device = (
         None
         if uart_device_raw is None
@@ -614,30 +584,30 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         enabled=uart_enabled,
         device=uart_device,
         baudrate=_positive_int(
-            _required(uart_raw, "baudrate", "uart"),
+            uart_raw.get("baudrate", 115200),
             "uart.baudrate",
         ),
         read_timeout_ms=_finite_float(
-            _required(uart_raw, "read_timeout_ms", "uart"),
+            uart_raw.get("read_timeout_ms", 100.0),
             "uart.read_timeout_ms",
             minimum=0.001,
         ),
         write_timeout_ms=_finite_float(
-            _required(uart_raw, "write_timeout_ms", "uart"),
+            uart_raw.get("write_timeout_ms", 100.0),
             "uart.write_timeout_ms",
             minimum=0.001,
         ),
         receive_queue_capacity=_positive_int(
-            _required(uart_raw, "receive_queue_capacity", "uart"),
+            uart_raw.get("receive_queue_capacity", 256),
             "uart.receive_queue_capacity",
         ),
         max_line_bytes=_positive_int(
-            _required(uart_raw, "max_line_bytes", "uart"),
+            uart_raw.get("max_line_bytes", 512),
             "uart.max_line_bytes",
         ),
     )
 
-    remote_raw = _mapping(_required(root, "remote", "root"), "remote")
+    remote_raw = _mapping(root.get("remote", {}), "remote")
     _reject_unknown(
         remote_raw,
         {
@@ -655,23 +625,23 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         },
         "remote",
     )
-    remote_enabled = _required(remote_raw, "enabled", "remote")
+    remote_enabled = remote_raw.get("enabled", False)
     if not isinstance(remote_enabled, bool):
         raise ValueError("remote.enabled must be a boolean.")
     try:
-        remote_role = RemoteRole(_required(remote_raw, "role", "remote"))
+        remote_role = RemoteRole(remote_raw.get("role", "server"))
     except (TypeError, ValueError) as exc:
         raise ValueError("remote.role must be 'server' or 'client'.") from exc
     try:
         remote_access_mode = RemoteAccessMode(
-            _required(remote_raw, "access_mode", "remote")
+            remote_raw.get("access_mode", "observe_only")
         )
     except (TypeError, ValueError) as exc:
         raise ValueError(
             "remote.access_mode must be 'observe_only' or 'debug_control'."
         ) from exc
     remote_port = _positive_int(
-        _required(remote_raw, "port", "remote"),
+        remote_raw.get("port", 8765),
         "remote.port",
     )
     if remote_port > 65_535:
@@ -679,38 +649,38 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     remote = RemoteConfig(
         enabled=remote_enabled,
         role=remote_role,
-        host=_string(_required(remote_raw, "host", "remote"), "remote.host"),
+        host=_string(remote_raw.get("host", "0.0.0.0"), "remote.host"),
         port=remote_port,
         access_mode=remote_access_mode,
         connect_timeout_ms=_finite_float(
-            _required(remote_raw, "connect_timeout_ms", "remote"),
+            remote_raw.get("connect_timeout_ms", 2000.0),
             "remote.connect_timeout_ms",
             minimum=0.001,
         ),
         io_timeout_ms=_finite_float(
-            _required(remote_raw, "io_timeout_ms", "remote"),
+            remote_raw.get("io_timeout_ms", 100.0),
             "remote.io_timeout_ms",
             minimum=0.001,
         ),
         control_queue_capacity=_positive_int(
-            _required(remote_raw, "control_queue_capacity", "remote"),
+            remote_raw.get("control_queue_capacity", 32),
             "remote.control_queue_capacity",
         ),
         observation_queue_capacity=_positive_int(
-            _required(remote_raw, "observation_queue_capacity", "remote"),
+            remote_raw.get("observation_queue_capacity", 2),
             "remote.observation_queue_capacity",
         ),
         max_header_bytes=_positive_int(
-            _required(remote_raw, "max_header_bytes", "remote"),
+            remote_raw.get("max_header_bytes", 4096),
             "remote.max_header_bytes",
         ),
         max_payload_bytes=_positive_int(
-            _required(remote_raw, "max_payload_bytes", "remote"),
+            remote_raw.get("max_payload_bytes", 2_097_152),
             "remote.max_payload_bytes",
         ),
     )
 
-    motion_raw = _mapping(_required(root, "motion", "root"), "motion")
+    motion_raw = _mapping(root.get("motion", {}), "motion")
     _reject_unknown(
         motion_raw,
         {
@@ -725,10 +695,10 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         },
         "motion",
     )
-    motion_enabled = _required(motion_raw, "enabled", "motion")
+    motion_enabled = motion_raw.get("enabled", False)
     if not isinstance(motion_enabled, bool):
         raise ValueError("motion.enabled must be a boolean.")
-    wheel_track_raw = _required(motion_raw, "wheel_track_m", "motion")
+    wheel_track_raw = motion_raw.get("wheel_track_m")
     wheel_track_m = (
         None
         if wheel_track_raw is None
@@ -743,11 +713,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     if motion_enabled and not uart.enabled:
         raise ValueError("Enabled motion requires uart.enabled=true.")
     max_remote_validity = _positive_int(
-        _required(
-            motion_raw,
-            "max_remote_command_valid_for_ms",
-            "motion",
-        ),
+        motion_raw.get("max_remote_command_valid_for_ms", 500),
         "motion.max_remote_command_valid_for_ms",
     )
     if max_remote_validity > 5_000:
@@ -755,7 +721,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "motion.max_remote_command_valid_for_ms must be <= 5000."
         )
     gripper_raw = _mapping(
-        _required(motion_raw, "gripper", "motion"),
+        motion_raw.get("gripper", {}),
         "motion.gripper",
     )
     _reject_unknown(
@@ -770,12 +736,12 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         },
         "motion.gripper",
     )
-    gripper_enabled = _required(gripper_raw, "enabled", "motion.gripper")
+    gripper_enabled = gripper_raw.get("enabled", False)
     if not isinstance(gripper_enabled, bool):
         raise ValueError("motion.gripper.enabled must be a boolean.")
     gripper_values = {
         name: _optional_servo_angle(
-            _required(gripper_raw, name, "motion.gripper"),
+            gripper_raw.get(name),
             f"motion.gripper.{name}",
         )
         for name in (
@@ -785,11 +751,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "closed_right_angle_deg",
         )
     }
-    travel_time_raw = _required(
-        gripper_raw,
-        "full_travel_time_s",
-        "motion.gripper",
-    )
+    travel_time_raw = gripper_raw.get("full_travel_time_s")
     full_travel_time_s = (
         None
         if travel_time_raw is None
@@ -826,38 +788,22 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         enabled=motion_enabled,
         wheel_track_m=wheel_track_m,
         max_linear_velocity_m_s=_finite_float(
-            _required(
-                motion_raw,
-                "max_linear_velocity_m_s",
-                "motion",
-            ),
+            motion_raw.get("max_linear_velocity_m_s", 0.25),
             "motion.max_linear_velocity_m_s",
             minimum=0.001,
         ),
         max_angular_velocity_rad_s=_finite_float(
-            _required(
-                motion_raw,
-                "max_angular_velocity_rad_s",
-                "motion",
-            ),
+            motion_raw.get("max_angular_velocity_rad_s", 1.0),
             "motion.max_angular_velocity_rad_s",
             minimum=0.001,
         ),
         max_wheel_velocity_m_s=_finite_float(
-            _required(
-                motion_raw,
-                "max_wheel_velocity_m_s",
-                "motion",
-            ),
+            motion_raw.get("max_wheel_velocity_m_s", 0.30),
             "motion.max_wheel_velocity_m_s",
             minimum=0.001,
         ),
         max_wheel_acceleration_m_s2=_finite_float(
-            _required(
-                motion_raw,
-                "max_wheel_acceleration_m_s2",
-                "motion",
-            ),
+            motion_raw.get("max_wheel_acceleration_m_s2", 0.50),
             "motion.max_wheel_acceleration_m_s2",
             minimum=0.001,
         ),
@@ -866,7 +812,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     )
 
     tracking_raw = _mapping(
-        _required(root, "tracking", "root"),
+        root.get("tracking", {}),
         "tracking",
     )
     _reject_unknown(
@@ -883,43 +829,35 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     )
     tracking = TrackingConfig(
         confirmation_hits=_positive_int(
-            _required(tracking_raw, "confirmation_hits", "tracking"),
+            tracking_raw.get("confirmation_hits", 2),
             "tracking.confirmation_hits",
         ),
         max_association_ground_mm=_finite_float(
-            _required(
-                tracking_raw,
-                "max_association_ground_mm",
-                "tracking",
-            ),
+            tracking_raw.get("max_association_ground_mm", 250.0),
             "tracking.max_association_ground_mm",
             minimum=0.001,
         ),
         min_association_iou=_threshold(
-            _required(tracking_raw, "min_association_iou", "tracking"),
+            tracking_raw.get("min_association_iou", 0.10),
             "tracking.min_association_iou",
         ),
         max_coast_ms=_finite_float(
-            _required(tracking_raw, "max_coast_ms", "tracking"),
+            tracking_raw.get("max_coast_ms", 600.0),
             "tracking.max_coast_ms",
             minimum=0.001,
         ),
         confidence_decay_per_second=_finite_float(
-            _required(
-                tracking_raw,
-                "confidence_decay_per_second",
-                "tracking",
-            ),
+            tracking_raw.get("confidence_decay_per_second", 0.8),
             "tracking.confidence_decay_per_second",
             minimum=0.001,
         ),
         min_confidence=_threshold(
-            _required(tracking_raw, "min_confidence", "tracking"),
+            tracking_raw.get("min_confidence", 0.15),
             "tracking.min_confidence",
         ),
     )
 
-    world_raw = _mapping(_required(root, "world", "root"), "world")
+    world_raw = _mapping(root.get("world", {}), "world")
     _reject_unknown(
         world_raw,
         {
@@ -934,41 +872,29 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     )
     world_model = WorldModelConfig(
         max_visual_age_ms=_finite_float(
-            _required(world_raw, "max_visual_age_ms", "world"),
+            world_raw.get("max_visual_age_ms", 250.0),
             "world.max_visual_age_ms",
             minimum=0.001,
         ),
         opponent_max_age_ms=_finite_float(
-            _required(world_raw, "opponent_max_age_ms", "world"),
+            world_raw.get("opponent_max_age_ms", 500.0),
             "world.opponent_max_age_ms",
             minimum=0.001,
         ),
         danger_confirm_threshold=_threshold(
-            _required(
-                world_raw,
-                "danger_confirm_threshold",
-                "world",
-            ),
+            world_raw.get("danger_confirm_threshold", 0.60),
             "world.danger_confirm_threshold",
         ),
         danger_suspect_threshold=_threshold(
-            _required(
-                world_raw,
-                "danger_suspect_threshold",
-                "world",
-            ),
+            world_raw.get("danger_suspect_threshold", 0.15),
             "world.danger_suspect_threshold",
         ),
         unknown_suspect_threshold=_threshold(
-            _required(
-                world_raw,
-                "unknown_suspect_threshold",
-                "world",
-            ),
+            world_raw.get("unknown_suspect_threshold", 0.50),
             "world.unknown_suspect_threshold",
         ),
     )
-    regions_value = _required(world_raw, "regions", "world")
+    regions_value = world_raw.get("regions", [])
     if not isinstance(regions_value, list):
         raise ValueError("world.regions must be a list.")
     regions: list[StaticRegion] = []
@@ -1033,7 +959,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     world = WorldRuntimeConfig(world_model, tuple(regions))
 
     mission_raw = _mapping(
-        _required(root, "mission", "root"),
+        root.get("mission", {}),
         "mission",
     )
     _reject_unknown(
@@ -1047,10 +973,9 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         },
         "mission",
     )
-    priority_value = _required(
-        mission_raw,
+    priority_value = mission_raw.get(
         "target_priority",
-        "mission",
+        ["orange_injured", "black_core", "green_supply"],
     )
     if not isinstance(priority_value, list):
         raise ValueError("mission.target_priority must be a list.")
@@ -1071,41 +996,29 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         ) from exc
     mission = MissionConfig(
         match_duration_s=_finite_float(
-            _required(mission_raw, "match_duration_s", "mission"),
+            mission_raw.get("match_duration_s", 180.0),
             "mission.match_duration_s",
             minimum=0.001,
         ),
         no_motion_timeout_s=_finite_float(
-            _required(
-                mission_raw,
-                "no_motion_timeout_s",
-                "mission",
-            ),
+            mission_raw.get("no_motion_timeout_s", 15.0),
             "mission.no_motion_timeout_s",
             minimum=0.001,
         ),
         opponent_contact_timeout_s=_finite_float(
-            _required(
-                mission_raw,
-                "opponent_contact_timeout_s",
-                "mission",
-            ),
+            mission_raw.get("opponent_contact_timeout_s", 10.0),
             "mission.opponent_contact_timeout_s",
             minimum=0.001,
         ),
         danger_avoid_distance_mm=_finite_float(
-            _required(
-                mission_raw,
-                "danger_avoid_distance_mm",
-                "mission",
-            ),
+            mission_raw.get("danger_avoid_distance_mm", 500.0),
             "mission.danger_avoid_distance_mm",
             minimum=0.001,
         ),
         target_priority=target_priority,
     )
 
-    hailo_raw = _mapping(_required(root, "hailo", "root"), "hailo")
+    hailo_raw = _mapping(root.get("hailo", {}), "hailo")
     _reject_unknown(
         hailo_raw,
         {
@@ -1113,8 +1026,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "hef_path",
             "postprocess_onnx_path",
             "output_mapping_path",
-            "model_version",
-            "hef_sha256",
             "raw_classes",
             "class_mapping",
             "backend_score_threshold",
@@ -1125,7 +1036,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         },
         "hailo",
     )
-    hailo_enabled = _required(hailo_raw, "enabled", "hailo")
+    hailo_enabled = hailo_raw.get("enabled", False)
     if not isinstance(hailo_enabled, bool):
         raise ValueError("hailo.enabled must be a boolean.")
     hef_path = _path_or_none(
@@ -1141,24 +1052,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         base_dir,
         "hailo.output_mapping_path",
     )
-    model_version_value = hailo_raw.get("model_version")
-    model_version = (
-        _string(model_version_value, "hailo.model_version")
-        if model_version_value is not None
-        else None
-    )
-    checksum_value = hailo_raw.get("hef_sha256")
-    checksum = (
-        _string(checksum_value, "hailo.hef_sha256").lower()
-        if checksum_value is not None
-        else None
-    )
-    if checksum is not None and (
-        len(checksum) != 64
-        or any(character not in "0123456789abcdef" for character in checksum)
-    ):
-        raise ValueError("hailo.hef_sha256 must be 64 hexadecimal characters.")
-
     raw_classes_value = hailo_raw.get("raw_classes", [])
     if not isinstance(raw_classes_value, list):
         raise ValueError("hailo.raw_classes must be a list.")
@@ -1187,19 +1080,19 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         ) from exc
 
     backend_score_threshold = _threshold(
-        _required(hailo_raw, "backend_score_threshold", "hailo"),
+        hailo_raw.get("backend_score_threshold", 0.01),
         "hailo.backend_score_threshold",
     )
     detection_threshold = _threshold(
-        _required(hailo_raw, "detection_threshold", "hailo"),
+        hailo_raw.get("detection_threshold", 0.25),
         "hailo.detection_threshold",
     )
     semantic_threshold = _threshold(
-        _required(hailo_raw, "semantic_threshold", "hailo"),
+        hailo_raw.get("semantic_threshold", 0.50),
         "hailo.semantic_threshold",
     )
     k0_threshold = _threshold(
-        _required(hailo_raw, "k0_threshold", "hailo"),
+        hailo_raw.get("k0_threshold", 0.50),
         "hailo.k0_threshold",
     )
     for location, value in (
@@ -1221,7 +1114,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             f"{detection_threshold}."
         )
     max_detections = _positive_int(
-        _required(hailo_raw, "max_detections", "hailo"),
+        hailo_raw.get("max_detections", 100),
         "hailo.max_detections",
     )
 
@@ -1229,22 +1122,18 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         hef_path,
         postprocess_onnx_path,
         output_mapping_path,
-        model_version,
-        checksum,
     )
     if hailo_enabled and (
         any(value is None for value in required_assets) or not raw_classes
     ):
         raise ValueError(
-            "Enabled hailo requires all asset paths, model identity and raw_classes."
+            "Enabled hailo requires all asset paths and raw_classes."
         )
     hailo = HailoConfig(
         enabled=hailo_enabled,
         hef_path=hef_path,
         postprocess_onnx_path=postprocess_onnx_path,
         output_mapping_path=output_mapping_path,
-        model_version=model_version,
-        hef_sha256=checksum,
         raw_classes=raw_classes,
         class_mapping=class_mapping,
         backend_score_threshold=backend_score_threshold,
@@ -1255,7 +1144,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     )
 
     return AppConfig(
-        SCHEMA_VERSION,
         camera,
         geometry,
         recording,

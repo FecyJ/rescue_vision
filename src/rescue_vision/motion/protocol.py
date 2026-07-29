@@ -144,7 +144,7 @@ class CarStopReason(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class CarSafetyStatus:
-    """版本化 ``s1`` 安全状态；所有时间均来自 STM32 单调时钟。"""
+    """``s1`` 安全状态；所有时间均来自 STM32 单调时钟。"""
 
     uart_sequence: int
     received_timestamp_ns: int

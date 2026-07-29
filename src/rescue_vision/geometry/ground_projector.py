@@ -139,11 +139,6 @@ class GroundProjector:
         """加载地面映射，并拒绝与当前内参不匹配的产物。"""
 
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        if int(data.get("schema_version", -1)) != 3:
-            raise ValueError(
-                "Ground mapping schema_version must be 3; regenerate it with "
-                "the current calibration tool."
-            )
         quality = data.get("quality")
         if not isinstance(quality, dict) or quality.get("usable") is not True:
             raise ValueError(
@@ -171,12 +166,11 @@ class GroundProjector:
                 f"Ground mapping model {actual_model!r} does not match "
                 f"intrinsics {camera_calibration.model.value!r}."
             )
-        actual_fingerprint = str(intrinsic.get("fingerprint_sha256"))
-        expected_fingerprint = camera_calibration.fingerprint()
-        if actual_fingerprint != expected_fingerprint:
+        actual_calibration_id = intrinsic.get("calibration_id")
+        if actual_calibration_id != camera_calibration.calibration_id:
             raise ValueError(
                 "Ground mapping was produced with different intrinsic "
-                "parameters (fingerprint mismatch)."
+                "parameters (calibration_id mismatch)."
             )
 
         bev_data = data.get("bev")

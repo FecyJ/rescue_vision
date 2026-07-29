@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -12,7 +11,6 @@ from rescue_vision.data.split_manifest import REQUIRED_TAGS
 from rescue_vision.geometry.camera_model import IMAGE_BORDER_FILL_VALUE
 from rescue_vision.motion.recording import (
     MANUAL_MOTION_LOG_FILENAME,
-    MANUAL_MOTION_LOG_SCHEMA_VERSION,
     MANUAL_MOTION_STREAM_NAME,
     inspect_manual_motion_log,
 )
@@ -36,11 +34,7 @@ def build_dataset_records(
     recording_directories: list[Path],
     *,
     dataset_root: Path,
-    dataset_version: str,
-    verify_images: bool = True,
 ) -> list[dict[str, Any]]:
-    if not dataset_version:
-        raise ValueError("dataset_version must be non-empty.")
     if not recording_directories:
         raise ValueError("At least one recording directory is required.")
 
@@ -50,43 +44,28 @@ def build_dataset_records(
     for directory_value in recording_directories:
         directory = directory_value.expanduser().resolve()
         session = _load_json(directory / "session.json")
-        if session.get("schema_version") not in {3, 4}:
-            raise ValueError(
-                f"{directory}: session schema_version must be 3 or 4."
-            )
         motion_report: dict[str, object] | None = None
-        if session.get("schema_version") == 4:
-            recording_kind = session.get("recording_kind")
-            auxiliary_streams = session.get("auxiliary_streams")
-            if recording_kind not in {
-                "camera",
-                "supervised_manual_motion",
-            } or not isinstance(auxiliary_streams, dict):
-                raise ValueError(
-                    f"{directory}: invalid recording_kind/auxiliary_streams."
-                )
-            if recording_kind == "camera" and auxiliary_streams:
-                raise ValueError(
-                    f"{directory}: camera recording cannot declare auxiliary "
-                    "streams."
-                )
-            if recording_kind == "supervised_manual_motion":
-                descriptor = auxiliary_streams.get(
-                    MANUAL_MOTION_STREAM_NAME
-                )
-                if set(auxiliary_streams) != {
-                    MANUAL_MOTION_STREAM_NAME
-                } or descriptor != {
-                    "schema_version": MANUAL_MOTION_LOG_SCHEMA_VERSION,
-                    "path": MANUAL_MOTION_LOG_FILENAME,
-                    "time_base": "application_monotonic_ns",
-                }:
-                    raise ValueError(
-                        f"{directory}: invalid manual_motion stream."
-                    )
-                motion_report = inspect_manual_motion_log(
-                    directory / MANUAL_MOTION_LOG_FILENAME
-                )
+        recording_kind = session.get("recording_kind")
+        auxiliary_streams = session.get("auxiliary_streams")
+        if recording_kind not in {
+            "camera",
+            "supervised_manual_motion",
+        } or not isinstance(auxiliary_streams, dict):
+            raise ValueError(
+                f"{directory}: invalid recording_kind/auxiliary_streams."
+            )
+        if recording_kind == "camera" and auxiliary_streams:
+            raise ValueError(
+                f"{directory}: camera recording cannot declare auxiliary streams."
+            )
+        if recording_kind == "supervised_manual_motion":
+            if auxiliary_streams != {
+                MANUAL_MOTION_STREAM_NAME: MANUAL_MOTION_LOG_FILENAME
+            }:
+                raise ValueError(f"{directory}: invalid manual_motion stream.")
+            motion_report = inspect_manual_motion_log(
+                directory / MANUAL_MOTION_LOG_FILENAME
+            )
         if session.get("completed") is not True:
             raise ValueError(f"{directory}: recording is not marked completed.")
         if session.get("image_coordinate_system") != "undistorted_pixel":
@@ -94,21 +73,9 @@ def build_dataset_records(
                 f"{directory}: target datasets require undistorted_pixel "
                 "recordings."
             )
-        intrinsics_fingerprint = session.get(
-            "intrinsics_fingerprint_sha256"
-        )
-        if (
-            not isinstance(intrinsics_fingerprint, str)
-            or len(intrinsics_fingerprint) != 64
-            or intrinsics_fingerprint != intrinsics_fingerprint.lower()
-            or any(
-                character not in "0123456789abcdef"
-                for character in intrinsics_fingerprint.lower()
-            )
-        ):
-            raise ValueError(
-                f"{directory}: invalid intrinsics fingerprint."
-            )
+        calibration_id = session.get("calibration_id")
+        if not isinstance(calibration_id, str) or not calibration_id.strip():
+            raise ValueError(f"{directory}: invalid calibration_id.")
         valid_pixel_ratio = session.get("valid_pixel_ratio")
         if (
             isinstance(valid_pixel_ratio, bool)
@@ -140,8 +107,6 @@ def build_dataset_records(
 
         annotation_path = directory / "annotations.json"
         annotations = _load_json(annotation_path)
-        if annotations.get("schema_version") != 1:
-            raise ValueError(f"{annotation_path}: schema_version must be 1.")
         if annotations.get("recording_id") != recording_id:
             raise ValueError(
                 f"{annotation_path}: recording_id does not match session."
@@ -160,7 +125,7 @@ def build_dataset_records(
             if not line.strip():
                 continue
             frame = json.loads(line)
-            if not isinstance(frame, dict) or frame.get("schema_version") != 1:
+            if not isinstance(frame, dict):
                 raise ValueError(
                     f"{directory}/frames.jsonl:{line_number}: invalid schema."
                 )
@@ -187,22 +152,10 @@ def build_dataset_records(
             if first_timestamp_ns is None:
                 first_timestamp_ns = timestamp_ns
             image_path = directory / str(frame.get("image_path"))
-            expected_hash = frame.get("image_sha256")
-            if not isinstance(expected_hash, str) or len(expected_hash) != 64:
+            if not image_path.is_file():
                 raise ValueError(
-                    f"{directory}/frames.jsonl:{line_number}: invalid image hash."
+                    f"{directory}/frames.jsonl:{line_number}: image does not exist."
                 )
-            try:
-                int(expected_hash, 16)
-            except ValueError as error:
-                raise ValueError(
-                    f"{directory}/frames.jsonl:{line_number}: image hash "
-                    "must be hexadecimal."
-                ) from error
-            if verify_images:
-                actual_hash = hashlib.sha256(image_path.read_bytes()).hexdigest()
-                if actual_hash != expected_hash:
-                    raise ValueError(f"Image hash mismatch for {image_path}.")
 
             sample_id = f"{recording_id}/frame_{sequence:08d}"
             if sample_id in seen_sample_ids:
@@ -211,16 +164,13 @@ def build_dataset_records(
             frame_count += 1
             output.append(
                 {
-                    "schema_version": 2,
-                    "dataset_version": dataset_version,
                     "sample_id": sample_id,
                     "recording_id": recording_id,
                     "frame_sequence": sequence,
                     "timestamp_ns": timestamp_ns,
                     "image_path": _relative_to_root(image_path, dataset_root),
-                    "image_sha256": expected_hash,
                     "image_coordinate_system": "undistorted_pixel",
-                    "intrinsics_fingerprint_sha256": intrinsics_fingerprint,
+                    "calibration_id": calibration_id,
                     "valid_pixel_ratio": float(valid_pixel_ratio),
                     "undistort_fill_value": undistort_fill_value,
                     "annotation_manifest": _relative_to_root(
@@ -259,20 +209,12 @@ def main() -> None:
     )
     parser.add_argument("recordings", type=Path, nargs="+")
     parser.add_argument("--dataset-root", type=Path, required=True)
-    parser.add_argument("--dataset-version", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument(
-        "--skip-image-verification",
-        action="store_true",
-        help="Skip SHA-256 verification (faster but unsafe for release manifests).",
-    )
     args = parser.parse_args()
 
     records = build_dataset_records(
         args.recordings,
         dataset_root=args.dataset_root,
-        dataset_version=args.dataset_version,
-        verify_images=not args.skip_image_verification,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(

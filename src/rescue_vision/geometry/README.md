@@ -42,7 +42,8 @@ camera_model = geometry.camera_model
 ground_projector = geometry.ground_projector
 ```
 
-配置装配会检查运行分辨率、标定可用性、相机模型以及地面映射中的内参指纹。
+配置装配会检查运行分辨率、标定可用性、相机模型以及地面映射中的
+`calibration_id`。
 只有内参时 `ground_projector` 合法地为 `None`。下文继续复用这里创建的
 `config`、`geometry`、`camera_model` 和 `ground_projector`。
 

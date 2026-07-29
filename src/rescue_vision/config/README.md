@@ -1,6 +1,8 @@
 # `config`：运行配置与对象装配
 
-本包是运行参数的唯一入口。`load_runtime_config()` 加载 schema v10 YAML，拒绝缺失字段、未知字段、错误类型和不一致资产；相对路径以 YAML 所在目录为基准。
+本包是运行参数的唯一入口。`load_runtime_config()` 读取 YAML，拒绝未知字段、
+错误类型和不一致资产；相对路径以 YAML 所在目录为基准。`camera` 必填，
+其余段可以省略并采用安全默认值。
 
 本机运行统一读取不提交的 `configs/runtime.yaml`。`configs/runtime.example.yaml` 只用于创建新配置：
 
@@ -98,7 +100,7 @@ UART/TCP 生命周期和 motion 的停止语义分别见相邻模块 README，�
 
 ```python
 # build_geometry() 会同时检查运行分辨率、标定可用性、
-# 相机模型和地面映射中的内参指纹。
+# 相机模型和地面映射中的 calibration_id。
 geometry = config.build_geometry()
 if geometry is None:
     raise RuntimeError("当前功能需要在 runtime.yaml 中启用内参")
@@ -153,7 +155,8 @@ geometry:
 | 开 | 开 | 可进一步把 K0 投影到机器人地面毫米坐标 |
 | 关 | 开 | 非法配置，加载阶段直接拒绝 |
 
-正式四类目标采集和感知必须启用内参。地面映射尚未完成时保持关闭，不应伪造路径或绕过指纹校验。
+正式四类目标采集和感知必须启用内参。地面映射尚未完成时保持关闭，不应
+伪造路径或绕过 `calibration_id` 配对检查。
 
 ## 7. Hailo 装配语义
 
@@ -206,29 +209,16 @@ PySerial 并打开设备。电机命令、轮速和未来 IMU 报文由后续协
 网络；`connect_client()` 会立即建立 TCP 连接，因此只能在本仓库参考工具
 的装配层调用。
 
-## schema 与路径
+## 默认值与路径
 
-- 当前运行配置为 schema v10。
-- schema v9 升级到 v10 时，`motion` 段必须增加完整的 `gripper` 映射。
-  未完成真机标定时将 `enabled` 设为 `false`，四个端点角度和
-  `full_travel_time_s` 均设为 `null`；启用时它们必须全部给出，左右各自的
-  开/闭端点必须不同。加载器不会用 0/180° 或协议示例值猜测机械安全范围。
-- schema v8 升级到 v9 时，`motion` 段必须增加正有限数
-  `max_wheel_acceleration_m_s2`。示例值 `0.50` 表示单轮目标速度每秒最多
-  变化 0.50 m/s；控制器不会静默使用旧配置或猜测真车安全加速度。
-- schema v7 升级到 v8 时必须增加完整的 `motion` 段；默认关闭且轮距为
-  `null`，不会猜测机械尺寸、打开 UART 或接受远程运动。
-- schema v6 升级到 v7 时，删除 `authentication_key_path` 和
-  `handshake_timeout_ms`，增加 `connect_timeout_ms`。这是为了降低赛场
-  连接复杂度而有意做出的不兼容简化，不提供旧字段兼容。
-- schema v5 升级到 v6 时必须增加完整的 `remote` 段；不会静默开放网络或
-  远程控制。未使用时设置 `enabled: false`、`access_mode: observe_only`。
-- schema v4 升级时还必须增加完整的 `uart` 段；不会静默猜测设备名
-  或打开串口。UART 尚未使用时设置 `enabled: false`、`device: null`。
-- schema v3 升级时还必须增加完整的 `tracking`、`world` 和 `mission`
-  段；不会静默套用比赛安全默认值。
-- 更旧 schema 的 `geometry.enabled` 不会被静默兼容，应拆成两个独立开关。
+- `geometry`、`uart`、`remote`、`motion`、`motion.gripper` 和 `hailo`
+  缺省时全部关闭；远程访问缺省为 `observe_only`。
+- 录制队列、通信超时、运动上限、跟踪和任务阈值缺省为
+  `runtime.example.yaml` 展示的值。现场只需写需要覆盖的字段。
+- 子系统一旦启用，设备路径、轮距、夹爪机械端点、标定路径和模型资产仍然
+  必须完整有效，不会猜测这些安全关键参数。
 - 位于 `configs/` 的 YAML 指向仓库根目录资产时通常以 `../` 开头。
-- 路径、类别、阈值和模型哈希只在配置中维护，不在业务模块再次硬编码。
+- 路径、类别和阈值只在配置中维护，不在业务模块再次硬编码。
 
-新增配置字段时必须同步严格校验、`configs/runtime.example.yaml`、无硬件测试和受影响模块 README。
+新增配置字段时必须同步校验、默认值、`configs/runtime.example.yaml`、
+无硬件测试和受影响模块 README。

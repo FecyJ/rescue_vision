@@ -113,20 +113,18 @@ def test_tensor_mapping_rejects_missing_or_wrong_dtype() -> None:
         )
 
 
-def test_backend_rejects_hef_checksum_before_hardware_import(tmp_path) -> None:
+def test_backend_validates_mapping_before_hardware_import(tmp_path) -> None:
     hef = tmp_path / "model.hef"
     onnx = tmp_path / "postprocess.onnx"
     mapping = tmp_path / "mapping.json"
     hef.write_bytes(b"not-a-real-hef")
     onnx.write_bytes(b"not-a-real-onnx")
     mapping.write_text("{}", encoding="utf-8")
-    with pytest.raises(ValueError, match="checksum mismatch"):
+    with pytest.raises(ValueError, match="output_format"):
         HailoYolo26PoseBackend(
             hef_path=hef,
             postprocess_onnx_path=onnx,
             output_mapping_path=mapping,
-            model_version="test",
-            model_sha256="0" * 64,
             class_count=4,
             max_detections=10,
             score_threshold=0.25,

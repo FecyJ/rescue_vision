@@ -32,8 +32,7 @@ def test_recorder_roundtrip_is_deterministic(tmp_path) -> None:
     recorder = FrameRecorder(
         session,
         image_size=(8, 6),
-        config_snapshot={"schema_version": 1, "camera": {"fps": 20}},
-        versions={"code": "abc", "config": "v1"},
+        config_snapshot={"camera": {"fps": 20}},
         queue_capacity=2,
     )
     recorder.start()
@@ -67,11 +66,10 @@ def test_recorder_roundtrip_is_deterministic(tmp_path) -> None:
     assert np.array_equal(repeated.image_bgr, first.image_bgr)
 
     session_document = json.loads((session / "session.json").read_text())
-    assert session_document["schema_version"] == 4
     assert session_document["recording_kind"] == "camera"
     assert session_document["auxiliary_streams"] == {}
     assert session_document["image_coordinate_system"] == "raw_pixel"
-    assert session_document["intrinsics_fingerprint_sha256"] is None
+    assert session_document["calibration_id"] is None
     assert session_document["undistort_fill_value"] is None
     assert session_document["completed"] is True
     assert session_document["statistics"]["dropped_frames"] == 0
@@ -82,7 +80,7 @@ def test_recorder_roundtrip_is_deterministic(tmp_path) -> None:
     first_path.write_bytes(b"corrupt")
     corrupt = RecordingSource(session)
     corrupt.start()
-    with pytest.raises(ValueError, match="hash mismatch"):
+    with pytest.raises(RuntimeError, match="Cannot read recorded frame"):
         corrupt.read()
     corrupt.stop()
 
@@ -91,8 +89,7 @@ def test_recorder_queue_full_does_not_block(tmp_path, monkeypatch) -> None:
     recorder = FrameRecorder(
         tmp_path / "recording",
         image_size=(8, 6),
-        config_snapshot={"schema_version": 1},
-        versions={"code": "abc"},
+        config_snapshot={},
         queue_capacity=1,
     )
     recorder.start()
@@ -110,28 +107,24 @@ def test_recorder_queue_full_does_not_block(tmp_path, monkeypatch) -> None:
     assert session["completed"] is False
 
 
-def test_recording_source_accepts_legacy_session_v3(tmp_path) -> None:
+def test_recording_source_rejects_incomplete_session_shape(tmp_path) -> None:
     directory = tmp_path / "legacy-v3"
     recorder = FrameRecorder(
         directory,
         image_size=(8, 6),
-        config_snapshot={"schema_version": 1},
-        versions={"code": "abc"},
+        config_snapshot={},
     )
     recorder.start()
     assert recorder.record(frame(0, 10))
     recorder.stop()
     session_path = directory / "session.json"
     session = json.loads(session_path.read_text(encoding="utf-8"))
-    session["schema_version"] = 3
     session.pop("recording_kind")
     session.pop("auxiliary_streams")
     session_path.write_text(json.dumps(session), encoding="utf-8")
 
-    with RecordingSource(directory) as source:
-        replayed = source.read()
-
-    assert replayed.sequence == 0
+    with pytest.raises(ValueError, match="auxiliary_streams"):
+        RecordingSource(directory)
 
 
 def test_recorder_stop_does_not_block_after_worker_death_with_full_queue(
@@ -140,8 +133,7 @@ def test_recorder_stop_does_not_block_after_worker_death_with_full_queue(
     recorder = FrameRecorder(
         tmp_path / "recording-dead-worker",
         image_size=(8, 6),
-        config_snapshot={"schema_version": 1},
-        versions={"code": "abc"},
+        config_snapshot={},
         queue_capacity=1,
     )
     recorder.session_directory.mkdir()
@@ -160,14 +152,13 @@ def test_recorder_stop_does_not_block_after_worker_death_with_full_queue(
 
 
 def test_undistorted_recording_replays_calibration_identity(tmp_path) -> None:
-    fingerprint = "a" * 64
+    calibration_id = "camera-front-20260729"
     recorder = FrameRecorder(
         tmp_path / "recording",
         image_size=(8, 6),
-        config_snapshot={"schema_version": 3},
-        versions={"code": "abc"},
+        config_snapshot={},
         image_coordinate_system="undistorted_pixel",
-        intrinsics_fingerprint_sha256=fingerprint,
+        calibration_id=calibration_id,
         valid_pixel_ratio=0.95,
         undistort_fill_value=114,
     )
@@ -179,7 +170,7 @@ def test_undistorted_recording_replays_calibration_identity(tmp_path) -> None:
         replayed = source.read()
 
     assert replayed.metadata["image_coordinate_system"] == "undistorted_pixel"
-    assert replayed.metadata["intrinsics_fingerprint_sha256"] == fingerprint
+    assert replayed.metadata["calibration_id"] == calibration_id
     assert replayed.metadata["valid_pixel_ratio"] == 0.95
     assert replayed.metadata["undistort_fill_value"] == 114
 

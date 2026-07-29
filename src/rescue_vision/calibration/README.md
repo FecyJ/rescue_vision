@@ -10,7 +10,7 @@
 | `python -m rescue_vision.calibration.calibrate_intrinsics` | 比较三种模型并选择内参 | `selected_calibration.json`、诊断图 |
 | `python -m rescue_vision.calibration.calibrate_extrinsics_ground` | 相机安装姿态最终固定后 | `ground_mapping.json`、BEV 与误差诊断 |
 | `CameraModel.from_json()` | 独立检查标定产物 | 默认拒绝 `quality.usable=false` |
-| `load_runtime_config(...).build_geometry()` | 实际运行接入 | 联合验证内参、分辨率和地面映射指纹 |
+| `load_runtime_config(...).build_geometry()` | 实际运行接入 | 联合验证内参、分辨率和地面映射 ID |
 
 ## 完整工作流速览
 
@@ -111,7 +111,10 @@ python -m rescue_vision.calibration.calibrate_intrinsics \
   --square-size-mm 15.0 --balance 0.0
 ```
 
-默认值均为 `0.35`，应结合诊断图、`CameraModel.valid_mask` 的有效比例和比赛所需视野选择。参数变化会生成不同的 `new_K` 和内参指纹；确定新参数后必须重新验证内参，并重新制作所有依赖旧指纹的地面映射和任务数据。不能只修改 `selected_calibration.json` 中的数值。
+默认值均为 `0.35`，应结合诊断图、`CameraModel.valid_mask` 的有效比例和比赛
+所需视野选择。参数变化会生成不同的 `new_K`；确定新参数后必须使用新的
+`calibration_id`，并重新制作所有依赖旧标定的地面映射和任务数据。不能只
+修改 `selected_calibration.json` 中的数值。
 
 ## 3. 准备地面映射数据
 
@@ -158,13 +161,14 @@ output/ground_mapping_YYYYMMDD_HHMMSS_ffffff/
 
 `image_to_ground` 表示去畸变像素到机器人地面毫米坐标。直接单应拟合用于地面点定位；PnP 推导矩阵用于交叉诊断。部署前必须使用未参与拟合的保留点实测地面误差，并复核 BEV 有效范围。
 
-对应点文件绑定原图文件名与 SHA-256；更换或覆盖原图后必须
-`--recollect`。输出 schema v3 同时保存物理有效性、误差门限、
-`quality.usable`、`model_type` 与内参 SHA-256 指纹。默认门限可通过
+对应点文件绑定原图文件名与尺寸；更换原图或分辨率后必须
+`--recollect`。输出同时保存物理有效性、误差门限、
+`quality.usable`、`model_type` 与可读 `calibration_id`。内参命令可用
+`--calibration-id` 显式命名，未指定时使用输出目录名。默认门限可通过
 `--maximum-mean-inlier-error-mm`、`--maximum-inlier-error-mm` 和
 `--maximum-pose-rmse-px` 显式调整并落盘。运行时
 `GroundProjector.from_json(...)` 会拒绝 `quality.usable=false`、非物理
-有效位姿、错误 schema、图像尺寸、模型或指纹不匹配的产物。
+有效位姿、错误图像尺寸、模型或 `calibration_id` 不匹配的产物。
 基础矩阵往返和 BEV 四角方向已有自动测试；实际安装仍必须使用独立保留点
 测量地面误差。
 
@@ -208,4 +212,6 @@ print("ground mapping:", geometry.ground_projector is not None)
 PY
 ```
 
-这一步比只解析 YAML 更重要：它会真正读取产物并检查运行分辨率、标定质量、模型类型和指纹。应用代码随后只使用 `geometry.camera_model` 与 `geometry.ground_projector`，不再直接解释 JSON 字段。
+这一步比只解析 YAML 更重要：它会真正读取产物并检查运行分辨率、标定质量、
+模型类型和 `calibration_id`。应用代码随后只使用 `geometry.camera_model`
+与 `geometry.ground_projector`，不再直接解释 JSON 字段。

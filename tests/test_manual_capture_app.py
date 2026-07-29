@@ -180,7 +180,7 @@ def _received(topic: RemoteTopic, payload: bytes, sequence: int):
 
 def _config() -> SimpleNamespace:
     return SimpleNamespace(
-        schema_version=10,
+
         camera=SimpleNamespace(image_size=(4, 3), fps=20),
         recording=SimpleNamespace(queue_capacity=8, image_format="png"),
         remote=SimpleNamespace(access_mode=RemoteAccessMode.DEBUG_CONTROL),
@@ -273,7 +273,7 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
     capture = CaptureSession(
         output_root=tmp_path,
         config=config,
-        config_snapshot={"schema_version": 10},
+        config_snapshot={},
         pipeline=pipeline,
     )
     start = DebugCaptureCommand(
@@ -394,7 +394,7 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
     second_capture = CaptureSession(
         output_root=tmp_path,
         config=config,
-        config_snapshot={"schema_version": 10},
+        config_snapshot={},
         pipeline=pipeline,
     )
     second_connection = FakeConnection([])
@@ -447,7 +447,7 @@ def test_recording_queue_overflow_faults_capture_and_requires_stop(
     capture = CaptureSession(
         output_root=tmp_path,
         config=config,
-        config_snapshot={"schema_version": 10},
+        config_snapshot={},
         pipeline=pipeline,
     )
     capture.execute(
@@ -608,7 +608,7 @@ def test_camera_failure_faults_capture_and_stops_motion(tmp_path) -> None:
     capture = CaptureSession(
         output_root=tmp_path,
         config=config,
-        config_snapshot={"schema_version": 10},
+        config_snapshot={},
         pipeline=pipeline,
     )
     car = FakeCarChannel()

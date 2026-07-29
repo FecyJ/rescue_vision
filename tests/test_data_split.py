@@ -7,13 +7,11 @@ from rescue_vision.data.split_manifest import REQUIRED_TAGS, split_records
 
 def record(sample_id: str, recording_id: str) -> dict:
     return {
-        "schema_version": 2,
-        "dataset_version": "dataset-v1",
         "sample_id": sample_id,
         "recording_id": recording_id,
         "image_path": f"{sample_id}.png",
         "image_coordinate_system": "undistorted_pixel",
-        "intrinsics_fingerprint_sha256": "a" * 64,
+        "calibration_id": "camera-front-20260729",
         "valid_pixel_ratio": 0.95,
         "undistort_fill_value": 114,
         "tags": {tag: "known" for tag in REQUIRED_TAGS},
@@ -59,12 +57,11 @@ def test_split_rejects_missing_stratification_tag() -> None:
         split_records([invalid], seed="fixed")
 
 
-def test_split_rejects_mixed_dataset_versions() -> None:
-    first = record("sample-a", "recording-a")
-    second = record("sample-b", "recording-b")
-    second["dataset_version"] = "dataset-v2"
-    with pytest.raises(ValueError, match="does not match"):
-        split_records([first, second], seed="fixed")
+def test_split_rejects_missing_calibration_id() -> None:
+    invalid = record("sample", "recording")
+    invalid["calibration_id"] = ""
+    with pytest.raises(ValueError, match="calibration_id"):
+        split_records([invalid], seed="fixed")
 
 
 def test_split_rejects_raw_or_unidentified_image_coordinates() -> None:

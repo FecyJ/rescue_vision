@@ -30,11 +30,11 @@
 | `send_observation()` | 提交视频、地图、车辆最新值 | 按 topic 合并，队列满时丢旧保新 |
 | `receive_observation()` | 接收观察消息 | 仓库参考客户端也按 topic 保留最新值 |
 | `DebugMotionCommand` | 调试运动 JSON schema | 死手、有效期、车体速度和可选目标朝向 |
-| `DebugGripperCommand` | 调试夹爪 JSON schema v2 | 有效期和张开/闭合扳机按压布尔状态 |
+| `DebugGripperCommand` | 调试夹爪 JSON | 有效期和张开/闭合扳机按压布尔状态 |
 | `DebugCaptureCommand` | 调试采集 JSON schema | 开始、停止、抓拍和事件标记 |
 | `RemoteSessionStatus` | 会话权限、能力、限值和周期 | TCP 建立后的首条业务消息 |
 | `VideoFrameAttributes` | JPEG 帧 header attributes | 严格尺寸、坐标系、时间和标定身份 |
-| `VehicleStateObservation` | 车辆观察 JSON schema v4 | UART、轮速、夹爪角度、显式安全模式和命令 ID |
+| `VehicleStateObservation` | 车辆观察 JSON | UART、轮速、夹爪角度、显式安全模式和命令 ID |
 | `CaptureStatusObservation` | 采集观察 JSON schema | 当前记录状态及最近请求结果 |
 
 ## 1. 从运行配置装配 UART
@@ -269,7 +269,7 @@ video_attributes = VideoFrameAttributes(
     width=frame.image_bgr.shape[1],
     height=frame.image_bgr.shape[0],
     coordinate_system=ImageCoordinateSystem.RAW_PIXEL,
-    intrinsics_fingerprint_sha256=None,
+    calibration_id=None,
 )
 
 remote_connection.send_observation(

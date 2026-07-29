@@ -67,9 +67,6 @@ from rescue_vision.motion import (
     RemoteMotionResult,
     run_remote_motion,
 )
-from rescue_vision.versioning import git_version
-
-
 SESSION_STATUS_PERIOD_MS = 1_000
 VEHICLE_STATUS_PERIOD_MS = 100
 CAPTURE_STATUS_PERIOD_MS = 500
@@ -82,7 +79,7 @@ class CameraPipeline:
     source: FrameSource
     camera_model: CameraModel | None
     coordinate_system: ImageCoordinateSystem
-    intrinsics_fingerprint_sha256: str | None
+    calibration_id: str | None
 
     def prepare(self, frame: CameraFrame) -> CameraFrame:
         if self.camera_model is None:
@@ -255,18 +252,11 @@ class CaptureSession:
             directory,
             image_size=self.config.camera.image_size,
             config_snapshot=self.config_snapshot,
-            versions={
-                "code": git_version(),
-                "config_schema": str(self.config.schema_version),
-                "opencv": cv2.__version__,
-            },
             session_tags=tags,
             queue_capacity=self.config.recording.queue_capacity,
             image_format=self.config.recording.image_format,
             image_coordinate_system=self.pipeline.coordinate_system.value,
-            intrinsics_fingerprint_sha256=(
-                self.pipeline.intrinsics_fingerprint_sha256
-            ),
+            calibration_id=self.pipeline.calibration_id,
             valid_pixel_ratio=(
                 cv2.countNonZero(camera_model.valid_mask)
                 / camera_model.valid_mask.size
@@ -341,7 +331,6 @@ class CaptureSession:
             raise RuntimeError("OpenCV failed to encode snapshot.")
         image_path.write_bytes(encoded.tobytes())
         metadata = {
-            "schema_version": 1,
             "artifact_id": artifact_id,
             "request_id": command.request_id,
             "label": command.label,
@@ -349,9 +338,7 @@ class CaptureSession:
             "timestamp_ns": frame.timestamp_ns,
             "image_path": image_path.name,
             "coordinate_system": self.pipeline.coordinate_system.value,
-            "intrinsics_fingerprint_sha256": (
-                self.pipeline.intrinsics_fingerprint_sha256
-            ),
+            "calibration_id": self.pipeline.calibration_id,
         }
         (directory / f"{artifact_id}.json").write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
@@ -377,7 +364,6 @@ class CaptureSession:
             events.write(
                 json.dumps(
                     {
-                        "schema_version": 1,
                         "artifact_id": artifact_id,
                         "request_id": command.request_id,
                         "label": command.label,
@@ -806,7 +792,7 @@ def build_camera_pipeline(config: AppConfig) -> CameraPipeline:
         (
             None
             if camera_model is None
-            else camera_model.calibration.fingerprint()
+            else camera_model.calibration.calibration_id
         ),
     )
 
@@ -924,9 +910,7 @@ def _send_video_frame(
         width=width,
         height=height,
         coordinate_system=pipeline.coordinate_system,
-        intrinsics_fingerprint_sha256=(
-            pipeline.intrinsics_fingerprint_sha256
-        ),
+        calibration_id=pipeline.calibration_id,
     )
     connection.send_observation(
         RemoteTopic.VIDEO_FRAME.value,

@@ -66,15 +66,14 @@ def test_session_status_round_trip_and_topic() -> None:
         RemoteSessionStatus.from_payload(observe_only.to_payload())
         == observe_only
     )
-    assert status.SCHEMA_VERSION == 2
     assert (
         RemoteTopic.SESSION_STATUS.value == "observation/session/status"
     )
-    legacy = json.loads(status.to_payload())
-    legacy["schema_version"] = 1
-    with pytest.raises(ValueError, match="schema_version"):
+    unexpected = json.loads(status.to_payload())
+    unexpected["legacy_field"] = 1
+    with pytest.raises(ValueError, match="keys must be exactly"):
         RemoteSessionStatus.from_payload(
-            json.dumps(legacy).encode("utf-8")
+            json.dumps(unexpected).encode("utf-8")
         )
 
 
@@ -107,7 +106,7 @@ def test_video_attributes_round_trip_and_coordinate_binding() -> None:
         width=1280,
         height=720,
         coordinate_system=ImageCoordinateSystem.RAW_PIXEL,
-        intrinsics_fingerprint_sha256=None,
+        calibration_id=None,
     )
     undistorted = VideoFrameAttributes(
         frame_sequence=4,
@@ -115,7 +114,7 @@ def test_video_attributes_round_trip_and_coordinate_binding() -> None:
         width=1280,
         height=720,
         coordinate_system=ImageCoordinateSystem.UNDISTORTED_PIXEL,
-        intrinsics_fingerprint_sha256="a" * 64,
+        calibration_id="camera-front-20260729",
     )
 
     assert VideoFrameAttributes.from_attributes(raw.to_attributes()) == raw
@@ -130,12 +129,12 @@ def test_video_attributes_round_trip_and_coordinate_binding() -> None:
             width=640,
             height=480,
             coordinate_system=ImageCoordinateSystem.UNDISTORTED_PIXEL,
-            intrinsics_fingerprint_sha256=None,
+            calibration_id=None,
         )
-    boolean_version = raw.to_attributes()
-    boolean_version["schema_version"] = True
-    with pytest.raises(ValueError, match="schema_version"):
-        VideoFrameAttributes.from_attributes(boolean_version)
+    unexpected = raw.to_attributes()
+    unexpected["legacy_field"] = True
+    with pytest.raises(ValueError, match="keys must be exactly"):
+        VideoFrameAttributes.from_attributes(unexpected)
 
 
 def test_map_attributes_round_trip_and_bounds() -> None:
@@ -200,12 +199,11 @@ def test_vehicle_state_round_trip_and_safety_invariants() -> None:
     )
 
     assert VehicleStateObservation.from_payload(state.to_payload()) == state
-    assert state.SCHEMA_VERSION == 4
-    legacy = json.loads(state.to_payload())
-    legacy["schema_version"] = 2
-    with pytest.raises(ValueError, match="schema_version"):
+    unexpected = json.loads(state.to_payload())
+    unexpected["legacy_field"] = 2
+    with pytest.raises(ValueError, match="keys must be exactly"):
         VehicleStateObservation.from_payload(
-            json.dumps(legacy).encode("utf-8")
+            json.dumps(unexpected).encode("utf-8")
         )
     with pytest.raises(ValueError, match="control_ready requires"):
         VehicleStateObservation(
@@ -316,7 +314,6 @@ def test_vehicle_state_gripper_angles_must_be_paired_and_bounded() -> None:
     values = {
         field: getattr(state, field)
         for field in state.__dataclass_fields__
-        if field != "SCHEMA_VERSION"
     }
     values["gripper_left_angle_deg"] = 27.0
     with pytest.raises(ValueError, match="both be present"):

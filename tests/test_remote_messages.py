@@ -105,7 +105,6 @@ def test_debug_gripper_round_trip_and_boolean_states() -> None:
     )
 
     assert DebugGripperCommand.from_payload(command.to_payload()) == command
-    assert command.SCHEMA_VERSION == 2
     assert RemoteTopic.DEBUG_GRIPPER.value == "control/debug/gripper"
     with pytest.raises(ValueError, match="boolean"):
         DebugGripperCommand(
@@ -148,18 +147,11 @@ def test_capture_commands_do_not_accept_remote_output_paths() -> None:
         )
 
 
-def test_control_payload_rejects_unknown_schema_fields() -> None:
+def test_control_payload_rejects_unknown_fields() -> None:
     payload = (
-        b'{"schema_version":1,"request_id":"x","issued_timestamp_ns":0,'
+        b'{"request_id":"x","issued_timestamp_ns":0,'
         b'"action":"stop","label":null,"session_tags":{},"path":"/tmp/x"}'
     )
 
     with pytest.raises(ValueError, match="keys must be exactly"):
         DebugCaptureCommand.from_payload(payload)
-
-    boolean_version = (
-        b'{"schema_version":true,"request_id":"x","issued_timestamp_ns":0,'
-        b'"action":"stop","label":null,"session_tags":{}}'
-    )
-    with pytest.raises(ValueError, match="schema_version"):
-        DebugCaptureCommand.from_payload(boolean_version)

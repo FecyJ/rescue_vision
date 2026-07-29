@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 
 from rescue_vision.evaluation.report import evaluate_records
-from rescue_vision.versioning import git_version
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -25,17 +24,9 @@ def main() -> None:
     )
     parser.add_argument("records", type=Path)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--model-version", required=True)
-    parser.add_argument("--dataset-version", required=True)
-    parser.add_argument("--code-version", default=None)
     args = parser.parse_args()
 
-    report = evaluate_records(
-        _read_jsonl(args.records),
-        model_version=args.model_version,
-        dataset_version=args.dataset_version,
-        code_version=args.code_version or git_version(),
-    )
+    report = evaluate_records(_read_jsonl(args.records))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n",

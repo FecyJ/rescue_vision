@@ -17,7 +17,6 @@ from rescue_vision.camera.viewer import OpenCvFrameViewer, playback_delay_ms
 from rescue_vision.geometry.camera_model import IMAGE_BORDER_FILL_VALUE
 from rescue_vision.motion.recording import (
     MANUAL_MOTION_LOG_FILENAME,
-    MANUAL_MOTION_LOG_SCHEMA_VERSION,
     MANUAL_MOTION_STREAM_NAME,
     inspect_manual_motion_log,
 )
@@ -59,21 +58,10 @@ def inspect_recording(
 
     directory = Path(session_directory).expanduser().resolve()
     session = _load_object(directory / "session.json")
-    session_schema_version = session.get("schema_version")
-    if session_schema_version not in {3, 4}:
-        raise ValueError("Recording session schema_version must be 3 or 4.")
-    auxiliary_streams = (
-        session.get("auxiliary_streams")
-        if session_schema_version == 4
-        else {}
-    )
+    auxiliary_streams = session.get("auxiliary_streams", {})
     if not isinstance(auxiliary_streams, dict):
         raise ValueError("Recording auxiliary_streams must be a mapping.")
-    recording_kind = (
-        session.get("recording_kind")
-        if session_schema_version == 4
-        else "camera"
-    )
+    recording_kind = session.get("recording_kind")
     if recording_kind not in {"camera", "supervised_manual_motion"}:
         raise ValueError("Recording recording_kind is invalid.")
     if recording_kind == "supervised_manual_motion" and set(
@@ -192,16 +180,13 @@ def inspect_recording(
     )
 
     return {
-        "schema_version": 1,
         "recording_id": session.get("recording_id"),
         "recording_kind": recording_kind,
         "session_directory": str(directory),
         "image_size": session.get("image_size"),
         "image_format": session.get("image_format"),
         "image_coordinate_system": session.get("image_coordinate_system"),
-        "intrinsics_fingerprint_sha256": session.get(
-            "intrinsics_fingerprint_sha256"
-        ),
+        "calibration_id": session.get("calibration_id"),
         "valid_pixel_ratio": session.get("valid_pixel_ratio"),
         "undistort_fill_value": session.get("undistort_fill_value"),
         "auxiliary_streams": auxiliary_streams,
@@ -243,30 +228,13 @@ def _inspect_auxiliary_streams(
     streams: dict[str, Any],
 ) -> dict[str, object]:
     reports: dict[str, object] = {}
-    for name, descriptor in streams.items():
+    for name, path in streams.items():
         if name != MANUAL_MOTION_STREAM_NAME:
             raise ValueError(f"Unknown recording auxiliary stream {name!r}.")
-        if not isinstance(descriptor, dict) or set(descriptor) != {
-            "schema_version",
-            "path",
-            "time_base",
-        }:
-            raise ValueError(
-                f"Auxiliary stream {name!r} descriptor has invalid keys."
-            )
-        if descriptor["schema_version"] != MANUAL_MOTION_LOG_SCHEMA_VERSION:
-            raise ValueError(
-                f"Auxiliary stream {name!r} schema_version must be "
-                f"{MANUAL_MOTION_LOG_SCHEMA_VERSION}."
-            )
-        if descriptor["path"] != MANUAL_MOTION_LOG_FILENAME:
+        if path != MANUAL_MOTION_LOG_FILENAME:
             raise ValueError(
                 f"Auxiliary stream {name!r} path must be "
                 f"{MANUAL_MOTION_LOG_FILENAME!r}."
-            )
-        if descriptor["time_base"] != "application_monotonic_ns":
-            raise ValueError(
-                f"Auxiliary stream {name!r} has unsupported time_base."
             )
         reports[name] = inspect_manual_motion_log(
             directory / MANUAL_MOTION_LOG_FILENAME

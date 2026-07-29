@@ -17,20 +17,19 @@ from rescue_vision.motion import (
 )
 
 
-INTRINSICS_FINGERPRINT = "a" * 64
+CALIBRATION_ID = "camera-front-20260729"
 
 
-def test_recording_builds_verified_dataset_manifest(tmp_path) -> None:
+def test_recording_builds_dataset_manifest(tmp_path) -> None:
     recording = tmp_path / "recording-a"
     tags = {name: f"value-{name}" for name in REQUIRED_TAGS}
     recorder = FrameRecorder(
         recording,
         image_size=(8, 6),
-        config_snapshot={"schema_version": 1},
-        versions={"code": "abc-dirty"},
+        config_snapshot={},
         session_tags=tags,
         image_coordinate_system="undistorted_pixel",
-        intrinsics_fingerprint_sha256=INTRINSICS_FINGERPRINT,
+        calibration_id=CALIBRATION_ID,
         valid_pixel_ratio=0.95,
         undistort_fill_value=114,
     )
@@ -47,19 +46,16 @@ def test_recording_builds_verified_dataset_manifest(tmp_path) -> None:
     records = build_dataset_records(
         [recording],
         dataset_root=tmp_path,
-        dataset_version="dataset-v1",
     )
     assert len(records) == 1
     record = records[0]
     assert record["sample_id"] == "recording-a/frame_00000004"
     assert record["recording_id"] == "recording-a"
-    assert record["dataset_version"] == "dataset-v1"
     assert record["timestamp_ns"] == 123456
     assert record["image_coordinate_system"] == "undistorted_pixel"
-    assert record["intrinsics_fingerprint_sha256"] == INTRINSICS_FINGERPRINT
+    assert record["calibration_id"] == CALIBRATION_ID
     assert record["valid_pixel_ratio"] == 0.95
     assert record["undistort_fill_value"] == 114
-    assert record["schema_version"] == 2
     assert record["tags"] == dict(sorted(tags.items()))
     assert not str(record["image_path"]).startswith("/")
 
@@ -69,11 +65,10 @@ def test_manifest_validates_manual_motion_stream_time_coverage(tmp_path) -> None
     recorder = FrameRecorder(
         recording,
         image_size=(8, 6),
-        config_snapshot={"schema_version": 8},
-        versions={"code": "abc"},
+        config_snapshot={},
         session_tags={name: "known" for name in REQUIRED_TAGS},
         image_coordinate_system="undistorted_pixel",
-        intrinsics_fingerprint_sha256=INTRINSICS_FINGERPRINT,
+        calibration_id=CALIBRATION_ID,
         valid_pixel_ratio=0.95,
         undistort_fill_value=114,
         recording_kind="supervised_manual_motion",
@@ -99,7 +94,6 @@ def test_manifest_validates_manual_motion_stream_time_coverage(tmp_path) -> None
     records = build_dataset_records(
         [recording],
         dataset_root=tmp_path,
-        dataset_version="manual-v1",
     )
 
     assert len(records) == 1
@@ -111,10 +105,9 @@ def test_manifest_rejects_missing_session_tags(tmp_path) -> None:
     recorder = FrameRecorder(
         recording,
         image_size=(8, 6),
-        config_snapshot={"schema_version": 1},
-        versions={"code": "abc"},
+        config_snapshot={},
         image_coordinate_system="undistorted_pixel",
-        intrinsics_fingerprint_sha256=INTRINSICS_FINGERPRINT,
+        calibration_id=CALIBRATION_ID,
         valid_pixel_ratio=0.95,
         undistort_fill_value=114,
     )
@@ -131,20 +124,18 @@ def test_manifest_rejects_missing_session_tags(tmp_path) -> None:
         build_dataset_records(
             [recording],
             dataset_root=tmp_path,
-            dataset_version="dataset-v1",
         )
 
 
-def test_manifest_detects_image_corruption(tmp_path) -> None:
+def test_manifest_detects_missing_image(tmp_path) -> None:
     recording = tmp_path / "recording-a"
     recorder = FrameRecorder(
         recording,
         image_size=(8, 6),
-        config_snapshot={"schema_version": 1},
-        versions={"code": "abc"},
+        config_snapshot={},
         session_tags={name: "unknown" for name in REQUIRED_TAGS},
         image_coordinate_system="undistorted_pixel",
-        intrinsics_fingerprint_sha256=INTRINSICS_FINGERPRINT,
+        calibration_id=CALIBRATION_ID,
         valid_pixel_ratio=0.95,
         undistort_fill_value=114,
     )
@@ -160,12 +151,11 @@ def test_manifest_detects_image_corruption(tmp_path) -> None:
     frame_record = json.loads(
         (recording / "frames.jsonl").read_text(encoding="utf-8")
     )
-    (recording / frame_record["image_path"]).write_bytes(b"corrupt")
-    with pytest.raises(ValueError, match="hash mismatch"):
+    (recording / frame_record["image_path"]).unlink()
+    with pytest.raises(ValueError, match="does not exist"):
         build_dataset_records(
             [recording],
             dataset_root=tmp_path,
-            dataset_version="dataset-v1",
         )
 
 
@@ -174,8 +164,7 @@ def test_manifest_rejects_raw_pixel_recording(tmp_path) -> None:
     recorder = FrameRecorder(
         recording,
         image_size=(8, 6),
-        config_snapshot={"schema_version": 3},
-        versions={"code": "abc"},
+        config_snapshot={},
         session_tags={name: "unknown" for name in REQUIRED_TAGS},
     )
     recorder.start()
@@ -192,7 +181,6 @@ def test_manifest_rejects_raw_pixel_recording(tmp_path) -> None:
         build_dataset_records(
             [recording],
             dataset_root=tmp_path,
-            dataset_version="dataset-v1",
         )
 
 

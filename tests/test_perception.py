@@ -189,7 +189,7 @@ def test_realtime_detector_preserves_non_stale_errors() -> None:
         )
 
 
-def test_invalid_observation_coordinates_and_version_fail() -> None:
+def test_invalid_observation_coordinates_fail() -> None:
     with pytest.raises(ValueError, match="outside"):
         TargetObservation(
             frame_sequence=0,
@@ -206,11 +206,7 @@ def test_invalid_observation_coordinates_and_version_fail() -> None:
             k0_confidence=0.9,
             ground_point=None,
             quality=frozenset(),
-            model_version="v1",
-            model_sha256="0" * 64,
         )
-    with pytest.raises(ValueError, match="model_version"):
-        FakeInferenceBackend([], model_version="")
 
 
 def test_observations_to_evaluation_records_full_chain() -> None:
@@ -253,14 +249,10 @@ def test_observations_to_evaluation_records_full_chain() -> None:
     )
     report = evaluate_records(
         records,
-        model_version="fake-v1",
-        dataset_version="dataset-v1",
-        code_version="test",
     )
     assert report["failure_count"] == 3
     assert report["per_class"]["blue_danger"]["false_positive"] == 1
     assert report["per_class"]["orange_injured"]["false_negative"] == 1
     matched = next(record for record in records if record["object_id"] == "truth_1")
     assert matched["confidence"] == pytest.approx(0.8)
-    assert matched["model_sha256"] == "0" * 64
     assert matched["quality"] == []

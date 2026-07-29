@@ -35,7 +35,7 @@ def observations_to_evaluation_records(
     iou_threshold: float = 0.5,
     tags: Mapping[str, str] | None = None,
 ) -> list[dict[str, object]]:
-    """按类别无关 IoU 一对一匹配，并输出 schema v1 评测记录。"""
+    """按类别无关 IoU 一对一匹配，并输出逐对象评测记录。"""
 
     if not sample_id.strip():
         raise ValueError("sample_id must be non-empty.")
@@ -123,7 +123,6 @@ def _record(
 ) -> dict[str, object]:
     confidence = observation.detection_confidence if observation is not None else None
     return {
-        "schema_version": 1,
         "sample_id": sample_id,
         "object_id": object_id,
         "ground_truth_class": truth.target_class.value if truth else None,
@@ -133,9 +132,6 @@ def _record(
             sorted(item.value for item in observation.quality)
             if observation is not None
             else []
-        ),
-        "model_sha256": (
-            observation.model_sha256 if observation is not None else None
         ),
         "k0_confidence": (
             observation.k0_confidence if observation is not None else None

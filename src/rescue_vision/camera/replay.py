@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import hashlib
 from pathlib import Path
 
 import cv2
@@ -187,24 +186,16 @@ class RecordingSource(_FiniteSource):
         session = json.loads(
             (self.session_directory / "session.json").read_text(encoding="utf-8")
         )
-        schema_version = session.get("schema_version")
-        if schema_version not in {3, 4}:
+        if not isinstance(session.get("auxiliary_streams"), dict):
             raise ValueError(
-                "Recording session schema_version must be 3 or 4."
+                "Recording session auxiliary_streams must be a mapping."
             )
-        if schema_version == 4 and not isinstance(
-            session.get("auxiliary_streams"), dict
-        ):
-            raise ValueError(
-                "Recording session schema v4 auxiliary_streams must be a "
-                "mapping."
-            )
-        if schema_version == 4 and session.get("recording_kind") not in {
+        if session.get("recording_kind") not in {
             "camera",
             "supervised_manual_motion",
         }:
             raise ValueError(
-                "Recording session schema v4 recording_kind is invalid."
+                "Recording session recording_kind is invalid."
             )
         image_size = session.get("image_size")
         if not isinstance(image_size, list) or len(image_size) != 2:
@@ -216,22 +207,17 @@ class RecordingSource(_FiniteSource):
                 "Recording session image_coordinate_system must be "
                 "'raw_pixel' or 'undistorted_pixel'."
             )
-        fingerprint = session.get("intrinsics_fingerprint_sha256")
+        calibration_id = session.get("calibration_id")
         if coordinate_system == "undistorted_pixel" and (
-            not isinstance(fingerprint, str)
-            or len(fingerprint) != 64
-            or fingerprint != fingerprint.lower()
-            or any(
-                character not in "0123456789abcdef"
-                for character in fingerprint.lower()
-            )
+            not isinstance(calibration_id, str)
+            or not calibration_id.strip()
         ):
             raise ValueError(
-                "Undistorted recording is missing its intrinsics fingerprint."
+                "Undistorted recording is missing its calibration_id."
             )
-        if coordinate_system == "raw_pixel" and fingerprint is not None:
+        if coordinate_system == "raw_pixel" and calibration_id is not None:
             raise ValueError(
-                "Raw recording must not declare an intrinsics fingerprint."
+                "Raw recording must not declare a calibration_id."
             )
         valid_pixel_ratio = session.get("valid_pixel_ratio")
         if coordinate_system == "undistorted_pixel" and (
@@ -260,7 +246,7 @@ class RecordingSource(_FiniteSource):
                 "Raw recording must not declare undistort_fill_value."
             )
         self.image_coordinate_system = coordinate_system
-        self.intrinsics_fingerprint_sha256 = fingerprint
+        self.calibration_id = calibration_id
         self.valid_pixel_ratio = (
             float(valid_pixel_ratio)
             if valid_pixel_ratio is not None
@@ -293,17 +279,8 @@ class RecordingSource(_FiniteSource):
             raise EOFError("End of recording.")
         record = self.records[self._index]
         self._index += 1
-        if record.get("schema_version") != 1:
-            raise ValueError("Frame record schema_version must be 1.")
         image_path = self.session_directory / str(record["image_path"])
         payload = image_path.read_bytes()
-        expected_hash = record.get("image_sha256")
-        actual_hash = hashlib.sha256(payload).hexdigest()
-        if not isinstance(expected_hash, str) or actual_hash != expected_hash:
-            raise ValueError(
-                f"Recorded frame hash mismatch for {image_path}; "
-                "the recording is incomplete or corrupted."
-            )
         image = cv2.imdecode(
             np.frombuffer(payload, dtype=np.uint8),
             cv2.IMREAD_COLOR,
@@ -318,10 +295,8 @@ class RecordingSource(_FiniteSource):
             )
         metadata = dict(record.get("metadata", {}))
         metadata["image_coordinate_system"] = self.image_coordinate_system
-        if self.intrinsics_fingerprint_sha256 is not None:
-            metadata["intrinsics_fingerprint_sha256"] = (
-                self.intrinsics_fingerprint_sha256
-            )
+        if self.calibration_id is not None:
+            metadata["calibration_id"] = self.calibration_id
             metadata["valid_pixel_ratio"] = self.valid_pixel_ratio
             metadata["undistort_fill_value"] = self.undistort_fill_value
         return CameraFrame(

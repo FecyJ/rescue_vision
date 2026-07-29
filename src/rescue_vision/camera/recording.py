@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import queue
 import threading
@@ -14,12 +13,8 @@ from typing import Any
 import cv2
 
 from rescue_vision.camera.frame import CameraFrame
-from rescue_vision.motion.recording import MANUAL_MOTION_LOG_SCHEMA_VERSION
-
-
 _STOP = object()
 IMAGE_COORDINATE_SYSTEMS = {"raw_pixel", "undistorted_pixel"}
-RECORDING_SCHEMA_VERSION = 4
 RECORDING_KINDS = {"camera", "supervised_manual_motion"}
 
 
@@ -32,12 +27,11 @@ class FrameRecorder:
         *,
         image_size: tuple[int, int],
         config_snapshot: Mapping[str, Any],
-        versions: Mapping[str, str],
         session_tags: Mapping[str, str] | None = None,
         queue_capacity: int = 8,
         image_format: str = "png",
         image_coordinate_system: str = "raw_pixel",
-        intrinsics_fingerprint_sha256: str | None = None,
+        calibration_id: str | None = None,
         valid_pixel_ratio: float | None = None,
         undistort_fill_value: int | None = None,
         auxiliary_streams: Mapping[str, str] | None = None,
@@ -55,21 +49,11 @@ class FrameRecorder:
                 "'undistorted_pixel'."
             )
         if image_coordinate_system == "undistorted_pixel":
-            if (
-                not isinstance(intrinsics_fingerprint_sha256, str)
-                or len(intrinsics_fingerprint_sha256) != 64
-                or any(
-                    character not in "0123456789abcdef"
-                    for character in intrinsics_fingerprint_sha256.lower()
-                )
-            ):
+            if not isinstance(calibration_id, str) or not calibration_id.strip():
                 raise ValueError(
-                    "Undistorted recordings require a 64-character "
-                    "intrinsics_fingerprint_sha256."
+                    "Undistorted recordings require a non-empty calibration_id."
                 )
-            intrinsics_fingerprint_sha256 = (
-                intrinsics_fingerprint_sha256.lower()
-            )
+            calibration_id = calibration_id.strip()
             if (
                 isinstance(valid_pixel_ratio, bool)
                 or not isinstance(valid_pixel_ratio, (int, float))
@@ -90,7 +74,7 @@ class FrameRecorder:
                     "undistort_fill_value in [0, 255]."
                 )
         elif (
-            intrinsics_fingerprint_sha256 is not None
+            calibration_id is not None
             or valid_pixel_ratio is not None
             or undistort_fill_value is not None
         ):
@@ -100,7 +84,6 @@ class FrameRecorder:
         self.session_directory = Path(session_directory).expanduser().resolve()
         self.image_size = image_size
         self.config_snapshot = dict(config_snapshot)
-        self.versions = dict(versions)
         self.session_tags = dict(session_tags or {})
         if not all(
             isinstance(key, str)
@@ -112,7 +95,7 @@ class FrameRecorder:
             raise ValueError("session_tags must contain non-empty string pairs.")
         self.image_format = image_format
         self.image_coordinate_system = image_coordinate_system
-        self.intrinsics_fingerprint_sha256 = intrinsics_fingerprint_sha256
+        self.calibration_id = calibration_id
         self.valid_pixel_ratio = valid_pixel_ratio
         self.undistort_fill_value = undistort_fill_value
         self.auxiliary_streams = dict(auxiliary_streams or {})
@@ -169,7 +152,6 @@ class FrameRecorder:
         (self.session_directory / "annotations.json").write_text(
             json.dumps(
                 {
-                    "schema_version": 1,
                     "recording_id": self.session_directory.name,
                     "categories": [],
                     "items": [],
@@ -265,11 +247,9 @@ class FrameRecorder:
                     )
                     (self.session_directory / relative_path).write_bytes(payload)
                     record = {
-                        "schema_version": 1,
                         "sequence": item.sequence,
                         "timestamp_ns": item.timestamp_ns,
                         "image_path": relative_path.as_posix(),
-                        "image_sha256": hashlib.sha256(payload).hexdigest(),
                         "metadata": dict(item.metadata),
                     }
                     manifest.write(
@@ -290,7 +270,6 @@ class FrameRecorder:
 
     def _write_session(self, *, completed: bool) -> None:
         document = {
-            "schema_version": RECORDING_SCHEMA_VERSION,
             "recording_id": self.session_directory.name,
             "recording_kind": self.recording_kind,
             "created_at": self._created_at,
@@ -301,24 +280,17 @@ class FrameRecorder:
             "image_size": list(self.image_size),
             "image_format": self.image_format,
             "image_coordinate_system": self.image_coordinate_system,
-            "intrinsics_fingerprint_sha256": (
-                self.intrinsics_fingerprint_sha256
-            ),
+            "calibration_id": self.calibration_id,
             "valid_pixel_ratio": self.valid_pixel_ratio,
             "undistort_fill_value": self.undistort_fill_value,
             "time_base": "application_monotonic_ns",
             "auxiliary_streams": {
-                name: {
-                    "schema_version": MANUAL_MOTION_LOG_SCHEMA_VERSION,
-                    "path": relative_path,
-                    "time_base": "application_monotonic_ns",
-                }
+                name: relative_path
                 for name, relative_path in sorted(
                     self.auxiliary_streams.items()
                 )
             },
             "config": self.config_snapshot,
-            "versions": self.versions,
             "tags": self.session_tags,
             "statistics": {
                 "accepted_frames": self.accepted_frames,

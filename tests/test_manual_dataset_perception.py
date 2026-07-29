@@ -7,10 +7,9 @@ import pytest
 from manual_tests.dataset_perception import _read_manifest
 
 
-def test_dataset_perception_reads_schema_v2_manifest(tmp_path) -> None:
+def test_dataset_perception_reads_manifest(tmp_path) -> None:
     path = tmp_path / "manifest.jsonl"
     record = {
-        "schema_version": 2,
         "sample_id": "session/frame_00000000",
         "image_path": "session/frames/00000000_1.jpg",
     }
