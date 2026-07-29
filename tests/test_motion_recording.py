@@ -42,8 +42,8 @@ def test_manual_motion_log_round_trip_preserves_monotonic_time_sources(
             result=RemoteGripperResult.APPLIED,
             received_timestamp_ns=115,
             deadline_timestamp_ns=215,
-            left_angle_deg=27.0,
-            right_angle_deg=167.0,
+            open_pressed=False,
+            close_pressed=True,
         )
     )
     writer.record_car_message(
@@ -76,6 +76,10 @@ def test_manual_motion_log_round_trip_preserves_monotonic_time_sources(
     )
     writer.record_car_message(UnknownCarMessage(6, 140, b"imu,1,2,3"))
     writer.record_timeout(command_id="drive-1", timestamp_ns=210)
+    writer.record_gripper_timeout(
+        command_id="grip-1",
+        timestamp_ns=216,
+    )
     writer.record_safety_stop(
         reason="application_shutdown",
         timestamp_ns=220,
@@ -84,13 +88,14 @@ def test_manual_motion_log_round_trip_preserves_monotonic_time_sources(
 
     report = inspect_manual_motion_log(path)
 
-    assert report["schema_version"] == 3
-    assert report["event_count"] == 10
+    assert report["schema_version"] == 4
+    assert report["event_count"] == 11
     assert report["first_timestamp_ns"] == 100
     assert report["last_timestamp_ns"] == 230
     assert report["event_counts"] == {
         "command_reply": 1,
         "gripper_command": 1,
+        "gripper_timeout": 1,
         "motion_command": 1,
         "motion_timeout": 1,
         "safety_stop": 1,
@@ -109,6 +114,7 @@ def test_manual_motion_log_round_trip_preserves_monotonic_time_sources(
     assert events[3]["timestamp_ns"] == 120
     assert events[5]["stop_reason"] == "running"
     assert events[6]["payload_hex"] == b"imu,1,2,3".hex()
+    assert events[8]["timestamp_ns"] == 216
 
 
 def test_manual_motion_log_rejects_sequence_and_truncation(tmp_path) -> None:

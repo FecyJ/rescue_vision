@@ -23,6 +23,7 @@
 | `forward()` / `backward()` | 非负速度 m/s | 直行前进/后退 |
 | `turn_left()` / `turn_right()` | 非负角速度 rad/s | 原地左转/右转 |
 | `set_gripper_angles()` | 左右舵机角度 degree | 同时下发严格 `[0, 180]` 角度 |
+| `gripper_target_angles_deg` | 无 | 启动遥测或本进程最近下发的左右舵机目标；尚无时为 `None` |
 | `soft_brake()` / `emergency_stop()` | 无 | 固件斜坡制动/紧急停止 |
 | `query_state()` | 无 | 请求固件立即返回状态 |
 | `receive_message()` | 可选等待秒数 | 忽略空行，返回轮速、安全状态、命令回复或未知回传 |
@@ -30,10 +31,14 @@
 | `drain_messages()` | 无 | 非阻塞排空当前 UART 回传 |
 | `RemoteMotionExecutor.execute()` | `ReceivedRemoteMessage` | 校验远程运动消息后执行 |
 | `RemoteMotionExecutor.check_timeout()` | 可选本机单调时间 ns | 到期时停车，返回是否触发 |
-| `RemoteGripperExecutor.execute()` | `ReceivedRemoteMessage` | 校验新鲜度和角度后执行一次性夹爪命令 |
+| `GripperCalibration` | 左右开/闭端点与固定速度全行程时间 | 严格验证机械安全范围 |
+| `RemoteGripperExecutor.execute()` | `ReceivedRemoteMessage` | 接受一帧持续夹爪扳机状态 |
+| `RemoteGripperExecutor.update()` | 可选本机单调时间 ns | 按按压方向以配置速度渐进下发舵机目标 |
+| `RemoteGripperExecutor.check_timeout()` / `stop()` | 可选本机单调时间 ns | 超时或退出时停止推进，保留当前角度 |
 | `run_remote_motion()` | 远程接收器、执行器、退出回调 | 持续收命令、排空回传、分派其他 control，并在退出时停车 |
 | `ManualMotionLogWriter` | recording 内的 `motion.jsonl` | 顺序写入运动/夹爪命令、遥测、UART 扩展和停车事件 |
-| `ManualMotionLogWriter.record_gripper()` | `ExecutedRemoteGripper` | 记录一次夹爪命令及 applied/expired 结果 |
+| `ManualMotionLogWriter.record_gripper()` | `ExecutedRemoteGripper` | 记录扳机状态及 applied/stopped/expired 结果 |
+| `record_gripper_timeout()` | 命令 ID、单调时间 ns | 记录持续夹爪命令到期停止 |
 | `inspect_manual_motion_log()` | `motion.jsonl` 路径 | 严格校验 schema、事件序号和时间范围摘要 |
 
 机器人坐标系沿用项目约定：`x` 向前、`y` 向左、`z` 向上。左右轮速度正值
@@ -52,7 +57,9 @@ right = linear + angular × wheel_track / 2
 ## 1. 从运行配置装配
 
 先在 `configs/runtime.yaml` 填入实测轮距和调试限速，并启用 `uart` 与
-`motion`。所有路径、设备名、机械参数和上限只从这份配置取得：
+`motion`。需要远程夹爪时，还要实测左右开/闭安全端点和固定速度全行程时间，
+写入 `motion.gripper` 后单独启用。所有路径、设备名、机械参数和上限只从
+这份配置取得：
 
 ```python
 from rescue_vision.config import load_runtime_config
@@ -154,17 +161,21 @@ controller.turn_right(angular_velocity_rad_s=0.80)
 以下片段应放在前文已打开的 `with channel` 内：
 
 ```python
-# 角度必须来自当前车辆机械标定；这里只演示协议说明书中的一组值。
+calibration = config.motion.gripper.build_calibration()
+if calibration is None:
+    raise RuntimeError("当前运行配置未启用夹爪机械标定")
+
+# 直接角度 API 也只消费同一份车端标定，不另写开/闭常量。
 controller.set_gripper_angles(
-    left_angle_deg=27.0,
-    right_angle_deg=167.0,
+    left_angle_deg=calibration.open_left_angle_deg,
+    right_angle_deg=calibration.open_right_angle_deg,
 )
 ```
 
 两个角度都必须是 `[0, 180]` 内有限 degree；越界、NaN 和 Infinity 会在
 写 UART 前被拒绝。该 API 只设置显式双舵机角度，不提供硬编码的
 `open_gripper()` / `close_gripper()`：机械连杆、舵机方向和装配零点会改变
-开合标定，说明书示例 `27/167` 不能当作所有车辆的通用闭合值。
+开合标定，协议说明书示例不能当作所有车辆的通用闭合值。
 
 夹爪位置由 STM32 锁存，和底盘运动目标具有不同安全语义。
 `soft_brake()`、运动命令超时或断线停车不会自动改变夹爪角度，以免运输时
@@ -243,9 +254,14 @@ for message in controller.drain_messages():
 ```python
 executor = config.motion.build_remote_executor(controller)
 gripper_executor = config.motion.build_remote_gripper_executor(controller)
-if executor is None or gripper_executor is None:
+if executor is None:
     raise RuntimeError("必须在 runtime.yaml 中启用 motion")
+if config.motion.gripper.enabled and gripper_executor is None:
+    raise RuntimeError("夹爪配置已启用但执行器未完成装配")
 ```
+
+`gripper_executor is None` 是正常的禁用语义；应用此时必须发布
+`gripper_control=false`。不能在调用处补一组默认开闭角度。
 
 应用已经取得一个通过 `RemoteMessageConnection.receive_control()` 接收的消息
 时，可以执行单条远程运动指令。UART 必须保持打开；示例结束前显式停车：
@@ -276,15 +292,33 @@ gripper_outcome = gripper_executor.execute(received_gripper)
 print(
     gripper_outcome.command_id,
     gripper_outcome.result.value,
-    gripper_outcome.left_angle_deg,
-    gripper_outcome.right_angle_deg,
+    gripper_outcome.open_pressed,
+    gripper_outcome.close_pressed,
 )
 ```
 
-它只接受 `control/debug/gripper`、空 attributes 和 JSON v1。新鲜命令下发
-显式左右角度；过期命令返回 `expired` 且不改变夹爪。非法 envelope、角度或
-有效期抛出 `RemoteGripperError`。该执行器不会自行改变底盘速度；应用把异常
-传播到 `run_remote_motion()` 时，外层仍会先走统一停车路径。
+它只接受 `control/debug/gripper`、空 attributes 和 JSON v2。两个字段都
+必须是 boolean：仅闭合为 `true` 时闭合，仅张开为 `true` 时张开；两者相同
+（都松开或同时按下）时停止。单方向按下命令返回 `applied` 表示车端已接受
+持续控制状态；停止命令返回
+`stopped`，过期命令返回 `expired`。这些结果都不代表舵机有物理位置反馈。
+
+接受命令后，应用循环必须以有界周期推进。以下片段承接前文
+`gripper_executor`；手动采集入口使用 20 ms 轮询：
+
+```python
+timed_out_command_id = gripper_executor.check_timeout()
+if timed_out_command_id is None:
+    gripper_executor.update()
+else:
+    record_gripper_timeout(timed_out_command_id)
+```
+
+`update()` 从 `MotionController.gripper_target_angles_deg` 取得最近下发值或
+STM32 遥测目标；尚未收到任何目标时安全等待，不猜测启动角度。非法 envelope、
+按压状态或有效期会清除当前持续状态并抛出 `RemoteGripperError`。该执行器不会
+自行改变底盘速度；应用把异常传播到 `run_remote_motion()` 时，外层仍会先走
+统一停车路径。
 
 跨模块应用可通过 `on_other_control` 把同一连接中的夹爪和采集命令分别交给
 上述执行器与采集状态机，
@@ -332,7 +366,7 @@ observation。`motion` 不重复实现这些发布器。完整 TCP 生命周期�
 ## 时间、故障与降级
 
 手动采集应用会在 recording 有效期间创建 `ManualMotionLogWriter`，并把
-运动/夹爪执行结果、运动超时回调和 UART 回传写入同一单调时间轴。
+运动/夹爪执行结果、运动/夹爪超时回调和 UART 回传写入同一单调时间轴。
 调用方不应另建第二份运动日志；完整目录由
 `rescue-vision-check-recording` 一并检查。直接使用 writer 时必须严格分开
 启动、写入和关闭：
@@ -359,9 +393,11 @@ finally:
 
 - `valid_for_ms` 从树莓派完成接收该消息的单调时间开始计算，不比较两台机器
   互不共享零点的 `issued_timestamp_ns`。
-- 远程夹爪是一次性锁存命令，不需要持续刷新，也不受运动死手控制；断线只
-  停车，不自动改变夹爪角度。
-- 远程 twist 的 payload 和电脑端协议不变；最大加速度是车端 schema v9
+- 远程夹爪不受运动死手控制，但任一按下状态必须持续刷新；客户端松开时发送
+  两个状态均为 `false` 的命令。到期、断线或调用 `stop()` 会停止后续角度推进并
+  保留最近目标，不自动开爪或闭爪。
+- 远程 twist 的 payload 和电脑端协议不变；最大加速度以及夹爪机械端点/
+  全行程时间是车端 schema v10
   运行配置，不由客户端逐条指定，避免绕过统一安全上限。
 - 死手保持开启且 twist 回到零时，零目标和其他有效目标一样经过单轮加速度
   限制；真机已发现固件 `b0,0` 会使实测轮速直接归零，因此普通回中不再
@@ -373,7 +409,7 @@ finally:
   空 UART 行没有业务内容，会被忽略。以上情况不会导致手动采集循环退出或被
   误判为命令成功；录制期间非空原始 bytes 以十六进制写入 `unknown_uart`。
   冻结的 `s1` 行解析为 `CarSafetyStatus` 并写入运动日志
-  schema v3；当前固件尚不产生该状态。`parse_car_line()` 对损坏的已知
+  schema v4；当前固件尚不产生该状态。`parse_car_line()` 对损坏的已知
   `t...` / `s1...` 报文仍严格抛出 `ValueError`；实时
   `MotionController.receive_message()` 会把单条损坏报文隔离为
   `UnknownCarMessage`，防止固件遥测和 `OK` 输出交错时终止采集。后续正常

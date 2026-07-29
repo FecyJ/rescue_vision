@@ -22,7 +22,7 @@ from rescue_vision.motion.remote_control import (
 
 MANUAL_MOTION_STREAM_NAME = "manual_motion"
 MANUAL_MOTION_LOG_FILENAME = "motion.jsonl"
-MANUAL_MOTION_LOG_SCHEMA_VERSION = 3
+MANUAL_MOTION_LOG_SCHEMA_VERSION = 4
 
 _EVENT_KEYS = {
     "stream_started": set(),
@@ -40,9 +40,10 @@ _EVENT_KEYS = {
         "command_id",
         "result",
         "deadline_timestamp_ns",
-        "left_angle_deg",
-        "right_angle_deg",
+        "open_pressed",
+        "close_pressed",
     },
+    "gripper_timeout": {"command_id"},
     "wheel_telemetry": {
         "uart_sequence",
         "controller_timestamp_ms",
@@ -132,8 +133,20 @@ class ManualMotionLogWriter:
             command_id=outcome.command_id,
             result=outcome.result.value,
             deadline_timestamp_ns=outcome.deadline_timestamp_ns,
-            left_angle_deg=outcome.left_angle_deg,
-            right_angle_deg=outcome.right_angle_deg,
+            open_pressed=outcome.open_pressed,
+            close_pressed=outcome.close_pressed,
+        )
+
+    def record_gripper_timeout(
+        self,
+        *,
+        command_id: str,
+        timestamp_ns: int,
+    ) -> None:
+        self._write(
+            "gripper_timeout",
+            timestamp_ns,
+            command_id=command_id,
         )
 
     def record_car_message(self, message: ParsedCarMessage) -> None:
@@ -319,8 +332,6 @@ def _validate_event_fields(
         "target_right_m_s",
         "servo_left_deg",
         "servo_right_deg",
-        "left_angle_deg",
-        "right_angle_deg",
     ):
         if name in record:
             _finite_number(record[name], f"{location}.{name}")
@@ -346,6 +357,9 @@ def _validate_event_fields(
     for name in ("watchdog_armed", "emergency_stop_latched"):
         if name in record and not isinstance(record[name], bool):
             raise ValueError(f"{location}.{name} must be a boolean.")
+    for name in ("open_pressed", "close_pressed"):
+        if name in record and not isinstance(record[name], bool):
+            raise ValueError(f"{location}.{name} must be a boolean.")
     if "last_motion_command_age_ms" in record:
         age = record["last_motion_command_age_ms"]
         if age is not None:
@@ -357,6 +371,7 @@ def _validate_event_fields(
         raise ValueError(f"{location}.result is not supported.")
     if event_type == "gripper_command" and record["result"] not in {
         "applied",
+        "stopped",
         "expired",
     }:
         raise ValueError(f"{location}.result is not supported.")
@@ -366,10 +381,6 @@ def _validate_event_fields(
         raise ValueError(
             f"{location}.deadline_timestamp_ns must follow timestamp_ns."
         )
-    if event_type == "gripper_command":
-        for name in ("left_angle_deg", "right_angle_deg"):
-            if not 0.0 <= float(record[name]) <= 180.0:
-                raise ValueError(f"{location}.{name} must be in [0, 180].")
     if (
         event_type == "safety_stop"
         and record["reason"] not in _STOP_REASONS

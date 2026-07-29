@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from rescue_vision.motion.protocol import (
+    CarTelemetry,
     CarLineChannel,
     ParsedCarMessage,
     UnknownCarMessage,
@@ -95,6 +96,8 @@ class MotionController:
         self._target_wheel_speeds_m_s = (0.0, 0.0)
         self._commanded_wheel_speeds_m_s = (0.0, 0.0)
         self._last_acceleration_update_ns = self._now()
+        self._gripper_target_angles_deg: tuple[float, float] | None = None
+        self._has_gripper_command = False
 
     @property
     def target_wheel_speeds_m_s(self) -> tuple[float, float]:
@@ -107,6 +110,12 @@ class MotionController:
         """返回加速度限制后最近下发的左右轮速度。"""
 
         return self._commanded_wheel_speeds_m_s
+
+    @property
+    def gripper_target_angles_deg(self) -> tuple[float, float] | None:
+        """返回启动遥测或本进程最近下发的左右舵机目标角度。"""
+
+        return self._gripper_target_angles_deg
 
     def set_wheel_speeds(
         self,
@@ -208,9 +217,13 @@ class MotionController:
     ) -> None:
         """同时设置左右夹爪舵机角度，单位 degree。"""
 
-        self._channel.send_line(
-            encode_gripper_command(left_angle_deg, right_angle_deg)
+        payload = encode_gripper_command(left_angle_deg, right_angle_deg)
+        self._channel.send_line(payload)
+        self._gripper_target_angles_deg = (
+            float(left_angle_deg),
+            float(right_angle_deg),
         )
+        self._has_gripper_command = True
 
     def soft_brake(self) -> None:
         """按固件减速度斜坡制动到静止。"""
@@ -247,13 +260,22 @@ class MotionController:
                     )
                 continue
             try:
-                return parse_car_line(line)
+                message = parse_car_line(line)
             except ValueError:
                 return UnknownCarMessage(
                     uart_sequence=line.sequence,
                     received_timestamp_ns=line.received_timestamp_ns,
                     payload=line.payload,
                 )
+            if (
+                isinstance(message, CarTelemetry)
+                and not self._has_gripper_command
+            ):
+                self._gripper_target_angles_deg = (
+                    message.servo_left_deg,
+                    message.servo_right_deg,
+                )
+            return message
 
     def drain_messages(self) -> tuple[ParsedCarMessage, ...]:
         """非阻塞排空当前回传，防止 10 Hz 遥测挤满 UART 队列。"""

@@ -1,4 +1,4 @@
-schema_version: 9
+schema_version: 10
 
 camera:
   # picamera2 可记录逐帧曝光/增益等元数据；rpicam_vid 是低开销备选。
@@ -67,6 +67,14 @@ motion:
   # 单轮目标速度变化率；0.5 m/s² 时从静止到 0.30 m/s 约需 0.6 秒。
   max_wheel_acceleration_m_s2: 0.50
   max_remote_command_valid_for_ms: 500
+  gripper:
+    # 必须先在真机逐侧测得安全端点和固定速度全行程时间，再启用持续扳机控制。
+    enabled: false
+    open_left_angle_deg: null
+    open_right_angle_deg: null
+    closed_left_angle_deg: null
+    closed_right_angle_deg: null
+    full_travel_time_s: null
 
 tracking:
   confirmation_hits: 2

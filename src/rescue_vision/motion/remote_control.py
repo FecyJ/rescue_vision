@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -21,6 +22,32 @@ from rescue_vision.motion.controller import MotionController
 from rescue_vision.motion.protocol import ParsedCarMessage
 
 
+def _finite_float(value: object, location: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+    ):
+        raise ValueError(f"{location} must be finite, got {value!r}.")
+    return float(value)
+
+
+def _move_toward(current: float, target: float, maximum_delta: float) -> float:
+    distance = abs(target - current)
+    if distance <= maximum_delta or math.isclose(
+        distance,
+        maximum_delta,
+        rel_tol=1e-12,
+        abs_tol=1e-15,
+    ):
+        return target
+    return (
+        current + maximum_delta
+        if target > current
+        else current - maximum_delta
+    )
+
+
 class RemoteControlReceiver(Protocol):
     def receive_control(
         self,
@@ -38,7 +65,45 @@ class RemoteGripperError(RuntimeError):
 
 class RemoteGripperResult(str, Enum):
     APPLIED = "applied"
+    STOPPED = "stopped"
     EXPIRED = "expired"
+
+
+@dataclass(frozen=True, slots=True)
+class GripperCalibration:
+    """远程连续控制所需的双舵机机械端点和速度标定。"""
+
+    open_left_angle_deg: float
+    open_right_angle_deg: float
+    closed_left_angle_deg: float
+    closed_right_angle_deg: float
+    full_travel_time_s: float
+
+    def __post_init__(self) -> None:
+        for name in (
+            "open_left_angle_deg",
+            "open_right_angle_deg",
+            "closed_left_angle_deg",
+            "closed_right_angle_deg",
+        ):
+            value = _finite_float(getattr(self, name), name)
+            if not 0.0 <= value <= 180.0:
+                raise ValueError(f"{name} must be in [0, 180], got {value!r}.")
+            object.__setattr__(self, name, value)
+        travel_time = _finite_float(
+            self.full_travel_time_s,
+            "full_travel_time_s",
+        )
+        if travel_time <= 0.0:
+            raise ValueError(
+                "full_travel_time_s must be > 0, "
+                f"got {travel_time!r}."
+            )
+        object.__setattr__(self, "full_travel_time_s", travel_time)
+        if self.open_left_angle_deg == self.closed_left_angle_deg:
+            raise ValueError("Left gripper open and closed angles must differ.")
+        if self.open_right_angle_deg == self.closed_right_angle_deg:
+            raise ValueError("Right gripper open and closed angles must differ.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,8 +112,8 @@ class ExecutedRemoteGripper:
     result: RemoteGripperResult
     received_timestamp_ns: int
     deadline_timestamp_ns: int
-    left_angle_deg: float
-    right_angle_deg: float
+    open_pressed: bool
+    close_pressed: bool
 
 
 class RemoteMotionResult(str, Enum):
@@ -69,16 +134,37 @@ class ExecutedRemoteMotion:
 
 
 class RemoteGripperExecutor:
-    """执行已经通过 TCP 帧校验的一次性夹爪角度消息。"""
+    """把持续刷新的扳机状态渐进转换为标定后的双舵机角度。"""
 
     def __init__(
         self,
         controller: MotionController,
+        calibration: GripperCalibration,
         *,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
     ) -> None:
+        if not isinstance(controller, MotionController):
+            raise TypeError("controller must be MotionController.")
+        if not isinstance(calibration, GripperCalibration):
+            raise TypeError("calibration must be GripperCalibration.")
+        if not callable(monotonic_ns):
+            raise TypeError("monotonic_ns must be callable.")
         self.controller = controller
+        self.calibration = calibration
         self._monotonic_ns = monotonic_ns
+        self._active_deadline_ns: int | None = None
+        self._active_command_id: str | None = None
+        self._open_pressed = False
+        self._close_pressed = False
+        self._last_update_ns: int | None = None
+
+    @property
+    def active_deadline_ns(self) -> int | None:
+        return self._active_deadline_ns
+
+    @property
+    def active_command_id(self) -> str | None:
+        return self._active_command_id
 
     def execute(
         self,
@@ -86,7 +172,7 @@ class RemoteGripperExecutor:
         *,
         now_ns: int | None = None,
     ) -> ExecutedRemoteGripper:
-        """校验并下发夹爪角度；过期消息不改变当前夹爪位置。"""
+        """接受扳机状态；释放或两个方向同时按下时停止继续改变角度。"""
 
         current_ns = self._now(now_ns)
         try:
@@ -109,32 +195,133 @@ class RemoteGripperExecutor:
                     f"{self.controller.limits.max_remote_command_valid_for_ms}: "
                     f"{command.valid_for_ms}."
                 )
+            self.update(now_ns=current_ns)
             if current_ns >= deadline_ns:
                 return ExecutedRemoteGripper(
                     command.command_id,
                     RemoteGripperResult.EXPIRED,
                     message.received_timestamp_ns,
                     deadline_ns,
-                    command.left_angle_deg,
-                    command.right_angle_deg,
+                    command.open_pressed,
+                    command.close_pressed,
                 )
-            self.controller.set_gripper_angles(
-                command.left_angle_deg,
-                command.right_angle_deg,
-            )
+            self._last_update_ns = current_ns
+            if command.open_pressed == command.close_pressed:
+                self._clear_active()
+                result = RemoteGripperResult.STOPPED
+            else:
+                self._active_deadline_ns = deadline_ns
+                self._active_command_id = command.command_id
+                self._open_pressed = command.open_pressed
+                self._close_pressed = command.close_pressed
+                result = RemoteGripperResult.APPLIED
         except Exception as exc:
+            self.stop(now_ns=current_ns)
             if isinstance(exc, (RemoteGripperError, UartError)):
                 raise
             raise RemoteGripperError("Invalid remote gripper command.") from exc
 
         return ExecutedRemoteGripper(
             command.command_id,
-            RemoteGripperResult.APPLIED,
+            result,
             message.received_timestamp_ns,
             deadline_ns,
-            command.left_angle_deg,
-            command.right_angle_deg,
+            command.open_pressed,
+            command.close_pressed,
         )
+
+    def update(self, *, now_ns: int | None = None) -> bool:
+        """按按压方向和固定全行程时间推进舵机目标。"""
+
+        current_ns = self._now(now_ns)
+        if (
+            self._last_update_ns is not None
+            and current_ns < self._last_update_ns
+        ):
+            raise ValueError(
+                "now_ns must not precede the previous gripper update: "
+                f"{current_ns} < {self._last_update_ns}."
+            )
+        elapsed_s = (
+            0.0
+            if self._last_update_ns is None
+            else (current_ns - self._last_update_ns) / 1_000_000_000.0
+        )
+        self._last_update_ns = current_ns
+        if self._active_deadline_ns is None:
+            return False
+        if current_ns >= self._active_deadline_ns:
+            self._clear_active()
+            return False
+        current_angles = self.controller.gripper_target_angles_deg
+        if current_angles is None:
+            return False
+        if self._close_pressed:
+            target_angles = (
+                self.calibration.closed_left_angle_deg,
+                self.calibration.closed_right_angle_deg,
+            )
+        else:
+            target_angles = (
+                self.calibration.open_left_angle_deg,
+                self.calibration.open_right_angle_deg,
+            )
+        left_rate = (
+            abs(
+                self.calibration.closed_left_angle_deg
+                - self.calibration.open_left_angle_deg
+            )
+            / self.calibration.full_travel_time_s
+        )
+        right_rate = (
+            abs(
+                self.calibration.closed_right_angle_deg
+                - self.calibration.open_right_angle_deg
+            )
+            / self.calibration.full_travel_time_s
+        )
+        next_angles = (
+            _move_toward(
+                current_angles[0],
+                target_angles[0],
+                left_rate * elapsed_s,
+            ),
+            _move_toward(
+                current_angles[1],
+                target_angles[1],
+                right_rate * elapsed_s,
+            ),
+        )
+        if next_angles == current_angles:
+            return False
+        self.controller.set_gripper_angles(*next_angles)
+        return True
+
+    def check_timeout(self, *, now_ns: int | None = None) -> str | None:
+        """到期时停止推进，并返回刚超时的命令 ID。"""
+
+        if self._active_deadline_ns is None:
+            return None
+        current_ns = self._now(now_ns)
+        if current_ns < self._active_deadline_ns:
+            return None
+        command_id = self._active_command_id
+        assert command_id is not None
+        self._last_update_ns = current_ns
+        self._clear_active()
+        return command_id
+
+    def stop(self, *, now_ns: int | None = None) -> None:
+        """清除持续控制状态；保留当前舵机目标角度。"""
+
+        self._last_update_ns = self._now(now_ns)
+        self._clear_active()
+
+    def _clear_active(self) -> None:
+        self._active_deadline_ns = None
+        self._active_command_id = None
+        self._open_pressed = False
+        self._close_pressed = False
 
     def _now(self, value: int | None) -> int:
         current = self._monotonic_ns() if value is None else value

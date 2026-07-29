@@ -30,13 +30,14 @@ if TYPE_CHECKING:
         UartLineChannel,
     )
     from rescue_vision.motion import (
+        GripperCalibration,
         MotionController,
         RemoteGripperExecutor,
         RemoteMotionExecutor,
     )
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 def _mapping(value: object, location: str) -> dict[str, Any]:
@@ -78,6 +79,15 @@ def _finite_float(value: object, location: str, *, minimum: float) -> float:
             f"{location} must be finite and >= {minimum}, got {value!r}."
         )
     return converted
+
+
+def _optional_servo_angle(value: object, location: str) -> float | None:
+    if value is None:
+        return None
+    angle = _finite_float(value, location, minimum=0.0)
+    if angle > 180.0:
+        raise ValueError(f"{location} must be <= 180, got {value!r}.")
+    return angle
 
 
 def _path_or_none(value: object, base_dir: Path, location: str) -> Path | None:
@@ -218,6 +228,36 @@ class RemoteConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class GripperRuntimeConfig:
+    enabled: bool
+    open_left_angle_deg: float | None
+    open_right_angle_deg: float | None
+    closed_left_angle_deg: float | None
+    closed_right_angle_deg: float | None
+    full_travel_time_s: float | None
+
+    def build_calibration(self) -> GripperCalibration | None:
+        """创建连续夹爪控制标定；禁用时返回 ``None``。"""
+
+        if not self.enabled:
+            return None
+        assert self.open_left_angle_deg is not None
+        assert self.open_right_angle_deg is not None
+        assert self.closed_left_angle_deg is not None
+        assert self.closed_right_angle_deg is not None
+        assert self.full_travel_time_s is not None
+        from rescue_vision.motion import GripperCalibration
+
+        return GripperCalibration(
+            open_left_angle_deg=self.open_left_angle_deg,
+            open_right_angle_deg=self.open_right_angle_deg,
+            closed_left_angle_deg=self.closed_left_angle_deg,
+            closed_right_angle_deg=self.closed_right_angle_deg,
+            full_travel_time_s=self.full_travel_time_s,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class MotionRuntimeConfig:
     enabled: bool
     wheel_track_m: float | None
@@ -226,6 +266,7 @@ class MotionRuntimeConfig:
     max_wheel_velocity_m_s: float
     max_wheel_acceleration_m_s2: float
     max_remote_command_valid_for_ms: int
+    gripper: GripperRuntimeConfig
 
     def build_controller(
         self,
@@ -276,13 +317,15 @@ class MotionRuntimeConfig:
     ) -> RemoteGripperExecutor | None:
         """为已装配的控制器创建远程夹爪执行器。"""
 
-        if not self.enabled:
+        if not self.enabled or not self.gripper.enabled:
             return None
         if controller is None:
             raise RuntimeError("Enabled motion requires a motion controller.")
         from rescue_vision.motion import RemoteGripperExecutor
 
-        return RemoteGripperExecutor(controller)
+        calibration = self.gripper.build_calibration()
+        assert calibration is not None
+        return RemoteGripperExecutor(controller, calibration)
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,7 +436,7 @@ class AppConfig:
 
 
 def load_runtime_config(path: str | Path) -> AppConfig:
-    """从 YAML 加载 schema v9；缺项和未知字段均视为错误。"""
+    """从 YAML 加载 schema v10；缺项和未知字段均视为错误。"""
 
     config_path = Path(path).expanduser().resolve()
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -678,6 +721,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "max_wheel_velocity_m_s",
             "max_wheel_acceleration_m_s2",
             "max_remote_command_valid_for_ms",
+            "gripper",
         },
         "motion",
     )
@@ -710,6 +754,74 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         raise ValueError(
             "motion.max_remote_command_valid_for_ms must be <= 5000."
         )
+    gripper_raw = _mapping(
+        _required(motion_raw, "gripper", "motion"),
+        "motion.gripper",
+    )
+    _reject_unknown(
+        gripper_raw,
+        {
+            "enabled",
+            "open_left_angle_deg",
+            "open_right_angle_deg",
+            "closed_left_angle_deg",
+            "closed_right_angle_deg",
+            "full_travel_time_s",
+        },
+        "motion.gripper",
+    )
+    gripper_enabled = _required(gripper_raw, "enabled", "motion.gripper")
+    if not isinstance(gripper_enabled, bool):
+        raise ValueError("motion.gripper.enabled must be a boolean.")
+    gripper_values = {
+        name: _optional_servo_angle(
+            _required(gripper_raw, name, "motion.gripper"),
+            f"motion.gripper.{name}",
+        )
+        for name in (
+            "open_left_angle_deg",
+            "open_right_angle_deg",
+            "closed_left_angle_deg",
+            "closed_right_angle_deg",
+        )
+    }
+    travel_time_raw = _required(
+        gripper_raw,
+        "full_travel_time_s",
+        "motion.gripper",
+    )
+    full_travel_time_s = (
+        None
+        if travel_time_raw is None
+        else _finite_float(
+            travel_time_raw,
+            "motion.gripper.full_travel_time_s",
+            minimum=0.001,
+        )
+    )
+    if gripper_enabled and not motion_enabled:
+        raise ValueError(
+            "Enabled motion.gripper requires motion.enabled=true."
+        )
+    if gripper_enabled and (
+        any(value is None for value in gripper_values.values())
+        or full_travel_time_s is None
+    ):
+        raise ValueError(
+            "Enabled motion.gripper requires four endpoint angles and "
+            "full_travel_time_s."
+        )
+    gripper = GripperRuntimeConfig(
+        enabled=gripper_enabled,
+        open_left_angle_deg=gripper_values["open_left_angle_deg"],
+        open_right_angle_deg=gripper_values["open_right_angle_deg"],
+        closed_left_angle_deg=gripper_values["closed_left_angle_deg"],
+        closed_right_angle_deg=gripper_values["closed_right_angle_deg"],
+        full_travel_time_s=full_travel_time_s,
+    )
+    if gripper.enabled:
+        # Reuse the motion-layer validation for distinct endpoints.
+        gripper.build_calibration()
     motion = MotionRuntimeConfig(
         enabled=motion_enabled,
         wheel_track_m=wheel_track_m,
@@ -750,6 +862,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             minimum=0.001,
         ),
         max_remote_command_valid_for_ms=max_remote_validity,
+        gripper=gripper,
     )
 
     tracking_raw = _mapping(

@@ -13,6 +13,7 @@ from rescue_vision.motion.protocol import (
 from rescue_vision.motion.remote_control import (
     ExecutedRemoteGripper,
     ExecutedRemoteMotion,
+    GripperCalibration,
     RemoteGripperError,
     RemoteGripperExecutor,
     RemoteGripperResult,
@@ -36,6 +37,7 @@ __all__ = [
     "CarTelemetry",
     "ExecutedRemoteGripper",
     "ExecutedRemoteMotion",
+    "GripperCalibration",
     "MotionController",
     "MotionLimits",
     "MANUAL_MOTION_LOG_FILENAME",

@@ -642,7 +642,7 @@ class MapSnapshotAttributes:
 class VehicleStateObservation:
     """车端 UART、运动、安全和朝向状态快照。"""
 
-    SCHEMA_VERSION: ClassVar[int] = 3
+    SCHEMA_VERSION: ClassVar[int] = 4
 
     state_sequence: int
     timestamp_ns: int

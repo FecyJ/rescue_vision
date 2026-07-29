@@ -300,15 +300,15 @@ class DebugMotionCommand:
 
 @dataclass(frozen=True, slots=True)
 class DebugGripperCommand:
-    """一次性夹爪角度指令；角度由机械标定调用方显式给出。"""
+    """需要持续刷新的夹爪扳机状态。"""
 
-    SCHEMA_VERSION: ClassVar[int] = 1
+    SCHEMA_VERSION: ClassVar[int] = 2
 
     command_id: str
     issued_timestamp_ns: int
     valid_for_ms: int
-    left_angle_deg: float
-    right_angle_deg: float
+    open_pressed: bool
+    close_pressed: bool
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -326,13 +326,9 @@ class DebugGripperCommand:
                 "valid_for_ms must be an integer in [1, 5000], "
                 f"got {self.valid_for_ms!r}."
             )
-        for name in ("left_angle_deg", "right_angle_deg"):
-            angle = _finite_float(getattr(self, name), name)
-            if not 0.0 <= angle <= 180.0:
-                raise ValueError(
-                    f"{name} must be in [0, 180], got {angle!r}."
-                )
-            object.__setattr__(self, name, angle)
+        for name in ("open_pressed", "close_pressed"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be a boolean.")
 
     def to_payload(self) -> bytes:
         document = {
@@ -340,8 +336,8 @@ class DebugGripperCommand:
             "command_id": self.command_id,
             "issued_timestamp_ns": self.issued_timestamp_ns,
             "valid_for_ms": self.valid_for_ms,
-            "left_angle_deg": self.left_angle_deg,
-            "right_angle_deg": self.right_angle_deg,
+            "open_pressed": self.open_pressed,
+            "close_pressed": self.close_pressed,
         }
         return (
             json.dumps(
@@ -364,8 +360,8 @@ class DebugGripperCommand:
                 "command_id",
                 "issued_timestamp_ns",
                 "valid_for_ms",
-                "left_angle_deg",
-                "right_angle_deg",
+                "open_pressed",
+                "close_pressed",
             },
             "DebugGripperCommand",
         )
@@ -378,8 +374,8 @@ class DebugGripperCommand:
             command_id=document["command_id"],
             issued_timestamp_ns=document["issued_timestamp_ns"],
             valid_for_ms=document["valid_for_ms"],
-            left_angle_deg=document["left_angle_deg"],
-            right_angle_deg=document["right_angle_deg"],
+            open_pressed=document["open_pressed"],
+            close_pressed=document["close_pressed"],
         )
 
 

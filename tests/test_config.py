@@ -42,7 +42,7 @@ def config_text(
     ground_mapping_enabled: bool = True,
     extra: str = "",
 ) -> str:
-    return f"""schema_version: 9
+    return f"""schema_version: 10
 camera:
   backend: rpicam_vid
   image_size: {image_size}
@@ -86,6 +86,13 @@ motion:
   max_wheel_velocity_m_s: 0.30
   max_wheel_acceleration_m_s2: 0.50
   max_remote_command_valid_for_ms: 500
+  gripper:
+    enabled: false
+    open_left_angle_deg: null
+    open_right_angle_deg: null
+    closed_left_angle_deg: null
+    closed_right_angle_deg: null
+    full_travel_time_s: null
 tracking:
   confirmation_hits: 2
   max_association_ground_mm: 250.0
@@ -277,7 +284,7 @@ def test_runtime_example_matches_strict_schema() -> None:
         Path(__file__).resolve().parents[1] / "configs" / "runtime.example.yaml"
     )
     config = load_runtime_config(example)
-    assert config.schema_version == 9
+    assert config.schema_version == 10
 
 
 def test_uart_config_builds_channel_without_opening_device(tmp_path) -> None:
@@ -325,6 +332,22 @@ def test_motion_config_builds_controller_without_opening_uart(tmp_path) -> None:
         .replace(
             "motion:\n  enabled: false\n  wheel_track_m: null",
             "motion:\n  enabled: true\n  wheel_track_m: 0.2",
+        )
+        .replace(
+            """  gripper:
+    enabled: false
+    open_left_angle_deg: null
+    open_right_angle_deg: null
+    closed_left_angle_deg: null
+    closed_right_angle_deg: null
+    full_travel_time_s: null""",
+            """  gripper:
+    enabled: true
+    open_left_angle_deg: 20.0
+    open_right_angle_deg: 160.0
+    closed_left_angle_deg: 80.0
+    closed_right_angle_deg: 100.0
+    full_travel_time_s: 1.5""",
         ),
         encoding="utf-8",
     )
@@ -344,6 +367,7 @@ def test_motion_config_builds_controller_without_opening_uart(tmp_path) -> None:
     assert executor.controller is controller
     assert gripper_executor is not None
     assert gripper_executor.controller is controller
+    assert gripper_executor.calibration.full_travel_time_s == pytest.approx(1.5)
 
 
 def test_motion_acceleration_limit_must_be_positive(tmp_path) -> None:

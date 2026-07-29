@@ -200,7 +200,7 @@ def test_vehicle_state_round_trip_and_safety_invariants() -> None:
     )
 
     assert VehicleStateObservation.from_payload(state.to_payload()) == state
-    assert state.SCHEMA_VERSION == 3
+    assert state.SCHEMA_VERSION == 4
     legacy = json.loads(state.to_payload())
     legacy["schema_version"] = 2
     with pytest.raises(ValueError, match="schema_version"):

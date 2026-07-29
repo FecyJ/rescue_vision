@@ -113,10 +113,10 @@ with source, detector:
 | 子包 | 常用入口 | 对接责任 |
 | --- | --- | --- |
 | [`app`](app/README.md) | `run_manual_capture_session()`、`rescue-vision-manual-capture` | 赛外受监督手动驾驶和车载采集装配 |
-| [`config`](config/README.md) | `load_runtime_config()`、`AppConfig.build_geometry()`、`HailoConfig.build_backend()` | 启动时严格加载和装配 |
+| [`config`](config/README.md) | `load_runtime_config()`、`GripperRuntimeConfig`、`AppConfig.build_geometry()`、`HailoConfig.build_backend()` | 启动时严格加载、机械标定和装配 |
 | [`camera`](camera/README.md) | `FrameSource`、`CameraFrame`、`Picamera2Source`、`RecordingSource` | 产生带时间和序号的最新帧 |
 | [`communication`](communication/README.md) | `UartLineChannel`、`RemoteMessageConnection`、`DebugMotionCommand`、`DebugGripperCommand`、`RemoteSessionStatus` | UART、直接 TCP 远程消息与严格观察 schema |
-| [`motion`](motion/README.md) | `MotionController`、`MotionLimits`、`RemoteMotionExecutor`、`RemoteGripperExecutor`、`run_remote_motion` | 差速运动、夹爪双舵机、Rescue Car 协议和远程调试执行 |
+| [`motion`](motion/README.md) | `MotionController`、`MotionLimits`、`GripperCalibration`、`RemoteMotionExecutor`、`RemoteGripperExecutor`、`run_remote_motion` | 差速运动、持续夹爪双舵机、Rescue Car 协议和远程调试执行 |
 | [`geometry`](geometry/README.md) | `CameraModel`、`GroundProjector`、显式坐标类型 | 去畸变及像素/地面/BEV 转换 |
 | [`perception`](perception/README.md) | `InferenceBackend`、`TargetPoseDetector`、`TargetObservation` | 模型结果转任务目标观测 |
 | [`tracking`](tracking/README.md) | `MultiTargetTracker`、`TrackedTarget`、`TrackStatus` | 时间关联、遮挡和轨迹生命周期 |

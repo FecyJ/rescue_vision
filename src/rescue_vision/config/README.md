@@ -1,6 +1,6 @@
 # `config`：运行配置与对象装配
 
-本包是运行参数的唯一入口。`load_runtime_config()` 加载 schema v9 YAML，拒绝缺失字段、未知字段、错误类型和不一致资产；相对路径以 YAML 所在目录为基准。
+本包是运行参数的唯一入口。`load_runtime_config()` 加载 schema v10 YAML，拒绝缺失字段、未知字段、错误类型和不一致资产；相对路径以 YAML 所在目录为基准。
 
 本机运行统一读取不提交的 `configs/runtime.yaml`。`configs/runtime.example.yaml` 只用于创建新配置：
 
@@ -20,7 +20,7 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `RemoteConfig.connect_client()` | 仓库内参考客户端建立直接 TCP 连接 | 只用于互操作/人工检查；独立电脑端不得依赖 |
 | `MotionRuntimeConfig.build_controller()` | 用已有 UART 通道创建运动控制器 | motion 关闭时返回 `None`；不打开 UART |
 | `MotionRuntimeConfig.build_remote_executor()` | 创建远程调试运动执行器 | 复用同一个运动控制器和限速 |
-| `MotionRuntimeConfig.build_remote_gripper_executor()` | 创建远程夹爪执行器 | 复用同一个运动控制器和命令有效期上限 |
+| `MotionRuntimeConfig.build_remote_gripper_executor()` | 创建远程夹爪执行器 | 夹爪禁用时返回 `None`；否则复用控制器、有效期与机械标定 |
 | `HailoConfig.build_backend()` | 校验模型资产并创建 Hailo 后端 | Hailo 关闭时返回 `None` |
 | `HailoConfig.model_class_mapping()` | 把模型 class ID 映射为 `TargetClass` | 直接传给 `TargetPoseDetector` |
 | `TrackingConfig.build_tracker()` | 创建一轮使用的多目标跟踪器 | 初始无轨迹 |
@@ -37,7 +37,8 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `ProcessingConfig` | `max_observation_age_ms` |
 | `UartConfig` | 设备名、波特率、读写超时、有界接收容量和最大行长度 |
 | `RemoteConfig` | 服务端/客户端、观察/调试权限、连接/IO 超时和有界队列 |
-| `MotionRuntimeConfig` | 实测轮距、车体/车轮速度上限、单轮加速度上限和远程命令有效期上限 |
+| `MotionRuntimeConfig` | 实测轮距、车体/车轮速度上限、单轮加速度上限、远程命令有效期和 `gripper` |
+| `GripperRuntimeConfig` | 能力开关、左右开/闭安全角度和固定速度全行程时间 |
 | `TrackingConfig` | 关联、确认、滑行、衰减和删除阈值 |
 | `WorldRuntimeConfig` | `WorldModelConfig` 与 `StaticRegion` 集合 |
 | `MissionConfig` | 比赛计时、安全超时、避让距离和目标优先级 |
@@ -77,6 +78,19 @@ gripper_executor = config.motion.build_remote_gripper_executor(
 
 UART/TCP 生命周期和 motion 的停止语义分别见相邻模块 README，不要把
 `build_*()` 的成功返回误认为硬件已经连通。
+`gripper_executor is None` 表示当前配置未完成机械标定或明确关闭夹爪能力；
+应用必须在会话状态中声明 `gripper_control=false`，不能自行补默认角度。
+`motion.gripper` 字段语义如下：
+
+| 字段 | 语义 |
+| --- | --- |
+| `enabled` | 是否允许装配并宣告远程夹爪能力 |
+| `open_left_angle_deg` / `open_right_angle_deg` | 当前车辆完全张开时的左右安全目标角度 |
+| `closed_left_angle_deg` / `closed_right_angle_deg` | 当前车辆完全闭合时的左右安全目标角度 |
+| `full_travel_time_s` | 单方向持续按下时，从一个端点匀速到另一端点的时间 |
+
+四个角度单位都是 degree，范围 `[0, 180]`。左右舵机方向可以相反，执行器按
+各自开/闭端点计算方向；客户端只发送按下/松开 boolean，不读取这些机械值。
 
 ## 3. 装配几何对象
 
@@ -192,7 +206,11 @@ PySerial 并打开设备。电机命令、轮速和未来 IMU 报文由后续协
 
 ## schema 与路径
 
-- 当前运行配置为 schema v9。
+- 当前运行配置为 schema v10。
+- schema v9 升级到 v10 时，`motion` 段必须增加完整的 `gripper` 映射。
+  未完成真机标定时将 `enabled` 设为 `false`，四个端点角度和
+  `full_travel_time_s` 均设为 `null`；启用时它们必须全部给出，左右各自的
+  开/闭端点必须不同。加载器不会用 0/180° 或协议示例值猜测机械安全范围。
 - schema v8 升级到 v9 时，`motion` 段必须增加正有限数
   `max_wheel_acceleration_m_s2`。示例值 `0.50` 表示单轮目标速度每秒最多
   变化 0.50 m/s；控制器不会静默使用旧配置或猜测真车安全加速度。

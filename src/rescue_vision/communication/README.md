@@ -30,11 +30,11 @@
 | `send_observation()` | 提交视频、地图、车辆最新值 | 按 topic 合并，队列满时丢旧保新 |
 | `receive_observation()` | 接收观察消息 | 仓库参考客户端也按 topic 保留最新值 |
 | `DebugMotionCommand` | 调试运动 JSON schema | 死手、有效期、车体速度和可选目标朝向 |
-| `DebugGripperCommand` | 调试夹爪 JSON schema | 有效期和显式左右舵机角度 `[0, 180]` degree |
+| `DebugGripperCommand` | 调试夹爪 JSON schema v2 | 有效期和张开/闭合扳机按压布尔状态 |
 | `DebugCaptureCommand` | 调试采集 JSON schema | 开始、停止、抓拍和事件标记 |
 | `RemoteSessionStatus` | 会话权限、能力、限值和周期 | TCP 建立后的首条业务消息 |
 | `VideoFrameAttributes` | JPEG 帧 header attributes | 严格尺寸、坐标系、时间和标定身份 |
-| `VehicleStateObservation` | 车辆观察 JSON schema v3 | UART、轮速、夹爪角度、显式安全模式和命令 ID |
+| `VehicleStateObservation` | 车辆观察 JSON schema v4 | UART、轮速、夹爪角度、显式安全模式和命令 ID |
 | `CaptureStatusObservation` | 采集观察 JSON schema | 当前记录状态及最近请求结果 |
 
 ## 1. 从运行配置装配 UART
@@ -418,9 +418,9 @@ def send_debug_twist(
     )
 ```
 
-同一参考客户端可以单独发送一次夹爪角度命令。此片段承接前文
-`remote_client` 和 `status`，角度必须来自当前车辆机械标定，示例值不能当作
-通用开合常量：
+同一参考客户端通过持续发送夹爪扳机状态控制开合。此片段承接前文
+`remote_client` 和 `status`；车端运行配置持有机械端点和固定速度，客户端
+只发送经过本地按下阈值判断后的布尔状态：
 
 ```python
 from rescue_vision.communication import DebugGripperCommand
@@ -429,13 +429,16 @@ from rescue_vision.communication import DebugGripperCommand
 def send_debug_gripper(
     connection: RemoteMessageConnection,
     status: RemoteSessionStatus,
+    *,
+    open_pressed: bool,
+    close_pressed: bool,
 ) -> None:
     command = DebugGripperCommand(
-        command_id="manual-grip-001",
+        command_id=f"manual-grip-{time.monotonic_ns()}",
         issued_timestamp_ns=time.monotonic_ns(),
         valid_for_ms=200,
-        left_angle_deg=27.0,
-        right_angle_deg=167.0,
+        open_pressed=open_pressed,
+        close_pressed=close_pressed,
     )
     if not status.gripper_control_available:
         raise RuntimeError("服务端没有声明 gripper_control capability")
@@ -447,13 +450,31 @@ def send_debug_gripper(
     )
 ```
 
+非零状态要在按住期间以不超过 `valid_for_ms / 3` 的周期持续刷新。例如
+`valid_for_ms=200` 时可每 50 ms 发送一次；左扳机按下时传
+`open_pressed=true`，右扳机按下时传 `close_pressed=true`。松开或手柄断开
+时立即发送一次两个字段均为 `false` 的命令，随后清除本地待发状态。两个
+扳机同时按下时车端停止，避免冲突方向运动。
+
 最后用一个资源代码段组合前文装配和三个操作函数：
 
 ```python
 with remote_client:
     status = receive_first_status(remote_client)
     send_debug_twist(remote_client, status)
-    send_debug_gripper(remote_client, status)
+    send_debug_gripper(
+        remote_client,
+        status,
+        open_pressed=False,
+        close_pressed=True,
+    )
+    # 松开扳机时停止车端继续改变舵机目标。
+    send_debug_gripper(
+        remote_client,
+        status,
+        open_pressed=False,
+        close_pressed=False,
+    )
 ```
 
 本地 `runtime.client.yaml` 也必须设置 `access_mode: debug_control`，否则
@@ -477,7 +498,8 @@ Python 包；其唯一跨项目依据是
 `DebugMotionCommand.linear_velocity_m_s` 正负表示前后，
 `angular_velocity_rad_s` 逆时针为正。`TARGET_HEADING` 必须声明 `field` 或
 `session_start` 参考系；当前没有 IMU/定位适配器，车端只能执行 `TWIST`。
-`DebugGripperCommand` 是一次性锁存角度；断线停车不会自动改变夹爪位置。
+`DebugGripperCommand` v2 是短有效期的持续扳机状态；超时、断线、全部松开
+或两个方向同时按下会停止继续改变舵机目标，但不会自动跳到开/闭端点。
 
 ## 队列、故障和降级语义
 

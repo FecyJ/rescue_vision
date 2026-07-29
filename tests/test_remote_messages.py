@@ -95,24 +95,25 @@ def test_deadman_disabled_can_only_request_stop() -> None:
         )
 
 
-def test_debug_gripper_round_trip_and_angle_bounds() -> None:
+def test_debug_gripper_round_trip_and_boolean_states() -> None:
     command = DebugGripperCommand(
         command_id="grip-001",
         issued_timestamp_ns=789,
         valid_for_ms=250,
-        left_angle_deg=27.0,
-        right_angle_deg=167.0,
+        open_pressed=True,
+        close_pressed=False,
     )
 
     assert DebugGripperCommand.from_payload(command.to_payload()) == command
+    assert command.SCHEMA_VERSION == 2
     assert RemoteTopic.DEBUG_GRIPPER.value == "control/debug/gripper"
-    with pytest.raises(ValueError, match=r"\[0, 180\]"):
+    with pytest.raises(ValueError, match="boolean"):
         DebugGripperCommand(
-            command_id="bad-angle",
+            command_id="bad-state",
             issued_timestamp_ns=0,
             valid_for_ms=100,
-            left_angle_deg=-1.0,
-            right_angle_deg=90.0,
+            open_pressed=1,  # type: ignore[arg-type]
+            close_pressed=False,
         )
     document = json.loads(command.to_payload())
     document["open"] = False
