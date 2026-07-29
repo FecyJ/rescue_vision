@@ -30,10 +30,11 @@
 | `send_observation()` | 提交视频、地图、车辆最新值 | 按 topic 合并，队列满时丢旧保新 |
 | `receive_observation()` | 接收观察消息 | 仓库参考客户端也按 topic 保留最新值 |
 | `DebugMotionCommand` | 调试运动 JSON schema | 死手、有效期、车体速度和可选目标朝向 |
+| `DebugGripperCommand` | 调试夹爪 JSON schema | 有效期和显式左右舵机角度 `[0, 180]` degree |
 | `DebugCaptureCommand` | 调试采集 JSON schema | 开始、停止、抓拍和事件标记 |
 | `RemoteSessionStatus` | 会话权限、能力、限值和周期 | TCP 建立后的首条业务消息 |
 | `VideoFrameAttributes` | JPEG 帧 header attributes | 严格尺寸、坐标系、时间和标定身份 |
-| `VehicleStateObservation` | 车辆观察 JSON schema v2 | UART、轮速、显式安全模式、朝向和应用命令 ID |
+| `VehicleStateObservation` | 车辆观察 JSON schema v3 | UART、轮速、夹爪角度、显式安全模式和命令 ID |
 | `CaptureStatusObservation` | 采集观察 JSON schema | 当前记录状态及最近请求结果 |
 
 ## 1. 从运行配置装配 UART
@@ -199,6 +200,7 @@ session_status = RemoteSessionStatus(
     timestamp_ns=time.monotonic_ns(),
     access_mode=config.remote.access_mode,
     motion_control_available=False,
+    gripper_control_available=False,
     capture_control_available=False,
     video_stream_available=True,
     map_snapshot_available=False,
@@ -212,7 +214,7 @@ session_status = RemoteSessionStatus(
     video_nominal_fps=15.0,
     max_linear_velocity_m_s=None,
     max_angular_velocity_rad_s=None,
-    max_motion_command_valid_for_ms=500,
+    max_control_command_valid_for_ms=500,
 )
 ```
 
@@ -247,7 +249,7 @@ remote_connection.send_reliable_observation(
 ```
 
 能力字段必须描述当前会话真实运行的发布器，不能因为 schema 已定义就写
-`true`。运动控制尤其要求视频和车辆状态同时可用。
+`true`。运动和夹爪控制尤其要求视频和车辆状态同时可用。
 
 ## 8. 发送视频等最新值观察
 
@@ -307,6 +309,7 @@ topic 分派，再用相应 schema 解析：
 ```python
 from rescue_vision.communication import (
     DebugCaptureCommand,
+    DebugGripperCommand,
     DebugMotionCommand,
     RemoteTopic,
 )
@@ -316,6 +319,9 @@ received = remote_connection.receive_control(timeout=0.1)
 if received.topic == RemoteTopic.DEBUG_MOTION.value:
     motion_command = DebugMotionCommand.from_payload(received.payload)
     handle_motion_command(received, motion_command)
+elif received.topic == RemoteTopic.DEBUG_GRIPPER.value:
+    gripper_command = DebugGripperCommand.from_payload(received.payload)
+    handle_gripper_command(received, gripper_command)
 elif received.topic == RemoteTopic.DEBUG_CAPTURE.value:
     capture_command = DebugCaptureCommand.from_payload(received.payload)
     handle_capture_command(received, capture_command)
@@ -323,8 +329,10 @@ else:
     raise ValueError(f"unsupported control topic: {received.topic!r}")
 ```
 
-这里的两个 `handle_*` 是应用领域适配器。运动指令应直接交给
+这里的三个 `handle_*` 是应用领域适配器。运动指令应直接交给
 `RemoteMotionExecutor.execute(received)`，不要在 communication 层换算轮速。
+夹爪指令应交给 `RemoteGripperExecutor.execute(received)`，不要在此层拼接
+Rescue Car 的 `g` 字符串。
 录制指令也不能携带电脑端路径；车端输出根目录必须来自自己的运行配置。
 
 `received.sender_timestamp_ns` 是电脑端单调时间，只用于电脑侧追踪；
@@ -401,7 +409,7 @@ def send_debug_twist(
         raise ValueError("线速度超过服务端声明上限")
     if abs(command.angular_velocity_rad_s) > status.max_angular_velocity_rad_s:
         raise ValueError("角速度超过服务端声明上限")
-    if command.valid_for_ms > status.max_motion_command_valid_for_ms:
+    if command.valid_for_ms > status.max_control_command_valid_for_ms:
         raise ValueError("命令有效期超过服务端声明上限")
 
     connection.send_control(
@@ -410,12 +418,42 @@ def send_debug_twist(
     )
 ```
 
-最后用一个资源代码段组合前文装配和两个操作函数：
+同一参考客户端可以单独发送一次夹爪角度命令。此片段承接前文
+`remote_client` 和 `status`，角度必须来自当前车辆机械标定，示例值不能当作
+通用开合常量：
+
+```python
+from rescue_vision.communication import DebugGripperCommand
+
+
+def send_debug_gripper(
+    connection: RemoteMessageConnection,
+    status: RemoteSessionStatus,
+) -> None:
+    command = DebugGripperCommand(
+        command_id="manual-grip-001",
+        issued_timestamp_ns=time.monotonic_ns(),
+        valid_for_ms=200,
+        left_angle_deg=27.0,
+        right_angle_deg=167.0,
+    )
+    if not status.gripper_control_available:
+        raise RuntimeError("服务端没有声明 gripper_control capability")
+    if command.valid_for_ms > status.max_control_command_valid_for_ms:
+        raise ValueError("命令有效期超过服务端声明上限")
+    connection.send_control(
+        RemoteTopic.DEBUG_GRIPPER.value,
+        command.to_payload(),
+    )
+```
+
+最后用一个资源代码段组合前文装配和三个操作函数：
 
 ```python
 with remote_client:
     status = receive_first_status(remote_client)
     send_debug_twist(remote_client, status)
+    send_debug_gripper(remote_client, status)
 ```
 
 本地 `runtime.client.yaml` 也必须设置 `access_mode: debug_control`，否则
@@ -429,6 +467,7 @@ Python 包；其唯一跨项目依据是
 | --- | --- | --- |
 | `observation/session/status` | 树莓派 → 电脑 | `RemoteSessionStatus` JSON |
 | `control/debug/motion` | 电脑 → 树莓派 | `DebugMotionCommand` JSON |
+| `control/debug/gripper` | 电脑 → 树莓派 | `DebugGripperCommand` JSON |
 | `control/debug/capture` | 电脑 → 树莓派 | `DebugCaptureCommand` JSON |
 | `observation/video/frame` | 树莓派 → 电脑 | JPEG 与 `VideoFrameAttributes` |
 | `observation/map/snapshot` | 树莓派 → 电脑 | PNG 与 `MapSnapshotAttributes` |
@@ -438,6 +477,7 @@ Python 包；其唯一跨项目依据是
 `DebugMotionCommand.linear_velocity_m_s` 正负表示前后，
 `angular_velocity_rad_s` 逆时针为正。`TARGET_HEADING` 必须声明 `field` 或
 `session_start` 参考系；当前没有 IMU/定位适配器，车端只能执行 `TWIST`。
+`DebugGripperCommand` 是一次性锁存角度；断线停车不会自动改变夹爪位置。
 
 ## 队列、故障和降级语义
 

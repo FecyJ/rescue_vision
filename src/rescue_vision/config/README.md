@@ -20,6 +20,7 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `RemoteConfig.connect_client()` | 仓库内参考客户端建立直接 TCP 连接 | 只用于互操作/人工检查；独立电脑端不得依赖 |
 | `MotionRuntimeConfig.build_controller()` | 用已有 UART 通道创建运动控制器 | motion 关闭时返回 `None`；不打开 UART |
 | `MotionRuntimeConfig.build_remote_executor()` | 创建远程调试运动执行器 | 复用同一个运动控制器和限速 |
+| `MotionRuntimeConfig.build_remote_gripper_executor()` | 创建远程夹爪执行器 | 复用同一个运动控制器和命令有效期上限 |
 | `HailoConfig.build_backend()` | 校验模型资产并创建 Hailo 后端 | Hailo 关闭时返回 `None` |
 | `HailoConfig.model_class_mapping()` | 把模型 class ID 映射为 `TargetClass` | 直接传给 `TargetPoseDetector` |
 | `TrackingConfig.build_tracker()` | 创建一轮使用的多目标跟踪器 | 初始无轨迹 |
@@ -69,6 +70,9 @@ remote_server = config.remote.build_server()
 # motion 复用同一个 UART 通道；禁用时返回 None。
 motion_controller = config.motion.build_controller(uart_channel)
 motion_executor = config.motion.build_remote_executor(motion_controller)
+gripper_executor = config.motion.build_remote_gripper_executor(
+    motion_controller
+)
 ```
 
 UART/TCP 生命周期和 motion 的停止语义分别见相邻模块 README，不要把

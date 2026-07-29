@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from rescue_vision.communication import (
     CaptureAction,
     DebugCaptureCommand,
+    DebugGripperCommand,
     DebugMotionCommand,
     HeadingReference,
     MotionControlMode,
@@ -90,6 +92,33 @@ def test_deadman_disabled_can_only_request_stop() -> None:
             control_mode=MotionControlMode.TWIST,
             linear_velocity_m_s=0.1,
             angular_velocity_rad_s=0.0,
+        )
+
+
+def test_debug_gripper_round_trip_and_angle_bounds() -> None:
+    command = DebugGripperCommand(
+        command_id="grip-001",
+        issued_timestamp_ns=789,
+        valid_for_ms=250,
+        left_angle_deg=27.0,
+        right_angle_deg=167.0,
+    )
+
+    assert DebugGripperCommand.from_payload(command.to_payload()) == command
+    assert RemoteTopic.DEBUG_GRIPPER.value == "control/debug/gripper"
+    with pytest.raises(ValueError, match=r"\[0, 180\]"):
+        DebugGripperCommand(
+            command_id="bad-angle",
+            issued_timestamp_ns=0,
+            valid_for_ms=100,
+            left_angle_deg=-1.0,
+            right_angle_deg=90.0,
+        )
+    document = json.loads(command.to_payload())
+    document["open"] = False
+    with pytest.raises(ValueError, match="keys must be exactly"):
+        DebugGripperCommand.from_payload(
+            json.dumps(document).encode("utf-8")
         )
 
 

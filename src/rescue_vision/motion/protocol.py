@@ -62,6 +62,24 @@ def encode_soft_brake_command(
     return f"b{left},{right}".encode("ascii")
 
 
+def encode_gripper_command(
+    left_angle_deg: float,
+    right_angle_deg: float,
+) -> bytes:
+    """编码同时设置左右夹爪舵机角度的 ``g`` 指令。"""
+
+    angles: list[str] = []
+    for name, value in (
+        ("left_angle_deg", left_angle_deg),
+        ("right_angle_deg", right_angle_deg),
+    ):
+        angle = _finite_float(value, name)
+        if not 0.0 <= angle <= 180.0:
+            raise ValueError(f"{name} must be in [0, 180], got {angle!r}.")
+        angles.append(_format_float(angle, name))
+    return f"g{angles[0]},{angles[1]}".encode("ascii")
+
+
 def encode_emergency_stop_command() -> bytes:
     """编码固件急停指令。"""
 
@@ -76,7 +94,7 @@ def encode_state_query_command() -> bytes:
 
 @dataclass(frozen=True, slots=True)
 class CarTelemetry:
-    """STM32 的 10 Hz 遥测；速度为 m/s，舵机角度为 degree。"""
+    """STM32 10 Hz 遥测；速度为 m/s，舵机字段为固件目标角度 degree。"""
 
     uart_sequence: int
     received_timestamp_ns: int

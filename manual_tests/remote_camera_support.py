@@ -86,6 +86,7 @@ def build_camera_session_status(
         timestamp_ns=time.monotonic_ns(),
         access_mode=config.remote.access_mode,
         motion_control_available=False,
+        gripper_control_available=False,
         capture_control_available=capture_control_available,
         video_stream_available=True,
         map_snapshot_available=False,
@@ -103,7 +104,7 @@ def build_camera_session_status(
         video_nominal_fps=video_nominal_fps,
         max_linear_velocity_m_s=None,
         max_angular_velocity_rad_s=None,
-        max_motion_command_valid_for_ms=500,
+        max_control_command_valid_for_ms=500,
     )
 
 

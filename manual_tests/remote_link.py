@@ -76,6 +76,7 @@ def main() -> None:
                 timestamp_ns=time.monotonic_ns(),
                 access_mode=config.remote.access_mode,
                 motion_control_available=False,
+                gripper_control_available=False,
                 capture_control_available=False,
                 video_stream_available=False,
                 map_snapshot_available=False,
@@ -89,7 +90,7 @@ def main() -> None:
                 video_nominal_fps=None,
                 max_linear_velocity_m_s=None,
                 max_angular_velocity_rad_s=None,
-                max_motion_command_valid_for_ms=500,
+                max_control_command_valid_for_ms=500,
             )
             connection.send_reliable_observation(
                 RemoteTopic.SESSION_STATUS.value,

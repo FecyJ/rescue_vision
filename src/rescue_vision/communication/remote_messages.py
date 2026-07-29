@@ -14,6 +14,7 @@ class RemoteTopic(str, Enum):
     """稳定控制与观察 topic；传输层仍允许扩展自定义 topic。"""
 
     DEBUG_MOTION = "control/debug/motion"
+    DEBUG_GRIPPER = "control/debug/gripper"
     DEBUG_CAPTURE = "control/debug/capture"
     SESSION_STATUS = "observation/session/status"
     VIDEO_FRAME = "observation/video/frame"
@@ -294,6 +295,91 @@ class DebugMotionCommand:
             angular_velocity_rad_s=document["angular_velocity_rad_s"],
             target_heading_rad=document["target_heading_rad"],
             heading_reference=heading_reference,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DebugGripperCommand:
+    """一次性夹爪角度指令；角度由机械标定调用方显式给出。"""
+
+    SCHEMA_VERSION: ClassVar[int] = 1
+
+    command_id: str
+    issued_timestamp_ns: int
+    valid_for_ms: int
+    left_angle_deg: float
+    right_angle_deg: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "command_id",
+            _identifier(self.command_id, "command_id"),
+        )
+        _non_negative_int(self.issued_timestamp_ns, "issued_timestamp_ns")
+        if (
+            isinstance(self.valid_for_ms, bool)
+            or not isinstance(self.valid_for_ms, int)
+            or not 1 <= self.valid_for_ms <= 5_000
+        ):
+            raise ValueError(
+                "valid_for_ms must be an integer in [1, 5000], "
+                f"got {self.valid_for_ms!r}."
+            )
+        for name in ("left_angle_deg", "right_angle_deg"):
+            angle = _finite_float(getattr(self, name), name)
+            if not 0.0 <= angle <= 180.0:
+                raise ValueError(
+                    f"{name} must be in [0, 180], got {angle!r}."
+                )
+            object.__setattr__(self, name, angle)
+
+    def to_payload(self) -> bytes:
+        document = {
+            "schema_version": self.SCHEMA_VERSION,
+            "command_id": self.command_id,
+            "issued_timestamp_ns": self.issued_timestamp_ns,
+            "valid_for_ms": self.valid_for_ms,
+            "left_angle_deg": self.left_angle_deg,
+            "right_angle_deg": self.right_angle_deg,
+        }
+        return (
+            json.dumps(
+                document,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> DebugGripperCommand:
+        document = _decode_json_object(payload, "DebugGripperCommand")
+        _require_exact_keys(
+            document,
+            {
+                "schema_version",
+                "command_id",
+                "issued_timestamp_ns",
+                "valid_for_ms",
+                "left_angle_deg",
+                "right_angle_deg",
+            },
+            "DebugGripperCommand",
+        )
+        _require_schema_version(
+            document["schema_version"],
+            cls.SCHEMA_VERSION,
+            "DebugGripperCommand",
+        )
+        return cls(
+            command_id=document["command_id"],
+            issued_timestamp_ns=document["issued_timestamp_ns"],
+            valid_for_ms=document["valid_for_ms"],
+            left_angle_deg=document["left_angle_deg"],
+            right_angle_deg=document["right_angle_deg"],
         )
 
 

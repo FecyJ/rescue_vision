@@ -94,8 +94,9 @@ rescue-vision-manual-capture \
   --accept-timeout-seconds 30
 ```
 
-入口同时声明 `motion_control`、`video_stream`、`vehicle_state`、
-`capture_control` 和 `capture_status`，并接收手动运动与采集命令。采集操作：
+入口同时声明 `motion_control`、`gripper_control`、`video_stream`、
+`vehicle_state`、`capture_control` 和 `capture_status`，并接收手动运动、
+显式左右夹爪舵机角度与采集命令。采集操作：
 
 - `start`：在 `<output-root>/recordings/` 创建新的标准 recording schema v4
   会话，持续记录经过配置去畸变的帧及 `motion.jsonl`；
@@ -109,3 +110,5 @@ rescue-vision-manual-capture \
 仍不得提交路径。入口退出时先停车，再关闭尚未结束的记录、相机和通信资源。
 它是同时只服务一个客户端的赛外入口，不是正式比赛应用。断线会先停车并关闭
 当前记录，随后可接受一个新连接；车端不会主动重连，也不会恢复旧死手使能。
+断线停车不自动改变夹爪角度；真机检查前必须先标定左右舵机的安全开合范围，
+不能直接套用协议说明书中的示例闭合角度。

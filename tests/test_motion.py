@@ -5,6 +5,7 @@ from collections.abc import Iterator
 import pytest
 
 from rescue_vision.communication import (
+    DebugGripperCommand,
     DebugMotionCommand,
     HeadingReference,
     MotionControlMode,
@@ -20,6 +21,9 @@ from rescue_vision.motion import (
     CarTelemetry,
     MotionController,
     MotionLimits,
+    RemoteGripperError,
+    RemoteGripperExecutor,
+    RemoteGripperResult,
     RemoteMotionError,
     RemoteMotionExecutor,
     RemoteMotionResult,
@@ -117,6 +121,39 @@ def twist_command(
     )
 
 
+def gripper_message(
+    command: DebugGripperCommand,
+    *,
+    received_timestamp_ns: int = 1_000_000_000,
+    topic: str = RemoteTopic.DEBUG_GRIPPER.value,
+) -> ReceivedRemoteMessage:
+    return ReceivedRemoteMessage(
+        stream=RemoteStream.CONTROL,
+        topic=topic,
+        content_type="application/json",
+        sequence=0,
+        sender_timestamp_ns=123,
+        received_timestamp_ns=received_timestamp_ns,
+        attributes={},
+        payload=command.to_payload(),
+    )
+
+
+def gripper_command(
+    *,
+    valid_for_ms: int = 200,
+    left_angle_deg: float = 27.0,
+    right_angle_deg: float = 167.0,
+) -> DebugGripperCommand:
+    return DebugGripperCommand(
+        command_id="grip-1",
+        issued_timestamp_ns=123,
+        valid_for_ms=valid_for_ms,
+        left_angle_deg=left_angle_deg,
+        right_angle_deg=right_angle_deg,
+    )
+
+
 def test_motion_functions_encode_differential_drive_and_stops() -> None:
     channel = FakeCarChannel()
     clock = FakeClock()
@@ -151,6 +188,20 @@ def test_motion_functions_encode_differential_drive_and_stops() -> None:
         b"e",
         b"v",
     ]
+
+
+def test_gripper_angles_encode_left_then_right_and_reject_invalid_values() -> None:
+    channel = FakeCarChannel()
+    controller = MotionController(channel, limits())
+
+    controller.set_gripper_angles(27.0, 167.0)
+    controller.set_gripper_angles(0.0, 180.0)
+    with pytest.raises(ValueError, match=r"\[0, 180\]"):
+        controller.set_gripper_angles(-1.0, 90.0)
+    with pytest.raises(ValueError, match="finite"):
+        controller.set_gripper_angles(float("nan"), 90.0)
+
+    assert channel.sent == [b"g27,167", b"g0,180"]
 
 
 def test_wheel_targets_are_slew_limited_across_acceleration_and_reversal() -> None:
@@ -449,6 +500,45 @@ def test_remote_validity_limit_is_enforced_without_using_sender_clock() -> None:
         )
 
     assert channel.sent == [b"b0,0"]
+
+
+def test_remote_gripper_applies_fresh_command_and_ignores_expired_command() -> None:
+    channel = FakeCarChannel()
+    executor = RemoteGripperExecutor(
+        MotionController(channel, limits()),
+        monotonic_ns=lambda: 1_050_000_000,
+    )
+
+    applied = executor.execute(gripper_message(gripper_command()))
+    expired = executor.execute(
+        gripper_message(gripper_command(), received_timestamp_ns=800_000_000)
+    )
+
+    assert applied.result is RemoteGripperResult.APPLIED
+    assert applied.deadline_timestamp_ns == 1_200_000_000
+    assert expired.result is RemoteGripperResult.EXPIRED
+    assert channel.sent == [b"g27,167"]
+
+
+def test_invalid_remote_gripper_command_does_not_actuate() -> None:
+    channel = FakeCarChannel()
+    executor = RemoteGripperExecutor(MotionController(channel, limits()))
+
+    with pytest.raises(RemoteGripperError, match="valid_for_ms"):
+        executor.execute(
+            gripper_message(gripper_command(valid_for_ms=501)),
+            now_ns=1_000_000_001,
+        )
+    with pytest.raises(RemoteGripperError, match="topic"):
+        executor.execute(
+            gripper_message(
+                gripper_command(),
+                topic=RemoteTopic.DEBUG_CAPTURE.value,
+            ),
+            now_ns=1_000_000_001,
+        )
+
+    assert channel.sent == []
 
 
 def test_remote_loop_drains_uart_and_stops_on_exit() -> None:

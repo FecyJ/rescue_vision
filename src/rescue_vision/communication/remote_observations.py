@@ -153,13 +153,14 @@ def _encode_json(document: Mapping[str, Any]) -> bytes:
 class RemoteSessionStatus:
     """TCP 会话的权限、能力、限制和发布周期。"""
 
-    SCHEMA_VERSION: ClassVar[int] = 1
+    SCHEMA_VERSION: ClassVar[int] = 2
 
     session_id: str
     server_instance_id: str
     timestamp_ns: int
     access_mode: RemoteAccessMode
     motion_control_available: bool
+    gripper_control_available: bool
     capture_control_available: bool
     video_stream_available: bool
     map_snapshot_available: bool
@@ -173,7 +174,7 @@ class RemoteSessionStatus:
     video_nominal_fps: float | None
     max_linear_velocity_m_s: float | None
     max_angular_velocity_rad_s: float | None
-    max_motion_command_valid_for_ms: int
+    max_control_command_valid_for_ms: int
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -191,6 +192,7 @@ class RemoteSessionStatus:
             raise ValueError("access_mode must be RemoteAccessMode.")
         for name in (
             "motion_control_available",
+            "gripper_control_available",
             "capture_control_available",
             "video_stream_available",
             "map_snapshot_available",
@@ -225,12 +227,12 @@ class RemoteSessionStatus:
             "max_angular_velocity_rad_s",
         )
         if (
-            isinstance(self.max_motion_command_valid_for_ms, bool)
-            or not isinstance(self.max_motion_command_valid_for_ms, int)
-            or not 1 <= self.max_motion_command_valid_for_ms <= 5_000
+            isinstance(self.max_control_command_valid_for_ms, bool)
+            or not isinstance(self.max_control_command_valid_for_ms, int)
+            or not 1 <= self.max_control_command_valid_for_ms <= 5_000
         ):
             raise ValueError(
-                "max_motion_command_valid_for_ms must be in [1, 5000]."
+                "max_control_command_valid_for_ms must be in [1, 5000]."
             )
         for name, converted in (
             ("vehicle_state_period_ms", vehicle_period),
@@ -242,7 +244,9 @@ class RemoteSessionStatus:
         ):
             object.__setattr__(self, name, converted)
         if self.access_mode is RemoteAccessMode.OBSERVE_ONLY and (
-            self.motion_control_available or self.capture_control_available
+            self.motion_control_available
+            or self.gripper_control_available
+            or self.capture_control_available
         ):
             raise ValueError(
                 "observe_only sessions cannot advertise control capabilities."
@@ -257,6 +261,13 @@ class RemoteSessionStatus:
         ):
             raise ValueError(
                 "motion control requires video and vehicle state."
+            )
+        if self.gripper_control_available and (
+            not self.video_stream_available
+            or not self.vehicle_state_available
+        ):
+            raise ValueError(
+                "gripper control requires video and vehicle state."
             )
         if self.capture_control_available and (
             not self.video_stream_available
@@ -299,6 +310,7 @@ class RemoteSessionStatus:
                 "access_mode": self.access_mode.value,
                 "capabilities": {
                     "motion_control": self.motion_control_available,
+                    "gripper_control": self.gripper_control_available,
                     "capture_control": self.capture_control_available,
                     "video_stream": self.video_stream_available,
                     "map_snapshot": self.map_snapshot_available,
@@ -318,8 +330,8 @@ class RemoteSessionStatus:
                 "limits": {
                     "max_linear_velocity_m_s": self.max_linear_velocity_m_s,
                     "max_angular_velocity_rad_s": self.max_angular_velocity_rad_s,
-                    "max_motion_command_valid_for_ms": (
-                        self.max_motion_command_valid_for_ms
+                    "max_control_command_valid_for_ms": (
+                        self.max_control_command_valid_for_ms
                     ),
                 },
             }
@@ -360,6 +372,7 @@ class RemoteSessionStatus:
             capabilities,
             {
                 "motion_control",
+                "gripper_control",
                 "capture_control",
                 "video_stream",
                 "map_snapshot",
@@ -385,7 +398,7 @@ class RemoteSessionStatus:
             {
                 "max_linear_velocity_m_s",
                 "max_angular_velocity_rad_s",
-                "max_motion_command_valid_for_ms",
+                "max_control_command_valid_for_ms",
             },
             "RemoteSessionStatus.limits",
         )
@@ -399,6 +412,7 @@ class RemoteSessionStatus:
                 "access_mode",
             ),
             motion_control_available=capabilities["motion_control"],
+            gripper_control_available=capabilities["gripper_control"],
             capture_control_available=capabilities["capture_control"],
             video_stream_available=capabilities["video_stream"],
             map_snapshot_available=capabilities["map_snapshot"],
@@ -414,8 +428,8 @@ class RemoteSessionStatus:
             video_nominal_fps=periods["video_nominal_fps"],
             max_linear_velocity_m_s=limits["max_linear_velocity_m_s"],
             max_angular_velocity_rad_s=limits["max_angular_velocity_rad_s"],
-            max_motion_command_valid_for_ms=limits[
-                "max_motion_command_valid_for_ms"
+            max_control_command_valid_for_ms=limits[
+                "max_control_command_valid_for_ms"
             ],
         )
 
@@ -628,7 +642,7 @@ class MapSnapshotAttributes:
 class VehicleStateObservation:
     """车端 UART、运动、安全和朝向状态快照。"""
 
-    SCHEMA_VERSION: ClassVar[int] = 2
+    SCHEMA_VERSION: ClassVar[int] = 3
 
     state_sequence: int
     timestamp_ns: int
@@ -644,10 +658,14 @@ class VehicleStateObservation:
     target_right_velocity_m_s: float | None
     measured_left_velocity_m_s: float | None
     measured_right_velocity_m_s: float | None
+    gripper_left_angle_deg: float | None
+    gripper_right_angle_deg: float | None
     heading_rad: float | None
     heading_reference: HeadingReference | None
     last_received_motion_command_id: str | None
     last_applied_motion_command_id: str | None
+    last_received_gripper_command_id: str | None
+    last_applied_gripper_command_id: str | None
 
     def __post_init__(self) -> None:
         _non_negative_int(self.state_sequence, "state_sequence")
@@ -685,6 +703,20 @@ class VehicleStateObservation:
                 name,
                 _optional_finite_float(getattr(self, name), name),
             )
+        for name in (
+            "gripper_left_angle_deg",
+            "gripper_right_angle_deg",
+        ):
+            angle = _optional_finite_float(getattr(self, name), name)
+            if angle is not None and not 0.0 <= angle <= 180.0:
+                raise ValueError(f"{name} must be in [0, 180].")
+            object.__setattr__(self, name, angle)
+        if (self.gripper_left_angle_deg is None) != (
+            self.gripper_right_angle_deg is None
+        ):
+            raise ValueError(
+                "gripper angle fields must both be present or null."
+            )
         heading = _optional_finite_float(self.heading_rad, "heading_rad")
         if heading is not None and not -math.pi <= heading <= math.pi:
             raise ValueError("heading_rad must be in [-pi, pi].")
@@ -701,6 +733,8 @@ class VehicleStateObservation:
         for name in (
             "last_received_motion_command_id",
             "last_applied_motion_command_id",
+            "last_received_gripper_command_id",
+            "last_applied_gripper_command_id",
         ):
             object.__setattr__(
                 self,
@@ -761,6 +795,8 @@ class VehicleStateObservation:
                 "target_right_velocity_m_s": self.target_right_velocity_m_s,
                 "measured_left_velocity_m_s": self.measured_left_velocity_m_s,
                 "measured_right_velocity_m_s": self.measured_right_velocity_m_s,
+                "gripper_left_angle_deg": self.gripper_left_angle_deg,
+                "gripper_right_angle_deg": self.gripper_right_angle_deg,
                 "heading_rad": self.heading_rad,
                 "heading_reference": (
                     None
@@ -772,6 +808,12 @@ class VehicleStateObservation:
                 ),
                 "last_applied_motion_command_id": (
                     self.last_applied_motion_command_id
+                ),
+                "last_received_gripper_command_id": (
+                    self.last_received_gripper_command_id
+                ),
+                "last_applied_gripper_command_id": (
+                    self.last_applied_gripper_command_id
                 ),
             }
         )
@@ -795,10 +837,14 @@ class VehicleStateObservation:
             "target_right_velocity_m_s",
             "measured_left_velocity_m_s",
             "measured_right_velocity_m_s",
+            "gripper_left_angle_deg",
+            "gripper_right_angle_deg",
             "heading_rad",
             "heading_reference",
             "last_received_motion_command_id",
             "last_applied_motion_command_id",
+            "last_received_gripper_command_id",
+            "last_applied_gripper_command_id",
         }
         _require_exact_keys(document, expected, "VehicleStateObservation")
         _require_schema_version(
@@ -834,6 +880,8 @@ class VehicleStateObservation:
             target_right_velocity_m_s=document["target_right_velocity_m_s"],
             measured_left_velocity_m_s=document["measured_left_velocity_m_s"],
             measured_right_velocity_m_s=document["measured_right_velocity_m_s"],
+            gripper_left_angle_deg=document["gripper_left_angle_deg"],
+            gripper_right_angle_deg=document["gripper_right_angle_deg"],
             heading_rad=document["heading_rad"],
             heading_reference=(
                 None
@@ -849,6 +897,12 @@ class VehicleStateObservation:
             ],
             last_applied_motion_command_id=document[
                 "last_applied_motion_command_id"
+            ],
+            last_received_gripper_command_id=document[
+                "last_received_gripper_command_id"
+            ],
+            last_applied_gripper_command_id=document[
+                "last_applied_gripper_command_id"
             ],
         )
 

@@ -1,4 +1,4 @@
-"""手动运动命令、轮速遥测与停车原因的版本化记录流。"""
+"""手动运动/夹爪命令、UART 遥测与停车原因的版本化记录流。"""
 
 from __future__ import annotations
 
@@ -14,12 +14,15 @@ from rescue_vision.motion.protocol import (
     ParsedCarMessage,
     UnknownCarMessage,
 )
-from rescue_vision.motion.remote_control import ExecutedRemoteMotion
+from rescue_vision.motion.remote_control import (
+    ExecutedRemoteGripper,
+    ExecutedRemoteMotion,
+)
 
 
 MANUAL_MOTION_STREAM_NAME = "manual_motion"
 MANUAL_MOTION_LOG_FILENAME = "motion.jsonl"
-MANUAL_MOTION_LOG_SCHEMA_VERSION = 2
+MANUAL_MOTION_LOG_SCHEMA_VERSION = 3
 
 _EVENT_KEYS = {
     "stream_started": set(),
@@ -33,6 +36,13 @@ _EVENT_KEYS = {
         "angular_velocity_rad_s",
     },
     "motion_timeout": {"command_id"},
+    "gripper_command": {
+        "command_id",
+        "result",
+        "deadline_timestamp_ns",
+        "left_angle_deg",
+        "right_angle_deg",
+    },
     "wheel_telemetry": {
         "uart_sequence",
         "controller_timestamp_ms",
@@ -113,6 +123,17 @@ class ManualMotionLogWriter:
             "motion_timeout",
             timestamp_ns,
             command_id=command_id,
+        )
+
+    def record_gripper(self, outcome: ExecutedRemoteGripper) -> None:
+        self._write(
+            "gripper_command",
+            outcome.received_timestamp_ns,
+            command_id=outcome.command_id,
+            result=outcome.result.value,
+            deadline_timestamp_ns=outcome.deadline_timestamp_ns,
+            left_angle_deg=outcome.left_angle_deg,
+            right_angle_deg=outcome.right_angle_deg,
         )
 
     def record_car_message(self, message: ParsedCarMessage) -> None:
@@ -298,6 +319,8 @@ def _validate_event_fields(
         "target_right_m_s",
         "servo_left_deg",
         "servo_right_deg",
+        "left_angle_deg",
+        "right_angle_deg",
     ):
         if name in record:
             _finite_number(record[name], f"{location}.{name}")
@@ -332,12 +355,21 @@ def _validate_event_fields(
         and record["result"] not in _MOTION_RESULTS
     ):
         raise ValueError(f"{location}.result is not supported.")
-    if event_type == "motion_command" and int(
+    if event_type == "gripper_command" and record["result"] not in {
+        "applied",
+        "expired",
+    }:
+        raise ValueError(f"{location}.result is not supported.")
+    if event_type in {"motion_command", "gripper_command"} and int(
         record["deadline_timestamp_ns"]
     ) <= int(record["timestamp_ns"]):
         raise ValueError(
             f"{location}.deadline_timestamp_ns must follow timestamp_ns."
         )
+    if event_type == "gripper_command":
+        for name in ("left_angle_deg", "right_angle_deg"):
+            if not 0.0 <= float(record[name]) <= 180.0:
+                raise ValueError(f"{location}.{name} must be in [0, 180].")
     if (
         event_type == "safety_stop"
         and record["reason"] not in _STOP_REASONS

@@ -29,7 +29,11 @@ if TYPE_CHECKING:
         RemoteTcpServer,
         UartLineChannel,
     )
-    from rescue_vision.motion import MotionController, RemoteMotionExecutor
+    from rescue_vision.motion import (
+        MotionController,
+        RemoteGripperExecutor,
+        RemoteMotionExecutor,
+    )
 
 
 SCHEMA_VERSION = 9
@@ -265,6 +269,20 @@ class MotionRuntimeConfig:
         from rescue_vision.motion import RemoteMotionExecutor
 
         return RemoteMotionExecutor(controller)
+
+    def build_remote_gripper_executor(
+        self,
+        controller: MotionController | None,
+    ) -> RemoteGripperExecutor | None:
+        """为已装配的控制器创建远程夹爪执行器。"""
+
+        if not self.enabled:
+            return None
+        if controller is None:
+            raise RuntimeError("Enabled motion requires a motion controller.")
+        from rescue_vision.motion import RemoteGripperExecutor
+
+        return RemoteGripperExecutor(controller)
 
 
 @dataclass(frozen=True, slots=True)

@@ -333,6 +333,7 @@ def test_motion_config_builds_controller_without_opening_uart(tmp_path) -> None:
     channel = config.uart.build_channel()
     controller = config.motion.build_controller(channel)
     executor = config.motion.build_remote_executor(controller)
+    gripper_executor = config.motion.build_remote_gripper_executor(controller)
 
     assert channel is not None
     assert not channel.started
@@ -341,6 +342,8 @@ def test_motion_config_builds_controller_without_opening_uart(tmp_path) -> None:
     assert controller.limits.max_wheel_acceleration_m_s2 == pytest.approx(0.5)
     assert executor is not None
     assert executor.controller is controller
+    assert gripper_executor is not None
+    assert gripper_executor.controller is controller
 
 
 def test_motion_acceleration_limit_must_be_positive(tmp_path) -> None:

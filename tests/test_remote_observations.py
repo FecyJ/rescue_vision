@@ -30,6 +30,7 @@ def session_status(**overrides: object) -> RemoteSessionStatus:
         "timestamp_ns": 100,
         "access_mode": RemoteAccessMode.DEBUG_CONTROL,
         "motion_control_available": True,
+        "gripper_control_available": True,
         "capture_control_available": True,
         "video_stream_available": True,
         "map_snapshot_available": False,
@@ -43,7 +44,7 @@ def session_status(**overrides: object) -> RemoteSessionStatus:
         "video_nominal_fps": 15.0,
         "max_linear_velocity_m_s": 0.25,
         "max_angular_velocity_rad_s": 1.0,
-        "max_motion_command_valid_for_ms": 500,
+        "max_control_command_valid_for_ms": 500,
     }
     values.update(overrides)
     return RemoteSessionStatus(**values)  # type: ignore[arg-type]
@@ -54,6 +55,7 @@ def test_session_status_round_trip_and_topic() -> None:
     observe_only = session_status(
         access_mode=RemoteAccessMode.OBSERVE_ONLY,
         motion_control_available=False,
+        gripper_control_available=False,
         capture_control_available=False,
         max_linear_velocity_m_s=None,
         max_angular_velocity_rad_s=None,
@@ -64,9 +66,16 @@ def test_session_status_round_trip_and_topic() -> None:
         RemoteSessionStatus.from_payload(observe_only.to_payload())
         == observe_only
     )
+    assert status.SCHEMA_VERSION == 2
     assert (
         RemoteTopic.SESSION_STATUS.value == "observation/session/status"
     )
+    legacy = json.loads(status.to_payload())
+    legacy["schema_version"] = 1
+    with pytest.raises(ValueError, match="schema_version"):
+        RemoteSessionStatus.from_payload(
+            json.dumps(legacy).encode("utf-8")
+        )
 
 
 def test_session_status_rejects_unsafe_or_inconsistent_capabilities() -> None:
@@ -78,6 +87,14 @@ def test_session_status_rejects_unsafe_or_inconsistent_capabilities() -> None:
         session_status(max_linear_velocity_m_s=None)
     with pytest.raises(ValueError, match="requires video"):
         session_status(
+            video_stream_available=False,
+            video_nominal_fps=None,
+        )
+    with pytest.raises(ValueError, match="gripper control requires"):
+        session_status(
+            motion_control_available=False,
+            max_linear_velocity_m_s=None,
+            max_angular_velocity_rad_s=None,
             video_stream_available=False,
             video_nominal_fps=None,
         )
@@ -172,13 +189,24 @@ def test_vehicle_state_round_trip_and_safety_invariants() -> None:
         target_right_velocity_m_s=0.15,
         measured_left_velocity_m_s=0.19,
         measured_right_velocity_m_s=0.14,
+        gripper_left_angle_deg=27.0,
+        gripper_right_angle_deg=167.0,
         heading_rad=None,
         heading_reference=None,
         last_received_motion_command_id="drive-005",
         last_applied_motion_command_id="drive-005",
+        last_received_gripper_command_id="grip-005",
+        last_applied_gripper_command_id="grip-005",
     )
 
     assert VehicleStateObservation.from_payload(state.to_payload()) == state
+    assert state.SCHEMA_VERSION == 3
+    legacy = json.loads(state.to_payload())
+    legacy["schema_version"] = 2
+    with pytest.raises(ValueError, match="schema_version"):
+        VehicleStateObservation.from_payload(
+            json.dumps(legacy).encode("utf-8")
+        )
     with pytest.raises(ValueError, match="control_ready requires"):
         VehicleStateObservation(
             state_sequence=0,
@@ -195,10 +223,14 @@ def test_vehicle_state_round_trip_and_safety_invariants() -> None:
             target_right_velocity_m_s=None,
             measured_left_velocity_m_s=None,
             measured_right_velocity_m_s=None,
+            gripper_left_angle_deg=None,
+            gripper_right_angle_deg=None,
             heading_rad=None,
             heading_reference=None,
             last_received_motion_command_id=None,
             last_applied_motion_command_id=None,
+            last_received_gripper_command_id=None,
+            last_applied_gripper_command_id=None,
         )
 
     supervised = VehicleStateObservation(
@@ -216,10 +248,14 @@ def test_vehicle_state_round_trip_and_safety_invariants() -> None:
         target_right_velocity_m_s=None,
         measured_left_velocity_m_s=None,
         measured_right_velocity_m_s=None,
+        gripper_left_angle_deg=None,
+        gripper_right_angle_deg=None,
         heading_rad=None,
         heading_reference=None,
         last_received_motion_command_id=None,
         last_applied_motion_command_id=None,
+        last_received_gripper_command_id=None,
+        last_applied_gripper_command_id=None,
     )
     assert (
         VehicleStateObservation.from_payload(supervised.to_payload())
@@ -241,11 +277,53 @@ def test_vehicle_state_round_trip_and_safety_invariants() -> None:
             target_right_velocity_m_s=None,
             measured_left_velocity_m_s=None,
             measured_right_velocity_m_s=None,
+            gripper_left_angle_deg=None,
+            gripper_right_angle_deg=None,
             heading_rad=None,
             heading_reference=None,
             last_received_motion_command_id=None,
             last_applied_motion_command_id=None,
+            last_received_gripper_command_id=None,
+            last_applied_gripper_command_id=None,
         )
+
+
+def test_vehicle_state_gripper_angles_must_be_paired_and_bounded() -> None:
+    state = VehicleStateObservation(
+        state_sequence=0,
+        timestamp_ns=0,
+        control_ready=True,
+        safety_mode=VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP,
+        uart_connected=True,
+        watchdog_armed=False,
+        emergency_stop_latched=False,
+        motion_state=VehicleMotionState.UNKNOWN,
+        stop_reason=VehicleStopReason.UNKNOWN,
+        controller_uptime_ms=None,
+        target_left_velocity_m_s=None,
+        target_right_velocity_m_s=None,
+        measured_left_velocity_m_s=None,
+        measured_right_velocity_m_s=None,
+        gripper_left_angle_deg=None,
+        gripper_right_angle_deg=None,
+        heading_rad=None,
+        heading_reference=None,
+        last_received_motion_command_id=None,
+        last_applied_motion_command_id=None,
+        last_received_gripper_command_id=None,
+        last_applied_gripper_command_id=None,
+    )
+    values = {
+        field: getattr(state, field)
+        for field in state.__dataclass_fields__
+        if field != "SCHEMA_VERSION"
+    }
+    values["gripper_left_angle_deg"] = 27.0
+    with pytest.raises(ValueError, match="both be present"):
+        VehicleStateObservation(**values)
+    values["gripper_right_angle_deg"] = 181.0
+    with pytest.raises(ValueError, match=r"\[0, 180\]"):
+        VehicleStateObservation(**values)
 
 
 def test_capture_status_round_trip_and_strict_keys() -> None:

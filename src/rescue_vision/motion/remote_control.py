@@ -1,4 +1,4 @@
-"""远程调试运动指令到小车运动函数的安全适配。"""
+"""远程调试运动与夹爪指令到 Rescue Car 控制函数的适配。"""
 
 from __future__ import annotations
 
@@ -9,11 +9,13 @@ from enum import Enum
 from typing import Protocol
 
 from rescue_vision.communication import (
+    DebugGripperCommand,
     DebugMotionCommand,
     MotionControlMode,
     ReceivedRemoteMessage,
     RemoteStream,
     RemoteTopic,
+    UartError,
 )
 from rescue_vision.motion.controller import MotionController
 from rescue_vision.motion.protocol import ParsedCarMessage
@@ -28,6 +30,25 @@ class RemoteControlReceiver(Protocol):
 
 class RemoteMotionError(RuntimeError):
     """远程运动消息无法安全执行。"""
+
+
+class RemoteGripperError(RuntimeError):
+    """远程夹爪消息无法执行。"""
+
+
+class RemoteGripperResult(str, Enum):
+    APPLIED = "applied"
+    EXPIRED = "expired"
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutedRemoteGripper:
+    command_id: str
+    result: RemoteGripperResult
+    received_timestamp_ns: int
+    deadline_timestamp_ns: int
+    left_angle_deg: float
+    right_angle_deg: float
 
 
 class RemoteMotionResult(str, Enum):
@@ -45,6 +66,104 @@ class ExecutedRemoteMotion:
     deadman_enabled: bool
     linear_velocity_m_s: float
     angular_velocity_rad_s: float
+
+
+class RemoteGripperExecutor:
+    """执行已经通过 TCP 帧校验的一次性夹爪角度消息。"""
+
+    def __init__(
+        self,
+        controller: MotionController,
+        *,
+        monotonic_ns: Callable[[], int] = time.monotonic_ns,
+    ) -> None:
+        self.controller = controller
+        self._monotonic_ns = monotonic_ns
+
+    def execute(
+        self,
+        message: ReceivedRemoteMessage,
+        *,
+        now_ns: int | None = None,
+    ) -> ExecutedRemoteGripper:
+        """校验并下发夹爪角度；过期消息不改变当前夹爪位置。"""
+
+        current_ns = self._now(now_ns)
+        try:
+            self._validate_envelope(message)
+            command = DebugGripperCommand.from_payload(message.payload)
+            deadline_ns = message.received_timestamp_ns + (
+                command.valid_for_ms * 1_000_000
+            )
+            if current_ns < message.received_timestamp_ns:
+                raise RemoteGripperError(
+                    "now_ns precedes the Raspberry Pi receive timestamp: "
+                    f"{current_ns} < {message.received_timestamp_ns}."
+                )
+            if (
+                command.valid_for_ms
+                > self.controller.limits.max_remote_command_valid_for_ms
+            ):
+                raise RemoteGripperError(
+                    "Remote command valid_for_ms exceeds configured limit "
+                    f"{self.controller.limits.max_remote_command_valid_for_ms}: "
+                    f"{command.valid_for_ms}."
+                )
+            if current_ns >= deadline_ns:
+                return ExecutedRemoteGripper(
+                    command.command_id,
+                    RemoteGripperResult.EXPIRED,
+                    message.received_timestamp_ns,
+                    deadline_ns,
+                    command.left_angle_deg,
+                    command.right_angle_deg,
+                )
+            self.controller.set_gripper_angles(
+                command.left_angle_deg,
+                command.right_angle_deg,
+            )
+        except Exception as exc:
+            if isinstance(exc, (RemoteGripperError, UartError)):
+                raise
+            raise RemoteGripperError("Invalid remote gripper command.") from exc
+
+        return ExecutedRemoteGripper(
+            command.command_id,
+            RemoteGripperResult.APPLIED,
+            message.received_timestamp_ns,
+            deadline_ns,
+            command.left_angle_deg,
+            command.right_angle_deg,
+        )
+
+    def _now(self, value: int | None) -> int:
+        current = self._monotonic_ns() if value is None else value
+        if isinstance(current, bool) or not isinstance(current, int) or current < 0:
+            raise ValueError(
+                f"now_ns must be a non-negative integer, got {current!r}."
+            )
+        return current
+
+    @staticmethod
+    def _validate_envelope(message: ReceivedRemoteMessage) -> None:
+        if not isinstance(message, ReceivedRemoteMessage):
+            raise TypeError("message must be ReceivedRemoteMessage.")
+        if message.stream is not RemoteStream.CONTROL:
+            raise RemoteGripperError(
+                "Remote gripper message must use control stream."
+            )
+        if message.topic != RemoteTopic.DEBUG_GRIPPER.value:
+            raise RemoteGripperError(
+                f"Unexpected remote gripper topic {message.topic!r}."
+            )
+        if message.content_type != "application/json":
+            raise RemoteGripperError(
+                "Remote gripper content_type must be 'application/json'."
+            )
+        if message.attributes:
+            raise RemoteGripperError(
+                "Remote gripper attributes must be empty."
+            )
 
 
 class RemoteMotionExecutor:
@@ -140,6 +259,8 @@ class RemoteMotionExecutor:
             except BaseException as stop_error:
                 exc.add_note(f"Remote motion safety stop also failed: {stop_error!r}")
             if not isinstance(exc, Exception):
+                raise
+            if isinstance(exc, UartError):
                 raise
             if isinstance(exc, RemoteMotionError):
                 raise

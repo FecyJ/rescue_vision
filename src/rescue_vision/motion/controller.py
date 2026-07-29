@@ -1,4 +1,4 @@
-"""双轮差速小车运动函数。"""
+"""Rescue Car 双轮差速与夹爪舵机控制函数。"""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from rescue_vision.motion.protocol import (
     ParsedCarMessage,
     UnknownCarMessage,
     encode_emergency_stop_command,
+    encode_gripper_command,
     encode_soft_brake_command,
     encode_state_query_command,
     encode_wheel_speed_command,
@@ -75,7 +76,7 @@ class MotionLimits:
 
 
 class MotionController:
-    """通过行通道驱动 Rescue Car 双轮差速底盘。"""
+    """通过同一行通道驱动 Rescue Car 底盘和夹爪。"""
 
     def __init__(
         self,
@@ -199,6 +200,17 @@ class MotionController:
             "angular_velocity_rad_s",
         )
         self.drive(0.0, -angular)
+
+    def set_gripper_angles(
+        self,
+        left_angle_deg: float,
+        right_angle_deg: float,
+    ) -> None:
+        """同时设置左右夹爪舵机角度，单位 degree。"""
+
+        self._channel.send_line(
+            encode_gripper_command(left_angle_deg, right_angle_deg)
+        )
 
     def soft_brake(self) -> None:
         """按固件减速度斜坡制动到静止。"""

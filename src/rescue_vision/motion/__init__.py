@@ -1,4 +1,4 @@
-"""Rescue Car 运动控制、协议适配与远程调试执行。"""
+"""Rescue Car 底盘/夹爪控制、协议适配与远程调试执行。"""
 
 from rescue_vision.motion.controller import MotionController, MotionLimits
 from rescue_vision.motion.protocol import (
@@ -11,7 +11,11 @@ from rescue_vision.motion.protocol import (
     parse_car_line,
 )
 from rescue_vision.motion.remote_control import (
+    ExecutedRemoteGripper,
     ExecutedRemoteMotion,
+    RemoteGripperError,
+    RemoteGripperExecutor,
+    RemoteGripperResult,
     RemoteMotionError,
     RemoteMotionExecutor,
     RemoteMotionResult,
@@ -30,6 +34,7 @@ __all__ = [
     "CarSafetyStatus",
     "CarStopReason",
     "CarTelemetry",
+    "ExecutedRemoteGripper",
     "ExecutedRemoteMotion",
     "MotionController",
     "MotionLimits",
@@ -38,6 +43,9 @@ __all__ = [
     "MANUAL_MOTION_STREAM_NAME",
     "ManualMotionLogWriter",
     "ParsedCarMessage",
+    "RemoteGripperError",
+    "RemoteGripperExecutor",
+    "RemoteGripperResult",
     "RemoteMotionError",
     "RemoteMotionExecutor",
     "RemoteMotionResult",
