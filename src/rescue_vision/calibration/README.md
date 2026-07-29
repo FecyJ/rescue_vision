@@ -181,10 +181,9 @@ output/ground_mapping_YYYYMMDD_HHMMSS_ffffff/
 原始采集和临时输出不提交 Git。最终部署应保留一份经过验收的配置，并同时记录：
 
 - 相机序列/硬件标识、分辨率和焦点；
-- 标定日期、代码提交和 OpenCV 版本；
-- 原始结果文件的校验和；
+- 标定日期和 OpenCV 版本；
 - 内参与地面映射误差摘要；
-- 相机安装版本或可复现的机械定位方式。
+- 可复现的相机机械定位方式。
 
 如果这些元数据无法对应，宁可重新标定，也不要混用两次标定产物。
 
@@ -211,7 +210,7 @@ geometry = config.build_geometry()
 if geometry is None:
     raise RuntimeError("内参未启用")
 
-print("intrinsics:", geometry.camera_model.calibration.fingerprint())
+print("intrinsics:", geometry.camera_model.calibration.calibration_id)
 print("ground mapping:", geometry.ground_projector is not None)
 PY
 ```

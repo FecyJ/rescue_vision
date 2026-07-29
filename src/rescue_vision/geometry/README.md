@@ -17,7 +17,7 @@
 | `GroundProjector.ground_to_bev_pixel()` / `ground_to_bev_pixels()` | 地面点转鸟瞰图像素 |
 | `GroundProjector.bev_pixel_to_ground()` / `bev_pixels_to_ground()` | 鸟瞰像素转地面点 |
 | `GroundProjector.make_bev_image()` | 按地面映射生成完整 BEV |
-| `CameraCalibration.fingerprint()` | 标识模型、尺寸、`K/D/new_K` 的稳定 SHA-256 |
+| `CameraCalibration.calibration_id` | 关联当前内参与地面标定的可读标识 |
 
 坐标数据结构：
 

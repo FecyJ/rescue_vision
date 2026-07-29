@@ -10,7 +10,7 @@
 | `FrameSource` | 相机与离线源共同协议 | `read(timeout)` 交付一帧 |
 | `Picamera2Source` | 正式采集首选真机源 | 保存曝光、增益、焦点等逐帧元数据 |
 | `RpicamSource` | `rpicam-vid` 低开销真机源 | 不承诺完整传感器元数据 |
-| `RecordingSource` | 严格回放记录目录 | 验证图片 SHA-256，保留原序号和时间 |
+| `RecordingSource` | 严格回放记录目录 | 验证图片可解码且尺寸一致，保留原序号和时间 |
 | `ImageDirectorySource` | 稳定顺序读取图片目录 | 按文件名排序并按 FPS 生成时间 |
 | `VideoFileSource` | 读取普通视频 | 使用视频或覆盖 FPS 生成时间 |
 | `FrameRecorder` | 有界异步写盘 | 队列满时返回 `False`，不阻塞主链路 |

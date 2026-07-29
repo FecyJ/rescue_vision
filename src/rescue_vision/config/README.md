@@ -192,9 +192,8 @@ geometry:
 `hailo.enabled: false` 时，导入配置和运行无硬件测试不会导入 HailoRT。启用后，`build_backend()` 才会：
 
 1. 检查 HEF、ONNX 后处理和张量映射文件；
-2. 核对 HEF SHA-256；
-3. 使用 `raw_classes` 数量和推理阈值创建后端；
-4. 打开 Hailo 设备资源。
+2. 使用 `raw_classes` 数量和推理阈值创建后端；
+3. 打开 Hailo 设备资源。
 
 后端必须由调用方 `close()`，通常交给 `TargetPoseDetector` 的上下文管理统一释放。
 
@@ -324,9 +323,8 @@ PySerial 并打开设备。电机命令、轮速和未来 IMU 报文由后续协
   `runtime.example.yaml` 展示的值。现场只需写需要覆盖的字段。
 - 子系统一旦启用，设备路径、轮距、夹爪机械端点、标定路径和模型资产仍然
   必须完整有效，不会猜测这些安全关键参数。
-- 旧配置中的 `schema_version`、模型版本和校验和字段已删除；这些字段会按
-  未知字段拒绝。`detection_threshold` 和 `k0_threshold` 位于 `perception`，
-  模型类别只保留为诊断证据，最终类别由 ROI HSV 决定。
+- `detection_threshold` 和 `k0_threshold` 位于 `perception`；模型类别只保留
+  为诊断证据，最终类别由 ROI HSV 决定。
 - 位于 `configs/` 的 YAML 指向仓库根目录资产时通常以 `../` 开头。
 - 路径、类别和阈值只在配置中维护，不在业务模块再次硬编码。
 
