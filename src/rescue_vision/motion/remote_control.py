@@ -104,6 +104,29 @@ class GripperCalibration:
             raise ValueError("Left gripper open and closed angles must differ.")
         if self.open_right_angle_deg == self.closed_right_angle_deg:
             raise ValueError("Right gripper open and closed angles must differ.")
+        for state, left, right in (
+            (
+                "open",
+                self.open_left_angle_deg,
+                self.open_right_angle_deg,
+            ),
+            (
+                "closed",
+                self.closed_left_angle_deg,
+                self.closed_right_angle_deg,
+            ),
+        ):
+            angle_sum = left + right
+            if not math.isclose(
+                angle_sum,
+                180.0,
+                rel_tol=1e-12,
+                abs_tol=1e-9,
+            ):
+                raise ValueError(
+                    f"Gripper {state} angles must sum to 180 degrees, "
+                    f"got {left} + {right} = {angle_sum}."
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,15 +280,9 @@ class RemoteGripperExecutor:
         if current_angles is None:
             return False
         if self._close_pressed:
-            target_angles = (
-                self.calibration.closed_left_angle_deg,
-                self.calibration.closed_right_angle_deg,
-            )
+            target_left_angle = self.calibration.closed_left_angle_deg
         else:
-            target_angles = (
-                self.calibration.open_left_angle_deg,
-                self.calibration.open_right_angle_deg,
-            )
+            target_left_angle = self.calibration.open_left_angle_deg
         left_rate = (
             abs(
                 self.calibration.closed_left_angle_deg
@@ -273,24 +290,19 @@ class RemoteGripperExecutor:
             )
             / self.calibration.full_travel_time_s
         )
-        right_rate = (
-            abs(
-                self.calibration.closed_right_angle_deg
-                - self.calibration.open_right_angle_deg
-            )
-            / self.calibration.full_travel_time_s
+        # 把可能来自旧命令的非互补目标投影到 left + right = 180 的
+        # 对称线上，再只推进一个自由度；所有远程 UART 下发都重新构造右角。
+        current_left_angle = (
+            current_angles[0] + (180.0 - current_angles[1])
+        ) / 2.0
+        next_left_angle = _move_toward(
+            current_left_angle,
+            target_left_angle,
+            left_rate * elapsed_s,
         )
         next_angles = (
-            _move_toward(
-                current_angles[0],
-                target_angles[0],
-                left_rate * elapsed_s,
-            ),
-            _move_toward(
-                current_angles[1],
-                target_angles[1],
-                right_rate * elapsed_s,
-            ),
+            next_left_angle,
+            180.0 - next_left_angle,
         )
         if next_angles == current_angles:
             return False

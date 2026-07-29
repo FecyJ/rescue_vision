@@ -68,7 +68,7 @@ motion:
   max_wheel_acceleration_m_s2: 0.50
   max_remote_command_valid_for_ms: 500
   gripper:
-    # 必须先在真机逐侧测得安全端点和固定速度全行程时间，再启用持续扳机控制。
+    # 必须先测得安全端点；每组左右角之和必须为 180°，再启用持续扳机控制。
     enabled: false
     open_left_angle_deg: null
     open_right_angle_deg: null

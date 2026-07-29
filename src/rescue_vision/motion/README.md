@@ -31,7 +31,7 @@
 | `drain_messages()` | 无 | 非阻塞排空当前 UART 回传 |
 | `RemoteMotionExecutor.execute()` | `ReceivedRemoteMessage` | 校验远程运动消息后执行 |
 | `RemoteMotionExecutor.check_timeout()` | 可选本机单调时间 ns | 到期时停车，返回是否触发 |
-| `GripperCalibration` | 左右开/闭端点与固定速度全行程时间 | 严格验证机械安全范围 |
+| `GripperCalibration` | 左右开/闭端点与固定速度全行程时间 | 严格验证安全范围及每组端点相加为 180° |
 | `RemoteGripperExecutor.execute()` | `ReceivedRemoteMessage` | 接受一帧持续夹爪扳机状态 |
 | `RemoteGripperExecutor.update()` | 可选本机单调时间 ns | 按按压方向以配置速度渐进下发舵机目标 |
 | `RemoteGripperExecutor.check_timeout()` / `stop()` | 可选本机单调时间 ns | 超时或退出时停止推进，保留当前角度 |
@@ -182,6 +182,8 @@ controller.set_gripper_angles(
 意外丢落；调用方退出前若确实需要释放，必须根据现场安全条件显式发送另一组
 已标定角度。10 Hz 遥测中的 `servo_left_deg` / `servo_right_deg` 是固件
 `CarState` 报告的目标角度，不是舵机物理位置反馈。
+低层 `set_gripper_angles()` 仍忠实编码调用方给出的两个角度；180° 互补约束
+属于远程夹爪执行器及其 `GripperCalibration`，不会暗中改变其他直接调用方。
 
 ## 6. 柔和停车和紧急停止
 
@@ -315,7 +317,9 @@ else:
 ```
 
 `update()` 从 `MotionController.gripper_target_angles_deg` 取得最近下发值或
-STM32 遥测目标；尚未收到任何目标时安全等待，不猜测启动角度。非法 envelope、
+STM32 遥测目标；若旧目标不互补，会先投影到 `left + right = 180°` 的对称线，
+随后只推进左角并以 `right = 180° - left` 重建每条远程 UART 指令。尚未收到
+任何目标时安全等待，不猜测启动角度。非法 envelope、
 按压状态或有效期会清除当前持续状态并抛出 `RemoteGripperError`。该执行器不会
 自行改变底盘速度；应用把异常传播到 `run_remote_motion()` 时，外层仍会先走
 统一停车路径。
