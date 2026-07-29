@@ -275,8 +275,15 @@ def _non_negative(value: object, location: str) -> float:
 
 
 def _move_toward(current: float, target: float, maximum_delta: float) -> float:
-    if target > current:
-        return min(target, current + maximum_delta)
-    if target < current:
-        return max(target, current - maximum_delta)
-    return current
+    delta = target - current
+    distance = abs(delta)
+    if distance <= maximum_delta or math.isclose(
+        distance,
+        maximum_delta,
+        rel_tol=1e-12,
+        abs_tol=1e-15,
+    ):
+        return target
+    if delta > 0.0:
+        return current + maximum_delta
+    return current - maximum_delta

@@ -125,8 +125,10 @@ class RemoteMotionExecutor:
                 and command.angular_velocity_rad_s == 0.0
             )
             if zero_twist:
-                # 手柄回中应使用固件减速度斜坡，不能用 m0,0 瞬间清零目标。
-                self.controller.soft_brake()
+                # 死手仍开启时，手柄回中是普通目标变化，必须与其他 twist
+                # 共用树莓派单轮加速度限制。真机固件的 b0,0 会让实测轮速
+                # 直接归零，只保留给死手关闭、超时和异常等安全停车路径。
+                self.controller.drive(0.0, 0.0)
             else:
                 self.controller.drive(
                     command.linear_velocity_m_s,

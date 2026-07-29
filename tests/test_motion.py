@@ -328,30 +328,57 @@ def test_remote_twist_executes_and_expiry_uses_receive_clock() -> None:
     assert channel.sent == [b"m0.1,0.1", b"b0,0"]
 
 
-def test_remote_zero_twist_uses_soft_brake_and_clears_deadline() -> None:
+def test_remote_zero_twist_slew_limits_to_zero_and_clears_deadline() -> None:
     channel = FakeCarChannel()
+    clock = FakeClock(1_050_000_000)
+    controller = MotionController(channel, limits(), monotonic_ns=clock)
     executor = RemoteMotionExecutor(
-        MotionController(channel, limits()),
-        monotonic_ns=lambda: 1_050_000_000,
+        controller,
+        monotonic_ns=clock,
     )
-    executor.execute(remote_message(twist_command()))
+    executor.execute(
+        remote_message(
+            twist_command(
+                linear_velocity_m_s=0.2,
+                angular_velocity_rad_s=0.0,
+                valid_for_ms=500,
+            )
+        )
+    )
+    clock.advance(0.4)
+    assert controller.update()
 
     stopped = executor.execute(
         remote_message(
             twist_command(
                 linear_velocity_m_s=0.0,
                 angular_velocity_rad_s=0.0,
+                valid_for_ms=500,
             ),
-            received_timestamp_ns=1_060_000_000,
+            received_timestamp_ns=1_440_000_000,
         ),
-        now_ns=1_070_000_000,
     )
 
     assert stopped.result is RemoteMotionResult.APPLIED
     assert stopped.linear_velocity_m_s == 0.0
     assert stopped.angular_velocity_rad_s == 0.0
     assert executor.active_deadline_ns is None
-    assert channel.sent == [b"b0,0"]
+    assert controller.target_wheel_speeds_m_s == (0.0, 0.0)
+    assert controller.commanded_wheel_speeds_m_s == pytest.approx((0.2, 0.2))
+    assert channel.sent == [b"m0.2,0.2"]
+
+    for _ in range(4):
+        clock.advance(0.1)
+        assert controller.update()
+
+    assert controller.commanded_wheel_speeds_m_s == (0.0, 0.0)
+    assert channel.sent == [
+        b"m0.2,0.2",
+        b"m0.15,0.15",
+        b"m0.1,0.1",
+        b"m0.05,0.05",
+        b"m0,0",
+    ]
 
 
 def test_remote_deadman_off_and_already_expired_commands_stop() -> None:
