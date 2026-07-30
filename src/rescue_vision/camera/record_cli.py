@@ -22,6 +22,7 @@ from rescue_vision.geometry.camera_model import (
     IMAGE_BORDER_FILL_VALUE,
     CameraModel,
 )
+from rescue_vision.exception_notes import add_exception_note
 from rescue_vision.versioning import git_version
 
 
@@ -106,12 +107,18 @@ def record_session(
 
     if primary_error is not None:
         for location, error in cleanup_errors:
-            primary_error.add_note(f"{location} also failed: {error!r}")
+            add_exception_note(
+                primary_error,
+                f"{location} also failed: {error!r}",
+            )
         raise primary_error.with_traceback(primary_error.__traceback__)
     if cleanup_errors:
         location, error = cleanup_errors[0]
         for later_location, later_error in cleanup_errors[1:]:
-            error.add_note(f"{later_location} also failed: {later_error!r}")
+            add_exception_note(
+                error,
+                f"{later_location} also failed: {later_error!r}",
+            )
         raise RuntimeError(f"Capture cleanup failed in {location}.") from error
     if interrupted:
         return delivered

@@ -9,6 +9,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
+from rescue_vision.exception_notes import add_exception_note
+
 
 class UartError(RuntimeError):
     """UART 通道无法继续可靠工作。"""
@@ -256,8 +258,9 @@ class UartLineChannel:
                 try:
                     self._serial.close()
                 except BaseException as cleanup_error:
-                    error.add_note(
-                        f"UART open cleanup also failed: {cleanup_error!r}"
+                    add_exception_note(
+                        error,
+                        f"UART open cleanup also failed: {cleanup_error!r}",
                     )
             self._serial = None
             self._reader_thread = None
@@ -388,8 +391,9 @@ class UartLineChannel:
         if cleanup_errors:
             location, error = cleanup_errors[0]
             for later_location, later_error in cleanup_errors[1:]:
-                error.add_note(
-                    f"{later_location} also failed: {later_error!r}"
+                add_exception_note(
+                    error,
+                    f"{later_location} also failed: {later_error!r}",
                 )
             raise RuntimeError(f"UART cleanup failed in {location}.") from error
 
@@ -450,8 +454,9 @@ class UartLineChannel:
             self.stop()
         except BaseException as cleanup_error:
             if isinstance(exc, BaseException):
-                exc.add_note(
-                    f"UartLineChannel cleanup also failed: {cleanup_error!r}"
+                add_exception_note(
+                    exc,
+                    f"UartLineChannel cleanup also failed: {cleanup_error!r}",
                 )
                 return
             raise

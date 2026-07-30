@@ -15,6 +15,7 @@ from rescue_vision.communication import (
     RemoteStream,
     RemoteTopic,
 )
+from rescue_vision.exception_notes import add_exception_note
 from rescue_vision.motion.controller import MotionController
 from rescue_vision.motion.protocol import ParsedCarMessage
 
@@ -136,7 +137,10 @@ class RemoteMotionExecutor:
             try:
                 self.stop()
             except BaseException as stop_error:
-                exc.add_note(f"Remote motion safety stop also failed: {stop_error!r}")
+                add_exception_note(
+                    exc,
+                    f"Remote motion safety stop also failed: {stop_error!r}",
+                )
             if not isinstance(exc, Exception):
                 raise
             if isinstance(exc, RemoteMotionError):
@@ -259,7 +263,10 @@ def run_remote_motion(
         try:
             executor.stop()
         except BaseException as stop_error:
-            exc.add_note(f"Remote motion shutdown stop also failed: {stop_error!r}")
+            add_exception_note(
+                exc,
+                f"Remote motion shutdown stop also failed: {stop_error!r}",
+            )
         raise
     else:
         executor.stop()

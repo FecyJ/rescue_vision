@@ -21,6 +21,7 @@ from rescue_vision.camera.picamera2_source import Picamera2Source
 from rescue_vision.camera.record_cli import undistort_camera_frame
 from rescue_vision.camera.recording import FrameRecorder
 from rescue_vision.camera.rpicam_source import RpicamSource
+from rescue_vision.exception_notes import add_exception_note
 from rescue_vision.communication import (
     CaptureAction,
     CaptureRecordingState,
@@ -288,9 +289,10 @@ class CaptureSession:
             try:
                 recorder.stop()
             except BaseException as cleanup_error:
-                exc.add_note(
+                add_exception_note(
+                    exc,
                     "Frame recorder cleanup after motion log start failure "
-                    f"also failed: {cleanup_error!r}"
+                    f"also failed: {cleanup_error!r}",
                 )
             raise
         self.recorder = recorder
@@ -458,8 +460,9 @@ class CaptureSession:
             if primary_error is None:
                 primary_error = exc
             else:
-                primary_error.add_note(
-                    f"Frame recorder cleanup also failed: {exc!r}"
+                add_exception_note(
+                    primary_error,
+                    f"Frame recorder cleanup also failed: {exc!r}",
                 )
         finally:
             self._remember_counts(recorder)
@@ -814,12 +817,16 @@ def run_manual_capture_session(
                 timestamp_ns=time.monotonic_ns(),
             )
         except BaseException as log_error:
-            exc.add_note(f"Safety stop logging also failed: {log_error!r}")
+            add_exception_note(
+                exc,
+                f"Safety stop logging also failed: {log_error!r}",
+            )
         try:
             capture.close()
         except BaseException as cleanup_error:
-            exc.add_note(
-                f"Capture session cleanup also failed: {cleanup_error!r}"
+            add_exception_note(
+                exc,
+                f"Capture session cleanup also failed: {cleanup_error!r}",
             )
         raise
     else:

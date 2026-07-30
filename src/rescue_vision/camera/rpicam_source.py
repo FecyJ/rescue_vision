@@ -8,6 +8,8 @@ import time
 import cv2
 import numpy as np
 
+from rescue_vision.exception_notes import add_exception_note
+
 from .frame import CameraFrame
 
 
@@ -124,7 +126,10 @@ class RpicamSource:
             try:
                 self.stop()
             except BaseException as cleanup_error:
-                error.add_note(f"rpicam cleanup also failed: {cleanup_error!r}")
+                add_exception_note(
+                    error,
+                    f"rpicam cleanup also failed: {cleanup_error!r}",
+                )
             raise error
 
         if self._reader_error is not None:
@@ -133,8 +138,9 @@ class RpicamSource:
             try:
                 self.stop()
             except BaseException as cleanup_error:
-                startup_error.add_note(
-                    f"rpicam cleanup also failed: {cleanup_error!r}"
+                add_exception_note(
+                    startup_error,
+                    f"rpicam cleanup also failed: {cleanup_error!r}",
                 )
             raise startup_error from reader_error
 
@@ -321,6 +327,9 @@ class RpicamSource:
             self.stop()
         except BaseException as cleanup_error:
             if isinstance(exc, BaseException):
-                exc.add_note(f"rpicam cleanup also failed: {cleanup_error!r}")
+                add_exception_note(
+                    exc,
+                    f"rpicam cleanup also failed: {cleanup_error!r}",
+                )
                 return
             raise

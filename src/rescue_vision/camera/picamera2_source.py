@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 
 from rescue_vision.camera.frame import CameraFrame, MetadataValue
+from rescue_vision.exception_notes import add_exception_note
 
 
 class Picamera2Source:
@@ -89,7 +90,10 @@ class Picamera2Source:
             try:
                 self.stop()
             except BaseException as cleanup_error:
-                error.add_note(f"Picamera2 cleanup also failed: {cleanup_error!r}")
+                add_exception_note(
+                    error,
+                    f"Picamera2 cleanup also failed: {cleanup_error!r}",
+                )
             raise error
         if self._reader_error is not None:
             error = self._reader_error
@@ -97,8 +101,9 @@ class Picamera2Source:
             try:
                 self.stop()
             except BaseException as cleanup_error:
-                startup_error.add_note(
-                    f"Picamera2 cleanup also failed: {cleanup_error!r}"
+                add_exception_note(
+                    startup_error,
+                    f"Picamera2 cleanup also failed: {cleanup_error!r}",
                 )
             raise startup_error from error
 
@@ -250,6 +255,9 @@ class Picamera2Source:
             self.stop()
         except BaseException as cleanup_error:
             if isinstance(exc, BaseException):
-                exc.add_note(f"Picamera2 cleanup also failed: {cleanup_error!r}")
+                add_exception_note(
+                    exc,
+                    f"Picamera2 cleanup also failed: {cleanup_error!r}",
+                )
                 return
             raise

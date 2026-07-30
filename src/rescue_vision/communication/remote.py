@@ -15,6 +15,8 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Protocol, TypeAlias, runtime_checkable
 
+from rescue_vision.exception_notes import add_exception_note
+
 
 PROTOCOL_SCHEMA_VERSION = 2
 _FRAME_MAGIC = b"RVM2"
@@ -664,8 +666,9 @@ class RemoteMessageConnection:
         if cleanup_errors:
             location, error = cleanup_errors[0]
             for later_location, later_error in cleanup_errors[1:]:
-                error.add_note(
-                    f"{later_location} also failed: {later_error!r}"
+                add_exception_note(
+                    error,
+                    f"{later_location} also failed: {later_error!r}",
                 )
             raise RuntimeError(
                 f"Remote connection cleanup failed in {location}."
@@ -920,9 +923,10 @@ class RemoteMessageConnection:
             self.stop()
         except BaseException as cleanup_error:
             if isinstance(exc, BaseException):
-                exc.add_note(
+                add_exception_note(
+                    exc,
                     "RemoteMessageConnection cleanup also failed: "
-                    f"{cleanup_error!r}"
+                    f"{cleanup_error!r}",
                 )
                 return
             raise
