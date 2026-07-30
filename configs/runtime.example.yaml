@@ -1,4 +1,4 @@
-schema_version: 10
+schema_version: 11
 
 camera:
   # picamera2 可记录逐帧曝光/增益等元数据；rpicam_vid 是低开销备选。
@@ -121,6 +121,55 @@ perception:
     open_iterations: 1
     close_iterations: 1
     min_component_area_fraction: 0.002
+  field_features:
+    # 当前环境没有现场场地样本，模板保持关闭；开启前必须启用并验证地面映射。
+    enabled: false
+    colors:
+      # 初值取自命题文件示意图而非官方色卡，只用于搭建和离线初调。
+      safe_red:
+        - lower: [0, 80, 80]
+          upper: [12, 255, 255]
+        - lower: [170, 80, 80]
+          upper: [179, 255, 255]
+      safe_blue:
+        - lower: [90, 60, 70]
+          upper: [110, 255, 255]
+      start_magenta:
+        - lower: [140, 80, 80]
+          upper: [165, 255, 255]
+      entrance_purple:
+        - lower: [130, 60, 50]
+          upper: [160, 255, 255]
+      dark_marking:
+        - lower: [0, 0, 0]
+          upper: [179, 255, 80]
+    morphology:
+      kernel_size: 5
+      open_iterations: 1
+      close_iterations: 2
+    region_filter:
+      min_area_fraction: 0.002
+      min_rectangularity: 0.55
+      # 同时容纳命题图内外尺寸和制造、标定误差；现场数据到位后收紧。
+      dimension_tolerance_fraction: 0.40
+    safe_zone:
+      width_mm: 600.0
+      depth_mm: 300.0
+      entrance_color_fraction: 0.10
+      divider_dark_fraction: 0.10
+    start_zone:
+      side_mm: 300.0
+    center_cross:
+      min_axis_span_fraction: 0.20
+      max_gap_fraction: 0.06
+      min_gap_count: 2
+      perpendicular_tolerance_deg: 15.0
+    boundary:
+      canny_low_threshold: 50
+      canny_high_threshold: 150
+      min_line_length_fraction: 0.20
+      corner_tolerance_deg: 20.0
+      max_features: 8
 
 hailo:
   # 模板默认禁用；实际部署值写入不提交的 configs/runtime.yaml。

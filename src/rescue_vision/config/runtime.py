@@ -19,6 +19,7 @@ from rescue_vision.perception.types import (
     HsvRange,
     TargetClass,
 )
+from rescue_vision.perception.field_feature_types import FieldFeatureConfig
 from rescue_vision.tracking import TrackingConfig
 from rescue_vision.world import (
     RegionKind,
@@ -37,7 +38,7 @@ if TYPE_CHECKING:
     from rescue_vision.motion import MotionController, RemoteMotionExecutor
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 def _mapping(value: object, location: str) -> dict[str, Any]:
@@ -120,6 +121,29 @@ def _hsv_triplet(value: object, location: str) -> tuple[int, int, int]:
     ):
         raise ValueError(f"{location} must be an integer [H, S, V] list.")
     return (value[0], value[1], value[2])
+
+
+def _hsv_ranges(value: object, location: str) -> tuple[HsvRange, ...]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{location} must be a non-empty list.")
+    ranges: list[HsvRange] = []
+    for index, item in enumerate(value):
+        item_location = f"{location}[{index}]"
+        item_raw = _mapping(item, item_location)
+        _reject_unknown(item_raw, {"lower", "upper"}, item_location)
+        ranges.append(
+            HsvRange(
+                lower=_hsv_triplet(
+                    _required(item_raw, "lower", item_location),
+                    f"{item_location}.lower",
+                ),
+                upper=_hsv_triplet(
+                    _required(item_raw, "upper", item_location),
+                    f"{item_location}.upper",
+                ),
+            )
+        )
+    return tuple(ranges)
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,6 +332,27 @@ class PerceptionConfig:
     detection_threshold: float
     k0_threshold: float
     color_classifier: HsvColorClassifierConfig
+    field_features: FieldFeatureConfig
+
+    def build_field_feature_detector(
+        self,
+        *,
+        max_observation_age_ms: float,
+        ground_projector: GroundProjector | None = None,
+    ):
+        """按配置创建传统视觉场地特征检测器；禁用时返回 ``None``。"""
+
+        if not self.field_features.enabled:
+            return None
+        from rescue_vision.perception.field_feature_detector import (
+            FieldFeatureDetector,
+        )
+
+        return FieldFeatureDetector(
+            self.field_features,
+            max_observation_age_ms=max_observation_age_ms,
+            ground_projector=ground_projector,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -407,7 +452,7 @@ class AppConfig:
 
 
 def load_runtime_config(path: str | Path) -> AppConfig:
-    """从 YAML 加载 schema v10；缺项和未知字段均视为错误。"""
+    """从 YAML 加载 schema v11；缺项和未知字段均视为错误。"""
 
     config_path = Path(path).expanduser().resolve()
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -1017,6 +1062,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "detection_threshold",
             "k0_threshold",
             "color_classifier",
+            "field_features",
         },
         "perception",
     )
@@ -1084,32 +1130,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "perception.color_classifier.ranges."
             f"{target_class.value}"
         )
-        if not isinstance(range_values, list) or not range_values:
-            raise ValueError(
-                f"{range_location} must be a non-empty list."
-            )
-        class_ranges: list[HsvRange] = []
-        for index, range_value in enumerate(range_values):
-            item_location = f"{range_location}[{index}]"
-            item_raw = _mapping(range_value, item_location)
-            _reject_unknown(
-                item_raw,
-                {"lower", "upper"},
-                item_location,
-            )
-            class_ranges.append(
-                HsvRange(
-                    lower=_hsv_triplet(
-                        _required(item_raw, "lower", item_location),
-                        f"{item_location}.lower",
-                    ),
-                    upper=_hsv_triplet(
-                        _required(item_raw, "upper", item_location),
-                        f"{item_location}.upper",
-                    ),
-                )
-            )
-        parsed_ranges[target_class] = tuple(class_ranges)
+        parsed_ranges[target_class] = _hsv_ranges(range_values, range_location)
 
     color_classifier = HsvColorClassifierConfig(
         green_supply=parsed_ranges[TargetClass.GREEN_SUPPLY],
@@ -1173,10 +1194,308 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "perception.color_classifier.min_component_area_fraction",
         ),
     )
+    field_raw = _mapping(
+        _required(perception_raw, "field_features", "perception"),
+        "perception.field_features",
+    )
+    _reject_unknown(
+        field_raw,
+        {
+            "enabled",
+            "colors",
+            "morphology",
+            "region_filter",
+            "safe_zone",
+            "start_zone",
+            "center_cross",
+            "boundary",
+        },
+        "perception.field_features",
+    )
+    field_enabled = _required(
+        field_raw,
+        "enabled",
+        "perception.field_features",
+    )
+    if not isinstance(field_enabled, bool):
+        raise ValueError("perception.field_features.enabled must be a boolean.")
+
+    field_colors_raw = _mapping(
+        _required(field_raw, "colors", "perception.field_features"),
+        "perception.field_features.colors",
+    )
+    field_color_names = {
+        "safe_red",
+        "safe_blue",
+        "start_magenta",
+        "entrance_purple",
+        "dark_marking",
+    }
+    if set(field_colors_raw) != field_color_names:
+        raise ValueError(
+            "perception.field_features.colors keys must exactly be "
+            f"{sorted(field_color_names)!r}."
+        )
+    field_ranges = {
+        name: _hsv_ranges(
+            field_colors_raw[name],
+            f"perception.field_features.colors.{name}",
+        )
+        for name in sorted(field_color_names)
+    }
+
+    morphology_raw = _mapping(
+        _required(field_raw, "morphology", "perception.field_features"),
+        "perception.field_features.morphology",
+    )
+    _reject_unknown(
+        morphology_raw,
+        {"kernel_size", "open_iterations", "close_iterations"},
+        "perception.field_features.morphology",
+    )
+    region_filter_raw = _mapping(
+        _required(field_raw, "region_filter", "perception.field_features"),
+        "perception.field_features.region_filter",
+    )
+    _reject_unknown(
+        region_filter_raw,
+        {
+            "min_area_fraction",
+            "min_rectangularity",
+            "dimension_tolerance_fraction",
+        },
+        "perception.field_features.region_filter",
+    )
+    safe_zone_raw = _mapping(
+        _required(field_raw, "safe_zone", "perception.field_features"),
+        "perception.field_features.safe_zone",
+    )
+    _reject_unknown(
+        safe_zone_raw,
+        {
+            "width_mm",
+            "depth_mm",
+            "entrance_color_fraction",
+            "divider_dark_fraction",
+        },
+        "perception.field_features.safe_zone",
+    )
+    start_zone_raw = _mapping(
+        _required(field_raw, "start_zone", "perception.field_features"),
+        "perception.field_features.start_zone",
+    )
+    _reject_unknown(
+        start_zone_raw,
+        {"side_mm"},
+        "perception.field_features.start_zone",
+    )
+    center_raw = _mapping(
+        _required(field_raw, "center_cross", "perception.field_features"),
+        "perception.field_features.center_cross",
+    )
+    _reject_unknown(
+        center_raw,
+        {
+            "min_axis_span_fraction",
+            "max_gap_fraction",
+            "min_gap_count",
+            "perpendicular_tolerance_deg",
+        },
+        "perception.field_features.center_cross",
+    )
+    boundary_raw = _mapping(
+        _required(field_raw, "boundary", "perception.field_features"),
+        "perception.field_features.boundary",
+    )
+    _reject_unknown(
+        boundary_raw,
+        {
+            "canny_low_threshold",
+            "canny_high_threshold",
+            "min_line_length_fraction",
+            "corner_tolerance_deg",
+            "max_features",
+        },
+        "perception.field_features.boundary",
+    )
+    field_features = FieldFeatureConfig(
+        enabled=field_enabled,
+        safe_red=field_ranges["safe_red"],
+        safe_blue=field_ranges["safe_blue"],
+        start_magenta=field_ranges["start_magenta"],
+        entrance_purple=field_ranges["entrance_purple"],
+        dark_marking=field_ranges["dark_marking"],
+        morphology_kernel_size=_positive_int(
+            _required(
+                morphology_raw,
+                "kernel_size",
+                "perception.field_features.morphology",
+            ),
+            "perception.field_features.morphology.kernel_size",
+        ),
+        open_iterations=_nonnegative_int(
+            _required(
+                morphology_raw,
+                "open_iterations",
+                "perception.field_features.morphology",
+            ),
+            "perception.field_features.morphology.open_iterations",
+        ),
+        close_iterations=_nonnegative_int(
+            _required(
+                morphology_raw,
+                "close_iterations",
+                "perception.field_features.morphology",
+            ),
+            "perception.field_features.morphology.close_iterations",
+        ),
+        min_region_area_fraction=_threshold(
+            _required(
+                region_filter_raw,
+                "min_area_fraction",
+                "perception.field_features.region_filter",
+            ),
+            "perception.field_features.region_filter.min_area_fraction",
+        ),
+        min_rectangularity=_threshold(
+            _required(
+                region_filter_raw,
+                "min_rectangularity",
+                "perception.field_features.region_filter",
+            ),
+            "perception.field_features.region_filter.min_rectangularity",
+        ),
+        safe_width_mm=_finite_float(
+            _required(
+                safe_zone_raw,
+                "width_mm",
+                "perception.field_features.safe_zone",
+            ),
+            "perception.field_features.safe_zone.width_mm",
+            minimum=0.001,
+        ),
+        safe_depth_mm=_finite_float(
+            _required(
+                safe_zone_raw,
+                "depth_mm",
+                "perception.field_features.safe_zone",
+            ),
+            "perception.field_features.safe_zone.depth_mm",
+            minimum=0.001,
+        ),
+        start_side_mm=_finite_float(
+            _required(
+                start_zone_raw,
+                "side_mm",
+                "perception.field_features.start_zone",
+            ),
+            "perception.field_features.start_zone.side_mm",
+            minimum=0.001,
+        ),
+        dimension_tolerance_fraction=_threshold(
+            _required(
+                region_filter_raw,
+                "dimension_tolerance_fraction",
+                "perception.field_features.region_filter",
+            ),
+            "perception.field_features.region_filter.dimension_tolerance_fraction",
+        ),
+        entrance_color_fraction=_threshold(
+            _required(
+                safe_zone_raw,
+                "entrance_color_fraction",
+                "perception.field_features.safe_zone",
+            ),
+            "perception.field_features.safe_zone.entrance_color_fraction",
+        ),
+        divider_dark_fraction=_threshold(
+            _required(
+                safe_zone_raw,
+                "divider_dark_fraction",
+                "perception.field_features.safe_zone",
+            ),
+            "perception.field_features.safe_zone.divider_dark_fraction",
+        ),
+        center_min_axis_span_fraction=_threshold(
+            _required(
+                center_raw,
+                "min_axis_span_fraction",
+                "perception.field_features.center_cross",
+            ),
+            "perception.field_features.center_cross.min_axis_span_fraction",
+        ),
+        center_max_gap_fraction=_threshold(
+            _required(
+                center_raw,
+                "max_gap_fraction",
+                "perception.field_features.center_cross",
+            ),
+            "perception.field_features.center_cross.max_gap_fraction",
+        ),
+        center_min_gap_count=_positive_int(
+            _required(
+                center_raw,
+                "min_gap_count",
+                "perception.field_features.center_cross",
+            ),
+            "perception.field_features.center_cross.min_gap_count",
+        ),
+        center_perpendicular_tolerance_deg=_finite_float(
+            _required(
+                center_raw,
+                "perpendicular_tolerance_deg",
+                "perception.field_features.center_cross",
+            ),
+            "perception.field_features.center_cross.perpendicular_tolerance_deg",
+            minimum=0.001,
+        ),
+        boundary_canny_low_threshold=_nonnegative_int(
+            _required(
+                boundary_raw,
+                "canny_low_threshold",
+                "perception.field_features.boundary",
+            ),
+            "perception.field_features.boundary.canny_low_threshold",
+        ),
+        boundary_canny_high_threshold=_positive_int(
+            _required(
+                boundary_raw,
+                "canny_high_threshold",
+                "perception.field_features.boundary",
+            ),
+            "perception.field_features.boundary.canny_high_threshold",
+        ),
+        boundary_min_line_length_fraction=_threshold(
+            _required(
+                boundary_raw,
+                "min_line_length_fraction",
+                "perception.field_features.boundary",
+            ),
+            "perception.field_features.boundary.min_line_length_fraction",
+        ),
+        boundary_corner_tolerance_deg=_finite_float(
+            _required(
+                boundary_raw,
+                "corner_tolerance_deg",
+                "perception.field_features.boundary",
+            ),
+            "perception.field_features.boundary.corner_tolerance_deg",
+            minimum=0.001,
+        ),
+        boundary_max_features=_positive_int(
+            _required(
+                boundary_raw,
+                "max_features",
+                "perception.field_features.boundary",
+            ),
+            "perception.field_features.boundary.max_features",
+        ),
+    )
     perception = PerceptionConfig(
         detection_threshold=detection_threshold,
         k0_threshold=k0_threshold,
         color_classifier=color_classifier,
+        field_features=field_features,
     )
 
     hailo_raw = _mapping(_required(root, "hailo", "root"), "hailo")

@@ -1,6 +1,6 @@
 # `config`：运行配置与对象装配
 
-本包是运行参数的唯一入口。`load_runtime_config()` 加载 schema v10 YAML，拒绝缺失字段、未知字段、错误类型和不一致资产；相对路径以 YAML 所在目录为基准。
+本包是运行参数的唯一入口。`load_runtime_config()` 加载 schema v11 YAML，拒绝缺失字段、未知字段、错误类型和不一致资产；相对路径以 YAML 所在目录为基准。
 
 本机运行统一读取不提交的 `configs/runtime.yaml`。`configs/runtime.example.yaml` 只用于创建新配置：
 
@@ -22,6 +22,7 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `MotionRuntimeConfig.build_remote_executor()` | 创建远程调试运动执行器 | 复用同一个运动控制器和限速 |
 | `HailoConfig.build_backend()` | 校验模型资产并创建 Hailo 后端 | Hailo 关闭时返回 `None` |
 | `HailoConfig.model_class_mapping()` | 把模型 class ID 映射为 `TargetClass` | 直接传给 `TargetPoseDetector` |
+| `PerceptionConfig.build_field_feature_detector()` | 创建传统视觉场地特征检测器 | `field_features.enabled=false` 时返回 `None` |
 | `TrackingConfig.build_tracker()` | 创建一轮使用的多目标跟踪器 | 初始无轨迹 |
 | `WorldRuntimeConfig.build_model()` | 使用静态区域和危险阈值创建世界模型 | 区域可以暂时为空 |
 | `MissionConfig.build_state_machine()` | 创建一轮使用的规则状态机 | 初始为 `WAIT_START` |
@@ -40,8 +41,9 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `TrackingConfig` | 关联、确认、滑行、衰减和删除阈值 |
 | `WorldRuntimeConfig` | `WorldModelConfig` 与 `StaticRegion` 集合 |
 | `MissionConfig` | 比赛计时、安全超时、避让距离和目标优先级 |
-| `PerceptionConfig` | 检测/K0 阈值和 ROI HSV 分类、分割参数 |
+| `PerceptionConfig` | 目标检测/K0、ROI HSV 和静态场地特征参数 |
 | `HsvColorClassifierConfig` | 四类 HSV 闭区间、颜色证据门槛和掩码去噪参数 |
+| `FieldFeatureConfig` | 场地颜色、区域尺寸、点划线和边界候选阈值 |
 | `HailoConfig` | 模型资产、身份、类别映射和后端粗筛阈值 |
 | `RuntimeGeometry` | `camera_model`、可选 `ground_projector` |
 
@@ -118,6 +120,18 @@ mission = config.mission.build_state_machine()
 
 配置对象和已构建对象应在进程生命周期内复用，不能在逐帧循环中重新读取
 YAML、重新生成去畸变映射或重复创建 Hailo 设备。
+
+传统视觉场地检测器同样只装配一次；它不创建 Hailo 或修改世界模型：
+
+```python
+field_detector = config.perception.build_field_feature_detector(
+    max_observation_age_ms=config.processing.max_observation_age_ms,
+    ground_projector=ground_projector,
+)
+```
+
+配置关闭时返回 `None`。没有地面映射时仍可输出部分图像观测，但不能分配
+安全区入口视角左右，也不能把像素伪装成毫米坐标。
 
 ## 6. 几何开关组合
 
@@ -231,7 +245,10 @@ PySerial 并打开设备。电机命令、轮速和未来 IMU 报文由后续协
 
 ## schema 与路径
 
-- 当前运行配置为 schema v10。
+- 当前运行配置为 schema v11。
+- schema v10 升级到 v11 时，必须在 `perception` 下新增完整的
+  `field_features` 段。即使暂不运行也必须保留全部严格字段并设置
+  `enabled: false`；不会静默使用场地颜色或尺寸默认值。
 - schema v9 升级到 v10 时，必须新增完整的 `perception` 段，并从 `hailo`
   删除 `detection_threshold`、`semantic_threshold` 和 `k0_threshold`。
   `detection_threshold`、`k0_threshold` 移入 `perception`；模型类别只保留为

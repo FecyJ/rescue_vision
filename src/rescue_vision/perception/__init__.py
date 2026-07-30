@@ -1,10 +1,26 @@
-"""任务目标感知的数据契约与可替换推理后端。"""
+"""任务目标与静态场地特征感知的公共契约。"""
 
 from rescue_vision.perception.backend import FakeInferenceBackend, InferenceBackend
 from rescue_vision.perception.detector import (
     RealtimeDetectionResult,
     StaleObservationError,
     TargetPoseDetector,
+)
+from rescue_vision.perception.field_feature_detector import FieldFeatureDetector
+from rescue_vision.perception.field_feature_types import (
+    BoundaryFeatureKind,
+    BoundaryFeatureObservation,
+    CenterCrossObservation,
+    FieldFeatureConfig,
+    FieldFeatureDetectionResult,
+    FieldFeatureQuality,
+    LineSegmentObservation,
+    RealtimeFieldFeatureResult,
+    SafeZoneColor,
+    SafeZoneHalfObservation,
+    SafeZoneObservation,
+    SafeZoneSide,
+    StartZoneObservation,
 )
 from rescue_vision.perception.types import (
     COLOR_TARGET_CLASSES,
@@ -22,19 +38,33 @@ from rescue_vision.perception.types import (
 
 __all__ = [
     "COLOR_TARGET_CLASSES",
+    "BoundaryFeatureKind",
+    "BoundaryFeatureObservation",
+    "CenterCrossObservation",
     "ClassProbabilities",
     "ColorSegmentationStatus",
     "FakeInferenceBackend",
+    "FieldFeatureConfig",
+    "FieldFeatureDetectionResult",
+    "FieldFeatureDetector",
+    "FieldFeatureQuality",
     "HsvColorClassifierConfig",
     "HsvRange",
     "InferenceBackend",
+    "LineSegmentObservation",
+    "RealtimeFieldFeatureResult",
     "ModelDetection",
     "ObservationQuality",
     "RealtimeDetectionResult",
     "RoiColorSegmentation",
+    "SafeZoneColor",
+    "SafeZoneHalfObservation",
+    "SafeZoneObservation",
+    "SafeZoneSide",
     "StaleObservationError",
     "TargetClass",
     "TargetObservation",
     "TargetPoseDetector",
+    "StartZoneObservation",
     "UndistortedBoundingBox",
 ]

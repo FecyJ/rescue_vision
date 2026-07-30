@@ -11,6 +11,7 @@
 - `geometry_projection.py`：使用本地测试图片人工检查 BEV 和点投影。
 - `hailo_pose.py`：从实际 `runtime.yaml` 加载 YOLO Pose 部署包，检查单张去畸变图像的框、K0、HSV 类别和 ROI 分割摘要。
 - `dataset_perception.py`：按 schema v2 数据清单批量运行 Hailo，覆盖式写出 schema v2 观测 JSONL，保留 Pose 类别、HSV 候选/覆盖率、UNKNOWN、质量信息和模型身份。
+- `field_features.py`：从图片或视频离线检测安全区、无编号出发区、中心十字和低精度边界候选，写出 JSONL 及可选叠加图；不访问相机或 Hailo。
 - `camera_undistort_perception.py`：按实际 `runtime.yaml` 连续执行相机、去畸变、Hailo Pose、ROI HSV 掩码和 K0/地面点叠加预览，按 `Q/Esc` 退出；偶发过期帧会标红并丢弃，不会终止预览。
 - `remote_link.py --config PATH`：在树莓派侧以 `remote.role: server` 监听电脑端客户端，连接后发送协议要求的最小会话状态，并持续打印收到的 control；该状态有意声明所有业务能力不可用，所以正式客户端应保持控制禁用。仅验证连接可使用 `observe_only`；用自制底层客户端检查 control 帧时使用 `debug_control`。
 - `remote_video.py --config PATH`：发送真实相机的最新 JPEG 帧和周期会话状态，不接收或执行控制。
@@ -19,6 +20,22 @@
 运行前先执行 `python -m pip install -e .`，并确保系统包和显示环境可用。
 
 数据采集不另建重复的硬件脚本：用 `rescue-vision-record --frames 200 --display` 执行真机短录，再用 `rescue-vision-check-recording RECORDING --display` 可视化回放并完成哈希、帧率、丢帧和元数据验收。完整步骤见 [`docs/数据采集工具使用.md`](../docs/数据采集工具使用.md)。
+
+## 传统视觉场地特征离线检查
+
+输入已经按当前配置去畸变时：
+
+```bash
+python manual_tests/field_features.py recordings/field_sample.mp4 \
+  --config configs/runtime.yaml \
+  --already-undistorted \
+  --output-jsonl output/field_features.jsonl \
+  --overlay-dir output/field_feature_overlays
+```
+
+原始图片或视频应去掉 `--already-undistorted`，并启用有效内参。启用地面映射
+后才会进行 BEV 尺寸筛选并输出 `GroundPoint`；当前开发机检查不等于树莓派
+实时性能、围栏泛化或现场颜色精度验收。
 
 ## 相机、去畸变和 Hailo 联调
 

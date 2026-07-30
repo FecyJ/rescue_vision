@@ -1,9 +1,10 @@
-# `perception`：任务目标 Pose 与 ROI 颜色感知
+# `perception`：任务目标与静态场地特征感知
 
 本包把全尺寸去畸变图上的 Pose 模型结果转换为稳定的
 `TargetObservation`：模型负责目标框和 K0，框内 HSV 证据负责最终任务
-类别并提供局部颜色分割掩码。它不创建相机、不复制标定矩阵，也不修改跟踪、
-定位、世界模型或任务状态。
+类别并提供局部颜色分割掩码。独立的 `FieldFeatureDetector` 从同一去畸变帧
+检测安全区、出发区、中心十字和低精度边界候选。两条链路都不创建相机、
+不复制标定矩阵，也不修改跟踪、定位、世界模型或任务状态。
 
 ## 常用类和函数
 
@@ -12,6 +13,14 @@
 | `InferenceBackend` | 推理后端协议：`infer()`、模型身份和 `close()` |
 | `HailoYolo26PoseBackend` | HEF 推理与 ONNX 后处理的真实后端 |
 | `TargetPoseDetector` | 模型框/K0、ROI HSV 分类分割、观测年龄和可选地面投影 |
+| `FieldFeatureDetector` | 颜色、线段、角点和可选 BEV 的静态场地特征检测 |
+| `FieldFeatureDetectionResult` | 同帧安全区、出发区、中心十字和边界候选集合 |
+| `RealtimeFieldFeatureResult` | 实时场地结果或明确的过期丢弃原因 |
+| `SafeZoneObservation` | 红/蓝物理颜色、入口、隔板和入口视角左右半区 |
+| `StartZoneObservation` | 无编号洋红出发区轮廓及可选地面角点 |
+| `CenterCrossObservation` | 无序的两条中心轴或单轴部分观测 |
+| `BoundaryFeatureObservation` | 显式低置信度的围栏基线或场地角点候选 |
+| `FieldFeatureConfig` | 场地颜色、形态学、尺寸、线段和角点阈值 |
 | `RealtimeDetectionResult` | 实时检测结果，并明确记录是否丢弃了过期帧 |
 | `StaleObservationError` | 严格 `detect()` 在结果超过允许年龄时抛出的异常 |
 | `ModelDetection` | 后端输出；框和 K0 已反映射到去畸变原尺寸 |
@@ -183,7 +192,75 @@ for observation in observations:
 不足或歧义成为 `unknown`，仍保留顶部颜色候选掩码。完全无颜色像素时候选为
 `unknown` 且掩码全零。
 
-## 7. Hailo 部署包和配置
+## 7. 传统视觉场地特征
+
+以下片段承接第 1 节的 `config` 和 `geometry`。传统视觉不需要 Hailo；
+配置关闭时构造函数返回 `None`，不会静默运行另一套默认阈值：
+
+```python
+field_detector = config.perception.build_field_feature_detector(
+    max_observation_age_ms=config.processing.max_observation_age_ms,
+    ground_projector=geometry.ground_projector,
+)
+if field_detector is None:
+    raise RuntimeError("需要启用 perception.field_features")
+```
+
+对已经由当前 `CameraModel` 去畸变的同一帧执行：
+
+```python
+realtime_field_result = field_detector.detect_realtime(
+    raw_frame,
+    undistorted_bgr,
+)
+if realtime_field_result.stale_dropped:
+    # 不向定位层传递过期地标。
+    field_result = None
+else:
+    field_result = realtime_field_result.result
+
+for safe_zone in field_result.safe_zones if field_result is not None else ():
+    print(safe_zone.physical_color, safe_zone.quality)
+    for half in safe_zone.halves:
+        # side 是从场内面向入口时的 approach_left / approach_right。
+        print(half.side, half.polygon_ground)
+```
+
+启用带 BEV 配置的 `GroundProjector` 时，检测器每帧只生成一次 BEV 并在颜色、
+线段和角点步骤中复用。输出仍保留 `UndistortedPixel`；只有地面上的区域角点、
+线段端点才附带机器人系 `GroundPoint`。围栏顶部等非地面特征不会被地面
+单应性强行投影。
+
+安全区首先输出 `red` / `blue` 物理颜色，不在检测器中解释己方/对方或
+物资/伤员用途。左右以“从场内面向入口”为准；只有入口紫色证据、黑色隔板和
+地面方向均成立时才生成两个 `halves`。证据不足时保留整区并标记
+`entrance_unresolved`、`divider_unresolved` 或 `side_unresolved`。
+
+出发区只输出洋红轮廓和角点，不做数字 OCR，也不包含 1–4 编号。中心十字的
+两条点划线轴在地图匹配前保持无序；只有单条满足间断结构的轴时标记
+`partial`，普通实线不会作为中心轴。围栏基线和角点始终带
+`low_confidence_boundary`，单帧结果不能直接当作闭合场界。
+
+完整阈值位于 `configs/runtime.example.yaml` 的
+`perception.field_features`。红、蓝、洋红和紫色初值来自命题示意图，不是
+官方色卡；尺寸初值也包含较宽公差。获得现场材料、固定曝光和实际地面映射后
+必须重新标定。
+
+离线图片或视频检查：
+
+```bash
+python manual_tests/field_features.py recordings/field_sample.mp4 \
+  --config configs/runtime.yaml \
+  --already-undistorted \
+  --output-jsonl output/field_features.jsonl \
+  --overlay-dir output/field_feature_overlays
+```
+
+若输入是原始相机图像，去掉 `--already-undistorted`，脚本会使用配置中的
+`CameraModel` 去畸变。该工具不访问相机和 Hailo；合成图测试只证明逻辑和
+契约可运行，不能作为现场精度或树莓派性能证据。
+
+## 8. Hailo 部署包和配置
 
 部署包包含：
 
@@ -273,7 +350,7 @@ python manual_tests/camera_undistort_perception.py
 掩码；标签显示最终类别、HSV 候选/状态、覆盖率、dominance，启用地面映射后
 还会附加机器人地面 `(x, y) mm`。
 
-## 8. 转换为评测输入
+## 9. 转换为评测输入
 
 人工标注与观测准备好后，通过适配器完成类别无关 IoU 一对一匹配。以下片段位于已取得当前 `raw_frame`、`annotations` 和 `observations` 的评测循环中：
 

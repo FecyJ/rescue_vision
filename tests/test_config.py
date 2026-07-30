@@ -42,7 +42,7 @@ def config_text(
     ground_mapping_enabled: bool = True,
     extra: str = "",
 ) -> str:
-    return f"""schema_version: 10
+    return f"""schema_version: 11
 camera:
   backend: rpicam_vid
   image_size: {image_size}
@@ -132,6 +132,52 @@ perception:
     open_iterations: 1
     close_iterations: 1
     min_component_area_fraction: 0.002
+  field_features:
+    enabled: false
+    colors:
+      safe_red:
+        - lower: [0, 80, 80]
+          upper: [12, 255, 255]
+        - lower: [170, 80, 80]
+          upper: [179, 255, 255]
+      safe_blue:
+        - lower: [90, 60, 70]
+          upper: [110, 255, 255]
+      start_magenta:
+        - lower: [140, 80, 80]
+          upper: [165, 255, 255]
+      entrance_purple:
+        - lower: [130, 60, 50]
+          upper: [160, 255, 255]
+      dark_marking:
+        - lower: [0, 0, 0]
+          upper: [179, 255, 80]
+    morphology:
+      kernel_size: 5
+      open_iterations: 1
+      close_iterations: 2
+    region_filter:
+      min_area_fraction: 0.002
+      min_rectangularity: 0.55
+      dimension_tolerance_fraction: 0.40
+    safe_zone:
+      width_mm: 600.0
+      depth_mm: 300.0
+      entrance_color_fraction: 0.10
+      divider_dark_fraction: 0.10
+    start_zone:
+      side_mm: 300.0
+    center_cross:
+      min_axis_span_fraction: 0.20
+      max_gap_fraction: 0.06
+      min_gap_count: 2
+      perpendicular_tolerance_deg: 15.0
+    boundary:
+      canny_low_threshold: 50
+      canny_high_threshold: 150
+      min_line_length_fraction: 0.20
+      corner_tolerance_deg: 20.0
+      max_features: 8
 hailo:
   enabled: false
   hef_path: null
@@ -307,6 +353,73 @@ def test_color_classifier_config_is_loaded_from_perception(tmp_path) -> None:
     assert classifier.green_supply[0].lower == (35, 70, 71)
     assert len(classifier.orange_injured) == 2
     assert classifier.morphology_kernel_size == 3
+    field_features = config.perception.field_features
+    assert field_features.enabled is False
+    assert field_features.safe_width_mm == pytest.approx(600.0)
+    assert field_features.start_side_mm == pytest.approx(300.0)
+    assert field_features.safe_red[0].lower == (0, 80, 80)
+
+
+def test_field_feature_detector_is_built_only_when_enabled(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(config_text(), encoding="utf-8")
+    disabled = load_runtime_config(path)
+    assert (
+        disabled.perception.build_field_feature_detector(
+            max_observation_age_ms=150.0,
+        )
+        is None
+    )
+
+    path.write_text(
+        config_text().replace(
+            "  field_features:\n    enabled: false",
+            "  field_features:\n    enabled: true",
+        ),
+        encoding="utf-8",
+    )
+    enabled = load_runtime_config(path)
+    detector = enabled.perception.build_field_feature_detector(
+        max_observation_age_ms=150.0,
+    )
+    assert detector is not None
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "message"),
+    [
+        (
+            "      dimension_tolerance_fraction: 0.40",
+            "      dimension_tolerance_fraction: 1.00",
+            "dimension_tolerance_fraction",
+        ),
+        (
+            "      kernel_size: 5",
+            "      kernel_size: 4",
+            "morphology_kernel_size",
+        ),
+        (
+            "      perpendicular_tolerance_deg: 15.0",
+            "      perpendicular_tolerance_deg: 45.0",
+            "perpendicular_tolerance_deg",
+        ),
+        (
+            "      canny_low_threshold: 50",
+            "      canny_low_threshold: 200",
+            "boundary_canny_low_threshold",
+        ),
+    ],
+)
+def test_field_feature_config_rejects_unsafe_values(
+    tmp_path,
+    old,
+    new,
+    message,
+) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(config_text().replace(old, new), encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
+        load_runtime_config(path)
 
 
 @pytest.mark.parametrize(
@@ -369,7 +482,7 @@ def test_runtime_example_matches_strict_schema() -> None:
         Path(__file__).resolve().parents[1] / "configs" / "runtime.example.yaml"
     )
     config = load_runtime_config(example)
-    assert config.schema_version == 10
+    assert config.schema_version == 11
 
 
 def test_uart_config_builds_channel_without_opening_device(tmp_path) -> None:
