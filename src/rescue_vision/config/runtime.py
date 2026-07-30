@@ -13,7 +13,12 @@ from rescue_vision.geometry.camera_model import CameraCalibration, CameraModel
 from rescue_vision.geometry.ground_projector import GroundProjector
 from rescue_vision.geometry.types import FieldPoint
 from rescue_vision.mission import MissionConfig
-from rescue_vision.perception.types import TargetClass
+from rescue_vision.perception.types import (
+    COLOR_TARGET_CLASSES,
+    HsvColorClassifierConfig,
+    HsvRange,
+    TargetClass,
+)
 from rescue_vision.tracking import TrackingConfig
 from rescue_vision.world import (
     RegionKind,
@@ -32,7 +37,7 @@ if TYPE_CHECKING:
     from rescue_vision.motion import MotionController, RemoteMotionExecutor
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 def _mapping(value: object, location: str) -> dict[str, Any]:
@@ -65,6 +70,14 @@ def _positive_int(value: object, location: str) -> int:
     return value
 
 
+def _nonnegative_int(value: object, location: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"{location} must be a non-negative integer, got {value!r}."
+        )
+    return value
+
+
 def _finite_float(value: object, location: str, *, minimum: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{location} must be a number, got {value!r}.")
@@ -93,6 +106,20 @@ def _string(value: object, location: str) -> str:
 
 def _threshold(value: object, location: str) -> float:
     return _finite_float(value, location, minimum=0.0)
+
+
+def _hsv_triplet(value: object, location: str) -> tuple[int, int, int]:
+    if (
+        not isinstance(value, list)
+        or len(value) != 3
+        or any(
+            isinstance(component, bool)
+            or not isinstance(component, int)
+            for component in value
+        )
+    ):
+        raise ValueError(f"{location} must be an integer [H, S, V] list.")
+    return (value[0], value[1], value[2])
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,6 +304,13 @@ class WorldRuntimeConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class PerceptionConfig:
+    detection_threshold: float
+    k0_threshold: float
+    color_classifier: HsvColorClassifierConfig
+
+
+@dataclass(frozen=True, slots=True)
 class HailoConfig:
     enabled: bool
     hef_path: Path | None
@@ -287,9 +321,6 @@ class HailoConfig:
     raw_classes: tuple[str, ...]
     class_mapping: tuple[TargetClass, ...]
     backend_score_threshold: float
-    detection_threshold: float
-    semantic_threshold: float
-    k0_threshold: float
     max_detections: int
 
     def build_backend(self):
@@ -338,6 +369,7 @@ class AppConfig:
     tracking: TrackingConfig
     world: WorldRuntimeConfig
     mission: MissionConfig
+    perception: PerceptionConfig
     hailo: HailoConfig
 
     def build_camera_model(self) -> CameraModel | None:
@@ -375,7 +407,7 @@ class AppConfig:
 
 
 def load_runtime_config(path: str | Path) -> AppConfig:
-    """从 YAML 加载 schema v9；缺项和未知字段均视为错误。"""
+    """从 YAML 加载 schema v10；缺项和未知字段均视为错误。"""
 
     config_path = Path(path).expanduser().resolve()
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -394,6 +426,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "tracking",
             "world",
             "mission",
+            "perception",
             "hailo",
         },
         "root",
@@ -974,6 +1007,178 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         target_priority=target_priority,
     )
 
+    perception_raw = _mapping(
+        _required(root, "perception", "root"),
+        "perception",
+    )
+    _reject_unknown(
+        perception_raw,
+        {
+            "detection_threshold",
+            "k0_threshold",
+            "color_classifier",
+        },
+        "perception",
+    )
+    detection_threshold = _threshold(
+        _required(
+            perception_raw,
+            "detection_threshold",
+            "perception",
+        ),
+        "perception.detection_threshold",
+    )
+    k0_threshold = _threshold(
+        _required(perception_raw, "k0_threshold", "perception"),
+        "perception.k0_threshold",
+    )
+    for location, value in (
+        ("perception.detection_threshold", detection_threshold),
+        ("perception.k0_threshold", k0_threshold),
+    ):
+        if value > 1.0:
+            raise ValueError(f"{location} must be <= 1.0.")
+
+    color_raw = _mapping(
+        _required(
+            perception_raw,
+            "color_classifier",
+            "perception",
+        ),
+        "perception.color_classifier",
+    )
+    _reject_unknown(
+        color_raw,
+        {
+            "ranges",
+            "min_color_fraction",
+            "min_color_dominance",
+            "min_dominance_margin",
+            "morphology_kernel_size",
+            "open_iterations",
+            "close_iterations",
+            "min_component_area_fraction",
+        },
+        "perception.color_classifier",
+    )
+    ranges_raw = _mapping(
+        _required(
+            color_raw,
+            "ranges",
+            "perception.color_classifier",
+        ),
+        "perception.color_classifier.ranges",
+    )
+    expected_color_names = {
+        target_class.value for target_class in COLOR_TARGET_CLASSES
+    }
+    if set(ranges_raw) != expected_color_names:
+        raise ValueError(
+            "perception.color_classifier.ranges keys must exactly be "
+            f"{sorted(expected_color_names)!r}."
+        )
+    parsed_ranges: dict[TargetClass, tuple[HsvRange, ...]] = {}
+    for target_class in COLOR_TARGET_CLASSES:
+        range_values = ranges_raw[target_class.value]
+        range_location = (
+            "perception.color_classifier.ranges."
+            f"{target_class.value}"
+        )
+        if not isinstance(range_values, list) or not range_values:
+            raise ValueError(
+                f"{range_location} must be a non-empty list."
+            )
+        class_ranges: list[HsvRange] = []
+        for index, range_value in enumerate(range_values):
+            item_location = f"{range_location}[{index}]"
+            item_raw = _mapping(range_value, item_location)
+            _reject_unknown(
+                item_raw,
+                {"lower", "upper"},
+                item_location,
+            )
+            class_ranges.append(
+                HsvRange(
+                    lower=_hsv_triplet(
+                        _required(item_raw, "lower", item_location),
+                        f"{item_location}.lower",
+                    ),
+                    upper=_hsv_triplet(
+                        _required(item_raw, "upper", item_location),
+                        f"{item_location}.upper",
+                    ),
+                )
+            )
+        parsed_ranges[target_class] = tuple(class_ranges)
+
+    color_classifier = HsvColorClassifierConfig(
+        green_supply=parsed_ranges[TargetClass.GREEN_SUPPLY],
+        black_core=parsed_ranges[TargetClass.BLACK_CORE],
+        orange_injured=parsed_ranges[TargetClass.ORANGE_INJURED],
+        blue_danger=parsed_ranges[TargetClass.BLUE_DANGER],
+        min_color_fraction=_threshold(
+            _required(
+                color_raw,
+                "min_color_fraction",
+                "perception.color_classifier",
+            ),
+            "perception.color_classifier.min_color_fraction",
+        ),
+        min_color_dominance=_threshold(
+            _required(
+                color_raw,
+                "min_color_dominance",
+                "perception.color_classifier",
+            ),
+            "perception.color_classifier.min_color_dominance",
+        ),
+        min_dominance_margin=_threshold(
+            _required(
+                color_raw,
+                "min_dominance_margin",
+                "perception.color_classifier",
+            ),
+            "perception.color_classifier.min_dominance_margin",
+        ),
+        morphology_kernel_size=_positive_int(
+            _required(
+                color_raw,
+                "morphology_kernel_size",
+                "perception.color_classifier",
+            ),
+            "perception.color_classifier.morphology_kernel_size",
+        ),
+        open_iterations=_nonnegative_int(
+            _required(
+                color_raw,
+                "open_iterations",
+                "perception.color_classifier",
+            ),
+            "perception.color_classifier.open_iterations",
+        ),
+        close_iterations=_nonnegative_int(
+            _required(
+                color_raw,
+                "close_iterations",
+                "perception.color_classifier",
+            ),
+            "perception.color_classifier.close_iterations",
+        ),
+        min_component_area_fraction=_threshold(
+            _required(
+                color_raw,
+                "min_component_area_fraction",
+                "perception.color_classifier",
+            ),
+            "perception.color_classifier.min_component_area_fraction",
+        ),
+    )
+    perception = PerceptionConfig(
+        detection_threshold=detection_threshold,
+        k0_threshold=k0_threshold,
+        color_classifier=color_classifier,
+    )
+
     hailo_raw = _mapping(_required(root, "hailo", "root"), "hailo")
     _reject_unknown(
         hailo_raw,
@@ -987,9 +1192,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "raw_classes",
             "class_mapping",
             "backend_score_threshold",
-            "detection_threshold",
-            "semantic_threshold",
-            "k0_threshold",
             "max_detections",
         },
         "hailo",
@@ -1059,34 +1261,13 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         _required(hailo_raw, "backend_score_threshold", "hailo"),
         "hailo.backend_score_threshold",
     )
-    detection_threshold = _threshold(
-        _required(hailo_raw, "detection_threshold", "hailo"),
-        "hailo.detection_threshold",
-    )
-    semantic_threshold = _threshold(
-        _required(hailo_raw, "semantic_threshold", "hailo"),
-        "hailo.semantic_threshold",
-    )
-    k0_threshold = _threshold(
-        _required(hailo_raw, "k0_threshold", "hailo"),
-        "hailo.k0_threshold",
-    )
-    for location, value in (
-        ("hailo.backend_score_threshold", backend_score_threshold),
-        ("hailo.detection_threshold", detection_threshold),
-        ("hailo.semantic_threshold", semantic_threshold),
-        ("hailo.k0_threshold", k0_threshold),
-    ):
-        if value > 1.0:
-            raise ValueError(f"{location} must be <= 1.0.")
-    if semantic_threshold < detection_threshold:
-        raise ValueError(
-            "hailo.semantic_threshold must be >= hailo.detection_threshold."
-        )
+    if backend_score_threshold > 1.0:
+        raise ValueError("hailo.backend_score_threshold must be <= 1.0.")
     if backend_score_threshold > detection_threshold:
         raise ValueError(
             "hailo.backend_score_threshold must be <= "
-            f"hailo.detection_threshold, got {backend_score_threshold} > "
+            "perception.detection_threshold, got "
+            f"{backend_score_threshold} > "
             f"{detection_threshold}."
         )
     max_detections = _positive_int(
@@ -1117,9 +1298,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         raw_classes=raw_classes,
         class_mapping=class_mapping,
         backend_score_threshold=backend_score_threshold,
-        detection_threshold=detection_threshold,
-        semantic_threshold=semantic_threshold,
-        k0_threshold=k0_threshold,
         max_detections=max_detections,
     )
 
@@ -1135,5 +1313,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         tracking,
         world,
         mission,
+        perception,
         hailo,
     )

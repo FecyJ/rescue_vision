@@ -1,4 +1,4 @@
-schema_version: 9
+schema_version: 10
 
 camera:
   # picamera2 可记录逐帧曝光/增益等元数据；rpicam_vid 是低开销备选。
@@ -92,6 +92,36 @@ mission:
   danger_avoid_distance_mm: 500.0
   target_priority: [orange_injured, black_core, green_supply]
 
+perception:
+  # 模型负责检测框和 K0；最终任务类别由框内 HSV 颜色证据决定。
+  detection_threshold: 0.25
+  k0_threshold: 0.50
+  color_classifier:
+    # OpenCV HSV：H=0..179，S/V=0..255。初值来自命题文件示意图，
+    # 不是官方色卡；必须按现场实物、光照和相机参数重新校准。
+    ranges:
+      green_supply:
+        - lower: [35, 70, 71]
+          upper: [84, 255, 255]
+      black_core:
+        - lower: [0, 0, 0]
+          upper: [179, 255, 70]
+      orange_injured:
+        - lower: [0, 90, 80]
+          upper: [20, 255, 255]
+        - lower: [170, 90, 80]
+          upper: [179, 255, 255]
+      blue_danger:
+        - lower: [85, 50, 71]
+          upper: [110, 255, 255]
+    min_color_fraction: 0.15
+    min_color_dominance: 0.70
+    min_dominance_margin: 0.20
+    morphology_kernel_size: 3
+    open_iterations: 1
+    close_iterations: 1
+    min_component_area_fraction: 0.002
+
 hailo:
   # 模板默认禁用；实际部署值写入不提交的 configs/runtime.yaml。
   enabled: false
@@ -103,7 +133,4 @@ hailo:
   raw_classes: []
   class_mapping: {}
   backend_score_threshold: 0.01
-  detection_threshold: 0.25
-  semantic_threshold: 0.50
-  k0_threshold: 0.50
   max_detections: 100

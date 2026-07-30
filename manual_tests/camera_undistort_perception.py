@@ -6,6 +6,7 @@ import argparse
 from time import monotonic_ns
 
 import cv2
+import numpy as np
 
 from rescue_vision.camera.picamera2_source import Picamera2Source
 from rescue_vision.camera.rpicam_source import RpicamSource
@@ -54,9 +55,9 @@ def main() -> None:
     detector = TargetPoseDetector(
         backend=backend,
         class_mapping=config.hailo.model_class_mapping(),
-        detection_threshold=config.hailo.detection_threshold,
-        semantic_threshold=config.hailo.semantic_threshold,
-        k0_threshold=config.hailo.k0_threshold,
+        detection_threshold=config.perception.detection_threshold,
+        k0_threshold=config.perception.k0_threshold,
+        color_classifier=config.perception.color_classifier,
         max_observation_age_ms=config.processing.max_observation_age_ms,
         ground_projector=geometry.ground_projector,
     )
@@ -86,6 +87,28 @@ def main() -> None:
             preview = undistorted_bgr.copy()
             for observation in detection_result.observations:
                 box = observation.box
+                segmentation = observation.color_segmentation
+                roi_box = segmentation.roi_box
+                roi = preview[
+                    int(roi_box.y_min) : int(roi_box.y_max),
+                    int(roi_box.x_min) : int(roi_box.x_max),
+                ]
+                selected = segmentation.mask != 0
+                overlay_colors = {
+                    "green_supply": (0, 255, 0),
+                    "black_core": (80, 80, 80),
+                    "orange_injured": (0, 128, 255),
+                    "blue_danger": (255, 255, 0),
+                    "unknown": (255, 0, 255),
+                }
+                overlay_color = overlay_colors[
+                    segmentation.candidate_class.value
+                ]
+                if selected.any():
+                    roi[selected] = (
+                        roi[selected].astype("float32") * 0.55
+                        + np.asarray(overlay_color, dtype=np.float32) * 0.45
+                    ).astype("uint8")
                 cv2.rectangle(
                     preview,
                     (round(box.x_min), round(box.y_min)),
@@ -114,7 +137,14 @@ def main() -> None:
                 )
                 cv2.putText(
                     preview,
-                    f"{observation.target_class.value}{ground_text}",
+                    (
+                        f"{observation.target_class.value}"
+                        f" hsv={segmentation.candidate_class.value}"
+                        f"/{segmentation.status.value}"
+                        f" cov={segmentation.color_fraction:.2f}"
+                        f" dom={segmentation.dominance:.2f}"
+                        f"{ground_text}"
+                    ),
                     (round(box.x_min), max(20, round(box.y_min) - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,

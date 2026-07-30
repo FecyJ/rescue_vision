@@ -128,6 +128,31 @@ def _record(
         "object_id": object_id,
         "ground_truth_class": truth.target_class.value if truth else None,
         "predicted_class": observation.target_class.value if observation else None,
+        "model_predicted_class": (
+            observation.model_target_class.value
+            if observation is not None
+            else None
+        ),
+        "hsv_candidate_class": (
+            observation.color_segmentation.candidate_class.value
+            if observation is not None
+            else None
+        ),
+        "hsv_status": (
+            observation.color_segmentation.status.value
+            if observation is not None
+            else None
+        ),
+        "hsv_color_fraction": (
+            observation.color_segmentation.color_fraction
+            if observation is not None
+            else None
+        ),
+        "hsv_dominance": (
+            observation.color_segmentation.dominance
+            if observation is not None
+            else None
+        ),
         "confidence": confidence,
         "quality": (
             sorted(item.value for item in observation.quality)

@@ -4,16 +4,24 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import math
 from time import monotonic_ns
 
+import cv2
 import numpy as np
 
 from rescue_vision.camera.frame import CameraFrame
 from rescue_vision.geometry.ground_projector import GroundProjector
+from rescue_vision.geometry.types import GroundPoint, UndistortedPixel
 from rescue_vision.perception.backend import InferenceBackend
+from rescue_vision.perception.color_segmentation import segment_roi_colors
 from rescue_vision.perception.types import (
     ClassProbabilities,
+    ColorSegmentationStatus,
+    HsvColorClassifierConfig,
+    ModelDetection,
     ObservationQuality,
+    RoiColorSegmentation,
     TargetClass,
     TargetObservation,
 )
@@ -43,6 +51,18 @@ class RealtimeDetectionResult:
         return self.dropped_stale_age_ms is not None
 
 
+@dataclass(frozen=True, slots=True)
+class _ProcessedDetection:
+    detection: ModelDetection
+    model_target_class: TargetClass
+    target_class: TargetClass
+    class_probabilities: ClassProbabilities
+    color_segmentation: RoiColorSegmentation
+    k0: UndistortedPixel | None
+    ground_point: GroundPoint | None
+    quality: frozenset[ObservationQuality]
+
+
 class TargetPoseDetector:
     def __init__(
         self,
@@ -50,8 +70,8 @@ class TargetPoseDetector:
         *,
         class_mapping: Mapping[int, TargetClass],
         detection_threshold: float,
-        semantic_threshold: float,
         k0_threshold: float,
+        color_classifier: HsvColorClassifierConfig,
         max_observation_age_ms: float,
         ground_projector: GroundProjector | None = None,
     ) -> None:
@@ -79,21 +99,23 @@ class TargetPoseDetector:
             self._detection_threshold = self._threshold(
                 detection_threshold, "detection_threshold"
             )
-            self._semantic_threshold = self._threshold(
-                semantic_threshold, "semantic_threshold"
-            )
             self._k0_threshold = self._threshold(
                 k0_threshold, "k0_threshold"
             )
-            if self._semantic_threshold < self._detection_threshold:
+            if not isinstance(color_classifier, HsvColorClassifierConfig):
                 raise ValueError(
-                    "semantic_threshold must be >= detection_threshold."
+                    "color_classifier must be an HsvColorClassifierConfig."
                 )
-            if max_observation_age_ms <= 0.0:
+            self._color_classifier = color_classifier
+            converted_max_age_ms = float(max_observation_age_ms)
+            if (
+                not math.isfinite(converted_max_age_ms)
+                or converted_max_age_ms <= 0.0
+            ):
                 raise ValueError(
-                    "max_observation_age_ms must be positive."
+                    "max_observation_age_ms must be positive and finite."
                 )
-            self._max_observation_age_ms = float(max_observation_age_ms)
+            self._max_observation_age_ms = converted_max_age_ms
             self._ground_projector = ground_projector
         except BaseException:
             try:
@@ -119,10 +141,12 @@ class TargetPoseDetector:
         if (
             undistorted_image_bgr.ndim != 3
             or undistorted_image_bgr.shape[2] != 3
+            or undistorted_image_bgr.dtype != np.uint8
         ):
             raise ValueError(
-                "undistorted_image_bgr must have shape (height, width, 3), got "
-                f"{undistorted_image_bgr.shape}."
+                "undistorted_image_bgr must be uint8 with shape "
+                f"(height, width, 3), got dtype={undistorted_image_bgr.dtype}, "
+                f"shape={undistorted_image_bgr.shape}."
             )
         image_size = (
             int(undistorted_image_bgr.shape[1]),
@@ -135,21 +159,7 @@ class TargetPoseDetector:
             )
 
         detections = self._backend.infer(undistorted_image_bgr)
-        result_timestamp_ns = (
-            monotonic_ns() if result_timestamp_ns is None else result_timestamp_ns
-        )
-        if result_timestamp_ns < frame.timestamp_ns:
-            raise ValueError(
-                "result_timestamp_ns must not be earlier than frame timestamp."
-            )
-        age_ms = (result_timestamp_ns - frame.timestamp_ns) / 1_000_000.0
-        if age_ms > self._max_observation_age_ms:
-            raise StaleObservationError(
-                age_ms,
-                self._max_observation_age_ms,
-            )
-
-        observations: list[TargetObservation] = []
+        candidate_detections: list[ModelDetection] = []
         for detection in detections:
             if detection.confidence < self._detection_threshold:
                 continue
@@ -158,20 +168,36 @@ class TargetPoseDetector:
                 raise ValueError(
                     f"Model class ID {detection.model_class_id} has no configured mapping."
                 )
+            candidate_detections.append(detection)
 
+        image_hsv = (
+            cv2.cvtColor(undistorted_image_bgr, cv2.COLOR_BGR2HSV)
+            if candidate_detections
+            else None
+        )
+        processed: list[_ProcessedDetection] = []
+        for detection in candidate_detections:
+            assert image_hsv is not None
             quality: set[ObservationQuality] = set()
-            mapped_class = self._class_mapping[detection.model_class_id]
-            if detection.confidence < self._semantic_threshold:
+            model_target_class = self._class_mapping[detection.model_class_id]
+            color_segmentation, probabilities = segment_roi_colors(
+                image_hsv,
+                detection.box,
+                self._color_classifier,
+            )
+            if color_segmentation.status is ColorSegmentationStatus.INSUFFICIENT:
                 target_class = TargetClass.UNKNOWN
-                probabilities = ClassProbabilities.from_top_class(
-                    mapped_class, detection.confidence
-                )
-                quality.add(ObservationQuality.LOW_CLASS_CONFIDENCE)
+                quality.add(ObservationQuality.COLOR_EVIDENCE_INSUFFICIENT)
+            elif color_segmentation.status is ColorSegmentationStatus.AMBIGUOUS:
+                target_class = TargetClass.UNKNOWN
+                quality.add(ObservationQuality.COLOR_EVIDENCE_AMBIGUOUS)
             else:
-                target_class = mapped_class
-                probabilities = ClassProbabilities.from_top_class(
-                    mapped_class, detection.confidence
-                )
+                target_class = color_segmentation.candidate_class
+                if (
+                    model_target_class is not TargetClass.UNKNOWN
+                    and model_target_class is not target_class
+                ):
+                    quality.add(ObservationQuality.POSE_COLOR_CONFLICT)
 
             k0 = detection.k0
             if k0 is None or detection.k0_confidence < self._k0_threshold:
@@ -190,25 +216,54 @@ class TargetPoseDetector:
                     else None
                 )
 
-            observations.append(
-                TargetObservation(
-                    frame_sequence=frame.sequence,
-                    capture_timestamp_ns=frame.timestamp_ns,
-                    result_timestamp_ns=result_timestamp_ns,
-                    image_size=image_size,
+            processed.append(
+                _ProcessedDetection(
+                    detection=detection,
+                    model_target_class=model_target_class,
                     target_class=target_class,
                     class_probabilities=probabilities,
-                    detection_confidence=detection.confidence,
-                    box=detection.box,
+                    color_segmentation=color_segmentation,
                     k0=k0,
-                    k0_confidence=detection.k0_confidence,
                     ground_point=ground_point,
                     quality=frozenset(quality),
-                    model_version=self._backend.model_version,
-                    model_sha256=self._backend.model_sha256,
                 )
             )
-        return observations
+
+        completed_timestamp_ns = (
+            monotonic_ns() if result_timestamp_ns is None else result_timestamp_ns
+        )
+        if completed_timestamp_ns < frame.timestamp_ns:
+            raise ValueError(
+                "result_timestamp_ns must not be earlier than frame timestamp."
+            )
+        age_ms = (completed_timestamp_ns - frame.timestamp_ns) / 1_000_000.0
+        if age_ms > self._max_observation_age_ms:
+            raise StaleObservationError(
+                age_ms,
+                self._max_observation_age_ms,
+            )
+
+        return [
+            TargetObservation(
+                frame_sequence=frame.sequence,
+                capture_timestamp_ns=frame.timestamp_ns,
+                result_timestamp_ns=completed_timestamp_ns,
+                image_size=image_size,
+                model_target_class=item.model_target_class,
+                target_class=item.target_class,
+                class_probabilities=item.class_probabilities,
+                detection_confidence=item.detection.confidence,
+                box=item.detection.box,
+                color_segmentation=item.color_segmentation,
+                k0=item.k0,
+                k0_confidence=item.detection.k0_confidence,
+                ground_point=item.ground_point,
+                quality=item.quality,
+                model_version=self._backend.model_version,
+                model_sha256=self._backend.model_sha256,
+            )
+            for item in processed
+        ]
 
     def detect_realtime(
         self,

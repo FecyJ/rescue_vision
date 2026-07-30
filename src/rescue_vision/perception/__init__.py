@@ -7,21 +7,31 @@ from rescue_vision.perception.detector import (
     TargetPoseDetector,
 )
 from rescue_vision.perception.types import (
+    COLOR_TARGET_CLASSES,
     ClassProbabilities,
+    ColorSegmentationStatus,
+    HsvColorClassifierConfig,
+    HsvRange,
     ModelDetection,
     ObservationQuality,
+    RoiColorSegmentation,
     TargetClass,
     TargetObservation,
     UndistortedBoundingBox,
 )
 
 __all__ = [
+    "COLOR_TARGET_CLASSES",
     "ClassProbabilities",
+    "ColorSegmentationStatus",
     "FakeInferenceBackend",
+    "HsvColorClassifierConfig",
+    "HsvRange",
     "InferenceBackend",
     "ModelDetection",
     "ObservationQuality",
     "RealtimeDetectionResult",
+    "RoiColorSegmentation",
     "StaleObservationError",
     "TargetClass",
     "TargetObservation",

@@ -45,9 +45,9 @@ def main() -> None:
     detector = TargetPoseDetector(
         backend,
         class_mapping=config.hailo.model_class_mapping(),
-        detection_threshold=config.hailo.detection_threshold,
-        semantic_threshold=config.hailo.semantic_threshold,
-        k0_threshold=config.hailo.k0_threshold,
+        detection_threshold=config.perception.detection_threshold,
+        k0_threshold=config.perception.k0_threshold,
+        color_classifier=config.perception.color_classifier,
         max_observation_age_ms=config.processing.max_observation_age_ms,
         ground_projector=projector,
     )
@@ -62,6 +62,9 @@ def main() -> None:
                         "frame_sequence": observation.frame_sequence,
                         "capture_timestamp_ns": observation.capture_timestamp_ns,
                         "result_timestamp_ns": observation.result_timestamp_ns,
+                        "model_target_class": (
+                            observation.model_target_class.value
+                        ),
                         "target_class": observation.target_class.value,
                         "class_probabilities": (
                             observation.class_probabilities.as_dict()
@@ -72,6 +75,22 @@ def main() -> None:
                             observation.box.x_max,
                             observation.box.y_max,
                         ],
+                        "color_segmentation": {
+                            "candidate_class": (
+                                observation.color_segmentation.candidate_class.value
+                            ),
+                            "status": observation.color_segmentation.status.value,
+                            "roi_box_undistorted": [
+                                observation.color_segmentation.roi_box.x_min,
+                                observation.color_segmentation.roi_box.y_min,
+                                observation.color_segmentation.roi_box.x_max,
+                                observation.color_segmentation.roi_box.y_max,
+                            ],
+                            "color_fraction": (
+                                observation.color_segmentation.color_fraction
+                            ),
+                            "dominance": observation.color_segmentation.dominance,
+                        },
                         "k0_undistorted": (
                             [observation.k0.u, observation.k0.v]
                             if observation.k0 is not None

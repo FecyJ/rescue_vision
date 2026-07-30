@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
 from rescue_vision.geometry.types import GroundPoint, UndistortedPixel
 from rescue_vision.perception import (
     ClassProbabilities,
+    ColorSegmentationStatus,
+    RoiColorSegmentation,
     TargetClass,
     TargetObservation,
     UndistortedBoundingBox,
@@ -44,18 +48,49 @@ def observation(
         if ground_point is not None
         else None
     )
+    observation_box = box or UndistortedBoundingBox(10.0, 10.0, 30.0, 40.0)
+    mask_shape = (
+        math.ceil(observation_box.y_max) - math.floor(observation_box.y_min),
+        math.ceil(observation_box.x_max) - math.floor(observation_box.x_min),
+    )
+    if target_class is TargetClass.UNKNOWN:
+        candidate_class = TargetClass.UNKNOWN
+        status = ColorSegmentationStatus.INSUFFICIENT
+        mask = np.zeros(mask_shape, dtype=np.uint8)
+        color_fraction = 0.0
+        dominance = 0.0
+    else:
+        candidate_class = target_class
+        status = ColorSegmentationStatus.ACCEPTED
+        mask = np.full(mask_shape, 255, dtype=np.uint8)
+        color_fraction = 1.0
+        dominance = 1.0
     return TargetObservation(
         frame_sequence=sequence,
         capture_timestamp_ns=timestamp_ns,
         result_timestamp_ns=timestamp_ns + 1_000_000,
         image_size=(100, 80),
+        model_target_class=target_class,
         target_class=target_class,
         class_probabilities=ClassProbabilities.from_top_class(
             target_class,
             confidence,
         ),
         detection_confidence=confidence,
-        box=box or UndistortedBoundingBox(10.0, 10.0, 30.0, 40.0),
+        box=observation_box,
+        color_segmentation=RoiColorSegmentation(
+            candidate_class=candidate_class,
+            status=status,
+            roi_box=UndistortedBoundingBox(
+                float(math.floor(observation_box.x_min)),
+                float(math.floor(observation_box.y_min)),
+                float(math.ceil(observation_box.x_max)),
+                float(math.ceil(observation_box.y_max)),
+            ),
+            mask=mask,
+            color_fraction=color_fraction,
+            dominance=dominance,
+        ),
         k0=k0,
         k0_confidence=0.9 if k0 is not None else 0.0,
         ground_point=ground_point,

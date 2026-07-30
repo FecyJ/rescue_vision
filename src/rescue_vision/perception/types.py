@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from enum import Enum
 import math
 
+import numpy as np
+import numpy.typing as npt
+
 from rescue_vision.geometry.types import GroundPoint, UndistortedPixel
 
 
@@ -22,8 +25,18 @@ class TargetClass(str, Enum):
 class ObservationQuality(str, Enum):
     """不会被静默丢弃的观测质量信息。"""
 
-    LOW_CLASS_CONFIDENCE = "low_class_confidence"
+    COLOR_EVIDENCE_INSUFFICIENT = "color_evidence_insufficient"
+    COLOR_EVIDENCE_AMBIGUOUS = "color_evidence_ambiguous"
+    POSE_COLOR_CONFLICT = "pose_color_conflict"
     K0_UNAVAILABLE = "k0_unavailable"
+
+
+class ColorSegmentationStatus(str, Enum):
+    """ROI 颜色分类的判定状态。"""
+
+    ACCEPTED = "accepted"
+    INSUFFICIENT = "insufficient"
+    AMBIGUOUS = "ambiguous"
 
 
 def _probability(value: float, location: str) -> float:
@@ -129,6 +142,209 @@ class UndistortedBoundingBox:
 
 
 @dataclass(frozen=True, slots=True)
+class HsvRange:
+    """OpenCV HSV 闭区间，H 为 0..179，S/V 为 0..255。"""
+
+    lower: tuple[int, int, int]
+    upper: tuple[int, int, int]
+
+    def __post_init__(self) -> None:
+        for name, value in (("lower", self.lower), ("upper", self.upper)):
+            if (
+                not isinstance(value, tuple)
+                or len(value) != 3
+                or any(
+                    isinstance(component, bool)
+                    or not isinstance(component, int)
+                    for component in value
+                )
+            ):
+                raise ValueError(
+                    f"{name} must be an integer (H, S, V) tuple, got {value!r}."
+                )
+        limits = (179, 255, 255)
+        for index, (lower, upper, limit) in enumerate(
+            zip(self.lower, self.upper, limits, strict=True)
+        ):
+            if not 0 <= lower <= upper <= limit:
+                raise ValueError(
+                    f"HSV component {index} must satisfy 0 <= lower <= upper "
+                    f"<= {limit}, got {lower}..{upper}."
+                )
+
+    def overlaps(self, other: HsvRange) -> bool:
+        return all(
+            max(first_lower, second_lower) <= min(first_upper, second_upper)
+            for first_lower, first_upper, second_lower, second_upper in zip(
+                self.lower,
+                self.upper,
+                other.lower,
+                other.upper,
+                strict=True,
+            )
+        )
+
+
+COLOR_TARGET_CLASSES = (
+    TargetClass.GREEN_SUPPLY,
+    TargetClass.BLACK_CORE,
+    TargetClass.ORANGE_INJURED,
+    TargetClass.BLUE_DANGER,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class HsvColorClassifierConfig:
+    """ROI HSV 分类、分割及基础去噪参数。"""
+
+    green_supply: tuple[HsvRange, ...]
+    black_core: tuple[HsvRange, ...]
+    orange_injured: tuple[HsvRange, ...]
+    blue_danger: tuple[HsvRange, ...]
+    min_color_fraction: float
+    min_color_dominance: float
+    min_dominance_margin: float
+    morphology_kernel_size: int
+    open_iterations: int
+    close_iterations: int
+    min_component_area_fraction: float
+
+    def __post_init__(self) -> None:
+        for target_class in COLOR_TARGET_CLASSES:
+            ranges = self.ranges_for(target_class)
+            if (
+                not isinstance(ranges, tuple)
+                or not ranges
+                or not all(isinstance(item, HsvRange) for item in ranges)
+            ):
+                raise ValueError(
+                    f"{target_class.value} must contain at least one HsvRange."
+                )
+        for name, value in (
+            ("min_color_fraction", self.min_color_fraction),
+            ("min_color_dominance", self.min_color_dominance),
+            ("min_dominance_margin", self.min_dominance_margin),
+            ("min_component_area_fraction", self.min_component_area_fraction),
+        ):
+            _probability(value, name)
+        if (
+            isinstance(self.morphology_kernel_size, bool)
+            or not isinstance(self.morphology_kernel_size, int)
+            or self.morphology_kernel_size <= 0
+            or self.morphology_kernel_size % 2 == 0
+        ):
+            raise ValueError(
+                "morphology_kernel_size must be a positive odd integer."
+            )
+        for name, value in (
+            ("open_iterations", self.open_iterations),
+            ("close_iterations", self.close_iterations),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise ValueError(f"{name} must be a non-negative integer.")
+        class_ranges = tuple(
+            (target_class, hsv_range)
+            for target_class in COLOR_TARGET_CLASSES
+            for hsv_range in self.ranges_for(target_class)
+        )
+        for index, (first_class, first_range) in enumerate(class_ranges):
+            for second_class, second_range in class_ranges[index + 1 :]:
+                if (
+                    first_class is not second_class
+                    and first_range.overlaps(second_range)
+                ):
+                    raise ValueError(
+                        f"HSV ranges for {first_class.value} and "
+                        f"{second_class.value} must not overlap."
+                    )
+
+    def ranges_for(self, target_class: TargetClass) -> tuple[HsvRange, ...]:
+        if target_class is TargetClass.UNKNOWN:
+            raise ValueError("unknown does not have an HSV range.")
+        return getattr(self, target_class.value)
+
+
+Uint8Array = npt.NDArray[np.uint8]
+
+
+@dataclass(frozen=True, slots=True)
+class RoiColorSegmentation:
+    """去畸变检测框 ROI 内的顶部颜色候选及只读二值掩码。"""
+
+    candidate_class: TargetClass
+    status: ColorSegmentationStatus
+    roi_box: UndistortedBoundingBox
+    mask: Uint8Array
+    color_fraction: float
+    dominance: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.candidate_class, TargetClass):
+            raise ValueError("candidate_class must be a TargetClass.")
+        if not isinstance(self.status, ColorSegmentationStatus):
+            raise ValueError("status must be a ColorSegmentationStatus.")
+        if not isinstance(self.roi_box, UndistortedBoundingBox):
+            raise ValueError("roi_box must be an UndistortedBoundingBox.")
+        bounds = (
+            self.roi_box.x_min,
+            self.roi_box.y_min,
+            self.roi_box.x_max,
+            self.roi_box.y_max,
+        )
+        if any(not float(value).is_integer() for value in bounds):
+            raise ValueError(f"roi_box bounds must be integer-valued, got {bounds!r}.")
+        expected_shape = (
+            int(self.roi_box.y_max - self.roi_box.y_min),
+            int(self.roi_box.x_max - self.roi_box.x_min),
+        )
+        mask = np.asarray(self.mask)
+        if mask.dtype != np.uint8 or mask.ndim != 2 or mask.shape != expected_shape:
+            raise ValueError(
+                "mask must be a uint8 ROI array with shape "
+                f"{expected_shape}, got dtype={mask.dtype}, shape={mask.shape}."
+            )
+        if np.any((mask != 0) & (mask != 255)):
+            raise ValueError("mask values must be 0 or 255.")
+        owned_mask = np.ascontiguousarray(mask).copy()
+        owned_mask.flags.writeable = False
+        object.__setattr__(self, "mask", owned_mask)
+        _probability(self.color_fraction, "color_fraction")
+        _probability(self.dominance, "dominance")
+        if self.candidate_class is TargetClass.UNKNOWN and (
+            np.any(owned_mask)
+            or self.color_fraction != 0.0
+            or self.dominance != 0.0
+        ):
+            raise ValueError(
+                "unknown color candidate requires an empty mask and zero evidence."
+            )
+        if self.status is ColorSegmentationStatus.ACCEPTED and (
+            self.candidate_class is TargetClass.UNKNOWN
+            or not np.any(owned_mask)
+            or self.color_fraction == 0.0
+            or self.dominance == 0.0
+        ):
+            raise ValueError(
+                "accepted color segmentation requires a known non-empty candidate."
+            )
+        if (
+            self.candidate_class is not TargetClass.UNKNOWN
+            and (
+                not np.any(owned_mask)
+                or self.color_fraction == 0.0
+                or self.dominance == 0.0
+            )
+        ):
+            raise ValueError(
+                "known color candidate requires a non-empty mask and evidence."
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class ModelDetection:
     """推理后端输出；坐标已经反映射到去畸变输入图像。"""
 
@@ -164,10 +380,12 @@ class TargetObservation:
     capture_timestamp_ns: int
     result_timestamp_ns: int
     image_size: tuple[int, int]
+    model_target_class: TargetClass
     target_class: TargetClass
     class_probabilities: ClassProbabilities
     detection_confidence: float
     box: UndistortedBoundingBox
+    color_segmentation: RoiColorSegmentation
     k0: UndistortedPixel | None
     k0_confidence: float
     ground_point: GroundPoint | None
@@ -212,12 +430,45 @@ class TargetObservation:
             )
         if not isinstance(self.target_class, TargetClass):
             raise ValueError("target_class must be a TargetClass value.")
+        if not isinstance(self.model_target_class, TargetClass):
+            raise ValueError("model_target_class must be a TargetClass value.")
         if not isinstance(self.class_probabilities, ClassProbabilities):
             raise ValueError(
                 "class_probabilities must be a ClassProbabilities value."
             )
         _probability(self.detection_confidence, "detection_confidence")
         self.box.validate_image_size(self.image_size)
+        if not isinstance(self.color_segmentation, RoiColorSegmentation):
+            raise ValueError(
+                "color_segmentation must be a RoiColorSegmentation value."
+            )
+        self.color_segmentation.roi_box.validate_image_size(self.image_size)
+        expected_roi = (
+            math.floor(self.box.x_min),
+            math.floor(self.box.y_min),
+            math.ceil(self.box.x_max),
+            math.ceil(self.box.y_max),
+        )
+        actual_roi = (
+            self.color_segmentation.roi_box.x_min,
+            self.color_segmentation.roi_box.y_min,
+            self.color_segmentation.roi_box.x_max,
+            self.color_segmentation.roi_box.y_max,
+        )
+        if actual_roi != expected_roi:
+            raise ValueError(
+                f"color_segmentation roi_box {actual_roi!r} does not match "
+                f"rasterized detection box {expected_roi!r}."
+            )
+        if self.color_segmentation.status is ColorSegmentationStatus.ACCEPTED:
+            if self.target_class is not self.color_segmentation.candidate_class:
+                raise ValueError(
+                    "accepted color candidate must equal target_class."
+                )
+        elif self.target_class is not TargetClass.UNKNOWN:
+            raise ValueError(
+                "rejected color segmentation requires target_class unknown."
+            )
         _probability(self.k0_confidence, "k0_confidence")
         if self.k0 is not None:
             width, height = self.image_size

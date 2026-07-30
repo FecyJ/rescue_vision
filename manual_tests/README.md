@@ -9,9 +9,9 @@
 - `camera_undistort.py --intrinsics PATH`：加载指定内参实时预览去畸变结果。
 - `picamera_minimal.py`：直接使用 Picamera2 的最小检查。
 - `geometry_projection.py`：使用本地测试图片人工检查 BEV 和点投影。
-- `hailo_pose.py`：从实际 `runtime.yaml` 加载 YOLO Pose 部署包，检查单张去畸变图像的 K0 观测。
-- `dataset_perception.py`：按 schema v2 数据清单批量运行 Hailo，覆盖式写出保留 UNKNOWN、质量信息和模型身份的观测 JSONL。
-- `camera_undistort_perception.py`：按实际 `runtime.yaml` 连续执行相机、去畸变、Hailo Pose、K0/地面点叠加预览，按 `Q/Esc` 退出；偶发过期帧会标红并丢弃，不会终止预览。
+- `hailo_pose.py`：从实际 `runtime.yaml` 加载 YOLO Pose 部署包，检查单张去畸变图像的框、K0、HSV 类别和 ROI 分割摘要。
+- `dataset_perception.py`：按 schema v2 数据清单批量运行 Hailo，覆盖式写出 schema v2 观测 JSONL，保留 Pose 类别、HSV 候选/覆盖率、UNKNOWN、质量信息和模型身份。
+- `camera_undistort_perception.py`：按实际 `runtime.yaml` 连续执行相机、去畸变、Hailo Pose、ROI HSV 掩码和 K0/地面点叠加预览，按 `Q/Esc` 退出；偶发过期帧会标红并丢弃，不会终止预览。
 - `remote_link.py --config PATH`：在树莓派侧以 `remote.role: server` 监听电脑端客户端，连接后发送协议要求的最小会话状态，并持续打印收到的 control；该状态有意声明所有业务能力不可用，所以正式客户端应保持控制禁用。仅验证连接可使用 `observe_only`；用自制底层客户端检查 control 帧时使用 `debug_control`。
 - `remote_video.py --config PATH`：发送真实相机的最新 JPEG 帧和周期会话状态，不接收或执行控制。
 - `remote_capture.py`：兼容旧人工命令的薄包装；正式入口为 `rescue-vision-manual-capture`。
@@ -38,7 +38,10 @@ python manual_tests/camera_undistort_perception.py \
   --frames 20
 ```
 
-画面左上角显示从相机时间戳到推理完成的 `age`，以及全尺寸去畸变耗时。超过 `processing.max_observation_age_ms` 的结果会显示为红色 `STALE dropped` 并被丢弃；这属于实时安全降级，不应通过盲目增大阈值消除。
+画面左上角显示从相机时间戳到 Pose 推理、HSV 分类和掩码后处理全部完成的
+`age`，以及全尺寸去畸变耗时。超过
+`processing.max_observation_age_ms` 的结果会显示为红色 `STALE dropped`
+并被丢弃；这属于实时安全降级，不应通过盲目增大阈值消除。
 
 ### `Schema error: ... already registered`
 

@@ -53,9 +53,9 @@ from rescue_vision.perception import TargetPoseDetector
 detector = TargetPoseDetector(
     backend,
     class_mapping=config.hailo.model_class_mapping(),
-    detection_threshold=config.hailo.detection_threshold,
-    semantic_threshold=config.hailo.semantic_threshold,
-    k0_threshold=config.hailo.k0_threshold,
+    detection_threshold=config.perception.detection_threshold,
+    k0_threshold=config.perception.k0_threshold,
+    color_classifier=config.perception.color_classifier,
     max_observation_age_ms=config.processing.max_observation_age_ms,
     ground_projector=geometry.ground_projector,
 )

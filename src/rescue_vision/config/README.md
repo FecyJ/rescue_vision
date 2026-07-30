@@ -1,6 +1,6 @@
 # `config`：运行配置与对象装配
 
-本包是运行参数的唯一入口。`load_runtime_config()` 加载 schema v9 YAML，拒绝缺失字段、未知字段、错误类型和不一致资产；相对路径以 YAML 所在目录为基准。
+本包是运行参数的唯一入口。`load_runtime_config()` 加载 schema v10 YAML，拒绝缺失字段、未知字段、错误类型和不一致资产；相对路径以 YAML 所在目录为基准。
 
 本机运行统一读取不提交的 `configs/runtime.yaml`。`configs/runtime.example.yaml` 只用于创建新配置：
 
@@ -40,7 +40,9 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `TrackingConfig` | 关联、确认、滑行、衰减和删除阈值 |
 | `WorldRuntimeConfig` | `WorldModelConfig` 与 `StaticRegion` 集合 |
 | `MissionConfig` | 比赛计时、安全超时、避让距离和目标优先级 |
-| `HailoConfig` | 模型资产、身份、类别映射和阈值 |
+| `PerceptionConfig` | 检测/K0 阈值和 ROI HSV 分类、分割参数 |
+| `HsvColorClassifierConfig` | 四类 HSV 闭区间、颜色证据门槛和掩码去噪参数 |
+| `HailoConfig` | 模型资产、身份、类别映射和后端粗筛阈值 |
 | `RuntimeGeometry` | `camera_model`、可选 `ground_projector` |
 
 ## 1. 加载运行配置
@@ -98,6 +100,7 @@ if backend is None:
     raise RuntimeError("当前功能需要在 runtime.yaml 中启用 Hailo")
 
 class_mapping = config.hailo.model_class_mapping()
+color_classifier = config.perception.color_classifier
 ```
 
 `backend` 必须由调用方关闭；正常生产路径通常立即交给
@@ -146,12 +149,52 @@ geometry:
 
 后端必须由调用方 `close()`，通常交给 `TargetPoseDetector` 的上下文管理统一释放。
 
-阈值分为三层：`backend_score_threshold` 是后端粗筛，必须小于等于
-`detection_threshold`；`detection_threshold` 决定是否形成观测；
-`semantic_threshold` 决定是否保留模型类别，低于它时保守降级为
-`unknown`。`k0_threshold` 独立控制地面接触点是否可用。
+`hailo.backend_score_threshold` 是后端粗筛，必须小于等于
+`perception.detection_threshold`；后者决定模型框是否进入统一观测。
+`perception.k0_threshold` 独立控制接触点是否可用。最终任务类别不再由
+模型分类分数决定，而由 `perception.color_classifier` 对检测框 ROI 进行
+HSV 分类；颜色覆盖不足或多色歧义时输出 `unknown`。
 
-## 8. UART 装配语义
+## 8. ROI HSV 配置
+
+OpenCV HSV 的 H 范围为 `0..179`，S/V 为 `0..255`。每个任务类别可配置一个
+或多个闭区间；橘色跨 Hue 边界，因此示例使用两个区间。不同类别的区间必须
+互不重叠，避免一个像素被解释为多个任务类别。
+
+```yaml
+perception:
+  detection_threshold: 0.25
+  k0_threshold: 0.50
+  color_classifier:
+    ranges:
+      green_supply:
+        - lower: [35, 70, 71]
+          upper: [84, 255, 255]
+      black_core:
+        - lower: [0, 0, 0]
+          upper: [179, 255, 70]
+      orange_injured:
+        - lower: [0, 90, 80]
+          upper: [20, 255, 255]
+        - lower: [170, 90, 80]
+          upper: [179, 255, 255]
+      blue_danger:
+        - lower: [85, 50, 71]
+          upper: [110, 255, 255]
+    min_color_fraction: 0.15
+    min_color_dominance: 0.70
+    min_dominance_margin: 0.20
+    morphology_kernel_size: 3
+    open_iterations: 1
+    close_iterations: 1
+    min_component_area_fraction: 0.002
+```
+
+这些 HSV 范围由官方命题示意图取样后放宽，只是尚未经过现场验证的启动值。
+固定相机、曝光/白平衡、光照和实物后，应通过实拍数据同时校准 HSV 范围、
+覆盖率、dominance 和去噪参数；危险类必须单独报告失败样例。
+
+## 9. UART 装配语义
 
 ```yaml
 uart:
@@ -169,7 +212,7 @@ PySerial 并打开设备。电机命令、轮速和未来 IMU 报文由后续协
 不能把类别前缀或字段数塞进运行配置。完整生命周期和故障语义见
 [`communication` README](../communication/README.md)。
 
-## 9. 远程通信装配语义
+## 10. 远程通信装配语义
 
 `remote.role: server` 用于树莓派监听，`client` 只用于本仓库参考客户端和
 双机人工检查。独立电脑端维护自己的配置和协议实现，不读取本仓库 YAML 或
@@ -188,7 +231,11 @@ PySerial 并打开设备。电机命令、轮速和未来 IMU 报文由后续协
 
 ## schema 与路径
 
-- 当前运行配置为 schema v9。
+- 当前运行配置为 schema v10。
+- schema v9 升级到 v10 时，必须新增完整的 `perception` 段，并从 `hailo`
+  删除 `detection_threshold`、`semantic_threshold` 和 `k0_threshold`。
+  `detection_threshold`、`k0_threshold` 移入 `perception`；模型类别只保留为
+  诊断证据，最终类别由 ROI HSV 决定。旧字段不会被静默兼容。
 - schema v8 升级到 v9 时，`motion` 段必须增加正有限数
   `max_wheel_acceleration_m_s2`。示例值 `0.50` 表示单轮目标速度每秒最多
   变化 0.50 m/s；控制器不会静默使用旧配置或猜测真车安全加速度。

@@ -42,7 +42,7 @@ def config_text(
     ground_mapping_enabled: bool = True,
     extra: str = "",
 ) -> str:
-    return f"""schema_version: 9
+    return f"""schema_version: 10
 camera:
   backend: rpicam_vid
   image_size: {image_size}
@@ -106,6 +106,32 @@ mission:
   opponent_contact_timeout_s: 10.0
   danger_avoid_distance_mm: 500.0
   target_priority: [orange_injured, black_core, green_supply]
+perception:
+  detection_threshold: 0.25
+  k0_threshold: 0.5
+  color_classifier:
+    ranges:
+      green_supply:
+        - lower: [35, 70, 71]
+          upper: [84, 255, 255]
+      black_core:
+        - lower: [0, 0, 0]
+          upper: [179, 255, 70]
+      orange_injured:
+        - lower: [0, 90, 80]
+          upper: [20, 255, 255]
+        - lower: [170, 90, 80]
+          upper: [179, 255, 255]
+      blue_danger:
+        - lower: [85, 50, 71]
+          upper: [110, 255, 255]
+    min_color_fraction: 0.15
+    min_color_dominance: 0.70
+    min_dominance_margin: 0.20
+    morphology_kernel_size: 3
+    open_iterations: 1
+    close_iterations: 1
+    min_component_area_fraction: 0.002
 hailo:
   enabled: false
   hef_path: null
@@ -116,9 +142,6 @@ hailo:
   raw_classes: []
   class_mapping: {{}}
   backend_score_threshold: 0.01
-  detection_threshold: 0.25
-  semantic_threshold: 0.5
-  k0_threshold: 0.5
   max_detections: 100
 {extra}"""
 
@@ -272,12 +295,81 @@ def test_backend_threshold_must_not_hide_detector_candidates(tmp_path) -> None:
         load_runtime_config(path)
 
 
+def test_color_classifier_config_is_loaded_from_perception(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(config_text(), encoding="utf-8")
+
+    config = load_runtime_config(path)
+
+    assert config.perception.detection_threshold == pytest.approx(0.25)
+    assert config.perception.k0_threshold == pytest.approx(0.5)
+    classifier = config.perception.color_classifier
+    assert classifier.green_supply[0].lower == (35, 70, 71)
+    assert len(classifier.orange_injured) == 2
+    assert classifier.morphology_kernel_size == 3
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "message"),
+    [
+        (
+            """      blue_danger:
+        - lower: [85, 50, 71]
+          upper: [110, 255, 255]
+""",
+            "",
+            "ranges keys",
+        ),
+        ("lower: [35, 70, 71]", "lower: [180, 70, 71]", "HSV component"),
+        (
+            """      blue_danger:
+        - lower: [85, 50, 71]
+          upper: [110, 255, 255]""",
+            """      blue_danger:
+        - lower: [35, 70, 71]
+          upper: [84, 255, 255]""",
+            "must not overlap",
+        ),
+        (
+            "    morphology_kernel_size: 3",
+            "    morphology_kernel_size: 4",
+            "positive odd",
+        ),
+    ],
+)
+def test_color_classifier_rejects_invalid_schema(
+    tmp_path,
+    old: str,
+    new: str,
+    message: str,
+) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(config_text().replace(old, new), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        load_runtime_config(path)
+
+
+def test_removed_hailo_semantic_threshold_is_rejected(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text().replace(
+            "  backend_score_threshold: 0.01",
+            "  backend_score_threshold: 0.01\n  semantic_threshold: 0.5",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="semantic_threshold"):
+        load_runtime_config(path)
+
+
 def test_runtime_example_matches_strict_schema() -> None:
     example = (
         Path(__file__).resolve().parents[1] / "configs" / "runtime.example.yaml"
     )
     config = load_runtime_config(example)
-    assert config.schema_version == 9
+    assert config.schema_version == 10
 
 
 def test_uart_config_builds_channel_without_opening_device(tmp_path) -> None:
