@@ -1,4 +1,4 @@
-schema_version: 11
+schema_version: 12
 
 camera:
   # picamera2 可记录逐帧曝光/增益等元数据；rpicam_vid 是低开销备选。
@@ -121,6 +121,50 @@ perception:
     open_iterations: 1
     close_iterations: 1
     min_component_area_fraction: 0.002
+  target_ground_geometry:
+    # 依赖带完整相机外参的地面标定。现场轮廓与性能验证前保持关闭。
+    enabled: false
+    objects:
+      # 盒体 length 沿目标局部长轴，width 沿短轴，height 向上。
+      green_supply:
+        shape: box
+        length_mm: 40.0
+        width_mm: 40.0
+        height_mm: 40.0
+      # 核心物资确认为以正三角形面接地的正四面体。
+      black_core:
+        shape: regular_tetrahedron
+        edge_mm: 40.0
+      orange_injured:
+        shape: box
+        length_mm: 80.0
+        width_mm: 40.0
+        height_mm: 40.0
+      blue_danger:
+        shape: box
+        length_mm: 40.0
+        width_mm: 40.0
+        height_mm: 40.0
+    fitting:
+      # 先在 K0 周围按已知足迹搜索，再对最优位置和朝向细化。
+      coarse_center_step_mm: 5.0
+      coarse_yaw_step_deg: 10.0
+      refine_center_step_mm: 1.0
+      refine_center_radius_mm: 6.0
+      refine_top_candidates: 3
+      refine_yaw_step_deg: 2.0
+      refine_yaw_radius_deg: 10.0
+      search_radius_margin_mm: 8.0
+      silhouette_weight: 0.65
+      contour_weight: 0.25
+      contact_weight: 0.10
+      contour_distance_scale_px: 4.0
+      contact_distance_scale_px: 6.0
+      max_contact_residual_px: 12.0
+      ambiguity_score_delta: 0.03
+      max_center_uncertainty_mm: 12.0
+      min_fit_score: 0.60
+      min_silhouette_iou: 0.45
   field_features:
     # 当前环境没有现场场地样本，模板保持关闭；开启前必须启用并验证地面映射。
     enabled: false

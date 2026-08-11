@@ -2,7 +2,7 @@
 
 2027 工创赛“智能救援”赛项的上位机视觉工程，目标平台为 Raspberry Pi 5、Hailo-8L 和 Camera Module 3 NoIR Wide。
 
-当前已完成相机、标定与地面几何、严格配置、录制回放、数据集工具、离线评测、协议无关 UART、直接 TCP 远程消息通道、Rescue Car v2.0 运动控制、受监督手动驾驶采集入口、统一目标观测、Hailo YOLO Pose 后端、传统视觉场地特征观测基线，以及可用合成事件运行的目标跟踪、最小世界模型和规则状态机；尚未完成正式四类目标模型、定位、完整区域/对手感知、规划、脚本运动采集、固件失联看门狗闭环、真实接触/交付证据适配和比赛应用入口。这不是可直接参赛的完整程序。
+当前已完成相机、标定与地面几何、严格配置、录制回放、数据集工具、离线评测、协议无关 UART、直接 TCP 远程消息通道、Rescue Car v2.0 运动控制、受监督手动驾驶采集入口、统一目标观测、Hailo YOLO Pose 后端、四类目标传统视觉地面几何估计基线、传统视觉场地特征观测基线，以及可用合成事件运行的目标跟踪、最小世界模型和规则状态机；尚未完成正式四类目标模型、定位、完整区域/对手感知、规划、脚本运动采集、固件失联看门狗闭环、真实接触/交付证据适配和比赛应用入口。这不是可直接参赛的完整程序。
 
 ## 快速上手
 
@@ -53,14 +53,14 @@ python -m pytest
 | --- | --- | --- |
 | [`camera`](src/rescue_vision/camera/README.md) | 已实现 | 真机最新帧、离线回放和有界异步记录 |
 | [`calibration`](src/rescue_vision/calibration/README.md) | 已实现 | 棋盘采集、三模型内参比较和地面映射 |
-| [`geometry`](src/rescue_vision/geometry/README.md) | 已实现 | 去畸变、显式坐标类型、地面与 BEV 转换 |
-| [`config`](src/rescue_vision/config/README.md) | 已实现 | schema v11 配置、UART/远程/motion/几何/模型和算法装配 |
+| [`geometry`](src/rescue_vision/geometry/README.md) | 已实现 | 去畸变、显式坐标类型、地面/三维点投影与 BEV 转换 |
+| [`config`](src/rescue_vision/config/README.md) | 已实现 | schema v12 配置、UART/远程/motion/几何/模型和算法装配 |
 | [`communication`](src/rescue_vision/communication/README.md) | 已实现基础设施 | UART、直接 TCP 远程消息、独立客户端严格 schema 和有界队列；发布器待接入 |
 | [`motion`](src/rescue_vision/motion/README.md) | 已实现基础设施 | 差速运动、单轮加速度限制、Rescue Car 电控协议解析、远程调试执行和车端超时停车 |
 | [`app`](src/rescue_vision/app/README.md) | 已实现手动采集入口 | 赛外受监督驾驶、图传、采集控制与状态装配；比赛入口待实现 |
 | [`data`](src/rescue_vision/data/README.md) | 已实现 | 记录检查、清单生成和按会话防泄漏划分 |
 | [`evaluation`](src/rescue_vision/evaluation/README.md) | 已实现 | 分类、地面误差、时延和失败样例报告 |
-| [`perception`](src/rescue_vision/perception/README.md) | 已实现基础设施 | Pose 框/K0、ROI HSV 分类分割，以及安全区、无编号出发区、中心十字和低精度边界候选；正式模型、现场阈值与树莓派性能待验证 |
+| [`perception`](src/rescue_vision/perception/README.md) | 已实现基础设施 | Pose 框/K0、ROI HSV 分类分割、四类可配置三维模板地面中心估计，以及安全区、无编号出发区、中心十字和低精度边界候选；正式模型、实物精度与树莓派性能待验证 |
 | [`tracking`](src/rescue_vision/tracking/README.md) | 已实现纯逻辑 | 时间关联、轨迹确认、短时遮挡、衰减和删除 |
 | [`world`](src/rescue_vision/world/README.md) | 已实现纯逻辑 | 静态区域、动态目标、危险状态、对手占据和不确定性 |
 | [`mission`](src/rescue_vision/mission/README.md) | 已实现纯逻辑 | 首次/容量/伤员/危险规则、安全降级和抽象动作 |
@@ -74,6 +74,8 @@ python -m pytest
 FrameSource → CameraFrame → CameraModel → 去畸变帧
                                       ├─> TargetPoseDetector
                                       │          └─> TargetObservation
+                                      │                     ├─> TargetGroundGeometryEstimator
+                                      │                     │          └─> TargetGroundGeometry
                                       │                     ↓
                                       │          MultiTargetTracker
                                       │                     ↓
@@ -89,11 +91,12 @@ RemoteMessageConnection → DebugMotionCommand → RemoteMotionExecutor
 ```
 
 - 像素必须区分 `RawPixel` 与 `UndistortedPixel`；地面点使用 `GroundPoint`，单位 mm。
-- `CameraModel` 是去畸变唯一权威；`GroundProjector` 是去畸变像素与机器人地面的唯一权威。
+- `CameraModel` 是去畸变唯一权威；`GroundProjector` 是去畸变像素与机器人地面/三维投影的唯一权威。
 - 实时路径只处理最新帧；录像、显示和日志使用有界旁路。
 - 危险目标允许 `unknown`/疑似危险，不得用总体指标掩盖危险类漏检。
 - 规则状态机只消费显式世界、接触、交付和安全证据；当前真实证据提供者尚未完成。
 - 场地特征检测只输出去畸变像素和可选机器人地面观测，不在定位完成前伪造 `FieldPoint` 或直接修改世界模型。
+- 目标地面几何估计保留 K0 接触锚点和中心的语义区别；拟合不充分时中心为 `None`，不会用检测框中心兜底。
 - 原始录像、批量图片、标定临时输出、正式数据集和模型权重不提交 Git。
 
 ## 命令行工具

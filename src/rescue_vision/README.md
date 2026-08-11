@@ -59,6 +59,12 @@ detector = TargetPoseDetector(
     max_observation_age_ms=config.processing.max_observation_age_ms,
     ground_projector=geometry.ground_projector,
 )
+ground_geometry_estimator = (
+    config.perception.build_target_ground_geometry_estimator(
+        max_observation_age_ms=config.processing.max_observation_age_ms,
+        ground_projector=geometry.ground_projector,
+    )
+)
 field_detector = config.perception.build_field_feature_detector(
     max_observation_age_ms=config.processing.max_observation_age_ms,
     ground_projector=geometry.ground_projector,
@@ -93,6 +99,13 @@ with source, detector:
             raw_frame,
             undistorted_bgr,
         )
+        ground_geometry_result = (
+            ground_geometry_estimator.estimate_realtime(
+                detection_result.observations
+            )
+            if ground_geometry_estimator is not None
+            else None
+        )
         field_realtime_result = (
             field_detector.detect_realtime(raw_frame, undistorted_bgr)
             if field_detector is not None
@@ -114,6 +127,8 @@ with source, detector:
             # field_result 留给后续定位消费。P4 定位接入前不传
             # robot/target FieldPoint，
             # 世界模型会保留明确的不确定性。
+            # ground_geometry_result 当前提供机器人系中心/足迹；后续规划
+            # 接口接入前不在这里伪造全局目标坐标。
         )
 
         # 真实接触、交付和电控安全适配器尚未实现；应用入口完成后，
@@ -133,7 +148,7 @@ with source, detector:
 | [`communication`](communication/README.md) | `UartLineChannel`、`RemoteMessageConnection`、`DebugMotionCommand`、`RemoteSessionStatus` | UART、直接 TCP 远程消息与严格观察 schema |
 | [`motion`](motion/README.md) | `MotionController`、`MotionLimits`、`RemoteMotionExecutor`、`run_remote_motion` | 差速运动、Rescue Car 协议和远程调试执行 |
 | [`geometry`](geometry/README.md) | `CameraModel`、`GroundProjector`、显式坐标类型 | 去畸变及像素/地面/BEV 转换 |
-| [`perception`](perception/README.md) | `TargetPoseDetector`、`FieldFeatureDetector`、两类观测结果 | 任务目标和静态场地特征观测 |
+| [`perception`](perception/README.md) | `TargetPoseDetector`、`TargetGroundGeometryEstimator`、`FieldFeatureDetector` | 任务目标、地面几何和静态场地特征观测 |
 | [`tracking`](tracking/README.md) | `MultiTargetTracker`、`TrackedTarget`、`TrackStatus` | 时间关联、遮挡和轨迹生命周期 |
 | [`world`](world/README.md) | `WorldModel`、`WorldSnapshot`、`HazardState` | 区域、动态目标、对手占据和不确定性 |
 | [`mission`](mission/README.md) | `MissionStateMachine`、`replay_mission()`、`MissionDecision` | 规则、安全降级和抽象动作 |
@@ -147,6 +162,6 @@ with source, detector:
 
 - `CameraFrame.image_bgr` 是相机原始帧；任务模型消费 `CameraModel` 产生的全尺寸去畸变图。
 - 原始像素使用 `RawPixel`，去畸变像素使用 `UndistortedPixel`，只有后者能交给 `GroundProjector`。
-- 两类检测器只产生 `TargetObservation` 或 `FieldFeatureDetectionResult`，不持有跟踪、定位、世界模型或规则状态。
+- 感知算法只产生 `TargetObservation`、`TargetGroundGeometry` 或 `FieldFeatureDetectionResult`，不持有跟踪、定位、世界模型或规则状态。
 - 实时循环只处理最新帧；录制、显示、日志和通信使用有界旁路。
 - 当前正式任务目标模型、定位、完整区域/对手感知、真实接触与交付证据、规划、正式任务动作到运动控制的适配和比赛应用入口尚未完成。传统视觉场地特征目前只有合成测试基线；`app` 的远程驾驶/图传只用于赛外受监督采集，不能替代固件失联看门狗。

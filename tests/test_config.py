@@ -8,6 +8,7 @@ import pytest
 
 from rescue_vision.config.runtime import load_runtime_config
 from rescue_vision.geometry.camera_model import CameraCalibration, CameraModelType
+from rescue_vision.geometry.ground_projector import GroundProjector
 
 
 def write_intrinsics(path, *, usable: bool = True) -> CameraCalibration:
@@ -42,7 +43,7 @@ def config_text(
     ground_mapping_enabled: bool = True,
     extra: str = "",
 ) -> str:
-    return f"""schema_version: 11
+    return f"""schema_version: 12
 camera:
   backend: rpicam_vid
   image_size: {image_size}
@@ -132,6 +133,46 @@ perception:
     open_iterations: 1
     close_iterations: 1
     min_component_area_fraction: 0.002
+  target_ground_geometry:
+    enabled: false
+    objects:
+      green_supply:
+        shape: box
+        length_mm: 40.0
+        width_mm: 40.0
+        height_mm: 40.0
+      black_core:
+        shape: regular_tetrahedron
+        edge_mm: 40.0
+      orange_injured:
+        shape: box
+        length_mm: 80.0
+        width_mm: 40.0
+        height_mm: 40.0
+      blue_danger:
+        shape: box
+        length_mm: 40.0
+        width_mm: 40.0
+        height_mm: 40.0
+    fitting:
+      coarse_center_step_mm: 5.0
+      coarse_yaw_step_deg: 10.0
+      refine_center_step_mm: 1.0
+      refine_center_radius_mm: 6.0
+      refine_top_candidates: 3
+      refine_yaw_step_deg: 2.0
+      refine_yaw_radius_deg: 10.0
+      search_radius_margin_mm: 8.0
+      silhouette_weight: 0.65
+      contour_weight: 0.25
+      contact_weight: 0.10
+      contour_distance_scale_px: 4.0
+      contact_distance_scale_px: 6.0
+      max_contact_residual_px: 12.0
+      ambiguity_score_delta: 0.03
+      max_center_uncertainty_mm: 12.0
+      min_fit_score: 0.60
+      min_silhouette_iou: 0.45
   field_features:
     enabled: false
     colors:
@@ -353,6 +394,11 @@ def test_color_classifier_config_is_loaded_from_perception(tmp_path) -> None:
     assert classifier.green_supply[0].lower == (35, 70, 71)
     assert len(classifier.orange_injured) == 2
     assert classifier.morphology_kernel_size == 3
+    target_geometry = config.perception.target_ground_geometry
+    assert target_geometry.enabled is False
+    assert target_geometry.green_supply.length_mm == pytest.approx(40.0)
+    assert target_geometry.black_core.edge_mm == pytest.approx(40.0)
+    assert target_geometry.orange_injured.length_mm == pytest.approx(80.0)
     field_features = config.perception.field_features
     assert field_features.enabled is False
     assert field_features.safe_width_mm == pytest.approx(600.0)
@@ -383,6 +429,91 @@ def test_field_feature_detector_is_built_only_when_enabled(tmp_path) -> None:
         max_observation_age_ms=150.0,
     )
     assert detector is not None
+
+
+def test_target_ground_geometry_estimator_is_strictly_configured(
+    tmp_path,
+) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(config_text(), encoding="utf-8")
+    disabled = load_runtime_config(path)
+    assert (
+        disabled.perception.build_target_ground_geometry_estimator(
+            max_observation_age_ms=150.0,
+            ground_projector=None,
+        )
+        is None
+    )
+
+    path.write_text(
+        config_text().replace(
+            "  target_ground_geometry:\n    enabled: false",
+            "  target_ground_geometry:\n    enabled: true",
+        ),
+        encoding="utf-8",
+    )
+    enabled = load_runtime_config(path)
+    with pytest.raises(RuntimeError, match="requires ground mapping"):
+        enabled.perception.build_target_ground_geometry_estimator(
+            max_observation_age_ms=150.0,
+            ground_projector=None,
+        )
+
+    camera_matrix = np.array(
+        [[800.0, 0.0, 320.0], [0.0, 800.0, 240.0], [0.0, 0.0, 1.0]]
+    )
+    rotation = np.array(
+        [[0.0, -1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, -1.0]]
+    )
+    projector = GroundProjector(
+        np.eye(3),
+        new_camera_matrix=camera_matrix,
+        rotation_robot_to_camera=rotation,
+        translation_robot_to_camera_mm=np.asarray((0.0, 0.0, 500.0)),
+    )
+    estimator = enabled.perception.build_target_ground_geometry_estimator(
+        max_observation_age_ms=150.0,
+        ground_projector=projector,
+    )
+    assert estimator is not None
+    assert estimator.config.black_core.edge_mm == pytest.approx(40.0)
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "message"),
+    [
+        (
+            "        edge_mm: 40.0",
+            "        edge_mm: 0.0",
+            "edge_mm",
+        ),
+        (
+            "        shape: regular_tetrahedron",
+            "        shape: sphere",
+            "shape",
+        ),
+        (
+            "      silhouette_weight: 0.65",
+            "      silhouette_weight: 0.70",
+            "must equal",
+        ),
+        (
+            "      refine_center_step_mm: 1.0",
+            "      refine_center_step_mm: 10.0",
+            "must not exceed",
+        ),
+    ],
+)
+def test_target_ground_geometry_config_rejects_invalid_values(
+    tmp_path,
+    old,
+    new,
+    message,
+) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(config_text().replace(old, new), encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
+        load_runtime_config(path)
 
 
 @pytest.mark.parametrize(
@@ -482,7 +613,7 @@ def test_runtime_example_matches_strict_schema() -> None:
         Path(__file__).resolve().parents[1] / "configs" / "runtime.example.yaml"
     )
     config = load_runtime_config(example)
-    assert config.schema_version == 11
+    assert config.schema_version == 12
 
 
 def test_uart_config_builds_channel_without_opening_device(tmp_path) -> None:

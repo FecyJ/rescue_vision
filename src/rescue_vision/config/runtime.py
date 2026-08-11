@@ -20,6 +20,13 @@ from rescue_vision.perception.types import (
     TargetClass,
 )
 from rescue_vision.perception.field_feature_types import FieldFeatureConfig
+from rescue_vision.perception.target_ground_geometry import (
+    BoxTargetGeometry,
+    RegularTetrahedronTargetGeometry,
+    TargetGeometry,
+    TargetGeometryShape,
+    TargetGroundGeometryConfig,
+)
 from rescue_vision.tracking import TrackingConfig
 from rescue_vision.world import (
     RegionKind,
@@ -38,7 +45,7 @@ if TYPE_CHECKING:
     from rescue_vision.motion import MotionController, RemoteMotionExecutor
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 def _mapping(value: object, location: str) -> dict[str, Any]:
@@ -144,6 +151,52 @@ def _hsv_ranges(value: object, location: str) -> tuple[HsvRange, ...]:
             )
         )
     return tuple(ranges)
+
+
+def _target_geometry(value: object, location: str) -> TargetGeometry:
+    raw = _mapping(value, location)
+    shape_value = _string(
+        _required(raw, "shape", location),
+        f"{location}.shape",
+    )
+    try:
+        shape = TargetGeometryShape(shape_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{location}.shape must be 'box' or "
+            "'regular_tetrahedron'."
+        ) from exc
+    if shape is TargetGeometryShape.BOX:
+        _reject_unknown(
+            raw,
+            {"shape", "length_mm", "width_mm", "height_mm"},
+            location,
+        )
+        return BoxTargetGeometry(
+            length_mm=_finite_float(
+                _required(raw, "length_mm", location),
+                f"{location}.length_mm",
+                minimum=0.001,
+            ),
+            width_mm=_finite_float(
+                _required(raw, "width_mm", location),
+                f"{location}.width_mm",
+                minimum=0.001,
+            ),
+            height_mm=_finite_float(
+                _required(raw, "height_mm", location),
+                f"{location}.height_mm",
+                minimum=0.001,
+            ),
+        )
+    _reject_unknown(raw, {"shape", "edge_mm"}, location)
+    return RegularTetrahedronTargetGeometry(
+        edge_mm=_finite_float(
+            _required(raw, "edge_mm", location),
+            f"{location}.edge_mm",
+            minimum=0.001,
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,7 +385,32 @@ class PerceptionConfig:
     detection_threshold: float
     k0_threshold: float
     color_classifier: HsvColorClassifierConfig
+    target_ground_geometry: TargetGroundGeometryConfig
     field_features: FieldFeatureConfig
+
+    def build_target_ground_geometry_estimator(
+        self,
+        *,
+        max_observation_age_ms: float,
+        ground_projector: GroundProjector | None,
+    ):
+        """按配置创建目标地面几何估计器；禁用时返回 ``None``。"""
+
+        if not self.target_ground_geometry.enabled:
+            return None
+        if ground_projector is None:
+            raise RuntimeError(
+                "Enabled target_ground_geometry requires ground mapping."
+            )
+        from rescue_vision.perception.target_ground_geometry import (
+            TargetGroundGeometryEstimator,
+        )
+
+        return TargetGroundGeometryEstimator(
+            self.target_ground_geometry,
+            max_observation_age_ms=max_observation_age_ms,
+            ground_projector=ground_projector,
+        )
 
     def build_field_feature_detector(
         self,
@@ -452,7 +530,7 @@ class AppConfig:
 
 
 def load_runtime_config(path: str | Path) -> AppConfig:
-    """从 YAML 加载 schema v11；缺项和未知字段均视为错误。"""
+    """从 YAML 加载 schema v12；缺项和未知字段均视为错误。"""
 
     config_path = Path(path).expanduser().resolve()
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -1062,6 +1140,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "detection_threshold",
             "k0_threshold",
             "color_classifier",
+            "target_ground_geometry",
             "field_features",
         },
         "perception",
@@ -1192,6 +1271,262 @@ def load_runtime_config(path: str | Path) -> AppConfig:
                 "perception.color_classifier",
             ),
             "perception.color_classifier.min_component_area_fraction",
+        ),
+    )
+    target_geometry_raw = _mapping(
+        _required(
+            perception_raw,
+            "target_ground_geometry",
+            "perception",
+        ),
+        "perception.target_ground_geometry",
+    )
+    _reject_unknown(
+        target_geometry_raw,
+        {"enabled", "objects", "fitting"},
+        "perception.target_ground_geometry",
+    )
+    target_geometry_enabled = _required(
+        target_geometry_raw,
+        "enabled",
+        "perception.target_ground_geometry",
+    )
+    if not isinstance(target_geometry_enabled, bool):
+        raise ValueError(
+            "perception.target_ground_geometry.enabled must be a boolean."
+        )
+    target_objects_raw = _mapping(
+        _required(
+            target_geometry_raw,
+            "objects",
+            "perception.target_ground_geometry",
+        ),
+        "perception.target_ground_geometry.objects",
+    )
+    expected_target_geometry_names = {
+        item.value for item in COLOR_TARGET_CLASSES
+    }
+    if set(target_objects_raw) != expected_target_geometry_names:
+        raise ValueError(
+            "perception.target_ground_geometry.objects keys must exactly "
+            f"be {sorted(expected_target_geometry_names)!r}."
+        )
+    target_geometries = {
+        target_class: _target_geometry(
+            target_objects_raw[target_class.value],
+            "perception.target_ground_geometry.objects."
+            f"{target_class.value}",
+        )
+        for target_class in COLOR_TARGET_CLASSES
+    }
+    target_fitting_raw = _mapping(
+        _required(
+            target_geometry_raw,
+            "fitting",
+            "perception.target_ground_geometry",
+        ),
+        "perception.target_ground_geometry.fitting",
+    )
+    target_fitting_names = {
+        "coarse_center_step_mm",
+        "coarse_yaw_step_deg",
+        "refine_center_step_mm",
+        "refine_center_radius_mm",
+        "refine_top_candidates",
+        "refine_yaw_step_deg",
+        "refine_yaw_radius_deg",
+        "search_radius_margin_mm",
+        "silhouette_weight",
+        "contour_weight",
+        "contact_weight",
+        "contour_distance_scale_px",
+        "contact_distance_scale_px",
+        "max_contact_residual_px",
+        "ambiguity_score_delta",
+        "max_center_uncertainty_mm",
+        "min_fit_score",
+        "min_silhouette_iou",
+    }
+    _reject_unknown(
+        target_fitting_raw,
+        target_fitting_names,
+        "perception.target_ground_geometry.fitting",
+    )
+    target_ground_geometry = TargetGroundGeometryConfig(
+        enabled=target_geometry_enabled,
+        green_supply=target_geometries[TargetClass.GREEN_SUPPLY],
+        black_core=target_geometries[TargetClass.BLACK_CORE],
+        orange_injured=target_geometries[TargetClass.ORANGE_INJURED],
+        blue_danger=target_geometries[TargetClass.BLUE_DANGER],
+        coarse_center_step_mm=_finite_float(
+            _required(
+                target_fitting_raw,
+                "coarse_center_step_mm",
+                "perception.target_ground_geometry.fitting",
+            ),
+            "perception.target_ground_geometry.fitting."
+            "coarse_center_step_mm",
+            minimum=0.001,
+        ),
+        coarse_yaw_step_deg=_finite_float(
+            _required(
+                target_fitting_raw,
+                "coarse_yaw_step_deg",
+                "perception.target_ground_geometry.fitting",
+            ),
+            "perception.target_ground_geometry.fitting."
+            "coarse_yaw_step_deg",
+            minimum=0.001,
+        ),
+        refine_center_step_mm=_finite_float(
+            _required(
+                target_fitting_raw,
+                "refine_center_step_mm",
+                "perception.target_ground_geometry.fitting",
+            ),
+            "perception.target_ground_geometry.fitting."
+            "refine_center_step_mm",
+            minimum=0.001,
+        ),
+        refine_center_radius_mm=_finite_float(
+            _required(
+                target_fitting_raw,
+                "refine_center_radius_mm",
+                "perception.target_ground_geometry.fitting",
+            ),
+            "perception.target_ground_geometry.fitting."
+            "refine_center_radius_mm",
+            minimum=0.001,
+        ),
+        refine_top_candidates=_positive_int(
+            _required(
+                target_fitting_raw,
+                "refine_top_candidates",
+                "perception.target_ground_geometry.fitting",
+            ),
+            "perception.target_ground_geometry.fitting."
+            "refine_top_candidates",
+        ),
+        refine_yaw_step_deg=_finite_float(
+            _required(
+                target_fitting_raw,
+                "refine_yaw_step_deg",
+                "perception.target_ground_geometry.fitting",
+            ),
+            "perception.target_ground_geometry.fitting."
+            "refine_yaw_step_deg",
+            minimum=0.001,
+        ),
+        refine_yaw_radius_deg=_finite_float(
+            _required(
+                target_fitting_raw,
+                "refine_yaw_radius_deg",
+                "perception.target_ground_geometry.fitting",
+            ),
+            "perception.target_ground_geometry.fitting."
+            "refine_yaw_radius_deg",
+            minimum=0.001,
+        ),
+        search_radius_margin_mm=_finite_float(
+            _required(
+                target_fitting_raw,
+                "search_radius_margin_mm",
+                "perception.target_ground_geometry.fitting",
+            ),
+            "perception.target_ground_geometry.fitting."
+            "search_radius_margin_mm",
+            minimum=0.001,
+        ),
+        silhouette_weight=_threshold(
+            _required(
+                target_fitting_raw,
+                "silhouette_weight",
+                "perception.target_ground_geometry.fitting",
+            ),
+            "perception.target_ground_geometry.fitting."
+            "silhouette_weight",
+        ),
+        contour_weight=_threshold(
+            _required(
+                target_fitting_raw,
+                "contour_weight",
+                "perception.target_ground_geometry.fitting",
+            ),
+            "perception.target_ground_geometry.fitting.contour_weight",
+        ),
+        contact_weight=_threshold(
+            _required(
+                target_fitting_raw,
+                "contact_weight",
+                "perception.target_ground_geometry.fitting",
+            ),
+            "perception.target_ground_geometry.fitting.contact_weight",
+        ),
+        contour_distance_scale_px=_finite_float(
+            _required(
+                target_fitting_raw,
+                "contour_distance_scale_px",
+                "perception.target_ground_geometry.fitting",
+            ),
+            "perception.target_ground_geometry.fitting."
+            "contour_distance_scale_px",
+            minimum=0.001,
+        ),
+        contact_distance_scale_px=_finite_float(
+            _required(
+                target_fitting_raw,
+                "contact_distance_scale_px",
+                "perception.target_ground_geometry.fitting",
+            ),
+            "perception.target_ground_geometry.fitting."
+            "contact_distance_scale_px",
+            minimum=0.001,
+        ),
+        max_contact_residual_px=_finite_float(
+            _required(
+                target_fitting_raw,
+                "max_contact_residual_px",
+                "perception.target_ground_geometry.fitting",
+            ),
+            "perception.target_ground_geometry.fitting."
+            "max_contact_residual_px",
+            minimum=0.001,
+        ),
+        ambiguity_score_delta=_threshold(
+            _required(
+                target_fitting_raw,
+                "ambiguity_score_delta",
+                "perception.target_ground_geometry.fitting",
+            ),
+            "perception.target_ground_geometry.fitting."
+            "ambiguity_score_delta",
+        ),
+        max_center_uncertainty_mm=_finite_float(
+            _required(
+                target_fitting_raw,
+                "max_center_uncertainty_mm",
+                "perception.target_ground_geometry.fitting",
+            ),
+            "perception.target_ground_geometry.fitting."
+            "max_center_uncertainty_mm",
+            minimum=0.001,
+        ),
+        min_fit_score=_threshold(
+            _required(
+                target_fitting_raw,
+                "min_fit_score",
+                "perception.target_ground_geometry.fitting",
+            ),
+            "perception.target_ground_geometry.fitting.min_fit_score",
+        ),
+        min_silhouette_iou=_threshold(
+            _required(
+                target_fitting_raw,
+                "min_silhouette_iou",
+                "perception.target_ground_geometry.fitting",
+            ),
+            "perception.target_ground_geometry.fitting."
+            "min_silhouette_iou",
         ),
     )
     field_raw = _mapping(
@@ -1495,6 +1830,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         detection_threshold=detection_threshold,
         k0_threshold=k0_threshold,
         color_classifier=color_classifier,
+        target_ground_geometry=target_ground_geometry,
         field_features=field_features,
     )
 

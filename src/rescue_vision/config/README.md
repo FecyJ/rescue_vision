@@ -1,6 +1,6 @@
 # `config`：运行配置与对象装配
 
-本包是运行参数的唯一入口。`load_runtime_config()` 加载 schema v11 YAML，拒绝缺失字段、未知字段、错误类型和不一致资产；相对路径以 YAML 所在目录为基准。
+本包是运行参数的唯一入口。`load_runtime_config()` 加载 schema v12 YAML，拒绝缺失字段、未知字段、错误类型和不一致资产；相对路径以 YAML 所在目录为基准。
 
 本机运行统一读取不提交的 `configs/runtime.yaml`。`configs/runtime.example.yaml` 只用于创建新配置：
 
@@ -23,6 +23,7 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `HailoConfig.build_backend()` | 校验模型资产并创建 Hailo 后端 | Hailo 关闭时返回 `None` |
 | `HailoConfig.model_class_mapping()` | 把模型 class ID 映射为 `TargetClass` | 直接传给 `TargetPoseDetector` |
 | `PerceptionConfig.build_field_feature_detector()` | 创建传统视觉场地特征检测器 | `field_features.enabled=false` 时返回 `None` |
+| `PerceptionConfig.build_target_ground_geometry_estimator()` | 创建目标地面中心估计器 | 禁用时返回 `None`；启用时要求完整地面外参 |
 | `TrackingConfig.build_tracker()` | 创建一轮使用的多目标跟踪器 | 初始无轨迹 |
 | `WorldRuntimeConfig.build_model()` | 使用静态区域和危险阈值创建世界模型 | 区域可以暂时为空 |
 | `MissionConfig.build_state_machine()` | 创建一轮使用的规则状态机 | 初始为 `WAIT_START` |
@@ -41,8 +42,9 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `TrackingConfig` | 关联、确认、滑行、衰减和删除阈值 |
 | `WorldRuntimeConfig` | `WorldModelConfig` 与 `StaticRegion` 集合 |
 | `MissionConfig` | 比赛计时、安全超时、避让距离和目标优先级 |
-| `PerceptionConfig` | 目标检测/K0、ROI HSV 和静态场地特征参数 |
+| `PerceptionConfig` | 目标检测/K0、ROI HSV、目标地面几何和静态场地特征参数 |
 | `HsvColorClassifierConfig` | 四类 HSV 闭区间、颜色证据门槛和掩码去噪参数 |
+| `TargetGroundGeometryConfig` | 四类三维形状尺寸、搜索步长、评分权重和接受门限 |
 | `FieldFeatureConfig` | 场地颜色、区域尺寸、点划线和边界候选阈值 |
 | `HailoConfig` | 模型资产、身份、类别映射和后端粗筛阈值 |
 | `RuntimeGeometry` | `camera_model`、可选 `ground_projector` |
@@ -89,7 +91,17 @@ if geometry is None:
 
 camera_model = geometry.camera_model
 ground_projector = geometry.ground_projector  # 尚无地面映射时为 None
+
+target_ground_geometry_estimator = (
+    config.perception.build_target_ground_geometry_estimator(
+        max_observation_age_ms=config.processing.max_observation_age_ms,
+        ground_projector=ground_projector,
+    )
+)
 ```
+
+`target_ground_geometry.enabled=false` 时最后一项为 `None`；启用时缺少地面映射
+或完整相机外参会立即报错，不会退化成检测框中心。
 
 ## 4. 装配 Hailo 后端
 
@@ -208,7 +220,42 @@ perception:
 固定相机、曝光/白平衡、光照和实物后，应通过实拍数据同时校准 HSV 范围、
 覆盖率、dominance 和去噪参数；危险类必须单独报告失败样例。
 
-## 9. UART 装配语义
+## 9. 目标地面几何配置
+
+`perception.target_ground_geometry.objects` 必须完整列出四类。盒体使用
+`length_mm / width_mm / height_mm`，正四面体使用 `edge_mm`；尺寸改变只改
+配置，不改估计代码：
+
+```yaml
+perception:
+  target_ground_geometry:
+    enabled: false
+    objects:
+      green_supply:
+        shape: box
+        length_mm: 40.0
+        width_mm: 40.0
+        height_mm: 40.0
+      black_core:
+        shape: regular_tetrahedron
+        edge_mm: 40.0
+      orange_injured:
+        shape: box
+        length_mm: 80.0
+        width_mm: 40.0
+        height_mm: 40.0
+      blue_danger:
+        shape: box
+        length_mm: 40.0
+        width_mm: 40.0
+        height_mm: 40.0
+```
+
+完整粗搜索/细化步长、拟合权重、接触残差、中心歧义和接受门限见
+`configs/runtime.example.yaml`。三项评分权重之和必须为 1；现场修改尺寸后
+需要重新验证各距离和角度下的中心误差。
+
+## 10. UART 装配语义
 
 ```yaml
 uart:
@@ -226,7 +273,7 @@ PySerial 并打开设备。电机命令、轮速和未来 IMU 报文由后续协
 不能把类别前缀或字段数塞进运行配置。完整生命周期和故障语义见
 [`communication` README](../communication/README.md)。
 
-## 10. 远程通信装配语义
+## 11. 远程通信装配语义
 
 `remote.role: server` 用于树莓派监听，`client` 只用于本仓库参考客户端和
 双机人工检查。独立电脑端维护自己的配置和协议实现，不读取本仓库 YAML 或
@@ -245,7 +292,10 @@ PySerial 并打开设备。电机命令、轮速和未来 IMU 报文由后续协
 
 ## schema 与路径
 
-- 当前运行配置为 schema v11。
+- 当前运行配置为 schema v12。
+- schema v11 升级到 v12 时，必须在 `perception` 下新增完整的
+  `target_ground_geometry` 段。暂不运行时仍需保留四类形状、尺寸和全部拟合
+  字段并设置 `enabled: false`；不会猜测实物尺寸或把检测框中心当作地面中心。
 - schema v10 升级到 v11 时，必须在 `perception` 下新增完整的
   `field_features` 段。即使暂不运行也必须保留全部严格字段并设置
   `enabled: false`；不会静默使用场地颜色或尺寸默认值。

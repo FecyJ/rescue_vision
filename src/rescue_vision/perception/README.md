@@ -2,9 +2,11 @@
 
 本包把全尺寸去畸变图上的 Pose 模型结果转换为稳定的
 `TargetObservation`：模型负责目标框和 K0，框内 HSV 证据负责最终任务
-类别并提供局部颜色分割掩码。独立的 `FieldFeatureDetector` 从同一去畸变帧
-检测安全区、出发区、中心十字和低精度边界候选。两条链路都不创建相机、
-不复制标定矩阵，也不修改跟踪、定位、世界模型或任务状态。
+类别并提供局部颜色分割掩码。`TargetGroundGeometryEstimator` 再利用该掩码、
+K0、完整相机外参和可配置三维形状估计目标地面中心、朝向与足迹。独立的
+`FieldFeatureDetector` 从同一去畸变帧检测安全区、出发区、中心十字和低精度
+边界候选。这些链路都不创建相机、不复制标定矩阵，也不修改跟踪、定位、
+世界模型或任务状态。
 
 ## 常用类和函数
 
@@ -13,6 +15,10 @@
 | `InferenceBackend` | 推理后端协议：`infer()`、模型身份和 `close()` |
 | `HailoYolo26PoseBackend` | HEF 推理与 ONNX 后处理的真实后端 |
 | `TargetPoseDetector` | 模型框/K0、ROI HSV 分类分割、观测年龄和可选地面投影 |
+| `TargetGroundGeometryEstimator` | 四类目标的传统视觉三维模板拟合和地面中心估计 |
+| `TargetGroundGeometry` | 接触锚点、可选中心/足迹/朝向、误差和降级原因 |
+| `TargetGroundGeometryConfig` | 四类形状尺寸、搜索步长、拟合权重和接受门限 |
+| `BoxTargetGeometry` / `RegularTetrahedronTargetGeometry` | 盒体和正四面体尺寸 |
 | `FieldFeatureDetector` | 颜色、线段、角点和可选 BEV 的静态场地特征检测 |
 | `FieldFeatureDetectionResult` | 同帧安全区、出发区、中心十字和边界候选集合 |
 | `RealtimeFieldFeatureResult` | 实时场地结果或明确的过期丢弃原因 |
@@ -192,7 +198,77 @@ for observation in observations:
 不足或歧义成为 `unknown`，仍保留顶部颜色候选掩码。完全无颜色像素时候选为
 `unknown` 且掩码全零。
 
-## 7. 传统视觉场地特征
+## 7. 传统视觉目标几何与场地特征
+
+### 7.1 估计任务目标地面中心
+
+以下片段承接第 1 节的 `config`、`geometry`，以及第 4 节刚产生的
+`detection_result.observations`。配置关闭时不构造估计器；启用时必须加载带
+完整物理外参的地面标定：
+
+```python
+ground_geometry_estimator = (
+    config.perception.build_target_ground_geometry_estimator(
+        max_observation_age_ms=config.processing.max_observation_age_ms,
+        ground_projector=geometry.ground_projector,
+    )
+)
+```
+
+在实时帧循环中，紧接目标检测调用：
+
+```python
+if ground_geometry_estimator is not None:
+    geometry_result = ground_geometry_estimator.estimate_realtime(
+        detection_result.observations
+    )
+    if geometry_result.stale_dropped:
+        target_geometries = ()
+    else:
+        target_geometries = geometry_result.estimates
+else:
+    target_geometries = ()
+```
+
+结果顺序与输入 `TargetObservation` 一致，帧号和采集时间保持不变。现有
+`TargetObservation.ground_point` 仍只表示 K0 接触锚点；不能把它当作中心。
+中心只读取 `TargetGroundGeometry.center_ground`，拟合不充分时该字段为
+`None`：
+
+```python
+for estimate in target_geometries:
+    if estimate.center_ground is None:
+        print(estimate.target_class, estimate.quality)
+        continue
+    print(
+        estimate.center_ground,
+        estimate.footprint_ground,
+        estimate.center_uncertainty_mm,
+    )
+```
+
+当前实现对四类使用两种三维模型：
+
+- 绿色普通物资、浅蓝危险目标：可配置长、宽、高的盒体；
+- 橘色伤员：可配置长、宽、高的长方体；
+- 黑色核心物资：以正三角形面接地、棱长可配置的正四面体。
+
+估计器在 K0 周围按足迹外接半径搜索 `center_x / center_y / yaw`，把候选三维
+顶点投影回去畸变 ROI，以颜色掩码 IoU、轮廓距离和 K0 到接触边的距离评分，
+再对多个空间上不同的候选细化。正方形盒体朝向按 90° 对称，长方体按 180°，
+正四面体按 120°；对称朝向不会伪装成中心歧义。
+
+颜色为 `unknown`、掩码不可用、拟合分数不足、K0 与模型接触边矛盾或候选中心
+分散超过门限时，保留失败分数和质量标记但返回 `center_ground=None`。
+K0 不可用时可从检测框底部建立搜索种子，但会显式附加
+`k0_unavailable`。黑色阴影也可能进入 HSV 掩码，因此实物验收必须单列阴影、
+低对比地面和遮挡失败样例。
+
+形状尺寸和全部拟合门限只在运行配置的
+`perception.target_ground_geometry` 中维护。当前合成投影测试证明坐标、形状
+和降级契约可运行，不证明现场中心误差或树莓派端到端性能。
+
+### 7.2 静态场地特征
 
 以下片段承接第 1 节的 `config` 和 `geometry`。传统视觉不需要 Hailo；
 配置关闭时构造函数返回 `None`，不会静默运行另一套默认阈值：

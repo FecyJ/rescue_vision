@@ -51,11 +51,26 @@ def main() -> None:
         max_observation_age_ms=config.processing.max_observation_age_ms,
         ground_projector=projector,
     )
+    ground_geometry_estimator = (
+        config.perception.build_target_ground_geometry_estimator(
+            max_observation_age_ms=config.processing.max_observation_age_ms,
+            ground_projector=projector,
+        )
+    )
     capture_timestamp_ns = monotonic_ns()
     frame = CameraFrame(0, capture_timestamp_ns, image)
     try:
         observations = detector.detect(frame, image)
-        for observation in observations:
+        target_geometries = (
+            ground_geometry_estimator.estimate(observations)
+            if ground_geometry_estimator is not None
+            else (None,) * len(observations)
+        )
+        for observation, ground_geometry in zip(
+            observations,
+            target_geometries,
+            strict=True,
+        ):
             print(
                 json.dumps(
                     {
@@ -103,6 +118,46 @@ def main() -> None:
                                 observation.ground_point.y,
                             ]
                             if observation.ground_point is not None
+                            else None
+                        ),
+                        "ground_geometry": (
+                            {
+                                "center_ground_mm": (
+                                    [
+                                        ground_geometry.center_ground.x,
+                                        ground_geometry.center_ground.y,
+                                    ]
+                                    if ground_geometry.center_ground
+                                    is not None
+                                    else None
+                                ),
+                                "footprint_ground_mm": [
+                                    [point.x, point.y]
+                                    for point in (
+                                        ground_geometry.footprint_ground
+                                    )
+                                ],
+                                "yaw_rad": ground_geometry.yaw_rad,
+                                "yaw_symmetry_rad": (
+                                    ground_geometry.yaw_symmetry_rad
+                                ),
+                                "center_uncertainty_mm": (
+                                    ground_geometry.center_uncertainty_mm
+                                ),
+                                "fit_score": ground_geometry.fit_score,
+                                "silhouette_iou": (
+                                    ground_geometry.silhouette_iou
+                                ),
+                                "contact_residual_px": (
+                                    ground_geometry.contact_residual_px
+                                ),
+                                "method": ground_geometry.method.value,
+                                "quality": sorted(
+                                    item.value
+                                    for item in ground_geometry.quality
+                                ),
+                            }
+                            if ground_geometry is not None
                             else None
                         ),
                         "quality": sorted(item.value for item in observation.quality),

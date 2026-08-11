@@ -9,7 +9,7 @@
 - `camera_undistort.py --intrinsics PATH`：加载指定内参实时预览去畸变结果。
 - `picamera_minimal.py`：直接使用 Picamera2 的最小检查。
 - `geometry_projection.py`：使用本地测试图片人工检查 BEV 和点投影。
-- `hailo_pose.py`：从实际 `runtime.yaml` 加载 YOLO Pose 部署包，检查单张去畸变图像的框、K0、HSV 类别和 ROI 分割摘要。
+- `hailo_pose.py`：从实际 `runtime.yaml` 加载 YOLO Pose 部署包，检查单张去畸变图像的框、K0、HSV 类别和 ROI 分割摘要；启用 `target_ground_geometry` 时同时输出中心、足迹、朝向、拟合分数和降级原因。
 - `dataset_perception.py`：按 schema v2 数据清单批量运行 Hailo，覆盖式写出 schema v2 观测 JSONL，保留 Pose 类别、HSV 候选/覆盖率、UNKNOWN、质量信息和模型身份。
 - `field_features.py`：从图片或视频离线检测安全区、无编号出发区、中心十字和低精度边界候选，写出 JSONL 及可选叠加图；不访问相机或 Hailo。
 - `camera_undistort_perception.py`：按实际 `runtime.yaml` 连续执行相机、去畸变、Hailo Pose、ROI HSV 掩码和 K0/地面点叠加预览，按 `Q/Esc` 退出；偶发过期帧会标红并丢弃，不会终止预览。
