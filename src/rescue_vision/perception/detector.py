@@ -259,8 +259,6 @@ class TargetPoseDetector:
                 k0_confidence=item.detection.k0_confidence,
                 ground_point=item.ground_point,
                 quality=item.quality,
-                model_version=self._backend.model_version,
-                model_sha256=self._backend.model_sha256,
             )
             for item in processed
         ]

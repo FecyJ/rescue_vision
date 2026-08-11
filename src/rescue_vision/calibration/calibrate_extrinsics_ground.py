@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -159,14 +158,6 @@ def save_json(path: Path, data: dict[str, Any]) -> None:
         json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False),
         encoding="utf-8",
     )
-
-
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def find_latest_intrinsics() -> Path:
@@ -347,7 +338,7 @@ def collect_correspondences(
 
     result = {
         "image": image_path.name,
-        "image_sha256": file_sha256(image_path),
+        "image_size": [int(image.shape[1]), int(image.shape[0])],
         "coordinate_frame": {
             "x": "robot_forward",
             "y": "robot_left",
@@ -394,13 +385,18 @@ def validate_correspondence_source(
             "recollect them."
         )
     expected_name = data.get("image")
-    expected_hash = data.get("image_sha256")
-    actual_hash = file_sha256(image_path)
-    if expected_name != image_path.name or expected_hash != actual_hash:
+    expected_size = data.get("image_size")
+    image = cv2.imread(str(image_path))
+    actual_size = (
+        [int(image.shape[1]), int(image.shape[0])]
+        if image is not None
+        else None
+    )
+    if expected_name != image_path.name or expected_size != actual_size:
         raise ValueError(
             f"Correspondences {correspondences_path} were collected from "
-            f"image={expected_name!r}, sha256={expected_hash!r}, but current "
-            f"image is {image_path.name!r}, sha256={actual_hash}; recollect them."
+            f"image={expected_name!r}, size={expected_size!r}, but current "
+            f"image is {image_path.name!r}, size={actual_size!r}; recollect them."
         )
 
 
@@ -786,7 +782,7 @@ def main() -> None:
         )
 
     result = {
-        "schema_version": 3,
+        "calibration_id": calibration.calibration_id,
         "quality": {
             "usable": not quality_failures,
             "physically_valid": True,
@@ -811,12 +807,11 @@ def main() -> None:
         "source": {
             "intrinsics": str(intrinsics_path),
             "ground_image": str(image_path),
-            "ground_image_sha256": file_sha256(image_path),
             "correspondences": str(correspondences_path),
         },
         "intrinsics": {
             "model_type": calibration.model.value,
-            "fingerprint_sha256": calibration.fingerprint(),
+            "calibration_id": calibration.calibration_id,
             "quality": intrinsic_data.get("quality"),
         },
         "image_size": list(image_size),

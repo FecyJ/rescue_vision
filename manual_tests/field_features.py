@@ -67,7 +67,6 @@ def _line(line) -> dict[str, object]:
 
 def _record(result: FieldFeatureDetectionResult) -> dict[str, object]:
     return {
-        "schema_version": 1,
         "frame_sequence": result.frame_sequence,
         "capture_timestamp_ns": result.capture_timestamp_ns,
         "result_timestamp_ns": result.result_timestamp_ns,

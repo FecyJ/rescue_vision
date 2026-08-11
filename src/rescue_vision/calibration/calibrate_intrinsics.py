@@ -224,6 +224,11 @@ def parse_args() -> argparse.Namespace:
         default="intrinsics",
         help="Prefix of the timestamped output directory.",
     )
+    parser.add_argument(
+        "--calibration-id",
+        default=None,
+        help="Readable calibration identity; defaults to the output directory name.",
+    )
     return parser.parse_args()
 
 
@@ -1023,6 +1028,7 @@ def quality_from_score(
 
 
 def make_model_document(
+    calibration_id: str,
     fit: CalibrationFit,
     new_K: np.ndarray,
     undistortion_settings: dict[str, Any],
@@ -1045,7 +1051,7 @@ def make_model_document(
     }
 
     return {
-        "schema_version": 3,
+        "calibration_id": calibration_id,
         "calibration_type": "intrinsics",
         "model_type": fit.model_type,
         "opencv_version": cv2.__version__,
@@ -1159,6 +1165,11 @@ def main() -> None:
         raise FileNotFoundError(f"No images found in {session_dir}")
 
     run_dir = create_run_directory(args.output_prefix)
+    calibration_id = (
+        args.calibration_id.strip()
+        if isinstance(args.calibration_id, str) and args.calibration_id.strip()
+        else run_dir.name
+    )
     print(f"Input session: {session_dir}")
     print(f"Output run:   {run_dir}")
 
@@ -1216,7 +1227,7 @@ def main() -> None:
             save_json(
                 run_dir / "models" / f"{model_type}.json",
                 {
-                    "schema_version": 3,
+                    "calibration_id": calibration_id,
                     "model_type": model_type,
                     "status": "failed",
                     "error": final_fit_errors.get(model_type, "unknown error"),
@@ -1240,6 +1251,7 @@ def main() -> None:
         )
 
         document = make_model_document(
+            calibration_id,
             fit,
             new_K,
             undistortion_settings,
@@ -1301,7 +1313,7 @@ def main() -> None:
     )
 
     comparison = {
-        "schema_version": 3,
+        "calibration_id": calibration_id,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "opencv_version": cv2.__version__,
         "source_session": str(session_dir.resolve()),

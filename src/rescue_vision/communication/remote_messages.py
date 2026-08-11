@@ -7,13 +7,14 @@ import math
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, ClassVar, Mapping
+from typing import Any, Mapping
 
 
 class RemoteTopic(str, Enum):
     """稳定控制与观察 topic；传输层仍允许扩展自定义 topic。"""
 
     DEBUG_MOTION = "control/debug/motion"
+    DEBUG_GRIPPER = "control/debug/gripper"
     DEBUG_CAPTURE = "control/debug/capture"
     SESSION_STATUS = "observation/session/status"
     VIDEO_FRAME = "observation/video/frame"
@@ -100,26 +101,9 @@ def _require_exact_keys(
         )
 
 
-def _require_schema_version(
-    value: object,
-    expected: int,
-    location: str,
-) -> None:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or value != expected
-    ):
-        raise ValueError(
-            f"Unsupported {location} schema_version {value!r}."
-        )
-
-
 @dataclass(frozen=True, slots=True)
 class DebugMotionCommand:
     """调试用车体运动意图；deadman 字段承载切换式使能的当前状态。"""
-
-    SCHEMA_VERSION: ClassVar[int] = 1
 
     command_id: str
     issued_timestamp_ns: int
@@ -217,7 +201,6 @@ class DebugMotionCommand:
 
     def to_payload(self) -> bytes:
         document = {
-            "schema_version": self.SCHEMA_VERSION,
             "command_id": self.command_id,
             "issued_timestamp_ns": self.issued_timestamp_ns,
             "valid_for_ms": self.valid_for_ms,
@@ -249,7 +232,6 @@ class DebugMotionCommand:
         _require_exact_keys(
             document,
             {
-                "schema_version",
                 "command_id",
                 "issued_timestamp_ns",
                 "valid_for_ms",
@@ -260,11 +242,6 @@ class DebugMotionCommand:
                 "target_heading_rad",
                 "heading_reference",
             },
-            "DebugMotionCommand",
-        )
-        _require_schema_version(
-            document["schema_version"],
-            cls.SCHEMA_VERSION,
             "DebugMotionCommand",
         )
         try:
@@ -298,10 +275,80 @@ class DebugMotionCommand:
 
 
 @dataclass(frozen=True, slots=True)
+class DebugGripperCommand:
+    """需要持续刷新的夹爪扳机状态。"""
+
+    command_id: str
+    issued_timestamp_ns: int
+    valid_for_ms: int
+    open_pressed: bool
+    close_pressed: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "command_id",
+            _identifier(self.command_id, "command_id"),
+        )
+        _non_negative_int(self.issued_timestamp_ns, "issued_timestamp_ns")
+        if (
+            isinstance(self.valid_for_ms, bool)
+            or not isinstance(self.valid_for_ms, int)
+            or not 1 <= self.valid_for_ms <= 5_000
+        ):
+            raise ValueError(
+                "valid_for_ms must be an integer in [1, 5000], "
+                f"got {self.valid_for_ms!r}."
+            )
+        for name in ("open_pressed", "close_pressed"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be a boolean.")
+
+    def to_payload(self) -> bytes:
+        document = {
+            "command_id": self.command_id,
+            "issued_timestamp_ns": self.issued_timestamp_ns,
+            "valid_for_ms": self.valid_for_ms,
+            "open_pressed": self.open_pressed,
+            "close_pressed": self.close_pressed,
+        }
+        return (
+            json.dumps(
+                document,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> DebugGripperCommand:
+        document = _decode_json_object(payload, "DebugGripperCommand")
+        _require_exact_keys(
+            document,
+            {
+                "command_id",
+                "issued_timestamp_ns",
+                "valid_for_ms",
+                "open_pressed",
+                "close_pressed",
+            },
+            "DebugGripperCommand",
+        )
+        return cls(
+            command_id=document["command_id"],
+            issued_timestamp_ns=document["issued_timestamp_ns"],
+            valid_for_ms=document["valid_for_ms"],
+            open_pressed=document["open_pressed"],
+            close_pressed=document["close_pressed"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class DebugCaptureCommand:
     """调试录制控制；不允许远端指定车端文件路径。"""
-
-    SCHEMA_VERSION: ClassVar[int] = 1
 
     request_id: str
     issued_timestamp_ns: int
@@ -350,7 +397,6 @@ class DebugCaptureCommand:
 
     def to_payload(self) -> bytes:
         document = {
-            "schema_version": self.SCHEMA_VERSION,
             "request_id": self.request_id,
             "issued_timestamp_ns": self.issued_timestamp_ns,
             "action": self.action.value,
@@ -374,18 +420,12 @@ class DebugCaptureCommand:
         _require_exact_keys(
             document,
             {
-                "schema_version",
                 "request_id",
                 "issued_timestamp_ns",
                 "action",
                 "label",
                 "session_tags",
             },
-            "DebugCaptureCommand",
-        )
-        _require_schema_version(
-            document["schema_version"],
-            cls.SCHEMA_VERSION,
             "DebugCaptureCommand",
         )
         try:

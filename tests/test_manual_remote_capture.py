@@ -34,9 +34,8 @@ def test_capture_session_executes_artifacts_and_deduplicates_requests(
     tmp_path,
 ) -> None:
     config_path = tmp_path / "runtime.yaml"
-    config_path.write_text("schema_version: 12\n", encoding="utf-8")
+    config_path.write_text("camera: {}\n", encoding="utf-8")
     config = SimpleNamespace(
-        schema_version=11,
         camera=SimpleNamespace(image_size=(4, 3)),
         recording=SimpleNamespace(queue_capacity=2, image_format="jpg"),
     )
@@ -44,12 +43,12 @@ def test_capture_session_executes_artifacts_and_deduplicates_requests(
         source=SimpleNamespace(),
         camera_model=None,
         coordinate_system=ImageCoordinateSystem.RAW_PIXEL,
-        intrinsics_fingerprint_sha256=None,
+        calibration_id=None,
     )
     session = CaptureSession(
         output_root=tmp_path,
         config=config,
-        config_snapshot={"schema_version": 11},
+        config_snapshot={},
         pipeline=pipeline,
     )
     frame = CameraFrame(
@@ -104,20 +103,19 @@ def test_capture_session_executes_artifacts_and_deduplicates_requests(
 
 def test_capture_session_rejects_state_conflicts(tmp_path) -> None:
     config_path = tmp_path / "runtime.yaml"
-    config_path.write_text("schema_version: 12\n", encoding="utf-8")
+    config_path.write_text("camera: {}\n", encoding="utf-8")
     session = CaptureSession(
         output_root=tmp_path,
         config=SimpleNamespace(
-            schema_version=11,
             camera=SimpleNamespace(image_size=(2, 2)),
             recording=SimpleNamespace(queue_capacity=1, image_format="png"),
         ),
-        config_snapshot={"schema_version": 11},
+        config_snapshot={},
         pipeline=CameraPipeline(
             source=SimpleNamespace(),
             camera_model=None,
             coordinate_system=ImageCoordinateSystem.RAW_PIXEL,
-            intrinsics_fingerprint_sha256=None,
+            calibration_id=None,
         ),
     )
     frame = CameraFrame(

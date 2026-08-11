@@ -7,10 +7,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import rescue_vision.app.manual_capture as manual_capture_module
 from rescue_vision.app.manual_capture import (
     CameraPipeline,
     CaptureSession,
     VehicleState,
+    _accept_with_shutdown,
     _validate_mode,
     build_session_status,
     run_manual_capture_session,
@@ -20,6 +22,7 @@ from rescue_vision.communication import (
     CaptureAction,
     CaptureStopReason,
     DebugCaptureCommand,
+    DebugGripperCommand,
     DebugMotionCommand,
     ImageCoordinateSystem,
     MotionControlMode,
@@ -35,9 +38,13 @@ from rescue_vision.communication import (
 )
 from rescue_vision.data.check_recording import inspect_recording
 from rescue_vision.motion import (
+    ExecutedRemoteGripper,
     ExecutedRemoteMotion,
+    GripperCalibration,
     MotionController,
     MotionLimits,
+    RemoteGripperExecutor,
+    RemoteGripperResult,
     RemoteMotionExecutor,
     RemoteMotionResult,
 )
@@ -135,6 +142,29 @@ class FakeConnection:
         self.observations.append((topic, payload))
 
 
+class PollingServer:
+    def __init__(self, connection: object, *, timeouts_before_connection: int) -> None:
+        self.connection = connection
+        self.timeouts_before_connection = timeouts_before_connection
+        self.accept_timeouts: list[float] = []
+
+    def accept(self, timeout: float | None = None) -> object:
+        assert timeout is not None
+        self.accept_timeouts.append(timeout)
+        if len(self.accept_timeouts) <= self.timeouts_before_connection:
+            raise TimeoutError
+        return self.connection
+
+
+class CountingDrainController:
+    def __init__(self) -> None:
+        self.drain_count = 0
+
+    def drain_messages(self) -> tuple[object, ...]:
+        self.drain_count += 1
+        return ()
+
+
 def _received(topic: RemoteTopic, payload: bytes, sequence: int):
     return ReceivedRemoteMessage(
         stream=RemoteStream.CONTROL,
@@ -150,7 +180,7 @@ def _received(topic: RemoteTopic, payload: bytes, sequence: int):
 
 def _config() -> SimpleNamespace:
     return SimpleNamespace(
-        schema_version=9,
+
         camera=SimpleNamespace(image_size=(4, 3), fps=20),
         recording=SimpleNamespace(queue_capacity=8, image_format="png"),
         remote=SimpleNamespace(access_mode=RemoteAccessMode.DEBUG_CONTROL),
@@ -158,8 +188,71 @@ def _config() -> SimpleNamespace:
             max_linear_velocity_m_s=0.25,
             max_angular_velocity_rad_s=1.0,
             max_remote_command_valid_for_ms=500,
+            gripper=SimpleNamespace(enabled=True),
         ),
     )
+
+
+def _gripper_calibration() -> GripperCalibration:
+    return GripperCalibration(
+        open_left_angle_deg=20.0,
+        open_right_angle_deg=160.0,
+        closed_left_angle_deg=80.0,
+        closed_right_angle_deg=100.0,
+        full_travel_time_s=1.0,
+    )
+
+
+def test_accept_wait_drains_uart_between_tcp_polls() -> None:
+    connection = object()
+    server = PollingServer(connection, timeouts_before_connection=2)
+    controller = CountingDrainController()
+
+    accepted = _accept_with_shutdown(
+        server,  # type: ignore[arg-type]
+        controller,  # type: ignore[arg-type]
+        timeout_s=1.0,
+        stop_requested=lambda: False,
+    )
+
+    assert accepted is connection
+    assert controller.drain_count == 3
+    assert server.accept_timeouts == [0.1, 0.1, 0.1]
+
+
+def test_session_status_only_advertises_configured_gripper() -> None:
+    config = _config()
+    config.motion.gripper.enabled = False
+
+    status = build_session_status(
+        config,
+        server_instance_id="test-server",
+        video_fps=10.0,
+    )
+
+    assert not status.gripper_control_available
+
+
+def test_accept_timeout_is_a_clean_stop(monkeypatch) -> None:
+    moments = iter((10.0, 11.0))
+    monkeypatch.setattr(
+        manual_capture_module.time,
+        "monotonic",
+        lambda: next(moments),
+    )
+    server = PollingServer(object(), timeouts_before_connection=0)
+    controller = CountingDrainController()
+
+    accepted = _accept_with_shutdown(
+        server,  # type: ignore[arg-type]
+        controller,  # type: ignore[arg-type]
+        timeout_s=0.5,
+        stop_requested=lambda: False,
+    )
+
+    assert accepted is None
+    assert controller.drain_count == 1
+    assert server.accept_timeouts == []
 
 
 def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
@@ -180,7 +273,7 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
     capture = CaptureSession(
         output_root=tmp_path,
         config=config,
-        config_snapshot={"schema_version": 9},
+        config_snapshot={},
         pipeline=pipeline,
     )
     start = DebugCaptureCommand(
@@ -197,10 +290,18 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
         linear_velocity_m_s=0.1,
         angular_velocity_rad_s=0.0,
     )
+    gripper = DebugGripperCommand(
+        command_id="grip-1",
+        issued_timestamp_ns=1,
+        valid_for_ms=500,
+        open_pressed=False,
+        close_pressed=True,
+    )
     connection = FakeConnection(
         [
             _received(RemoteTopic.DEBUG_CAPTURE, start.to_payload(), 0),
             _received(RemoteTopic.DEBUG_MOTION, motion.to_payload(), 1),
+            _received(RemoteTopic.DEBUG_GRIPPER, gripper.to_payload(), 2),
         ]
     )
     car = TelemetryAfterMotionChannel()
@@ -210,16 +311,23 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
             MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 500),
         )
     )
+    gripper_executor = RemoteGripperExecutor(
+        executor.controller,
+        _gripper_calibration(),
+    )
     status = build_session_status(
         config,
         server_instance_id="test-server",
         video_fps=10.0,
     )
+    assert status.gripper_control_available
+    assert status.max_control_command_valid_for_ms == 500
 
     with pytest.raises(RemoteDisconnectedError):
         run_manual_capture_session(
             connection,
             executor,
+            gripper_executor,
             capture,
             pipeline,
             status,
@@ -228,13 +336,17 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
             safety_mode=VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP,
         )
 
-    assert len(car.sent) >= 2
-    assert car.sent[-2].startswith(b"m")
+    assert len(car.sent) >= 3
+    motion_payload = next(
+        payload for payload in car.sent if payload.startswith(b"m")
+    )
+    assert motion_payload.startswith(b"m")
     limited_left, limited_right = (
-        float(value) for value in car.sent[-2][1:].split(b",")
+        float(value) for value in motion_payload[1:].split(b",")
     )
     assert 0.0 < limited_left < 0.1
     assert limited_right == pytest.approx(limited_left)
+    assert any(payload.startswith(b"g") for payload in car.sent)
     assert car.sent[-1] == b"b0,0"
     recordings = list((tmp_path / "recordings").iterdir())
     assert len(recordings) == 1
@@ -245,6 +357,7 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
         "manual_motion"
     ]
     assert motion_report["event_counts"]["motion_command"] == 1
+    assert motion_report["event_counts"]["gripper_command"] == 1
     assert motion_report["event_counts"]["wheel_telemetry"] == 1
     assert motion_report["event_counts"]["safety_stop"] == 1
     assert motion_report["covers_frame_time_range"] is True
@@ -281,7 +394,7 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
     second_capture = CaptureSession(
         output_root=tmp_path,
         config=config,
-        config_snapshot={"schema_version": 9},
+        config_snapshot={},
         pipeline=pipeline,
     )
     second_connection = FakeConnection([])
@@ -289,6 +402,7 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
         run_manual_capture_session(
             second_connection,
             executor,
+            gripper_executor,
             second_capture,
             pipeline,
             build_session_status(
@@ -333,7 +447,7 @@ def test_recording_queue_overflow_faults_capture_and_requires_stop(
     capture = CaptureSession(
         output_root=tmp_path,
         config=config,
-        config_snapshot={"schema_version": 9},
+        config_snapshot={},
         pipeline=pipeline,
     )
     capture.execute(
@@ -353,11 +467,16 @@ def test_recording_queue_overflow_faults_capture_and_requires_stop(
             MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 500),
         )
     )
+    gripper_executor = RemoteGripperExecutor(
+        executor.controller,
+        _gripper_calibration(),
+    )
 
     with pytest.raises(RuntimeError, match="queue overflowed"):
         run_manual_capture_session(
             FakeConnection([]),
             executor,
+            gripper_executor,
             capture,
             pipeline,
             build_session_status(
@@ -420,6 +539,41 @@ def test_vehicle_state_reports_zero_twist_as_braking() -> None:
     assert observation.last_applied_motion_command_id == "centered-1"
 
 
+def test_vehicle_state_tracks_gripper_command_and_firmware_angles() -> None:
+    vehicle = VehicleState(
+        safety_mode=VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP
+    )
+    vehicle.on_gripper(
+        ExecutedRemoteGripper(
+            command_id="grip-1",
+            result=RemoteGripperResult.APPLIED,
+            received_timestamp_ns=10,
+            deadline_timestamp_ns=210,
+            open_pressed=False,
+            close_pressed=True,
+        )
+    )
+    vehicle.on_car_message(
+        manual_capture_module.CarTelemetry(
+            uart_sequence=1,
+            received_timestamp_ns=20,
+            controller_timestamp_ms=5,
+            actual_left_m_s=0.0,
+            actual_right_m_s=0.0,
+            target_left_m_s=0.0,
+            target_right_m_s=0.0,
+            servo_left_deg=27.0,
+            servo_right_deg=167.0,
+        )
+    )
+
+    observation = vehicle.observation()
+    assert observation.gripper_left_angle_deg == pytest.approx(27.0)
+    assert observation.gripper_right_angle_deg == pytest.approx(167.0)
+    assert observation.last_received_gripper_command_id == "grip-1"
+    assert observation.last_applied_gripper_command_id == "grip-1"
+
+
 def test_manual_capture_requires_explicit_physical_stop_acknowledgement() -> None:
     config = _config()
     config.remote = SimpleNamespace(
@@ -454,7 +608,7 @@ def test_camera_failure_faults_capture_and_stops_motion(tmp_path) -> None:
     capture = CaptureSession(
         output_root=tmp_path,
         config=config,
-        config_snapshot={"schema_version": 9},
+        config_snapshot={},
         pipeline=pipeline,
     )
     car = FakeCarChannel()
@@ -464,11 +618,16 @@ def test_camera_failure_faults_capture_and_stops_motion(tmp_path) -> None:
             MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 500),
         )
     )
+    gripper_executor = RemoteGripperExecutor(
+        executor.controller,
+        _gripper_calibration(),
+    )
 
     with pytest.raises(OSError, match="camera failed"):
         run_manual_capture_session(
             FakeConnection([]),
             executor,
+            gripper_executor,
             capture,
             pipeline,
             build_session_status(

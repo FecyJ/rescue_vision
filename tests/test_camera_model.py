@@ -24,6 +24,7 @@ def calibration(model: CameraModelType) -> CameraCalibration:
         CameraModelType.FISHEYE: np.array([0.04, -0.01, 0.002, -0.0005]),
     }[model]
     return CameraCalibration(
+        calibration_id="test",
         model=model,
         image_size=(32, 24),
         K=np.array([[20.0, 0.0, 16.0], [0.0, 20.0, 12.0], [0.0, 0.0, 1.0]]),
@@ -74,14 +75,22 @@ def test_undistort_empty_and_single_point(model: CameraModelType) -> None:
     assert (single.u, single.v) != pytest.approx((3.0, 4.0))
 
 
-def test_calibration_fingerprint_changes_with_model() -> None:
-    assert calibration(CameraModelType.PINHOLE).fingerprint() != calibration(
-        CameraModelType.PINHOLE_RATIONAL
-    ).fingerprint()
+def test_calibration_id_must_be_non_empty() -> None:
+    parameters = calibration(CameraModelType.PINHOLE)
+    with pytest.raises(ValueError, match="calibration_id"):
+        CameraCalibration(
+            calibration_id=" ",
+            model=parameters.model,
+            image_size=parameters.image_size,
+            K=parameters.K,
+            D=parameters.D,
+            new_K=parameters.new_K,
+        )
 
 
 def test_unusable_calibration_is_rejected(tmp_path) -> None:
     document = {
+        "calibration_id": "test",
         "model_type": "pinhole",
         "image_size": [32, 24],
         "camera_matrix": calibration(CameraModelType.PINHOLE).K.tolist(),
@@ -106,6 +115,7 @@ def test_image_size_mismatch_is_rejected() -> None:
 def test_undistort_fills_invalid_pixels_with_letterbox_value() -> None:
     parameters = calibration(CameraModelType.PINHOLE)
     shifted = CameraCalibration(
+        calibration_id="test",
         model=parameters.model,
         image_size=parameters.image_size,
         K=parameters.K,
@@ -127,6 +137,7 @@ def test_undistort_fills_invalid_pixels_with_letterbox_value() -> None:
 def test_invalid_distortion_count_is_rejected() -> None:
     with pytest.raises(ValueError, match="exactly 4"):
         CameraCalibration(
+        calibration_id="test",
             model=CameraModelType.FISHEYE,
             image_size=(32, 24),
             K=np.eye(3),

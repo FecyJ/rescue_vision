@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -209,14 +208,6 @@ def parse_yolo26_pose_output(
     return parsed
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 class HailoYolo26PoseBackend:
     """HEF 主干加 ONNX 后处理的同步单帧后端。"""
 
@@ -226,8 +217,6 @@ class HailoYolo26PoseBackend:
         hef_path: Path,
         postprocess_onnx_path: Path,
         output_mapping_path: Path,
-        model_version: str,
-        model_sha256: str,
         class_count: int,
         max_detections: int,
         score_threshold: float,
@@ -236,12 +225,6 @@ class HailoYolo26PoseBackend:
         for path in paths:
             if not path.is_file():
                 raise FileNotFoundError(f"Model asset does not exist: {path}.")
-        actual_checksum = _sha256(hef_path)
-        if actual_checksum != model_sha256.lower():
-            raise ValueError(
-                f"HEF checksum mismatch for {hef_path}: expected "
-                f"{model_sha256}, got {actual_checksum}."
-            )
         config = json.loads(output_mapping_path.read_text(encoding="utf-8"))
         if config.get("output_format") != "yolo26_pose":
             raise ValueError("output_mapping output_format must be 'yolo26_pose'.")
@@ -286,8 +269,6 @@ class HailoYolo26PoseBackend:
                 "Hailo backend requires hailo_platform and onnxruntime."
             ) from exc
 
-        self._model_version = model_version
-        self._model_sha256 = actual_checksum
         self._max_detections = max_detections
         self._score_threshold = score_threshold
         self._closed = False
@@ -354,14 +335,6 @@ class HailoYolo26PoseBackend:
         except BaseException:
             self.close()
             raise
-
-    @property
-    def model_version(self) -> str:
-        return self._model_version
-
-    @property
-    def model_sha256(self) -> str:
-        return self._model_sha256
 
     def infer(self, image_bgr: np.ndarray) -> list[ModelDetection]:
         if self._closed:

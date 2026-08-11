@@ -35,7 +35,7 @@ def test_record_cli_rejects_invalid_frame_limit(
 
 
 def test_manifest_cli_writes_jsonl(monkeypatch, tmp_path) -> None:
-    record = {"schema_version": 2, "sample_id": "session/frame_00000000"}
+    record = {"sample_id": "session/frame_00000000"}
     monkeypatch.setattr(
         manifest_cli,
         "build_dataset_records",
@@ -49,8 +49,6 @@ def test_manifest_cli_writes_jsonl(monkeypatch, tmp_path) -> None:
             "rescue-vision-manifest",
             "--dataset-root",
             str(tmp_path),
-            "--dataset-version",
-            "dataset-v1",
             "--output",
             str(output),
             str(tmp_path / "recording"),
@@ -68,12 +66,10 @@ def test_split_cli_writes_empty_split_warning_before_nonzero_exit(
     manifest.write_text(
         json.dumps(
             {
-                "schema_version": 2,
-                "dataset_version": "dataset-v1",
                 "sample_id": "session/frame_00000000",
                 "recording_id": "session",
                 "image_coordinate_system": "undistorted_pixel",
-                "intrinsics_fingerprint_sha256": "a" * 64,
+                "calibration_id": "a" * 64,
                 "valid_pixel_ratio": 0.95,
                 "undistort_fill_value": 114,
                 "tags": {name: "known" for name in REQUIRED_TAGS},
@@ -108,7 +104,6 @@ def test_evaluation_cli_writes_report(monkeypatch, tmp_path) -> None:
     records.write_text(
         json.dumps(
             {
-                "schema_version": 1,
                 "sample_id": "sample",
                 "object_id": "danger",
                 "ground_truth_class": "blue_danger",
@@ -133,12 +128,6 @@ def test_evaluation_cli_writes_report(monkeypatch, tmp_path) -> None:
             str(records),
             "--output",
             str(output),
-            "--model-version",
-            "model-v1",
-            "--dataset-version",
-            "dataset-v1",
-            "--code-version",
-            "code-v1",
         ],
     )
     evaluation_cli.main()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from rescue_vision.communication import (
     CaptureAction,
     DebugCaptureCommand,
+    DebugGripperCommand,
     DebugMotionCommand,
     HeadingReference,
     MotionControlMode,
@@ -93,6 +95,33 @@ def test_deadman_disabled_can_only_request_stop() -> None:
         )
 
 
+def test_debug_gripper_round_trip_and_boolean_states() -> None:
+    command = DebugGripperCommand(
+        command_id="grip-001",
+        issued_timestamp_ns=789,
+        valid_for_ms=250,
+        open_pressed=True,
+        close_pressed=False,
+    )
+
+    assert DebugGripperCommand.from_payload(command.to_payload()) == command
+    assert RemoteTopic.DEBUG_GRIPPER.value == "control/debug/gripper"
+    with pytest.raises(ValueError, match="boolean"):
+        DebugGripperCommand(
+            command_id="bad-state",
+            issued_timestamp_ns=0,
+            valid_for_ms=100,
+            open_pressed=1,  # type: ignore[arg-type]
+            close_pressed=False,
+        )
+    document = json.loads(command.to_payload())
+    document["open"] = False
+    with pytest.raises(ValueError, match="keys must be exactly"):
+        DebugGripperCommand.from_payload(
+            json.dumps(document).encode("utf-8")
+        )
+
+
 def test_capture_commands_do_not_accept_remote_output_paths() -> None:
     start = DebugCaptureCommand(
         request_id="capture-001",
@@ -118,18 +147,11 @@ def test_capture_commands_do_not_accept_remote_output_paths() -> None:
         )
 
 
-def test_control_payload_rejects_unknown_schema_fields() -> None:
+def test_control_payload_rejects_unknown_fields() -> None:
     payload = (
-        b'{"schema_version":1,"request_id":"x","issued_timestamp_ns":0,'
+        b'{"request_id":"x","issued_timestamp_ns":0,'
         b'"action":"stop","label":null,"session_tags":{},"path":"/tmp/x"}'
     )
 
     with pytest.raises(ValueError, match="keys must be exactly"):
         DebugCaptureCommand.from_payload(payload)
-
-    boolean_version = (
-        b'{"schema_version":true,"request_id":"x","issued_timestamp_ns":0,'
-        b'"action":"stop","label":null,"session_tags":{}}'
-    )
-    with pytest.raises(ValueError, match="schema_version"):
-        DebugCaptureCommand.from_payload(boolean_version)

@@ -19,6 +19,7 @@ from rescue_vision.communication.remote import (
 from rescue_vision.communication.remote_messages import (
     CaptureAction,
     DebugCaptureCommand,
+    DebugGripperCommand,
     DebugMotionCommand,
     HeadingReference,
     MotionControlMode,
@@ -55,6 +56,7 @@ __all__ = [
     "CaptureStatusObservation",
     "CaptureStopReason",
     "DebugCaptureCommand",
+    "DebugGripperCommand",
     "DebugMotionCommand",
     "HeadingReference",
     "ImageCoordinateSystem",

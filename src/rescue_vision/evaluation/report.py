@@ -31,9 +31,6 @@ def _percentile(values: list[float], percentile: float) -> float | None:
 def evaluate_records(
     records: list[dict[str, Any]],
     *,
-    model_version: str,
-    dataset_version: str,
-    code_version: str,
     classes: tuple[str, ...] = DEFAULT_CLASSES,
 ) -> dict[str, Any]:
     """评测已经完成匹配的逐对象记录。
@@ -41,8 +38,6 @@ def evaluate_records(
     ``ground_truth_class=null`` 表示误检，``predicted_class=null`` 表示漏检。
     """
 
-    if not model_version or not dataset_version or not code_version:
-        raise ValueError("model, dataset and code versions must be non-empty.")
     if not records:
         raise ValueError("Evaluation records must not be empty.")
     if (
@@ -62,8 +57,6 @@ def evaluate_records(
     seen_keys: set[tuple[str, str]] = set()
 
     for index, record in enumerate(records):
-        if record.get("schema_version") != 1:
-            raise ValueError(f"Record {index} schema_version must be 1.")
         sample_id = record.get("sample_id")
         object_id = record.get("object_id")
         if not isinstance(sample_id, str) or not sample_id:
@@ -215,12 +208,6 @@ def evaluate_records(
             }
         )
     return {
-        "schema_version": 1,
-        "versions": {
-            "model": model_version,
-            "dataset": dataset_version,
-            "code": code_version,
-        },
         "record_count": len(records),
         "classes": ordered_labels,
         "per_class": per_class,

@@ -34,7 +34,7 @@ class RemoteCameraPipeline:
     source: FrameSource
     camera_model: CameraModel | None
     coordinate_system: ImageCoordinateSystem
-    intrinsics_fingerprint_sha256: str | None
+    calibration_id: str | None
 
     def prepare(self, frame: CameraFrame) -> CameraFrame:
         if self.camera_model is None:
@@ -65,8 +65,8 @@ def build_remote_camera_pipeline(config: AppConfig) -> RemoteCameraPipeline:
             if camera_model is not None
             else ImageCoordinateSystem.RAW_PIXEL
         ),
-        intrinsics_fingerprint_sha256=(
-            camera_model.calibration.fingerprint()
+        calibration_id=(
+            camera_model.calibration.calibration_id
             if camera_model is not None
             else None
         ),
@@ -86,6 +86,7 @@ def build_camera_session_status(
         timestamp_ns=time.monotonic_ns(),
         access_mode=config.remote.access_mode,
         motion_control_available=False,
+        gripper_control_available=False,
         capture_control_available=capture_control_available,
         video_stream_available=True,
         map_snapshot_available=False,
@@ -103,7 +104,7 @@ def build_camera_session_status(
         video_nominal_fps=video_nominal_fps,
         max_linear_velocity_m_s=None,
         max_angular_velocity_rad_s=None,
-        max_motion_command_valid_for_ms=500,
+        max_control_command_valid_for_ms=500,
     )
 
 
@@ -151,9 +152,7 @@ def send_video_frame(
         width=width,
         height=height,
         coordinate_system=pipeline.coordinate_system,
-        intrinsics_fingerprint_sha256=(
-            pipeline.intrinsics_fingerprint_sha256
-        ),
+        calibration_id=pipeline.calibration_id,
     )
     connection.send_observation(
         RemoteTopic.VIDEO_FRAME.value,

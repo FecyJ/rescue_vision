@@ -1,4 +1,4 @@
-"""双轮差速小车运动函数。"""
+"""Rescue Car 双轮差速与夹爪舵机控制函数。"""
 
 from __future__ import annotations
 
@@ -8,10 +8,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from rescue_vision.motion.protocol import (
+    CarTelemetry,
     CarLineChannel,
     ParsedCarMessage,
     UnknownCarMessage,
     encode_emergency_stop_command,
+    encode_gripper_command,
     encode_soft_brake_command,
     encode_state_query_command,
     encode_wheel_speed_command,
@@ -75,7 +77,7 @@ class MotionLimits:
 
 
 class MotionController:
-    """通过行通道驱动 Rescue Car 双轮差速底盘。"""
+    """通过同一行通道驱动 Rescue Car 底盘和夹爪。"""
 
     def __init__(
         self,
@@ -94,6 +96,8 @@ class MotionController:
         self._target_wheel_speeds_m_s = (0.0, 0.0)
         self._commanded_wheel_speeds_m_s = (0.0, 0.0)
         self._last_acceleration_update_ns = self._now()
+        self._gripper_target_angles_deg: tuple[float, float] | None = None
+        self._has_gripper_command = False
 
     @property
     def target_wheel_speeds_m_s(self) -> tuple[float, float]:
@@ -106,6 +110,12 @@ class MotionController:
         """返回加速度限制后最近下发的左右轮速度。"""
 
         return self._commanded_wheel_speeds_m_s
+
+    @property
+    def gripper_target_angles_deg(self) -> tuple[float, float] | None:
+        """返回启动遥测或本进程最近下发的左右舵机目标角度。"""
+
+        return self._gripper_target_angles_deg
 
     def set_wheel_speeds(
         self,
@@ -200,6 +210,21 @@ class MotionController:
         )
         self.drive(0.0, -angular)
 
+    def set_gripper_angles(
+        self,
+        left_angle_deg: float,
+        right_angle_deg: float,
+    ) -> None:
+        """同时设置左右夹爪舵机角度，单位 degree。"""
+
+        payload = encode_gripper_command(left_angle_deg, right_angle_deg)
+        self._channel.send_line(payload)
+        self._gripper_target_angles_deg = (
+            float(left_angle_deg),
+            float(right_angle_deg),
+        )
+        self._has_gripper_command = True
+
     def soft_brake(self) -> None:
         """按固件减速度斜坡制动到静止。"""
 
@@ -235,13 +260,22 @@ class MotionController:
                     )
                 continue
             try:
-                return parse_car_line(line)
+                message = parse_car_line(line)
             except ValueError:
                 return UnknownCarMessage(
                     uart_sequence=line.sequence,
                     received_timestamp_ns=line.received_timestamp_ns,
                     payload=line.payload,
                 )
+            if (
+                isinstance(message, CarTelemetry)
+                and not self._has_gripper_command
+            ):
+                self._gripper_target_angles_deg = (
+                    message.servo_left_deg,
+                    message.servo_right_deg,
+                )
+            return message
 
     def drain_messages(self) -> tuple[ParsedCarMessage, ...]:
         """非阻塞排空当前回传，防止 10 Hz 遥测挤满 UART 队列。"""
@@ -275,8 +309,15 @@ def _non_negative(value: object, location: str) -> float:
 
 
 def _move_toward(current: float, target: float, maximum_delta: float) -> float:
-    if target > current:
-        return min(target, current + maximum_delta)
-    if target < current:
-        return max(target, current - maximum_delta)
-    return current
+    delta = target - current
+    distance = abs(delta)
+    if distance <= maximum_delta or math.isclose(
+        distance,
+        maximum_delta,
+        rel_tol=1e-12,
+        abs_tol=1e-15,
+    ):
+        return target
+    if delta > 0.0:
+        return current + maximum_delta
+    return current - maximum_delta

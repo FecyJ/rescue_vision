@@ -390,8 +390,6 @@ class TargetObservation:
     k0_confidence: float
     ground_point: GroundPoint | None
     quality: frozenset[ObservationQuality]
-    model_version: str
-    model_sha256: str
 
     def __post_init__(self) -> None:
         if (
@@ -490,10 +488,3 @@ class TargetObservation:
             raise ValueError(f"ground_point must be finite, got {self.ground_point!r}.")
         if not all(isinstance(item, ObservationQuality) for item in self.quality):
             raise ValueError("quality must contain only ObservationQuality values.")
-        if not isinstance(self.model_version, str) or not self.model_version.strip():
-            raise ValueError("model_version must be non-empty.")
-        if not isinstance(self.model_sha256, str):
-            raise ValueError("model_sha256 must be a hexadecimal string.")
-        checksum = self.model_sha256.lower()
-        if len(checksum) != 64 or any(char not in "0123456789abcdef" for char in checksum):
-            raise ValueError("model_sha256 must be a 64-character hexadecimal digest.")

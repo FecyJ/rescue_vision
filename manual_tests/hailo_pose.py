@@ -161,8 +161,6 @@ def main() -> None:
                             else None
                         ),
                         "quality": sorted(item.value for item in observation.quality),
-                        "model_version": observation.model_version,
-                        "model_sha256": observation.model_sha256,
                     },
                     ensure_ascii=False,
                 )

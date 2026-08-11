@@ -91,7 +91,9 @@ with RecordingSource("recordings/session_001") as source:
         print(frame.sequence, frame.metadata["image_coordinate_system"])
 ```
 
-`RecordingSource` 会拒绝不支持的 session schema、图片哈希错误、尺寸错误和坐标元数据矛盾。`ImageDirectorySource`、`VideoFileSource` 更适合外部素材导入，不具备记录目录的完整 provenance。
+`RecordingSource` 会拒绝记录结构、图片解码、尺寸或坐标元数据错误。
+`ImageDirectorySource`、`VideoFileSource` 更适合外部素材导入，不包含
+session 配置和统计信息。
 
 ## 5. 正式录制命令
 
@@ -116,7 +118,7 @@ rescue-vision-record \
 
 1. 按 `camera.backend` 创建真机源；
 2. 在 `intrinsics_enabled: true` 时用 `CameraModel` 去畸变；
-3. 写入 session schema v4、内参指纹、有效像素比例、填充值和辅助流声明；
+3. 写入统一 session 格式、`calibration_id`、有效像素比例、填充值和辅助流声明；
 4. 使用 `FrameRecorder` 异步编码，正常关闭相机、线程和窗口。
 
 `--display` 展示实际交给记录器的画面，预览缩放不改变保存分辨率；按 `Q/Esc` 正常结束并收尾 session。显示可能降低吞吐，性能门禁应另做一次不带 `--display` 的短录。
@@ -135,8 +137,6 @@ import yaml
 
 from rescue_vision.config import load_runtime_config
 from rescue_vision.geometry.camera_model import IMAGE_BORDER_FILL_VALUE
-from rescue_vision.versioning import git_version
-
 config_path = Path("configs/runtime.yaml").resolve()
 config = load_runtime_config(config_path)
 camera_model = config.build_camera_model()
@@ -179,7 +179,6 @@ recorder = FrameRecorder(
     config_snapshot=yaml.safe_load(
         config_path.read_text(encoding="utf-8")
     ),
-    versions={"code": git_version(), "opencv": cv2.__version__},
     session_tags={
         "lighting": "indoor_bright",
         "distance": "near",
@@ -192,7 +191,7 @@ recorder = FrameRecorder(
     queue_capacity=config.recording.queue_capacity,
     image_format=config.recording.image_format,
     image_coordinate_system="undistorted_pixel",
-    intrinsics_fingerprint_sha256=camera_model.calibration.fingerprint(),
+    calibration_id=camera_model.calibration.calibration_id,
     valid_pixel_ratio=(
         cv2.countNonZero(camera_model.valid_mask)
         / camera_model.valid_mask.size

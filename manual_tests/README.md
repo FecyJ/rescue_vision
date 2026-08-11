@@ -10,7 +10,7 @@
 - `picamera_minimal.py`：直接使用 Picamera2 的最小检查。
 - `geometry_projection.py`：使用本地测试图片人工检查 BEV 和点投影。
 - `hailo_pose.py`：从实际 `runtime.yaml` 加载 YOLO Pose 部署包，检查单张去畸变图像的框、K0、HSV 类别和 ROI 分割摘要；启用 `target_ground_geometry` 时同时输出中心、足迹、朝向、拟合分数和降级原因。
-- `dataset_perception.py`：按 schema v2 数据清单批量运行 Hailo，覆盖式写出 schema v2 观测 JSONL，保留 Pose 类别、HSV 候选/覆盖率、UNKNOWN、质量信息和模型身份。
+- `dataset_perception.py`：按数据清单批量运行 Hailo，覆盖式写出观测 JSONL，保留 Pose 类别、HSV 候选/覆盖率、UNKNOWN 和质量信息。
 - `field_features.py`：从图片或视频离线检测安全区、无编号出发区、中心十字和低精度边界候选，写出 JSONL 及可选叠加图；不访问相机或 Hailo。
 - `camera_undistort_perception.py`：按实际 `runtime.yaml` 连续执行相机、去畸变、Hailo Pose、ROI HSV 掩码和 K0/地面点叠加预览，按 `Q/Esc` 退出；偶发过期帧会标红并丢弃，不会终止预览。
 - `remote_link.py --config PATH`：在树莓派侧以 `remote.role: server` 监听电脑端客户端，连接后发送协议要求的最小会话状态，并持续打印收到的 control；该状态有意声明所有业务能力不可用，所以正式客户端应保持控制禁用。仅验证连接可使用 `observe_only`；用自制底层客户端检查 control 帧时使用 `debug_control`。
@@ -19,7 +19,11 @@
 
 运行前先执行 `python -m pip install -e .`，并确保系统包和显示环境可用。
 
-数据采集不另建重复的硬件脚本：用 `rescue-vision-record --frames 200 --display` 执行真机短录，再用 `rescue-vision-check-recording RECORDING --display` 可视化回放并完成哈希、帧率、丢帧和元数据验收。完整步骤见 [`docs/数据采集工具使用.md`](../docs/数据采集工具使用.md)。
+数据采集不另建重复的硬件脚本：用
+`rescue-vision-record --frames 200 --display` 执行真机短录，再用
+`rescue-vision-check-recording RECORDING --display` 可视化回放并完成图片
+解码、帧率、丢帧和元数据验收。完整步骤见
+[`docs/数据采集工具使用.md`](../docs/数据采集工具使用.md)。
 
 ## 传统视觉场地特征离线检查
 
@@ -114,10 +118,11 @@ rescue-vision-manual-capture \
   --accept-timeout-seconds 30
 ```
 
-入口同时声明 `motion_control`、`video_stream`、`vehicle_state`、
-`capture_control` 和 `capture_status`，并接收手动运动与采集命令。采集操作：
+入口始终声明 `motion_control`、`video_stream`、`vehicle_state`、
+`capture_control` 和 `capture_status`；只有运行配置完成并启用机械标定时才
+声明 `gripper_control`。它接收手动运动、持续夹爪扳机状态与采集命令。采集操作：
 
-- `start`：在 `<output-root>/recordings/` 创建新的标准 recording schema v4
+- `start`：在 `<output-root>/recordings/` 创建新的标准 recording
   会话，持续记录经过配置去畸变的帧及 `motion.jsonl`；
 - `stop`：冲洗队列并完整关闭当前记录；
 - `snapshot`：在 `<output-root>/snapshots/` 保存 JPEG 和同名 JSON 元数据；
@@ -129,3 +134,8 @@ rescue-vision-manual-capture \
 仍不得提交路径。入口退出时先停车，再关闭尚未结束的记录、相机和通信资源。
 它是同时只服务一个客户端的赛外入口，不是正式比赛应用。断线会先停车并关闭
 当前记录，随后可接受一个新连接；车端不会主动重连，也不会恢复旧死手使能。
+夹爪真机检查前必须先标定左右舵机的安全开合范围和固定速度全行程时间，写入
+`motion.gripper` 后再启用。按住左/右扳机时持续发送张开/闭合按压状态，松开
+时发送两个状态均为 `false`；释放、命令超时或断线只停止角度继续变化，不会
+自动开合，也不能直接套用协议说明书中的示例角度。逐次核对 UART/车辆状态中
+的左右目标角之和始终为 180°，包括从旧的非互补目标首次开始运动时。

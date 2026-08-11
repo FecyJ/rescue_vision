@@ -55,19 +55,19 @@ from rescue_vision.geometry.camera_model import (
 )
 from rescue_vision.motion import (
     CarTelemetry,
+    ExecutedRemoteGripper,
     ExecutedRemoteMotion,
     MotionController,
     MANUAL_MOTION_LOG_FILENAME,
     MANUAL_MOTION_STREAM_NAME,
     ManualMotionLogWriter,
     ParsedCarMessage,
+    RemoteGripperExecutor,
+    RemoteGripperResult,
     RemoteMotionExecutor,
     RemoteMotionResult,
     run_remote_motion,
 )
-from rescue_vision.versioning import git_version
-
-
 SESSION_STATUS_PERIOD_MS = 1_000
 VEHICLE_STATUS_PERIOD_MS = 100
 CAPTURE_STATUS_PERIOD_MS = 500
@@ -80,7 +80,7 @@ class CameraPipeline:
     source: FrameSource
     camera_model: CameraModel | None
     coordinate_system: ImageCoordinateSystem
-    intrinsics_fingerprint_sha256: str | None
+    calibration_id: str | None
 
     def prepare(self, frame: CameraFrame) -> CameraFrame:
         if self.camera_model is None:
@@ -253,18 +253,11 @@ class CaptureSession:
             directory,
             image_size=self.config.camera.image_size,
             config_snapshot=self.config_snapshot,
-            versions={
-                "code": git_version(),
-                "config_schema": str(self.config.schema_version),
-                "opencv": cv2.__version__,
-            },
             session_tags=tags,
             queue_capacity=self.config.recording.queue_capacity,
             image_format=self.config.recording.image_format,
             image_coordinate_system=self.pipeline.coordinate_system.value,
-            intrinsics_fingerprint_sha256=(
-                self.pipeline.intrinsics_fingerprint_sha256
-            ),
+            calibration_id=self.pipeline.calibration_id,
             valid_pixel_ratio=(
                 cv2.countNonZero(camera_model.valid_mask)
                 / camera_model.valid_mask.size
@@ -340,7 +333,6 @@ class CaptureSession:
             raise RuntimeError("OpenCV failed to encode snapshot.")
         image_path.write_bytes(encoded.tobytes())
         metadata = {
-            "schema_version": 1,
             "artifact_id": artifact_id,
             "request_id": command.request_id,
             "label": command.label,
@@ -348,9 +340,7 @@ class CaptureSession:
             "timestamp_ns": frame.timestamp_ns,
             "image_path": image_path.name,
             "coordinate_system": self.pipeline.coordinate_system.value,
-            "intrinsics_fingerprint_sha256": (
-                self.pipeline.intrinsics_fingerprint_sha256
-            ),
+            "calibration_id": self.pipeline.calibration_id,
         }
         (directory / f"{artifact_id}.json").write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
@@ -376,7 +366,6 @@ class CaptureSession:
             events.write(
                 json.dumps(
                     {
-                        "schema_version": 1,
                         "artifact_id": artifact_id,
                         "request_id": command.request_id,
                         "label": command.label,
@@ -426,6 +415,22 @@ class CaptureSession:
                 timestamp_ns=timestamp_ns,
             )
 
+    def record_gripper(self, outcome: ExecutedRemoteGripper) -> None:
+        if self.motion_log is not None:
+            self.motion_log.record_gripper(outcome)
+
+    def record_gripper_timeout(
+        self,
+        *,
+        command_id: str,
+        timestamp_ns: int,
+    ) -> None:
+        if self.motion_log is not None:
+            self.motion_log.record_gripper_timeout(
+                command_id=command_id,
+                timestamp_ns=timestamp_ns,
+            )
+
     def record_car_message(self, message: ParsedCarMessage) -> None:
         if self.motion_log is not None:
             self.motion_log.record_car_message(message)
@@ -471,7 +476,7 @@ class CaptureSession:
 
 
 class VehicleState:
-    """把运动执行结果和最新轮速遥测汇总为协议观察。"""
+    """把运动/夹爪执行结果和最新 UART 遥测汇总为协议观察。"""
 
     def __init__(self, *, safety_mode: VehicleSafetyMode) -> None:
         if safety_mode is not VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP:
@@ -487,6 +492,8 @@ class VehicleState:
         self.stop_reason = VehicleStopReason.DEADMAN_RELEASE
         self.last_received_command_id: str | None = None
         self.last_applied_command_id: str | None = None
+        self.last_received_gripper_command_id: str | None = None
+        self.last_applied_gripper_command_id: str | None = None
 
     def on_car_message(self, message: ParsedCarMessage) -> None:
         if isinstance(message, CarTelemetry):
@@ -514,6 +521,14 @@ class VehicleState:
     def on_motion_timeout(self) -> None:
         self.motion_state = VehicleMotionState.BRAKING
         self.stop_reason = VehicleStopReason.COMMAND_EXPIRED
+
+    def on_gripper(self, outcome: ExecutedRemoteGripper) -> None:
+        self.last_received_gripper_command_id = outcome.command_id
+        if outcome.result in {
+            RemoteGripperResult.APPLIED,
+            RemoteGripperResult.STOPPED,
+        }:
+            self.last_applied_gripper_command_id = outcome.command_id
 
     def observation(self) -> VehicleStateObservation:
         telemetry = self.telemetry
@@ -544,10 +559,22 @@ class VehicleState:
             measured_right_velocity_m_s=(
                 None if telemetry is None else telemetry.actual_right_m_s
             ),
+            gripper_left_angle_deg=(
+                None if telemetry is None else telemetry.servo_left_deg
+            ),
+            gripper_right_angle_deg=(
+                None if telemetry is None else telemetry.servo_right_deg
+            ),
             heading_rad=None,
             heading_reference=None,
             last_received_motion_command_id=self.last_received_command_id,
             last_applied_motion_command_id=self.last_applied_command_id,
+            last_received_gripper_command_id=(
+                self.last_received_gripper_command_id
+            ),
+            last_applied_gripper_command_id=(
+                self.last_applied_gripper_command_id
+            ),
         )
         self.sequence += 1
         return observation
@@ -561,6 +588,7 @@ class ManualCaptureRuntime:
         *,
         connection: RemoteMessageConnection,
         executor: RemoteMotionExecutor,
+        gripper_executor: RemoteGripperExecutor | None,
         capture: CaptureSession,
         pipeline: CameraPipeline,
         session_status: RemoteSessionStatus,
@@ -571,6 +599,7 @@ class ManualCaptureRuntime:
     ) -> None:
         self.connection = connection
         self.executor = executor
+        self.gripper_executor = gripper_executor
         self.capture = capture
         self.pipeline = pipeline
         self.session_status = session_status
@@ -588,17 +617,21 @@ class ManualCaptureRuntime:
 
     def run(self) -> None:
         self._send_initial_status()
-        run_remote_motion(
-            self.connection,
-            self.executor,
-            stop_requested=self.stop_requested,
-            on_car_message=self._on_car_message,
-            on_motion_executed=self._on_motion,
-            on_motion_timeout=self._on_motion_timeout,
-            on_other_control=self._handle_other_control,
-            on_cycle=self._cycle,
-            poll_interval_s=0.02,
-        )
+        try:
+            run_remote_motion(
+                self.connection,
+                self.executor,
+                stop_requested=self.stop_requested,
+                on_car_message=self._on_car_message,
+                on_motion_executed=self._on_motion,
+                on_motion_timeout=self._on_motion_timeout,
+                on_other_control=self._handle_other_control,
+                on_cycle=self._cycle,
+                poll_interval_s=0.02,
+            )
+        finally:
+            if self.gripper_executor is not None:
+                self.gripper_executor.stop()
 
     def _on_car_message(self, message: ParsedCarMessage) -> None:
         self.vehicle.on_car_message(message)
@@ -618,6 +651,15 @@ class ManualCaptureRuntime:
             )
 
     def _cycle(self) -> None:
+        if self.gripper_executor is not None:
+            timed_out_command_id = self.gripper_executor.check_timeout()
+            if timed_out_command_id is None:
+                self.gripper_executor.update()
+            else:
+                self.capture.record_gripper_timeout(
+                    command_id=timed_out_command_id,
+                    timestamp_ns=time.monotonic_ns(),
+                )
         try:
             frame = self.pipeline.source.read(timeout=0.01)
         except TimeoutError:
@@ -692,10 +734,22 @@ class ManualCaptureRuntime:
     def _handle_other_control(self, message: ReceivedRemoteMessage) -> None:
         if (
             message.stream is not RemoteStream.CONTROL
-            or message.topic != RemoteTopic.DEBUG_CAPTURE.value
             or message.content_type != "application/json"
             or message.attributes
         ):
+            raise ValueError(
+                f"Unsupported remote control message {message.topic!r}."
+            )
+        if message.topic == RemoteTopic.DEBUG_GRIPPER.value:
+            if self.gripper_executor is None:
+                raise ValueError(
+                    "Remote gripper control is disabled by runtime config."
+                )
+            outcome = self.gripper_executor.execute(message)
+            self.vehicle.on_gripper(outcome)
+            self.capture.record_gripper(outcome)
+            return
+        if message.topic != RemoteTopic.DEBUG_CAPTURE.value:
             raise ValueError(
                 f"Unsupported remote control message {message.topic!r}."
             )
@@ -741,7 +795,7 @@ def build_camera_pipeline(config: AppConfig) -> CameraPipeline:
         (
             None
             if camera_model is None
-            else camera_model.calibration.fingerprint()
+            else camera_model.calibration.calibration_id
         ),
     )
 
@@ -758,6 +812,7 @@ def build_session_status(
         timestamp_ns=time.monotonic_ns(),
         access_mode=config.remote.access_mode,
         motion_control_available=True,
+        gripper_control_available=config.motion.gripper.enabled,
         capture_control_available=True,
         video_stream_available=True,
         map_snapshot_available=False,
@@ -771,7 +826,7 @@ def build_session_status(
         video_nominal_fps=video_fps,
         max_linear_velocity_m_s=config.motion.max_linear_velocity_m_s,
         max_angular_velocity_rad_s=config.motion.max_angular_velocity_rad_s,
-        max_motion_command_valid_for_ms=(
+        max_control_command_valid_for_ms=(
             config.motion.max_remote_command_valid_for_ms
         ),
     )
@@ -780,6 +835,7 @@ def build_session_status(
 def run_manual_capture_session(
     connection: RemoteMessageConnection,
     executor: RemoteMotionExecutor,
+    gripper_executor: RemoteGripperExecutor | None,
     capture: CaptureSession,
     pipeline: CameraPipeline,
     session_status: RemoteSessionStatus,
@@ -792,6 +848,7 @@ def run_manual_capture_session(
     runtime = ManualCaptureRuntime(
         connection=connection,
         executor=executor,
+        gripper_executor=gripper_executor,
         capture=capture,
         pipeline=pipeline,
         session_status=session_status,
@@ -860,9 +917,7 @@ def _send_video_frame(
         width=width,
         height=height,
         coordinate_system=pipeline.coordinate_system,
-        intrinsics_fingerprint_sha256=(
-            pipeline.intrinsics_fingerprint_sha256
-        ),
+        calibration_id=pipeline.calibration_id,
     )
     connection.send_observation(
         RemoteTopic.VIDEO_FRAME.value,
@@ -880,17 +935,22 @@ def _artifact_id(prefix: str) -> str:
 
 def _accept_with_shutdown(
     server: RemoteTcpServer,
+    controller: MotionController,
     *,
     timeout_s: float,
     stop_requested: Callable[[], bool],
 ) -> RemoteMessageConnection | None:
     deadline = time.monotonic() + timeout_s
     while not stop_requested():
+        # STM32 continuously publishes 10 Hz telemetry, including while no
+        # remote client is connected.  Keep the UART's bounded queue healthy
+        # instead of leaving it unconsumed for the whole accept timeout.
+        controller.drain_messages()
         remaining_s = deadline - time.monotonic()
         if remaining_s <= 0:
-            raise TimeoutError("Timed out waiting for remote TCP client.")
+            return None
         try:
-            return server.accept(timeout=min(0.5, remaining_s))
+            return server.accept(timeout=min(0.1, remaining_s))
         except TimeoutError:
             continue
     return None
@@ -958,6 +1018,7 @@ def main() -> None:
     channel = config.uart.build_channel()
     controller: MotionController | None = config.motion.build_controller(channel)
     executor = config.motion.build_remote_executor(controller)
+    gripper_executor = config.motion.build_remote_gripper_executor(controller)
     assert server is not None
     assert channel is not None
     assert executor is not None
@@ -977,6 +1038,7 @@ def main() -> None:
                 while not shutdown_requested.is_set():
                     connection = _accept_with_shutdown(
                         server,
+                        controller,
                         timeout_s=args.accept_timeout_seconds,
                         stop_requested=shutdown_requested.is_set,
                     )
@@ -998,6 +1060,7 @@ def main() -> None:
                             run_manual_capture_session(
                                 connection,
                                 executor,
+                                gripper_executor,
                                 capture,
                                 pipeline,
                                 status,

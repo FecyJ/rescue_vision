@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -60,6 +59,7 @@ class CameraCalibration:
     Fisheye 使用 ``cv2.fisheye`` 接口。
     """
 
+    calibration_id: str
     model: CameraModelType
     image_size: tuple[int, int]
     K: FloatArray
@@ -67,12 +67,15 @@ class CameraCalibration:
     new_K: FloatArray
 
     def __post_init__(self) -> None:
+        calibration_id = str(self.calibration_id).strip()
         model = CameraModelType.parse(self.model)
         image_size = tuple(int(value) for value in self.image_size)
         K = np.ascontiguousarray(self.K, dtype=np.float64)
         D = np.ascontiguousarray(self.D, dtype=np.float64).reshape(-1, 1)
         new_K = np.ascontiguousarray(self.new_K, dtype=np.float64)
 
+        if not calibration_id:
+            raise ValueError("calibration_id must be a non-empty string.")
         if len(image_size) != 2 or any(value <= 0 for value in image_size):
             raise ValueError(
                 f"image_size must be two positive integers, got {image_size}."
@@ -98,6 +101,7 @@ class CameraCalibration:
                 "Pinhole D must contain 4, 5, 8, 12 or 14 parameters."
             )
 
+        object.__setattr__(self, "calibration_id", calibration_id)
         object.__setattr__(self, "model", model)
         object.__setattr__(self, "image_size", image_size)
         object.__setattr__(self, "K", K)
@@ -127,7 +131,7 @@ class CameraCalibration:
         *,
         allow_unusable: bool = False,
     ) -> CameraCalibration:
-        """从新版或旧版内参字典加载并执行统一校验。"""
+        """从内参字典加载并执行统一校验。"""
 
         quality = data.get("quality", {})
         if not isinstance(quality, dict):
@@ -138,13 +142,17 @@ class CameraCalibration:
                 "and diagnostics before loading it."
             )
 
-        model_value = data.get("model_type", data.get("model"))
+        calibration_id = data.get("calibration_id")
+        if not isinstance(calibration_id, str) or not calibration_id.strip():
+            raise ValueError("Calibration JSON is missing a non-empty calibration_id.")
+
+        model_value = data.get("model_type")
         if model_value is None:
             raise KeyError("Calibration JSON is missing 'model_type'.")
 
-        K_value = data.get("camera_matrix", data.get("K"))
-        D_value = data.get("distortion", data.get("D"))
-        new_K_value = data.get("new_camera_matrix", data.get("new_K"))
+        K_value = data.get("camera_matrix")
+        D_value = data.get("distortion")
+        new_K_value = data.get("new_camera_matrix")
 
         if K_value is None or D_value is None or new_K_value is None:
             raise KeyError(
@@ -157,31 +165,13 @@ class CameraCalibration:
             raise ValueError("Calibration image_size must be [width, height].")
 
         return cls(
+            calibration_id=calibration_id,
             model=CameraModelType.parse(model_value),
             image_size=tuple(int(value) for value in image_size_value),
             K=np.asarray(K_value, dtype=np.float64),
             D=np.asarray(D_value, dtype=np.float64),
             new_K=np.asarray(new_K_value, dtype=np.float64),
         )
-
-    def fingerprint(self) -> str:
-        """返回与模型、尺寸和全部投影参数绑定的稳定 SHA-256。"""
-
-        payload = {
-            "model_type": self.model.value,
-            "image_size": list(self.image_size),
-            "camera_matrix": self.K.tolist(),
-            "distortion": self.D.reshape(-1).tolist(),
-            "new_camera_matrix": self.new_K.tolist(),
-        }
-        encoded = json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
-
 
 class CameraModel:
     """把原始畸变图像/像素转换到固定的去畸变像素坐标系。"""

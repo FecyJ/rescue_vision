@@ -18,8 +18,7 @@ from typing import Any, Protocol, TypeAlias, runtime_checkable
 from rescue_vision.exception_notes import add_exception_note
 
 
-PROTOCOL_SCHEMA_VERSION = 2
-_FRAME_MAGIC = b"RVM2"
+_FRAME_MAGIC = b"RVM!"
 _FRAME_PREFIX = struct.Struct("!4sII")
 
 RemoteAttributeValue: TypeAlias = str | int | float | bool | None
@@ -235,7 +234,6 @@ class RemoteMessageCodec:
             )
 
         header_document = {
-            "schema_version": PROTOCOL_SCHEMA_VERSION,
             "stream": stream.value,
             "topic": topic,
             "content_type": content_type,
@@ -309,7 +307,6 @@ class RemoteMessageCodec:
                 "Remote frame header must be valid UTF-8 JSON."
             ) from exc
         expected_keys = {
-            "schema_version",
             "stream",
             "topic",
             "content_type",
@@ -321,15 +318,6 @@ class RemoteMessageCodec:
             raise RemoteProtocolError(
                 f"Remote frame header keys must be exactly "
                 f"{sorted(expected_keys)}."
-            )
-        if (
-            isinstance(header["schema_version"], bool)
-            or not isinstance(header["schema_version"], int)
-            or header["schema_version"] != PROTOCOL_SCHEMA_VERSION
-        ):
-            raise RemoteProtocolError(
-                "Unsupported remote protocol schema_version "
-                f"{header['schema_version']!r}."
             )
         try:
             stream = RemoteStream(header["stream"])

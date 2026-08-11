@@ -1,6 +1,8 @@
 # `config`：运行配置与对象装配
 
-本包是运行参数的唯一入口。`load_runtime_config()` 加载 schema v12 YAML，拒绝缺失字段、未知字段、错误类型和不一致资产；相对路径以 YAML 所在目录为基准。
+本包是运行参数的唯一入口。`load_runtime_config()` 读取 YAML，拒绝未知字段、
+错误类型和不一致资产；相对路径以 YAML 所在目录为基准。`camera` 必填，
+其余段可以省略并采用安全默认值。
 
 本机运行统一读取不提交的 `configs/runtime.yaml`。`configs/runtime.example.yaml` 只用于创建新配置：
 
@@ -20,6 +22,7 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `RemoteConfig.connect_client()` | 仓库内参考客户端建立直接 TCP 连接 | 只用于互操作/人工检查；独立电脑端不得依赖 |
 | `MotionRuntimeConfig.build_controller()` | 用已有 UART 通道创建运动控制器 | motion 关闭时返回 `None`；不打开 UART |
 | `MotionRuntimeConfig.build_remote_executor()` | 创建远程调试运动执行器 | 复用同一个运动控制器和限速 |
+| `MotionRuntimeConfig.build_remote_gripper_executor()` | 创建远程夹爪执行器 | 夹爪禁用时返回 `None`；否则复用控制器、有效期与机械标定 |
 | `HailoConfig.build_backend()` | 校验模型资产并创建 Hailo 后端 | Hailo 关闭时返回 `None` |
 | `HailoConfig.model_class_mapping()` | 把模型 class ID 映射为 `TargetClass` | 直接传给 `TargetPoseDetector` |
 | `PerceptionConfig.build_field_feature_detector()` | 创建传统视觉场地特征检测器 | `field_features.enabled=false` 时返回 `None` |
@@ -38,7 +41,8 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `ProcessingConfig` | `max_observation_age_ms` |
 | `UartConfig` | 设备名、波特率、读写超时、有界接收容量和最大行长度 |
 | `RemoteConfig` | 服务端/客户端、观察/调试权限、连接/IO 超时和有界队列 |
-| `MotionRuntimeConfig` | 实测轮距、车体/车轮速度上限、单轮加速度上限和远程命令有效期上限 |
+| `MotionRuntimeConfig` | 实测轮距、车体/车轮速度上限、单轮加速度上限、远程命令有效期和 `gripper` |
+| `GripperRuntimeConfig` | 能力开关、左右开/闭安全角度和固定速度全行程时间 |
 | `TrackingConfig` | 关联、确认、滑行、衰减和删除阈值 |
 | `WorldRuntimeConfig` | `WorldModelConfig` 与 `StaticRegion` 集合 |
 | `MissionConfig` | 比赛计时、安全超时、避让距离和目标优先级 |
@@ -75,16 +79,34 @@ remote_server = config.remote.build_server()
 # motion 复用同一个 UART 通道；禁用时返回 None。
 motion_controller = config.motion.build_controller(uart_channel)
 motion_executor = config.motion.build_remote_executor(motion_controller)
+gripper_executor = config.motion.build_remote_gripper_executor(
+    motion_controller
+)
 ```
 
 UART/TCP 生命周期和 motion 的停止语义分别见相邻模块 README，不要把
 `build_*()` 的成功返回误认为硬件已经连通。
+`gripper_executor is None` 表示当前配置未完成机械标定或明确关闭夹爪能力；
+应用必须在会话状态中声明 `gripper_control=false`，不能自行补默认角度。
+`motion.gripper` 字段语义如下：
+
+| 字段 | 语义 |
+| --- | --- |
+| `enabled` | 是否允许装配并宣告远程夹爪能力 |
+| `open_left_angle_deg` / `open_right_angle_deg` | 当前车辆完全张开时的左右安全目标角度 |
+| `closed_left_angle_deg` / `closed_right_angle_deg` | 当前车辆完全闭合时的左右安全目标角度 |
+| `full_travel_time_s` | 单方向持续按下时，从一个端点匀速到另一端点的时间 |
+
+四个角度单位都是 degree，范围 `[0, 180]`。每组端点必须满足
+`left + right = 180°`；加载器会拒绝相等的 `0/0`、`180/180` 等非互补配置。
+执行器以左角为单一自由度并始终用 `right = 180° - left` 构造远程下发；
+客户端只发送按下/松开 boolean，不读取这些机械值。
 
 ## 3. 装配几何对象
 
 ```python
 # build_geometry() 会同时检查运行分辨率、标定可用性、
-# 相机模型和地面映射中的内参指纹。
+# 相机模型和地面映射中的 calibration_id。
 geometry = config.build_geometry()
 if geometry is None:
     raise RuntimeError("当前功能需要在 runtime.yaml 中启用内参")
@@ -162,7 +184,8 @@ geometry:
 | 开 | 开 | 可进一步把 K0 投影到机器人地面毫米坐标 |
 | 关 | 开 | 非法配置，加载阶段直接拒绝 |
 
-正式四类目标采集和感知必须启用内参。地面映射尚未完成时保持关闭，不应伪造路径或绕过指纹校验。
+正式四类目标采集和感知必须启用内参。地面映射尚未完成时保持关闭，不应
+伪造路径或绕过 `calibration_id` 配对检查。
 
 ## 7. Hailo 装配语义
 
@@ -290,35 +313,22 @@ PySerial 并打开设备。电机命令、轮速和未来 IMU 报文由后续协
 网络；`connect_client()` 会立即建立 TCP 连接，因此只能在本仓库参考工具
 的装配层调用。
 
-## schema 与路径
+## 默认值与路径
 
-- 当前运行配置为 schema v12。
-- schema v11 升级到 v12 时，必须在 `perception` 下新增完整的
-  `target_ground_geometry` 段。暂不运行时仍需保留四类形状、尺寸和全部拟合
-  字段并设置 `enabled: false`；不会猜测实物尺寸或把检测框中心当作地面中心。
-- schema v10 升级到 v11 时，必须在 `perception` 下新增完整的
-  `field_features` 段。即使暂不运行也必须保留全部严格字段并设置
-  `enabled: false`；不会静默使用场地颜色或尺寸默认值。
-- schema v9 升级到 v10 时，必须新增完整的 `perception` 段，并从 `hailo`
-  删除 `detection_threshold`、`semantic_threshold` 和 `k0_threshold`。
-  `detection_threshold`、`k0_threshold` 移入 `perception`；模型类别只保留为
-  诊断证据，最终类别由 ROI HSV 决定。旧字段不会被静默兼容。
-- schema v8 升级到 v9 时，`motion` 段必须增加正有限数
-  `max_wheel_acceleration_m_s2`。示例值 `0.50` 表示单轮目标速度每秒最多
-  变化 0.50 m/s；控制器不会静默使用旧配置或猜测真车安全加速度。
-- schema v7 升级到 v8 时必须增加完整的 `motion` 段；默认关闭且轮距为
-  `null`，不会猜测机械尺寸、打开 UART 或接受远程运动。
-- schema v6 升级到 v7 时，删除 `authentication_key_path` 和
-  `handshake_timeout_ms`，增加 `connect_timeout_ms`。这是为了降低赛场
-  连接复杂度而有意做出的不兼容简化，不提供旧字段兼容。
-- schema v5 升级到 v6 时必须增加完整的 `remote` 段；不会静默开放网络或
-  远程控制。未使用时设置 `enabled: false`、`access_mode: observe_only`。
-- schema v4 升级时还必须增加完整的 `uart` 段；不会静默猜测设备名
-  或打开串口。UART 尚未使用时设置 `enabled: false`、`device: null`。
-- schema v3 升级时还必须增加完整的 `tracking`、`world` 和 `mission`
-  段；不会静默套用比赛安全默认值。
-- 更旧 schema 的 `geometry.enabled` 不会被静默兼容，应拆成两个独立开关。
+- `geometry`、`uart`、`remote`、`motion`、`motion.gripper` 和 `hailo`
+  缺省时全部关闭；远程访问缺省为 `observe_only`。
+- `perception` 可以省略；此时目标三维拟合和场地特征检测均安全关闭，ROI HSV
+  分类及检测门限采用 `runtime.example.yaml` 展示的初始值。现场颜色、尺寸和
+  接受门限仍应在 YAML 中明确覆盖并重新标定。
+- 录制队列、通信超时、运动上限、跟踪和任务阈值缺省为
+  `runtime.example.yaml` 展示的值。现场只需写需要覆盖的字段。
+- 子系统一旦启用，设备路径、轮距、夹爪机械端点、标定路径和模型资产仍然
+  必须完整有效，不会猜测这些安全关键参数。
+- 旧配置中的 `schema_version`、模型版本和校验和字段已删除；这些字段会按
+  未知字段拒绝。`detection_threshold` 和 `k0_threshold` 位于 `perception`，
+  模型类别只保留为诊断证据，最终类别由 ROI HSV 决定。
 - 位于 `configs/` 的 YAML 指向仓库根目录资产时通常以 `../` 开头。
-- 路径、类别、阈值和模型哈希只在配置中维护，不在业务模块再次硬编码。
+- 路径、类别和阈值只在配置中维护，不在业务模块再次硬编码。
 
-新增配置字段时必须同步严格校验、`configs/runtime.example.yaml`、无硬件测试和受影响模块 README。
+新增配置字段时必须同步校验、默认值、`configs/runtime.example.yaml`、
+无硬件测试和受影响模块 README。

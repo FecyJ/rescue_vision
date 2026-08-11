@@ -143,10 +143,10 @@ with source, detector:
 | 子包 | 常用入口 | 对接责任 |
 | --- | --- | --- |
 | [`app`](app/README.md) | `run_manual_capture_session()`、`rescue-vision-manual-capture` | 赛外受监督手动驾驶和车载采集装配 |
-| [`config`](config/README.md) | `load_runtime_config()`、`AppConfig.build_geometry()`、`HailoConfig.build_backend()` | 启动时严格加载和装配 |
+| [`config`](config/README.md) | `load_runtime_config()`、`GripperRuntimeConfig`、`AppConfig.build_geometry()`、`HailoConfig.build_backend()` | 启动时严格加载、机械标定和装配 |
 | [`camera`](camera/README.md) | `FrameSource`、`CameraFrame`、`Picamera2Source`、`RecordingSource` | 产生带时间和序号的最新帧 |
-| [`communication`](communication/README.md) | `UartLineChannel`、`RemoteMessageConnection`、`DebugMotionCommand`、`RemoteSessionStatus` | UART、直接 TCP 远程消息与严格观察 schema |
-| [`motion`](motion/README.md) | `MotionController`、`MotionLimits`、`RemoteMotionExecutor`、`run_remote_motion` | 差速运动、Rescue Car 协议和远程调试执行 |
+| [`communication`](communication/README.md) | `UartLineChannel`、`RemoteMessageConnection`、`DebugMotionCommand`、`DebugGripperCommand`、`RemoteSessionStatus` | UART、直接 TCP 远程消息与严格观察 schema |
+| [`motion`](motion/README.md) | `MotionController`、`MotionLimits`、`GripperCalibration`、`RemoteMotionExecutor`、`RemoteGripperExecutor`、`run_remote_motion` | 差速运动、持续夹爪双舵机、Rescue Car 协议和远程调试执行 |
 | [`geometry`](geometry/README.md) | `CameraModel`、`GroundProjector`、显式坐标类型 | 去畸变及像素/地面/BEV 转换 |
 | [`perception`](perception/README.md) | `TargetPoseDetector`、`TargetGroundGeometryEstimator`、`FieldFeatureDetector` | 任务目标、地面几何和静态场地特征观测 |
 | [`tracking`](tracking/README.md) | `MultiTargetTracker`、`TrackedTarget`、`TrackStatus` | 时间关联、遮挡和轨迹生命周期 |
@@ -156,7 +156,6 @@ with source, detector:
 | [`data`](data/README.md) | `inspect_recording()`、`build_dataset_records()`、`split_records()` | 采集验收、清单和防泄漏划分 |
 | [`evaluation`](evaluation/README.md) | `observations_to_evaluation_records()`、`evaluate_records()` | 目标匹配适配和离线指标 |
 
-`versioning.py` 提供 `git_version()`，用于把当前提交及 dirty 状态写入记录和评测产物，不单独建立子包。
 
 ## 对接不变量
 

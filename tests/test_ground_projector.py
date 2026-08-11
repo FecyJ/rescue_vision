@@ -170,6 +170,7 @@ def test_partial_or_invalid_robot_projection_is_rejected() -> None:
 
 def test_ground_mapping_rejects_intrinsic_mismatch(tmp_path) -> None:
     calibration = CameraCalibration(
+        calibration_id="test",
         model=CameraModelType.PINHOLE,
         image_size=(32, 24),
         K=np.eye(3),
@@ -177,12 +178,11 @@ def test_ground_mapping_rejects_intrinsic_mismatch(tmp_path) -> None:
         new_K=np.eye(3),
     )
     document = {
-        "schema_version": 3,
         "quality": {"usable": True, "physically_valid": True},
         "image_size": [32, 24],
         "intrinsics": {
             "model_type": "pinhole",
-            "fingerprint_sha256": calibration.fingerprint(),
+            "calibration_id": calibration.calibration_id,
         },
         "image_to_ground": np.eye(3).tolist(),
         "bev": {
@@ -216,12 +216,12 @@ def test_ground_mapping_rejects_intrinsic_mismatch(tmp_path) -> None:
         GroundProjector.from_json(path, camera_calibration=calibration)
 
     document["intrinsics"]["model_type"] = "pinhole"
-    document["intrinsics"]["fingerprint_sha256"] = "wrong"
+    document["intrinsics"]["calibration_id"] = "wrong"
     path.write_text(json.dumps(document), encoding="utf-8")
-    with pytest.raises(ValueError, match="fingerprint"):
+    with pytest.raises(ValueError, match="calibration_id"):
         GroundProjector.from_json(path, camera_calibration=calibration)
 
-    document["intrinsics"]["fingerprint_sha256"] = calibration.fingerprint()
+    document["intrinsics"]["calibration_id"] = calibration.calibration_id
     document["quality"]["usable"] = False
     path.write_text(json.dumps(document), encoding="utf-8")
     with pytest.raises(ValueError, match="quality.usable"):

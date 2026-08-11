@@ -95,8 +95,6 @@ def observation(
         k0_confidence=0.9 if k0 is not None else 0.0,
         ground_point=ground_point,
         quality=frozenset(),
-        model_version="test",
-        model_sha256="0" * 64,
     )
 
 

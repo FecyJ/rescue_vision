@@ -27,7 +27,6 @@ def _read_manifest(path: Path) -> list[dict[str, object]]:
             raise ValueError(f"{path}:{line_number}: invalid JSON.") from error
         if (
             not isinstance(record, dict)
-            or record.get("schema_version") != 2
             or not isinstance(record.get("sample_id"), str)
             or not isinstance(record.get("image_path"), str)
         ):
@@ -40,7 +39,7 @@ def _read_manifest(path: Path) -> list[dict[str, object]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run the configured Hailo detector over a schema-v2 manifest."
+        description="Run the configured Hailo detector over a dataset manifest."
     )
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--dataset-root", type=Path, required=True)
@@ -88,7 +87,6 @@ def main() -> None:
             for index, observation in enumerate(observations):
                 output_records.append(
                     {
-                        "schema_version": 2,
                         "sample_id": sample_id,
                         "observation_id": f"observation_{index:04d}",
                         "model_target_class": observation.model_target_class.value,
@@ -136,8 +134,6 @@ def main() -> None:
                         "quality": sorted(
                             item.value for item in observation.quality
                         ),
-                        "model_version": observation.model_version,
-                        "model_sha256": observation.model_sha256,
                     }
                 )
     finally:

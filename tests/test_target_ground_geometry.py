@@ -223,8 +223,6 @@ def observation(
             if with_k0
             else frozenset({ObservationQuality.K0_UNAVAILABLE})
         ),
-        model_version="synthetic-test",
-        model_sha256="0" * 64,
     )
 
 

@@ -13,6 +13,7 @@ from rescue_vision.geometry.ground_projector import GroundProjector
 
 def write_intrinsics(path, *, usable: bool = True) -> CameraCalibration:
     calibration = CameraCalibration(
+        calibration_id="test",
         model=CameraModelType.PINHOLE,
         image_size=(32, 24),
         K=np.eye(3),
@@ -22,7 +23,7 @@ def write_intrinsics(path, *, usable: bool = True) -> CameraCalibration:
     path.write_text(
         json.dumps(
             {
-                "schema_version": 3,
+                "calibration_id": calibration.calibration_id,
                 "model_type": "pinhole",
                 "image_size": [32, 24],
                 "camera_matrix": calibration.K.tolist(),
@@ -43,8 +44,7 @@ def config_text(
     ground_mapping_enabled: bool = True,
     extra: str = "",
 ) -> str:
-    return f"""schema_version: 12
-camera:
+    return f"""camera:
   backend: rpicam_vid
   image_size: {image_size}
   fps: 20
@@ -87,6 +87,13 @@ motion:
   max_wheel_velocity_m_s: 0.30
   max_wheel_acceleration_m_s2: 0.50
   max_remote_command_valid_for_ms: 500
+  gripper:
+    enabled: false
+    open_left_angle_deg: null
+    open_right_angle_deg: null
+    closed_left_angle_deg: null
+    closed_right_angle_deg: null
+    full_travel_time_s: null
 tracking:
   confirmation_hits: 2
   max_association_ground_mm: 250.0
@@ -224,8 +231,6 @@ hailo:
   hef_path: null
   postprocess_onnx_path: null
   output_mapping_path: null
-  model_version: null
-  hef_sha256: null
   raw_classes: []
   class_mapping: {{}}
   backend_score_threshold: 0.01
@@ -238,15 +243,14 @@ def test_strict_config_and_geometry_build(tmp_path) -> None:
     (tmp_path / "ground.json").write_text(
         json.dumps(
             {
-                    "schema_version": 3,
-                    "quality": {
+                "quality": {
                         "usable": True,
                         "physically_valid": True,
-                    },
+                },
                 "image_size": [32, 24],
                 "intrinsics": {
                     "model_type": "pinhole",
-                    "fingerprint_sha256": calibration.fingerprint(),
+                    "calibration_id": calibration.calibration_id,
                 },
                 "image_to_ground": np.eye(3).tolist(),
             }
@@ -335,16 +339,12 @@ def test_hailo_class_mapping_and_relative_paths(tmp_path) -> None:
   hef_path: null
   postprocess_onnx_path: null
   output_mapping_path: null
-  model_version: null
-  hef_sha256: null
   raw_classes: []
   class_mapping: {}""",
         """  enabled: true
   hef_path: bundle/model.hef
   postprocess_onnx_path: bundle/postprocess.onnx
   output_mapping_path: bundle/mapping.json
-  model_version: model-v1
-  hef_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   raw_classes: [raw_a, raw_b]
   class_mapping:
     raw_a: green_supply
@@ -561,7 +561,10 @@ def test_field_feature_config_rejects_unsafe_values(
         - lower: [85, 50, 71]
           upper: [110, 255, 255]
 """,
-            "",
+            """      unexpected_color:
+        - lower: [85, 50, 71]
+          upper: [110, 255, 255]
+""",
             "ranges keys",
         ),
         ("lower: [35, 70, 71]", "lower: [180, 70, 71]", "HSV component"),
@@ -613,7 +616,52 @@ def test_runtime_example_matches_strict_schema() -> None:
         Path(__file__).resolve().parents[1] / "configs" / "runtime.example.yaml"
     )
     config = load_runtime_config(example)
-    assert config.schema_version == 12
+    assert config.hailo.enabled is False
+
+
+def test_optional_sections_use_safe_defaults(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        "camera:\n"
+        "  backend: rpicam_vid\n"
+        "  image_size: [32, 24]\n"
+        "  fps: 20\n"
+        "  lens_position: 1.0\n",
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(path)
+
+    assert not config.uart.enabled
+    assert not config.remote.enabled
+    assert not config.motion.enabled
+    assert not config.hailo.enabled
+    assert not config.perception.target_ground_geometry.enabled
+    assert not config.perception.field_features.enabled
+
+
+def test_perception_supports_partial_nested_overrides(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        "camera:\n"
+        "  backend: rpicam_vid\n"
+        "  image_size: [32, 24]\n"
+        "  fps: 20\n"
+        "  lens_position: 1.0\n"
+        "perception:\n"
+        "  detection_threshold: 0.4\n"
+        "  field_features:\n"
+        "    boundary:\n"
+        "      max_features: 4\n",
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(path)
+
+    assert config.perception.detection_threshold == pytest.approx(0.4)
+    assert config.perception.k0_threshold == pytest.approx(0.5)
+    assert config.perception.field_features.boundary_max_features == 4
+    assert not config.perception.field_features.enabled
 
 
 def test_uart_config_builds_channel_without_opening_device(tmp_path) -> None:
@@ -661,6 +709,22 @@ def test_motion_config_builds_controller_without_opening_uart(tmp_path) -> None:
         .replace(
             "motion:\n  enabled: false\n  wheel_track_m: null",
             "motion:\n  enabled: true\n  wheel_track_m: 0.2",
+        )
+        .replace(
+            """  gripper:
+    enabled: false
+    open_left_angle_deg: null
+    open_right_angle_deg: null
+    closed_left_angle_deg: null
+    closed_right_angle_deg: null
+    full_travel_time_s: null""",
+            """  gripper:
+    enabled: true
+    open_left_angle_deg: 20.0
+    open_right_angle_deg: 160.0
+    closed_left_angle_deg: 80.0
+    closed_right_angle_deg: 100.0
+    full_travel_time_s: 1.5""",
         ),
         encoding="utf-8",
     )
@@ -669,6 +733,7 @@ def test_motion_config_builds_controller_without_opening_uart(tmp_path) -> None:
     channel = config.uart.build_channel()
     controller = config.motion.build_controller(channel)
     executor = config.motion.build_remote_executor(controller)
+    gripper_executor = config.motion.build_remote_gripper_executor(controller)
 
     assert channel is not None
     assert not channel.started
@@ -677,6 +742,9 @@ def test_motion_config_builds_controller_without_opening_uart(tmp_path) -> None:
     assert controller.limits.max_wheel_acceleration_m_s2 == pytest.approx(0.5)
     assert executor is not None
     assert executor.controller is controller
+    assert gripper_executor is not None
+    assert gripper_executor.controller is controller
+    assert gripper_executor.calibration.full_travel_time_s == pytest.approx(1.5)
 
 
 def test_motion_acceleration_limit_must_be_positive(tmp_path) -> None:

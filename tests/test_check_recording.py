@@ -22,7 +22,6 @@ def make_recording(tmp_path):
         directory,
         image_size=(8, 6),
         config_snapshot={"camera": {"fps": 20}},
-        versions={"code": "test"},
     )
     recorder.start()
     for sequence, value in enumerate((20, 80, 140)):
@@ -41,7 +40,7 @@ def make_recording(tmp_path):
     return directory
 
 
-def test_inspection_replays_hashes_and_reports_capture_health(tmp_path) -> None:
+def test_inspection_replays_frames_and_reports_capture_health(tmp_path) -> None:
     report = inspect_recording(make_recording(tmp_path))
 
     assert report["frame_count"] == 3
@@ -119,7 +118,7 @@ def test_inspection_rejects_incomplete_or_corrupt_recording(tmp_path) -> None:
         (directory / "frames.jsonl").read_text(encoding="utf-8").splitlines()[0]
     )
     (directory / frame["image_path"]).write_bytes(b"corrupt")
-    with pytest.raises(ValueError, match="hash mismatch"):
+    with pytest.raises(RuntimeError, match="Cannot read recorded frame"):
         inspect_recording(directory)
 
 

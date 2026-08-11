@@ -20,7 +20,6 @@ from rescue_vision.communication.remote_messages import (
     _identifier,
     _non_negative_int,
     _require_exact_keys,
-    _require_schema_version,
 )
 
 
@@ -153,13 +152,12 @@ def _encode_json(document: Mapping[str, Any]) -> bytes:
 class RemoteSessionStatus:
     """TCP 会话的权限、能力、限制和发布周期。"""
 
-    SCHEMA_VERSION: ClassVar[int] = 1
-
     session_id: str
     server_instance_id: str
     timestamp_ns: int
     access_mode: RemoteAccessMode
     motion_control_available: bool
+    gripper_control_available: bool
     capture_control_available: bool
     video_stream_available: bool
     map_snapshot_available: bool
@@ -173,7 +171,7 @@ class RemoteSessionStatus:
     video_nominal_fps: float | None
     max_linear_velocity_m_s: float | None
     max_angular_velocity_rad_s: float | None
-    max_motion_command_valid_for_ms: int
+    max_control_command_valid_for_ms: int
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -191,6 +189,7 @@ class RemoteSessionStatus:
             raise ValueError("access_mode must be RemoteAccessMode.")
         for name in (
             "motion_control_available",
+            "gripper_control_available",
             "capture_control_available",
             "video_stream_available",
             "map_snapshot_available",
@@ -225,12 +224,12 @@ class RemoteSessionStatus:
             "max_angular_velocity_rad_s",
         )
         if (
-            isinstance(self.max_motion_command_valid_for_ms, bool)
-            or not isinstance(self.max_motion_command_valid_for_ms, int)
-            or not 1 <= self.max_motion_command_valid_for_ms <= 5_000
+            isinstance(self.max_control_command_valid_for_ms, bool)
+            or not isinstance(self.max_control_command_valid_for_ms, int)
+            or not 1 <= self.max_control_command_valid_for_ms <= 5_000
         ):
             raise ValueError(
-                "max_motion_command_valid_for_ms must be in [1, 5000]."
+                "max_control_command_valid_for_ms must be in [1, 5000]."
             )
         for name, converted in (
             ("vehicle_state_period_ms", vehicle_period),
@@ -242,7 +241,9 @@ class RemoteSessionStatus:
         ):
             object.__setattr__(self, name, converted)
         if self.access_mode is RemoteAccessMode.OBSERVE_ONLY and (
-            self.motion_control_available or self.capture_control_available
+            self.motion_control_available
+            or self.gripper_control_available
+            or self.capture_control_available
         ):
             raise ValueError(
                 "observe_only sessions cannot advertise control capabilities."
@@ -257,6 +258,13 @@ class RemoteSessionStatus:
         ):
             raise ValueError(
                 "motion control requires video and vehicle state."
+            )
+        if self.gripper_control_available and (
+            not self.video_stream_available
+            or not self.vehicle_state_available
+        ):
+            raise ValueError(
+                "gripper control requires video and vehicle state."
             )
         if self.capture_control_available and (
             not self.video_stream_available
@@ -292,13 +300,13 @@ class RemoteSessionStatus:
     def to_payload(self) -> bytes:
         return _encode_json(
             {
-                "schema_version": self.SCHEMA_VERSION,
                 "session_id": self.session_id,
                 "server_instance_id": self.server_instance_id,
                 "timestamp_ns": self.timestamp_ns,
                 "access_mode": self.access_mode.value,
                 "capabilities": {
                     "motion_control": self.motion_control_available,
+                    "gripper_control": self.gripper_control_available,
                     "capture_control": self.capture_control_available,
                     "video_stream": self.video_stream_available,
                     "map_snapshot": self.map_snapshot_available,
@@ -318,8 +326,8 @@ class RemoteSessionStatus:
                 "limits": {
                     "max_linear_velocity_m_s": self.max_linear_velocity_m_s,
                     "max_angular_velocity_rad_s": self.max_angular_velocity_rad_s,
-                    "max_motion_command_valid_for_ms": (
-                        self.max_motion_command_valid_for_ms
+                    "max_control_command_valid_for_ms": (
+                        self.max_control_command_valid_for_ms
                     ),
                 },
             }
@@ -331,7 +339,6 @@ class RemoteSessionStatus:
         _require_exact_keys(
             document,
             {
-                "schema_version",
                 "session_id",
                 "server_instance_id",
                 "timestamp_ns",
@@ -340,11 +347,6 @@ class RemoteSessionStatus:
                 "periods",
                 "limits",
             },
-            "RemoteSessionStatus",
-        )
-        _require_schema_version(
-            document["schema_version"],
-            cls.SCHEMA_VERSION,
             "RemoteSessionStatus",
         )
         capabilities = document["capabilities"]
@@ -360,6 +362,7 @@ class RemoteSessionStatus:
             capabilities,
             {
                 "motion_control",
+                "gripper_control",
                 "capture_control",
                 "video_stream",
                 "map_snapshot",
@@ -385,7 +388,7 @@ class RemoteSessionStatus:
             {
                 "max_linear_velocity_m_s",
                 "max_angular_velocity_rad_s",
-                "max_motion_command_valid_for_ms",
+                "max_control_command_valid_for_ms",
             },
             "RemoteSessionStatus.limits",
         )
@@ -399,6 +402,7 @@ class RemoteSessionStatus:
                 "access_mode",
             ),
             motion_control_available=capabilities["motion_control"],
+            gripper_control_available=capabilities["gripper_control"],
             capture_control_available=capabilities["capture_control"],
             video_stream_available=capabilities["video_stream"],
             map_snapshot_available=capabilities["map_snapshot"],
@@ -414,8 +418,8 @@ class RemoteSessionStatus:
             video_nominal_fps=periods["video_nominal_fps"],
             max_linear_velocity_m_s=limits["max_linear_velocity_m_s"],
             max_angular_velocity_rad_s=limits["max_angular_velocity_rad_s"],
-            max_motion_command_valid_for_ms=limits[
-                "max_motion_command_valid_for_ms"
+            max_control_command_valid_for_ms=limits[
+                "max_control_command_valid_for_ms"
             ],
         )
 
@@ -424,7 +428,6 @@ class RemoteSessionStatus:
 class VideoFrameAttributes:
     """JPEG 视频帧的严格 header attributes。"""
 
-    SCHEMA_VERSION: ClassVar[int] = 1
     MAX_DIMENSION: ClassVar[int] = 16_384
     MAX_PIXELS: ClassVar[int] = 33_554_432
 
@@ -433,7 +436,7 @@ class VideoFrameAttributes:
     width: int
     height: int
     coordinate_system: ImageCoordinateSystem
-    intrinsics_fingerprint_sha256: str | None
+    calibration_id: str | None
 
     def __post_init__(self) -> None:
         _non_negative_int(self.frame_sequence, "frame_sequence")
@@ -446,31 +449,23 @@ class VideoFrameAttributes:
             raise ValueError("video pixel count exceeds 33554432.")
         if not isinstance(self.coordinate_system, ImageCoordinateSystem):
             raise ValueError("coordinate_system must be ImageCoordinateSystem.")
-        fingerprint = self.intrinsics_fingerprint_sha256
+        calibration_id = self.calibration_id
         if self.coordinate_system is ImageCoordinateSystem.RAW_PIXEL:
-            if fingerprint is not None:
+            if calibration_id is not None:
                 raise ValueError("raw_pixel video must not declare intrinsics.")
-        elif (
-            not isinstance(fingerprint, str)
-            or len(fingerprint) != 64
-            or any(character not in "0123456789abcdef" for character in fingerprint)
-        ):
+        elif not isinstance(calibration_id, str) or not calibration_id.strip():
             raise ValueError(
-                "undistorted_pixel video requires a lowercase SHA-256 "
-                "intrinsics fingerprint."
+                "undistorted_pixel video requires a non-empty calibration_id."
             )
 
     def to_attributes(self) -> dict[str, RemoteAttributeValue]:
         return {
-            "schema_version": self.SCHEMA_VERSION,
             "frame_sequence": self.frame_sequence,
             "timestamp_ns": self.timestamp_ns,
             "width": self.width,
             "height": self.height,
             "coordinate_system": self.coordinate_system.value,
-            "intrinsics_fingerprint_sha256": (
-                self.intrinsics_fingerprint_sha256
-            ),
+            "calibration_id": self.calibration_id,
         }
 
     @classmethod
@@ -481,19 +476,13 @@ class VideoFrameAttributes:
         _require_exact_keys(
             attributes,
             {
-                "schema_version",
                 "frame_sequence",
                 "timestamp_ns",
                 "width",
                 "height",
                 "coordinate_system",
-                "intrinsics_fingerprint_sha256",
+                "calibration_id",
             },
-            "VideoFrameAttributes",
-        )
-        _require_schema_version(
-            attributes["schema_version"],
-            cls.SCHEMA_VERSION,
             "VideoFrameAttributes",
         )
         return cls(
@@ -506,9 +495,7 @@ class VideoFrameAttributes:
                 attributes["coordinate_system"],
                 "coordinate_system",
             ),
-            intrinsics_fingerprint_sha256=attributes[
-                "intrinsics_fingerprint_sha256"
-            ],
+            calibration_id=attributes["calibration_id"],
         )
 
 
@@ -516,8 +503,6 @@ class VideoFrameAttributes:
 class MapSnapshotAttributes:
     """PNG 场地地图的像素到 FieldPoint 映射。"""
 
-    SCHEMA_VERSION: ClassVar[int] = 1
-    RENDER_STYLE_VERSION: ClassVar[int] = 1
     MAX_DIMENSION: ClassVar[int] = 16_384
     MAX_PIXELS: ClassVar[int] = 33_554_432
 
@@ -558,8 +543,6 @@ class MapSnapshotAttributes:
 
     def to_attributes(self) -> dict[str, RemoteAttributeValue]:
         return {
-            "schema_version": self.SCHEMA_VERSION,
-            "render_style_version": self.RENDER_STYLE_VERSION,
             "snapshot_sequence": self.snapshot_sequence,
             "timestamp_ns": self.timestamp_ns,
             "width": self.width,
@@ -580,8 +563,6 @@ class MapSnapshotAttributes:
         _require_exact_keys(
             attributes,
             {
-                "schema_version",
-                "render_style_version",
                 "snapshot_sequence",
                 "timestamp_ns",
                 "width",
@@ -594,16 +575,6 @@ class MapSnapshotAttributes:
                 "team_color",
             },
             "MapSnapshotAttributes",
-        )
-        _require_schema_version(
-            attributes["schema_version"],
-            cls.SCHEMA_VERSION,
-            "MapSnapshotAttributes",
-        )
-        _require_schema_version(
-            attributes["render_style_version"],
-            cls.RENDER_STYLE_VERSION,
-            "MapSnapshotAttributes.render_style",
         )
         if attributes["coordinate_system"] != "field_mm":
             raise ValueError("Map coordinate_system must be 'field_mm'.")
@@ -628,8 +599,6 @@ class MapSnapshotAttributes:
 class VehicleStateObservation:
     """车端 UART、运动、安全和朝向状态快照。"""
 
-    SCHEMA_VERSION: ClassVar[int] = 2
-
     state_sequence: int
     timestamp_ns: int
     control_ready: bool
@@ -644,10 +613,14 @@ class VehicleStateObservation:
     target_right_velocity_m_s: float | None
     measured_left_velocity_m_s: float | None
     measured_right_velocity_m_s: float | None
+    gripper_left_angle_deg: float | None
+    gripper_right_angle_deg: float | None
     heading_rad: float | None
     heading_reference: HeadingReference | None
     last_received_motion_command_id: str | None
     last_applied_motion_command_id: str | None
+    last_received_gripper_command_id: str | None
+    last_applied_gripper_command_id: str | None
 
     def __post_init__(self) -> None:
         _non_negative_int(self.state_sequence, "state_sequence")
@@ -685,6 +658,20 @@ class VehicleStateObservation:
                 name,
                 _optional_finite_float(getattr(self, name), name),
             )
+        for name in (
+            "gripper_left_angle_deg",
+            "gripper_right_angle_deg",
+        ):
+            angle = _optional_finite_float(getattr(self, name), name)
+            if angle is not None and not 0.0 <= angle <= 180.0:
+                raise ValueError(f"{name} must be in [0, 180].")
+            object.__setattr__(self, name, angle)
+        if (self.gripper_left_angle_deg is None) != (
+            self.gripper_right_angle_deg is None
+        ):
+            raise ValueError(
+                "gripper angle fields must both be present or null."
+            )
         heading = _optional_finite_float(self.heading_rad, "heading_rad")
         if heading is not None and not -math.pi <= heading <= math.pi:
             raise ValueError("heading_rad must be in [-pi, pi].")
@@ -701,6 +688,8 @@ class VehicleStateObservation:
         for name in (
             "last_received_motion_command_id",
             "last_applied_motion_command_id",
+            "last_received_gripper_command_id",
+            "last_applied_gripper_command_id",
         ):
             object.__setattr__(
                 self,
@@ -746,7 +735,6 @@ class VehicleStateObservation:
     def to_payload(self) -> bytes:
         return _encode_json(
             {
-                "schema_version": self.SCHEMA_VERSION,
                 "state_sequence": self.state_sequence,
                 "timestamp_ns": self.timestamp_ns,
                 "control_ready": self.control_ready,
@@ -761,6 +749,8 @@ class VehicleStateObservation:
                 "target_right_velocity_m_s": self.target_right_velocity_m_s,
                 "measured_left_velocity_m_s": self.measured_left_velocity_m_s,
                 "measured_right_velocity_m_s": self.measured_right_velocity_m_s,
+                "gripper_left_angle_deg": self.gripper_left_angle_deg,
+                "gripper_right_angle_deg": self.gripper_right_angle_deg,
                 "heading_rad": self.heading_rad,
                 "heading_reference": (
                     None
@@ -773,6 +763,12 @@ class VehicleStateObservation:
                 "last_applied_motion_command_id": (
                     self.last_applied_motion_command_id
                 ),
+                "last_received_gripper_command_id": (
+                    self.last_received_gripper_command_id
+                ),
+                "last_applied_gripper_command_id": (
+                    self.last_applied_gripper_command_id
+                ),
             }
         )
 
@@ -780,7 +776,6 @@ class VehicleStateObservation:
     def from_payload(cls, payload: bytes) -> VehicleStateObservation:
         document = _decode_json_object(payload, "VehicleStateObservation")
         expected = {
-            "schema_version",
             "state_sequence",
             "timestamp_ns",
             "control_ready",
@@ -795,17 +790,16 @@ class VehicleStateObservation:
             "target_right_velocity_m_s",
             "measured_left_velocity_m_s",
             "measured_right_velocity_m_s",
+            "gripper_left_angle_deg",
+            "gripper_right_angle_deg",
             "heading_rad",
             "heading_reference",
             "last_received_motion_command_id",
             "last_applied_motion_command_id",
+            "last_received_gripper_command_id",
+            "last_applied_gripper_command_id",
         }
         _require_exact_keys(document, expected, "VehicleStateObservation")
-        _require_schema_version(
-            document["schema_version"],
-            cls.SCHEMA_VERSION,
-            "VehicleStateObservation",
-        )
         heading_reference = document["heading_reference"]
         return cls(
             state_sequence=document["state_sequence"],
@@ -834,6 +828,8 @@ class VehicleStateObservation:
             target_right_velocity_m_s=document["target_right_velocity_m_s"],
             measured_left_velocity_m_s=document["measured_left_velocity_m_s"],
             measured_right_velocity_m_s=document["measured_right_velocity_m_s"],
+            gripper_left_angle_deg=document["gripper_left_angle_deg"],
+            gripper_right_angle_deg=document["gripper_right_angle_deg"],
             heading_rad=document["heading_rad"],
             heading_reference=(
                 None
@@ -850,14 +846,18 @@ class VehicleStateObservation:
             last_applied_motion_command_id=document[
                 "last_applied_motion_command_id"
             ],
+            last_received_gripper_command_id=document[
+                "last_received_gripper_command_id"
+            ],
+            last_applied_gripper_command_id=document[
+                "last_applied_gripper_command_id"
+            ],
         )
 
 
 @dataclass(frozen=True, slots=True)
 class CaptureStatusObservation:
     """采集会话状态及最近请求结果。"""
-
-    SCHEMA_VERSION: ClassVar[int] = 1
 
     status_sequence: int
     timestamp_ns: int
@@ -971,7 +971,6 @@ class CaptureStatusObservation:
     def to_payload(self) -> bytes:
         return _encode_json(
             {
-                "schema_version": self.SCHEMA_VERSION,
                 "status_sequence": self.status_sequence,
                 "timestamp_ns": self.timestamp_ns,
                 "recording_state": self.recording_state.value,
@@ -1002,7 +1001,6 @@ class CaptureStatusObservation:
         _require_exact_keys(
             document,
             {
-                "schema_version",
                 "status_sequence",
                 "timestamp_ns",
                 "recording_state",
@@ -1019,11 +1017,6 @@ class CaptureStatusObservation:
                 "error_code",
                 "error_message",
             },
-            "CaptureStatusObservation",
-        )
-        _require_schema_version(
-            document["schema_version"],
-            cls.SCHEMA_VERSION,
             "CaptureStatusObservation",
         )
         stop_reason = document["stop_reason"]

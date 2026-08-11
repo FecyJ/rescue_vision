@@ -50,7 +50,6 @@ def make_recorder(tmp_path) -> FrameRecorder:
         tmp_path / "recording",
         image_size=(8, 6),
         config_snapshot={"camera": {"fps": 20}},
-        versions={"code": "test"},
     )
 
 
@@ -136,6 +135,7 @@ def test_record_session_rejects_transform_that_changes_frame_identity(
 
 def test_undistort_camera_frame_records_coordinate_identity() -> None:
     calibration = CameraCalibration(
+        calibration_id="test",
         model=CameraModelType.PINHOLE,
         image_size=(8, 6),
         K=np.eye(3),
@@ -157,9 +157,7 @@ def test_undistort_camera_frame_records_coordinate_identity() -> None:
     assert result.sequence == source_frame.sequence
     assert result.timestamp_ns == source_frame.timestamp_ns
     assert result.metadata["image_coordinate_system"] == "undistorted_pixel"
-    assert result.metadata["intrinsics_fingerprint_sha256"] == (
-        calibration.fingerprint()
-    )
+    assert result.metadata["calibration_id"] == calibration.calibration_id
     assert result.metadata["undistort_fill_value"] == IMAGE_BORDER_FILL_VALUE
 
 

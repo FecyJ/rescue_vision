@@ -1,4 +1,4 @@
-"""手动运动命令、轮速遥测与停车原因的版本化记录流。"""
+"""手动运动/夹爪命令、UART 遥测与停车原因记录流。"""
 
 from __future__ import annotations
 
@@ -14,12 +14,14 @@ from rescue_vision.motion.protocol import (
     ParsedCarMessage,
     UnknownCarMessage,
 )
-from rescue_vision.motion.remote_control import ExecutedRemoteMotion
+from rescue_vision.motion.remote_control import (
+    ExecutedRemoteGripper,
+    ExecutedRemoteMotion,
+)
 
 
 MANUAL_MOTION_STREAM_NAME = "manual_motion"
 MANUAL_MOTION_LOG_FILENAME = "motion.jsonl"
-MANUAL_MOTION_LOG_SCHEMA_VERSION = 2
 
 _EVENT_KEYS = {
     "stream_started": set(),
@@ -33,6 +35,14 @@ _EVENT_KEYS = {
         "angular_velocity_rad_s",
     },
     "motion_timeout": {"command_id"},
+    "gripper_command": {
+        "command_id",
+        "result",
+        "deadline_timestamp_ns",
+        "open_pressed",
+        "close_pressed",
+    },
+    "gripper_timeout": {"command_id"},
     "wheel_telemetry": {
         "uart_sequence",
         "controller_timestamp_ms",
@@ -57,7 +67,6 @@ _EVENT_KEYS = {
     "safety_stop": {"reason"},
 }
 _COMMON_KEYS = {
-    "schema_version",
     "log_sequence",
     "event_type",
     "timestamp_ns",
@@ -111,6 +120,29 @@ class ManualMotionLogWriter:
     def record_timeout(self, *, command_id: str, timestamp_ns: int) -> None:
         self._write(
             "motion_timeout",
+            timestamp_ns,
+            command_id=command_id,
+        )
+
+    def record_gripper(self, outcome: ExecutedRemoteGripper) -> None:
+        self._write(
+            "gripper_command",
+            outcome.received_timestamp_ns,
+            command_id=outcome.command_id,
+            result=outcome.result.value,
+            deadline_timestamp_ns=outcome.deadline_timestamp_ns,
+            open_pressed=outcome.open_pressed,
+            close_pressed=outcome.close_pressed,
+        )
+
+    def record_gripper_timeout(
+        self,
+        *,
+        command_id: str,
+        timestamp_ns: int,
+    ) -> None:
+        self._write(
+            "gripper_timeout",
             timestamp_ns,
             command_id=command_id,
         )
@@ -185,7 +217,6 @@ class ManualMotionLogWriter:
             raise RuntimeError("Manual motion log is not started.")
         _non_negative_integer(timestamp_ns, "timestamp_ns")
         record = {
-            "schema_version": MANUAL_MOTION_LOG_SCHEMA_VERSION,
             "log_sequence": self._sequence,
             "event_type": event_type,
             "timestamp_ns": timestamp_ns,
@@ -241,11 +272,6 @@ def inspect_manual_motion_log(path: str | Path) -> dict[str, object]:
                 f"{resolved}:{line_number}: keys must be exactly "
                 f"{sorted(expected)}."
             )
-        if record["schema_version"] != MANUAL_MOTION_LOG_SCHEMA_VERSION:
-            raise ValueError(
-                f"{resolved}:{line_number}: schema_version must be "
-                f"{MANUAL_MOTION_LOG_SCHEMA_VERSION}."
-            )
         if record["log_sequence"] != line_number - 1:
             raise ValueError(
                 f"{resolved}:{line_number}: log_sequence must be "
@@ -267,7 +293,6 @@ def inspect_manual_motion_log(path: str | Path) -> dict[str, object]:
     if json.loads(lines[-1])["event_type"] != "stream_finished":
         raise ValueError("Manual motion log must end with stream_finished.")
     return {
-        "schema_version": MANUAL_MOTION_LOG_SCHEMA_VERSION,
         "event_count": len(lines),
         "event_counts": dict(sorted(counts.items())),
         "first_timestamp_ns": min(timestamps_ns),
@@ -323,6 +348,9 @@ def _validate_event_fields(
     for name in ("watchdog_armed", "emergency_stop_latched"):
         if name in record and not isinstance(record[name], bool):
             raise ValueError(f"{location}.{name} must be a boolean.")
+    for name in ("open_pressed", "close_pressed"):
+        if name in record and not isinstance(record[name], bool):
+            raise ValueError(f"{location}.{name} must be a boolean.")
     if "last_motion_command_age_ms" in record:
         age = record["last_motion_command_age_ms"]
         if age is not None:
@@ -332,7 +360,13 @@ def _validate_event_fields(
         and record["result"] not in _MOTION_RESULTS
     ):
         raise ValueError(f"{location}.result is not supported.")
-    if event_type == "motion_command" and int(
+    if event_type == "gripper_command" and record["result"] not in {
+        "applied",
+        "stopped",
+        "expired",
+    }:
+        raise ValueError(f"{location}.result is not supported.")
+    if event_type in {"motion_command", "gripper_command"} and int(
         record["deadline_timestamp_ns"]
     ) <= int(record["timestamp_ns"]):
         raise ValueError(

@@ -9,8 +9,10 @@ from rescue_vision.motion import (
     CarSafetyStatus,
     CarStopReason,
     CarTelemetry,
+    ExecutedRemoteGripper,
     ExecutedRemoteMotion,
     ManualMotionLogWriter,
+    RemoteGripperResult,
     RemoteMotionResult,
     UnknownCarMessage,
     inspect_manual_motion_log,
@@ -32,6 +34,16 @@ def test_manual_motion_log_round_trip_preserves_monotonic_time_sources(
             deadman_enabled=True,
             linear_velocity_m_s=0.1,
             angular_velocity_rad_s=-0.2,
+        )
+    )
+    writer.record_gripper(
+        ExecutedRemoteGripper(
+            command_id="grip-1",
+            result=RemoteGripperResult.APPLIED,
+            received_timestamp_ns=115,
+            deadline_timestamp_ns=215,
+            open_pressed=False,
+            close_pressed=True,
         )
     )
     writer.record_car_message(
@@ -64,6 +76,10 @@ def test_manual_motion_log_round_trip_preserves_monotonic_time_sources(
     )
     writer.record_car_message(UnknownCarMessage(6, 140, b"imu,1,2,3"))
     writer.record_timeout(command_id="drive-1", timestamp_ns=210)
+    writer.record_gripper_timeout(
+        command_id="grip-1",
+        timestamp_ns=216,
+    )
     writer.record_safety_stop(
         reason="application_shutdown",
         timestamp_ns=220,
@@ -72,11 +88,13 @@ def test_manual_motion_log_round_trip_preserves_monotonic_time_sources(
 
     report = inspect_manual_motion_log(path)
 
-    assert report["event_count"] == 9
+    assert report["event_count"] == 11
     assert report["first_timestamp_ns"] == 100
     assert report["last_timestamp_ns"] == 230
     assert report["event_counts"] == {
         "command_reply": 1,
+        "gripper_command": 1,
+        "gripper_timeout": 1,
         "motion_command": 1,
         "motion_timeout": 1,
         "safety_stop": 1,
@@ -91,9 +109,11 @@ def test_manual_motion_log_round_trip_preserves_monotonic_time_sources(
         for line in path.read_text(encoding="utf-8").splitlines()
     ]
     assert events[1]["timestamp_ns"] == 110
-    assert events[2]["timestamp_ns"] == 120
-    assert events[4]["stop_reason"] == "running"
-    assert events[5]["payload_hex"] == b"imu,1,2,3".hex()
+    assert events[2]["timestamp_ns"] == 115
+    assert events[3]["timestamp_ns"] == 120
+    assert events[5]["stop_reason"] == "running"
+    assert events[6]["payload_hex"] == b"imu,1,2,3".hex()
+    assert events[8]["timestamp_ns"] == 216
 
 
 def test_manual_motion_log_rejects_sequence_and_truncation(tmp_path) -> None:

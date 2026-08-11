@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
+import zlib
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
 from rescue_vision.geometry.camera_model import IMAGE_BORDER_FILL_VALUE
 
-SCHEMA_VERSION = 2
 REQUIRED_TAGS = {
     "lighting",
     "distance",
@@ -23,9 +22,9 @@ REQUIRED_TAGS = {
 }
 
 
-def _unit_hash(seed: str, group_id: str) -> float:
-    digest = hashlib.sha256(f"{seed}\0{group_id}".encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], "big") / 2**64
+def _stable_unit_value(seed: str, group_id: str) -> float:
+    value = zlib.crc32(f"{seed}\0{group_id}".encode("utf-8"))
+    return value / 2**32
 
 
 def assign_split(
@@ -35,7 +34,7 @@ def assign_split(
     train_ratio: float,
     validation_ratio: float,
 ) -> str:
-    value = _unit_hash(seed, group_id)
+    value = _stable_unit_value(seed, group_id)
     if value < train_ratio:
         return "train"
     if value < train_ratio + validation_ratio:
@@ -63,35 +62,14 @@ def split_records(
     split_counts: Counter[str] = Counter()
     group_counts: Counter[str] = Counter()
     tag_counts: dict[str, Counter[str]] = defaultdict(Counter)
-    dataset_version: str | None = None
-
     for index, record in enumerate(records):
-        if record.get("schema_version") != SCHEMA_VERSION:
-            raise ValueError(
-                f"Record {index} schema_version must be {SCHEMA_VERSION}."
-            )
         sample_id = record.get("sample_id")
         recording_id = record.get("recording_id")
-        record_dataset_version = record.get("dataset_version")
         image_coordinate_system = record.get("image_coordinate_system")
-        intrinsics_fingerprint = record.get(
-            "intrinsics_fingerprint_sha256"
-        )
+        calibration_id = record.get("calibration_id")
         valid_pixel_ratio = record.get("valid_pixel_ratio")
         undistort_fill_value = record.get("undistort_fill_value")
         tags = record.get("tags")
-        if (
-            not isinstance(record_dataset_version, str)
-            or not record_dataset_version
-        ):
-            raise ValueError(f"Record {index} has invalid dataset_version.")
-        if dataset_version is None:
-            dataset_version = record_dataset_version
-        elif record_dataset_version != dataset_version:
-            raise ValueError(
-                f"Record {index} dataset_version {record_dataset_version!r} "
-                f"does not match {dataset_version!r}."
-            )
         if not isinstance(sample_id, str) or not sample_id:
             raise ValueError(f"Record {index} has invalid sample_id.")
         if sample_id in seen_samples:
@@ -105,17 +83,10 @@ def split_records(
                 "'undistorted_pixel'."
             )
         if (
-            not isinstance(intrinsics_fingerprint, str)
-            or len(intrinsics_fingerprint) != 64
-            or intrinsics_fingerprint != intrinsics_fingerprint.lower()
-            or any(
-                character not in "0123456789abcdef"
-                for character in intrinsics_fingerprint
-            )
+            not isinstance(calibration_id, str)
+            or not calibration_id.strip()
         ):
-            raise ValueError(
-                f"Record {index} has invalid intrinsics fingerprint."
-            )
+            raise ValueError(f"Record {index} has invalid calibration_id.")
         if (
             isinstance(valid_pixel_ratio, bool)
             or not isinstance(valid_pixel_ratio, (int, float))
@@ -184,8 +155,6 @@ def split_records(
         if explicit_group_counts[split] == 0
     ]
     report = {
-        "schema_version": 1,
-        "dataset_version": dataset_version,
         "seed": seed,
         "ratios": {
             "train": train_ratio,
