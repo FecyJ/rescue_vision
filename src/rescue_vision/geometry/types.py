@@ -49,6 +49,22 @@ class GroundPoint:
 
 
 @dataclass(frozen=True, slots=True)
+class RobotPoint3D:
+    """
+    机器人坐标系中的三维点，单位 mm。
+
+    坐标约定：
+        x 向机器人前方增大
+        y 向机器人左方增大
+        z 向上增大
+    """
+
+    x: float
+    y: float
+    z: float
+
+
+@dataclass(frozen=True, slots=True)
 class FieldPoint:
     """
     场地全局坐标系中的二维点，单位 mm

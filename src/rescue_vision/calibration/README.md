@@ -156,7 +156,11 @@ output/ground_mapping_YYYYMMDD_HHMMSS_ffffff/
     └── bev_preview.png
 ```
 
-`image_to_ground` 表示去畸变像素到机器人地面毫米坐标。直接单应拟合用于地面点定位；PnP 推导矩阵用于交叉诊断。部署前必须使用未参与拟合的保留点实测地面误差，并复核 BEV 有效范围。
+`image_to_ground` 表示去畸变像素到机器人地面毫米坐标。直接单应拟合用于
+地面点定位；PnP 外参除交叉诊断外，还由 `GroundProjector` 统一用于机器人系
+三维点重投影和像素射线与已知高度平面求交。部署前必须使用未参与拟合的
+保留点实测地面误差、复核 BEV 有效范围，并检查
+`pose_reprojection_rmse_px`；只验证地面单应性不足以启用目标三维模板拟合。
 
 对应点文件绑定原图文件名与 SHA-256；更换或覆盖原图后必须
 `--recollect`。输出 schema v3 同时保存物理有效性、误差门限、

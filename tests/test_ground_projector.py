@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import json
 
+import cv2
 import numpy as np
 import pytest
 
 from rescue_vision.geometry.camera_model import CameraCalibration, CameraModelType
 from rescue_vision.geometry.ground_projector import BevConfig, GroundProjector
-from rescue_vision.geometry.types import BevPixel, GroundPoint, UndistortedPixel
+from rescue_vision.geometry.types import (
+    BevPixel,
+    GroundPoint,
+    RobotPoint3D,
+    UndistortedPixel,
+)
 
 
 def make_projector() -> GroundProjector:
@@ -74,6 +80,94 @@ def test_invalid_homography_and_bev_are_rejected() -> None:
         BevConfig(0, 101, -100, 100, 10)
 
 
+def test_robot_3d_projection_and_horizontal_plane_intersection() -> None:
+    camera_matrix = np.array(
+        [[800.0, 0.0, 320.0], [0.0, 800.0, 240.0], [0.0, 0.0, 1.0]]
+    )
+    rotation = np.array(
+        [[0.0, -1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, -1.0]]
+    )
+    translation = np.array([0.0, 0.0, 500.0])
+    image_to_ground = np.array(
+        [[0.0, -0.625, 150.0], [-0.625, 0.0, 200.0], [0.0, 0.0, 1.0]]
+    )
+    projector = GroundProjector(
+        image_to_ground,
+        new_camera_matrix=camera_matrix,
+        rotation_robot_to_camera=rotation,
+        translation_robot_to_camera_mm=translation,
+    )
+
+    point = RobotPoint3D(100.0, 25.0, 40.0)
+    pixel = projector.project_robot_point(point)
+    recovered = projector.pixel_to_horizontal_plane(pixel, z_mm=40.0)
+
+    assert projector.supports_robot_projection
+    assert projector.project_robot_points([]) == []
+    assert (recovered.x, recovered.y, recovered.z) == pytest.approx(
+        (point.x, point.y, point.z)
+    )
+    batch = [
+        point,
+        RobotPoint3D(80.0, -10.0, 0.0),
+    ]
+    projected = projector.project_robot_points(batch)
+    rvec, _ = cv2.Rodrigues(rotation)
+    expected, _ = cv2.projectPoints(
+        np.asarray([(item.x, item.y, item.z) for item in batch]),
+        rvec,
+        translation,
+        camera_matrix,
+        np.zeros(5),
+    )
+    assert [(item.u, item.v) for item in projected] == pytest.approx(
+        expected.reshape(-1, 2)
+    )
+    ground_pixel = projector.ground_to_pixel(GroundPoint(100.0, 25.0))
+    physical_ground_pixel = projector.project_robot_point(
+        RobotPoint3D(100.0, 25.0, 0.0)
+    )
+    assert (ground_pixel.u, ground_pixel.v) == pytest.approx(
+        (physical_ground_pixel.u, physical_ground_pixel.v)
+    )
+
+
+def test_partial_or_invalid_robot_projection_is_rejected() -> None:
+    with pytest.raises(ValueError, match="provided together"):
+        GroundProjector(
+            np.eye(3),
+            new_camera_matrix=np.eye(3),
+        )
+    with pytest.raises(ValueError, match="proper rotation"):
+        GroundProjector(
+            np.eye(3),
+            new_camera_matrix=np.eye(3),
+            rotation_robot_to_camera=np.diag([1.0, 1.0, -1.0]),
+            translation_robot_to_camera_mm=np.zeros(3),
+        )
+    projector = GroundProjector(
+        np.eye(3),
+        new_camera_matrix=np.eye(3),
+        rotation_robot_to_camera=np.eye(3),
+        translation_robot_to_camera_mm=np.zeros(3),
+    )
+    with pytest.raises(ValueError, match="front"):
+        projector.project_robot_point(RobotPoint3D(0.0, 0.0, -1.0))
+    horizontal_ray_projector = GroundProjector(
+        np.eye(3),
+        new_camera_matrix=np.eye(3),
+        rotation_robot_to_camera=np.array(
+            [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]]
+        ),
+        translation_robot_to_camera_mm=np.asarray((0.0, 0.0, 1.0)),
+    )
+    with pytest.raises(ValueError, match="parallel"):
+        horizontal_ray_projector.pixel_to_horizontal_plane(
+            UndistortedPixel(0.0, 0.0),
+            z_mm=1.0,
+        )
+
+
 def test_ground_mapping_rejects_intrinsic_mismatch(tmp_path) -> None:
     calibration = CameraCalibration(
         model=CameraModelType.PINHOLE,
@@ -104,6 +198,17 @@ def test_ground_mapping_rejects_intrinsic_mismatch(tmp_path) -> None:
     assert GroundProjector.from_json(
         path, camera_calibration=calibration
     ).bev_config is not None
+
+    document["extrinsics"] = {
+        "rotation_robot_to_camera": np.eye(3).tolist(),
+        "translation_robot_to_camera_mm": [0.0, 0.0, 1.0],
+        "physically_valid": True,
+    }
+    path.write_text(json.dumps(document), encoding="utf-8")
+    assert GroundProjector.from_json(
+        path,
+        camera_calibration=calibration,
+    ).supports_robot_projection
 
     document["intrinsics"]["model_type"] = "fisheye"
     path.write_text(json.dumps(document), encoding="utf-8")

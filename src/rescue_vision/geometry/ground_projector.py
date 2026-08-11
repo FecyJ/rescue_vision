@@ -15,6 +15,7 @@ from rescue_vision.geometry.camera_model import CameraCalibration
 from rescue_vision.geometry.types import (
     BevPixel,
     GroundPoint,
+    RobotPoint3D,
     UndistortedPixel,
     array_to_points,
     pixels_to_array,
@@ -37,6 +38,50 @@ def _validated_homography(value: npt.ArrayLike, name: str) -> FloatArray:
             f"{name} must be stably invertible, condition_number={condition}."
         )
     return matrix
+
+
+def _validated_camera_matrix(value: npt.ArrayLike) -> FloatArray:
+    matrix = _validated_homography(value, "new_camera_matrix")
+    if matrix[0, 0] <= 0.0 or matrix[1, 1] <= 0.0:
+        raise ValueError("new_camera_matrix focal lengths must be positive.")
+    return matrix
+
+
+def _validated_rotation(value: npt.ArrayLike) -> FloatArray:
+    rotation = np.ascontiguousarray(value, dtype=np.float64)
+    if rotation.shape != (3, 3):
+        raise ValueError(
+            "rotation_robot_to_camera must have shape (3, 3), "
+            f"got {rotation.shape}."
+        )
+    if not np.all(np.isfinite(rotation)):
+        raise ValueError(
+            "rotation_robot_to_camera must contain only finite values."
+        )
+    if not np.allclose(
+        rotation @ rotation.T,
+        np.eye(3),
+        atol=1e-6,
+        rtol=0.0,
+    ) or not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-6, rtol=0.0):
+        raise ValueError(
+            "rotation_robot_to_camera must be an orthonormal proper rotation."
+        )
+    return rotation
+
+
+def _validated_translation(value: npt.ArrayLike) -> FloatArray:
+    translation = np.ascontiguousarray(value, dtype=np.float64).reshape(-1)
+    if translation.shape != (3,):
+        raise ValueError(
+            "translation_robot_to_camera_mm must contain three values, "
+            f"got shape {translation.shape}."
+        )
+    if not np.all(np.isfinite(translation)):
+        raise ValueError(
+            "translation_robot_to_camera_mm must contain only finite values."
+        )
+    return translation
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +144,10 @@ class GroundProjector:
         self,
         image_to_ground: npt.ArrayLike,
         bev_config: BevConfig | None = None,
+        *,
+        new_camera_matrix: npt.ArrayLike | None = None,
+        rotation_robot_to_camera: npt.ArrayLike | None = None,
+        translation_robot_to_camera_mm: npt.ArrayLike | None = None,
     ) -> None:
         self.image_to_ground = _validated_homography(
             image_to_ground,
@@ -106,6 +155,39 @@ class GroundProjector:
         )
         self.ground_to_image = np.linalg.inv(self.image_to_ground)
         self.bev_config = bev_config
+
+        projection_values = (
+            new_camera_matrix,
+            rotation_robot_to_camera,
+            translation_robot_to_camera_mm,
+        )
+        if any(value is not None for value in projection_values) and not all(
+            value is not None for value in projection_values
+        ):
+            raise ValueError(
+                "new_camera_matrix, rotation_robot_to_camera and "
+                "translation_robot_to_camera_mm must be provided together."
+            )
+        self.new_camera_matrix: FloatArray | None = None
+        self.rotation_robot_to_camera: FloatArray | None = None
+        self.translation_robot_to_camera_mm: FloatArray | None = None
+        self.camera_position_robot_mm: FloatArray | None = None
+        if new_camera_matrix is not None:
+            assert rotation_robot_to_camera is not None
+            assert translation_robot_to_camera_mm is not None
+            self.new_camera_matrix = _validated_camera_matrix(
+                new_camera_matrix
+            )
+            self.rotation_robot_to_camera = _validated_rotation(
+                rotation_robot_to_camera
+            )
+            self.translation_robot_to_camera_mm = _validated_translation(
+                translation_robot_to_camera_mm
+            )
+            self.camera_position_robot_mm = (
+                -self.rotation_robot_to_camera.T
+                @ self.translation_robot_to_camera_mm
+            )
 
         self.ground_to_bev: FloatArray | None = None
         self.bev_to_ground: FloatArray | None = None
@@ -185,7 +267,128 @@ class GroundProjector:
             if isinstance(bev_data, dict)
             else None
         )
-        return cls(data["image_to_ground"], bev_config)
+        extrinsics = data.get("extrinsics")
+        if extrinsics is not None and not isinstance(extrinsics, dict):
+            raise ValueError("Ground mapping extrinsics must be a mapping.")
+        if isinstance(extrinsics, dict):
+            if extrinsics.get("physically_valid") is not True:
+                raise ValueError(
+                    "Ground mapping extrinsics.physically_valid must be true."
+                )
+            rotation = extrinsics.get("rotation_robot_to_camera")
+            translation = extrinsics.get(
+                "translation_robot_to_camera_mm"
+            )
+            if rotation is None or translation is None:
+                raise ValueError(
+                    "Ground mapping extrinsics must contain "
+                    "rotation_robot_to_camera and "
+                    "translation_robot_to_camera_mm."
+                )
+        else:
+            rotation = None
+            translation = None
+        return cls(
+            data["image_to_ground"],
+            bev_config,
+            new_camera_matrix=(
+                camera_calibration.new_K
+                if rotation is not None
+                else None
+            ),
+            rotation_robot_to_camera=rotation,
+            translation_robot_to_camera_mm=translation,
+        )
+
+    @property
+    def supports_robot_projection(self) -> bool:
+        """是否加载了可用于三维机器人系投影的完整物理外参。"""
+
+        return self.new_camera_matrix is not None
+
+    def project_robot_points(
+        self,
+        points: Sequence[RobotPoint3D],
+    ) -> list[UndistortedPixel]:
+        """把机器人系三维点投影到全尺寸去畸变像素。"""
+
+        if not points:
+            return []
+        if (
+            self.new_camera_matrix is None
+            or self.rotation_robot_to_camera is None
+            or self.translation_robot_to_camera_mm is None
+        ):
+            raise ValueError(
+                "Ground mapping does not contain full camera extrinsics."
+            )
+        values = np.asarray(
+            [[point.x, point.y, point.z] for point in points],
+            dtype=np.float64,
+        )
+        if not np.all(np.isfinite(values)):
+            raise ValueError("RobotPoint3D values must be finite.")
+        camera_points = (
+            self.rotation_robot_to_camera @ values.T
+        ).T + self.translation_robot_to_camera_mm
+        depth = camera_points[:, 2]
+        if np.any(depth <= 1e-9):
+            raise ValueError(
+                "RobotPoint3D values must project in front of the camera."
+            )
+        homogeneous = (
+            self.new_camera_matrix @ camera_points.T
+        ).T
+        pixels = homogeneous[:, :2] / homogeneous[:, 2:3]
+        return array_to_points(pixels, UndistortedPixel)
+
+    def project_robot_point(
+        self,
+        point: RobotPoint3D,
+    ) -> UndistortedPixel:
+        return self.project_robot_points([point])[0]
+
+    def pixel_to_horizontal_plane(
+        self,
+        pixel: UndistortedPixel,
+        *,
+        z_mm: float,
+    ) -> RobotPoint3D:
+        """将去畸变像素射线与机器人系 ``z=z_mm`` 平面求交。"""
+
+        if (
+            self.new_camera_matrix is None
+            or self.rotation_robot_to_camera is None
+            or self.camera_position_robot_mm is None
+        ):
+            raise ValueError(
+                "Ground mapping does not contain full camera extrinsics."
+            )
+        values = np.asarray((pixel.u, pixel.v, z_mm), dtype=np.float64)
+        if not np.all(np.isfinite(values)):
+            raise ValueError("pixel and z_mm must be finite.")
+        ray_camera = np.linalg.solve(
+            self.new_camera_matrix,
+            np.asarray((pixel.u, pixel.v, 1.0), dtype=np.float64),
+        )
+        ray_robot = self.rotation_robot_to_camera.T @ ray_camera
+        if abs(float(ray_robot[2])) <= 1e-12:
+            raise ValueError(
+                "Pixel ray is parallel to the requested horizontal plane."
+            )
+        scale = (
+            float(z_mm) - float(self.camera_position_robot_mm[2])
+        ) / float(ray_robot[2])
+        if scale <= 0.0:
+            raise ValueError(
+                "Requested horizontal plane lies behind the pixel ray."
+            )
+        point = self.camera_position_robot_mm + scale * ray_robot
+        return RobotPoint3D(
+            float(point[0]),
+            float(point[1]),
+            float(point[2]),
+        )
 
     def pixels_to_ground(
         self,
