@@ -418,6 +418,7 @@ class RemoteMessageConnection:
         max_payload_bytes: int,
         allow_inbound_control: bool,
         allow_outbound_control: bool,
+        non_actuating_control_topics: tuple[str, ...] = (),
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
     ) -> None:
         if not isinstance(connection, _ConnectedSocket):
@@ -454,6 +455,12 @@ class RemoteMessageConnection:
             max_payload_bytes=max_payload_bytes,
         )
         self.max_payload_bytes = max_payload_bytes
+        if not isinstance(non_actuating_control_topics, tuple):
+            raise ValueError("non_actuating_control_topics must be a tuple.")
+        self.non_actuating_control_topics = frozenset(
+            _bounded_text(topic, "non_actuating_control_topics[]", 128)
+            for topic in non_actuating_control_topics
+        )
         self._monotonic_ns = monotonic_ns
         self._outbound_reliable = queue.Queue[_OutboundRemoteMessage](
             maxsize=self.control_queue_capacity
@@ -535,9 +542,13 @@ class RemoteMessageConnection:
     ) -> None:
         """非阻塞提交可靠控制；队列满时显式失败。"""
 
-        if not self.allow_outbound_control:
+        if (
+            not self.allow_outbound_control
+            and topic not in self.non_actuating_control_topics
+        ):
             raise RemotePolicyError(
-                "Outbound control is disabled by remote access mode."
+                "Outbound control is disabled by remote access mode; only the "
+                "configured non-actuating requests are allowed."
             )
         message = self._make_outbound(
             RemoteStream.CONTROL,
@@ -776,9 +787,13 @@ class RemoteMessageConnection:
 
     def _route_inbound(self, message: ReceivedRemoteMessage) -> None:
         if message.stream is RemoteStream.CONTROL:
-            if not self.allow_inbound_control:
+            if (
+                not self.allow_inbound_control
+                and message.topic not in self.non_actuating_control_topics
+            ):
                 raise RemotePolicyError(
-                    "Inbound control is disabled by remote access mode."
+                    "Inbound control is disabled by remote access mode; only "
+                    "configured non-actuating requests are allowed."
                 )
             try:
                 self._inbound_control.put_nowait(message)
@@ -927,6 +942,7 @@ class RemoteConnectionOptions:
     observation_queue_capacity: int
     max_header_bytes: int
     max_payload_bytes: int
+    non_actuating_control_topics: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _finite_positive_float(self.io_timeout_s, "io_timeout_s")
@@ -937,6 +953,10 @@ class RemoteConnectionOptions:
         )
         _positive_int(self.max_header_bytes, "max_header_bytes")
         _positive_int(self.max_payload_bytes, "max_payload_bytes")
+        if not isinstance(self.non_actuating_control_topics, tuple):
+            raise ValueError("non_actuating_control_topics must be a tuple.")
+        for topic in self.non_actuating_control_topics:
+            _bounded_text(topic, "non_actuating_control_topics[]", 128)
 
 
 class RemoteTcpServer:
@@ -1023,6 +1043,9 @@ class RemoteTcpServer:
                     self.access_mode is RemoteAccessMode.DEBUG_CONTROL
                 ),
                 allow_outbound_control=False,
+                non_actuating_control_topics=(
+                    self.connection_options.non_actuating_control_topics
+                ),
             )
         except BaseException:
             connection.close()
@@ -1083,6 +1106,9 @@ def connect_remote_client(
             allow_inbound_control=False,
             allow_outbound_control=(
                 access_mode is RemoteAccessMode.DEBUG_CONTROL
+            ),
+            non_actuating_control_topics=(
+                connection_options.non_actuating_control_topics
             ),
         )
     except BaseException:

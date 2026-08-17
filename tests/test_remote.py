@@ -19,6 +19,8 @@ from rescue_vision.communication import (
     RemoteQueueOverflowError,
     RemoteStream,
     RemoteTopic,
+    VideoFrameMode,
+    VideoModeCommand,
     connect_remote_client,
 )
 
@@ -130,6 +132,7 @@ def connected_pair(
             actual_robot_mode is RemoteAccessMode.DEBUG_CONTROL
         ),
         allow_outbound_control=False,
+        non_actuating_control_topics=(RemoteTopic.VIDEO_MODE.value,),
     )
     computer = RemoteMessageConnection(
         computer_socket,
@@ -142,6 +145,7 @@ def connected_pair(
         allow_outbound_control=(
             access_mode is RemoteAccessMode.DEBUG_CONTROL
         ),
+        non_actuating_control_topics=(RemoteTopic.VIDEO_MODE.value,),
     )
     return robot, computer
 
@@ -294,6 +298,27 @@ def test_observe_only_client_cannot_submit_control() -> None:
             computer.send_control(RemoteTopic.DEBUG_MOTION.value, b"{}")
         robot.send_observation(RemoteTopic.MAP_SNAPSHOT.value, b"map")
         assert computer.receive_observation(timeout=1.0).payload == b"map"
+    finally:
+        computer.stop()
+        robot.stop()
+
+
+def test_observe_only_client_can_select_video_mode() -> None:
+    robot, computer = connected_pair(RemoteAccessMode.OBSERVE_ONLY)
+    robot.start()
+    computer.start()
+    try:
+        command = VideoModeCommand(
+            request_id="video-001",
+            issued_timestamp_ns=10,
+            mode=VideoFrameMode.PERCEPTION,
+        )
+        computer.send_control(
+            RemoteTopic.VIDEO_MODE.value,
+            command.to_payload(),
+        )
+        received = robot.receive_control(timeout=1.0)
+        assert VideoModeCommand.from_payload(received.payload) == command
     finally:
         computer.stop()
         robot.stop()

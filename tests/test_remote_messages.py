@@ -13,6 +13,8 @@ from rescue_vision.communication import (
     HeadingReference,
     MotionControlMode,
     RemoteTopic,
+    VideoFrameMode,
+    VideoModeCommand,
 )
 
 
@@ -155,3 +157,28 @@ def test_control_payload_rejects_unknown_fields() -> None:
 
     with pytest.raises(ValueError, match="keys must be exactly"):
         DebugCaptureCommand.from_payload(payload)
+
+
+def test_video_mode_command_round_trip_and_strict_values() -> None:
+    command = VideoModeCommand(
+        request_id="video-001",
+        issued_timestamp_ns=321,
+        mode=VideoFrameMode.PERCEPTION,
+    )
+
+    assert VideoModeCommand.from_payload(command.to_payload()) == command
+    assert RemoteTopic.VIDEO_MODE.value == "control/video/mode"
+    document = json.loads(command.to_payload())
+    document["legacy_mode"] = "raw"
+    with pytest.raises(ValueError, match="keys must be exactly"):
+        VideoModeCommand.from_payload(json.dumps(document).encode("utf-8"))
+    with pytest.raises(ValueError, match="Unknown video mode"):
+        VideoModeCommand.from_payload(
+            json.dumps(
+                {
+                    "request_id": "video-002",
+                    "issued_timestamp_ns": 0,
+                    "mode": "bev",
+                }
+            ).encode("utf-8")
+        )

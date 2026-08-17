@@ -16,6 +16,7 @@ class RemoteTopic(str, Enum):
     DEBUG_MOTION = "control/debug/motion"
     DEBUG_GRIPPER = "control/debug/gripper"
     DEBUG_CAPTURE = "control/debug/capture"
+    VIDEO_MODE = "control/video/mode"
     SESSION_STATUS = "observation/session/status"
     VIDEO_FRAME = "observation/video/frame"
     MAP_SNAPSHOT = "observation/map/snapshot"
@@ -44,6 +45,13 @@ class CaptureAction(str, Enum):
     STOP = "stop"
     SNAPSHOT = "snapshot"
     MARK_EVENT = "mark_event"
+
+
+class VideoFrameMode(str, Enum):
+    """车端发送给电脑的图像内容。"""
+
+    RAW = "raw"
+    PERCEPTION = "perception"
 
 
 def _non_negative_int(value: object, location: str) -> int:
@@ -438,4 +446,59 @@ class DebugCaptureCommand:
             action=action,
             label=document["label"],
             session_tags=document["session_tags"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class VideoModeCommand:
+    """电脑端选择车端发送原图或 perception 可视化图像。"""
+
+    request_id: str
+    issued_timestamp_ns: int
+    mode: VideoFrameMode
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "request_id",
+            _identifier(self.request_id, "request_id"),
+        )
+        _non_negative_int(self.issued_timestamp_ns, "issued_timestamp_ns")
+        if not isinstance(self.mode, VideoFrameMode):
+            raise ValueError(
+                f"mode must be VideoFrameMode, got {self.mode!r}."
+            )
+
+    def to_payload(self) -> bytes:
+        return (
+            json.dumps(
+                {
+                    "request_id": self.request_id,
+                    "issued_timestamp_ns": self.issued_timestamp_ns,
+                    "mode": self.mode.value,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> VideoModeCommand:
+        document = _decode_json_object(payload, "VideoModeCommand")
+        _require_exact_keys(
+            document,
+            {"request_id", "issued_timestamp_ns", "mode"},
+            "VideoModeCommand",
+        )
+        try:
+            mode = VideoFrameMode(document["mode"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Unknown video mode {document['mode']!r}.") from exc
+        return cls(
+            request_id=document["request_id"],
+            issued_timestamp_ns=document["issued_timestamp_ns"],
+            mode=mode,
         )

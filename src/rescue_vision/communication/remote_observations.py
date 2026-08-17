@@ -15,6 +15,7 @@ from rescue_vision.communication.remote import (
 from rescue_vision.communication.remote_messages import (
     CaptureAction,
     HeadingReference,
+    VideoFrameMode,
     _decode_json_object,
     _finite_float,
     _identifier,
@@ -160,6 +161,7 @@ class RemoteSessionStatus:
     gripper_control_available: bool
     capture_control_available: bool
     video_stream_available: bool
+    video_modes: tuple[VideoFrameMode, ...]
     map_snapshot_available: bool
     vehicle_state_available: bool
     capture_status_available: bool
@@ -198,6 +200,16 @@ class RemoteSessionStatus:
             "target_heading_control_available",
         ):
             _boolean(getattr(self, name), name)
+        if (
+            not isinstance(self.video_modes, tuple)
+            or not self.video_modes
+            and self.video_stream_available
+            or any(not isinstance(mode, VideoFrameMode) for mode in self.video_modes)
+            or len(set(self.video_modes)) != len(self.video_modes)
+        ):
+            raise ValueError(
+                "video_modes must be a tuple of unique VideoFrameMode values."
+            )
         _positive_int(self.session_status_period_ms, "session_status_period_ms")
         vehicle_period = _optional_positive_int(
             self.vehicle_state_period_ms,
@@ -273,6 +285,10 @@ class RemoteSessionStatus:
             raise ValueError(
                 "capture control requires video and capture status."
             )
+        if self.video_stream_available and VideoFrameMode.RAW not in self.video_modes:
+            raise ValueError("video_modes must include raw when video is available.")
+        if not self.video_stream_available and self.video_modes:
+            raise ValueError("video_modes must be empty when video is unavailable.")
         if self.motion_control_available != (
             linear_limit is not None and angular_limit is not None
         ):
@@ -309,6 +325,7 @@ class RemoteSessionStatus:
                     "gripper_control": self.gripper_control_available,
                     "capture_control": self.capture_control_available,
                     "video_stream": self.video_stream_available,
+                    "video_modes": [mode.value for mode in self.video_modes],
                     "map_snapshot": self.map_snapshot_available,
                     "vehicle_state": self.vehicle_state_available,
                     "capture_status": self.capture_status_available,
@@ -365,6 +382,7 @@ class RemoteSessionStatus:
                 "gripper_control",
                 "capture_control",
                 "video_stream",
+                "video_modes",
                 "map_snapshot",
                 "vehicle_state",
                 "capture_status",
@@ -405,6 +423,12 @@ class RemoteSessionStatus:
             gripper_control_available=capabilities["gripper_control"],
             capture_control_available=capabilities["capture_control"],
             video_stream_available=capabilities["video_stream"],
+            video_modes=tuple(
+                _enum_value(VideoFrameMode, mode, "video_modes[]")
+                for mode in capabilities["video_modes"]
+            )
+            if isinstance(capabilities["video_modes"], list)
+            else capabilities["video_modes"],
             map_snapshot_available=capabilities["map_snapshot"],
             vehicle_state_available=capabilities["vehicle_state"],
             capture_status_available=capabilities["capture_status"],
@@ -437,6 +461,7 @@ class VideoFrameAttributes:
     height: int
     coordinate_system: ImageCoordinateSystem
     calibration_id: str | None
+    mode: VideoFrameMode = VideoFrameMode.RAW
 
     def __post_init__(self) -> None:
         _non_negative_int(self.frame_sequence, "frame_sequence")
@@ -449,6 +474,8 @@ class VideoFrameAttributes:
             raise ValueError("video pixel count exceeds 33554432.")
         if not isinstance(self.coordinate_system, ImageCoordinateSystem):
             raise ValueError("coordinate_system must be ImageCoordinateSystem.")
+        if not isinstance(self.mode, VideoFrameMode):
+            raise ValueError("mode must be VideoFrameMode.")
         calibration_id = self.calibration_id
         if self.coordinate_system is ImageCoordinateSystem.RAW_PIXEL:
             if calibration_id is not None:
@@ -466,6 +493,7 @@ class VideoFrameAttributes:
             "height": self.height,
             "coordinate_system": self.coordinate_system.value,
             "calibration_id": self.calibration_id,
+            "mode": self.mode.value,
         }
 
     @classmethod
@@ -482,6 +510,7 @@ class VideoFrameAttributes:
                 "height",
                 "coordinate_system",
                 "calibration_id",
+                "mode",
             },
             "VideoFrameAttributes",
         )
@@ -496,6 +525,7 @@ class VideoFrameAttributes:
                 "coordinate_system",
             ),
             calibration_id=attributes["calibration_id"],
+            mode=_enum_value(VideoFrameMode, attributes["mode"], "mode"),
         )
 
 

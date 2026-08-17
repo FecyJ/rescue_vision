@@ -24,6 +24,8 @@ from rescue_vision.communication.remote_messages import (
     HeadingReference,
     MotionControlMode,
     RemoteTopic,
+    VideoFrameMode,
+    VideoModeCommand,
 )
 from rescue_vision.communication.remote_observations import (
     CaptureRecordingState,
@@ -89,5 +91,7 @@ __all__ = [
     "VehicleStateObservation",
     "VehicleStopReason",
     "VideoFrameAttributes",
+    "VideoFrameMode",
+    "VideoModeCommand",
     "connect_remote_client",
 ]

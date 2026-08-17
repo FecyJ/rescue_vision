@@ -20,6 +20,7 @@ from rescue_vision.communication import (
     VehicleStateObservation,
     VehicleStopReason,
     VideoFrameAttributes,
+    VideoFrameMode,
 )
 
 
@@ -33,6 +34,7 @@ def session_status(**overrides: object) -> RemoteSessionStatus:
         "gripper_control_available": True,
         "capture_control_available": True,
         "video_stream_available": True,
+        "video_modes": (VideoFrameMode.RAW, VideoFrameMode.PERCEPTION),
         "map_snapshot_available": False,
         "vehicle_state_available": True,
         "capture_status_available": True,
@@ -115,6 +117,7 @@ def test_video_attributes_round_trip_and_coordinate_binding() -> None:
         height=720,
         coordinate_system=ImageCoordinateSystem.UNDISTORTED_PIXEL,
         calibration_id="camera-front-20260729",
+        mode=VideoFrameMode.PERCEPTION,
     )
 
     assert VideoFrameAttributes.from_attributes(raw.to_attributes()) == raw

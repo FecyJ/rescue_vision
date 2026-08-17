@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 import yaml
 
 from rescue_vision.communication.remote import RemoteAccessMode, RemoteRole
+from rescue_vision.communication.remote_messages import RemoteTopic
 from rescue_vision.geometry.camera_model import CameraCalibration, CameraModel
 from rescue_vision.geometry.ground_projector import GroundProjector
 from rescue_vision.geometry.types import FieldPoint
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
         RemoteGripperExecutor,
         RemoteMotionExecutor,
     )
+    from rescue_vision.perception import TargetPoseDetector
 
 
 def _mapping(value: object, location: str) -> dict[str, Any]:
@@ -440,6 +442,7 @@ class RemoteConfig:
             observation_queue_capacity=self.observation_queue_capacity,
             max_header_bytes=self.max_header_bytes,
             max_payload_bytes=self.max_payload_bytes,
+            non_actuating_control_topics=(RemoteTopic.VIDEO_MODE.value,),
         )
 
     def build_server(self) -> RemoteTcpServer | None:
@@ -730,6 +733,32 @@ class AppConfig:
             camera_calibration=camera_model.calibration,
         )
         return RuntimeGeometry(camera_model, projector)
+
+    def build_target_pose_detector(
+        self,
+        *,
+        ground_projector: GroundProjector | None = None,
+    ) -> TargetPoseDetector | None:
+        """按当前 Hailo、类别和 HSV 配置创建任务目标检测器。
+
+        Hailo 关闭时返回 ``None``，不会导入或访问硬件。返回的 detector 接管
+        backend 生命周期，调用方必须在退出前调用其 ``close()`` 或使用上下文。
+        """
+
+        backend = self.hailo.build_backend()
+        if backend is None:
+            return None
+        from rescue_vision.perception import TargetPoseDetector
+
+        return TargetPoseDetector(
+            backend,
+            class_mapping=self.hailo.model_class_mapping(),
+            detection_threshold=self.perception.detection_threshold,
+            k0_threshold=self.perception.k0_threshold,
+            color_classifier=self.perception.color_classifier,
+            max_observation_age_ms=self.processing.max_observation_age_ms,
+            ground_projector=ground_projector,
+        )
 
 
 def load_runtime_config(path: str | Path) -> AppConfig:

@@ -264,6 +264,21 @@ def test_strict_config_and_geometry_build(tmp_path) -> None:
     assert geometry.ground_projector is not None
 
 
+def test_disabled_hailo_does_not_create_target_pose_detector(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text(
+            intrinsics_enabled=False,
+            ground_mapping_enabled=False,
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(path)
+
+    assert config.build_target_pose_detector() is None
+
+
 def test_intrinsics_can_be_enabled_without_ground_mapping(tmp_path) -> None:
     write_intrinsics(tmp_path / "intrinsics.json")
     path = tmp_path / "runtime.yaml"

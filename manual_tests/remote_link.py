@@ -79,6 +79,7 @@ def main() -> None:
                 gripper_control_available=False,
                 capture_control_available=False,
                 video_stream_available=False,
+                video_modes=(),
                 map_snapshot_available=False,
                 vehicle_state_available=False,
                 capture_status_available=False,
