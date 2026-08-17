@@ -29,9 +29,9 @@ Default input layout:
 
 Default outputs:
 
-    output/ground_mapping.json
-    output/ground_mapping.npz
-    output/ground_diagnostics/
+    output/ground_mapping_<timestamp>/ground_mapping.json
+    output/ground_mapping_<timestamp>/ground_mapping.npz
+    output/ground_mapping_<timestamp>/diagnostics/
 
 Example:
     python -m rescue_vision.calibration.calibrate_extrinsics_ground
@@ -48,16 +48,19 @@ from typing import Any
 import cv2
 import numpy as np
 
+from rescue_vision.config import load_runtime_config
 from rescue_vision.geometry.camera_model import CameraCalibration, CameraModel
 from rescue_vision.geometry.ground_projector import BevConfig, GroundProjector
 from rescue_vision.geometry.types import RawPixel
 
 
 CALIBRATION_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CALIBRATION_DIR.parents[2]
 CAPTURES_DIR = CALIBRATION_DIR / "calibration_captures"
 OUTPUT_DIR = CALIBRATION_DIR / "output"
 
 DEFAULT_SESSION_DIR = CAPTURES_DIR / "ground_mapping"
+DEFAULT_RUNTIME_CONFIG_PATH = PROJECT_ROOT / "configs" / "runtime.yaml"
 WINDOW_NAME = "Ground Correspondence Collector"
 
 
@@ -72,12 +75,21 @@ def parse_args() -> argparse.Namespace:
         help="Ground calibration data directory.",
     )
     parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_RUNTIME_CONFIG_PATH,
+        help=(
+            "Runtime YAML used to resolve geometry.intrinsics_path when "
+            "--intrinsics is omitted."
+        ),
+    )
+    parser.add_argument(
         "--intrinsics",
         type=Path,
         default=None,
         help=(
-            "Intrinsic selected_calibration.json. Defaults to the latest "
-            "timestamped intrinsic output."
+            "Override selected_calibration.json. By default the path comes "
+            "from geometry.intrinsics_path in --config."
         ),
     )
     parser.add_argument(
@@ -149,7 +161,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_json(path: Path) -> dict[str, Any]:
+def load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -160,25 +172,46 @@ def save_json(path: Path, data: dict[str, Any]) -> None:
     )
 
 
-def find_latest_intrinsics() -> Path:
-    candidates = sorted(
-        path
-        for path in OUTPUT_DIR.glob("intrinsics_*/selected_calibration.json")
-        if path.is_file()
-    )
-    if not candidates:
-        raise FileNotFoundError(
-            f"No selected_calibration.json found under {OUTPUT_DIR}"
-        )
-    return candidates[-1]
-
-
 def load_intrinsics(
     path: Path,
 ) -> tuple[CameraCalibration, dict[str, Any]]:
     data = load_json(path)
-    calibration = CameraCalibration.from_dict(data)
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Intrinsic JSON must be an object, got {type(data).__name__}."
+        )
+    calibration = CameraCalibration.from_json(path)
     return calibration, data
+
+
+def load_configured_intrinsics(
+    config_path: Path,
+) -> tuple[Path, CameraModel, dict[str, Any]]:
+    """Load the intrinsic JSON selected by the strict runtime configuration."""
+
+    config = load_runtime_config(config_path)
+    if not config.geometry.intrinsics_enabled:
+        raise ValueError(
+            f"Runtime config {config_path} has "
+            "geometry.intrinsics_enabled=false; enable it or pass "
+            "--intrinsics explicitly."
+        )
+
+    camera_model = config.build_camera_model()
+    if camera_model is None or config.geometry.intrinsics_path is None:
+        raise ValueError(
+            f"Runtime config {config_path} does not provide usable "
+            "geometry.intrinsics_path."
+        )
+
+    intrinsics_path = config.geometry.intrinsics_path
+    intrinsic_data = load_json(intrinsics_path)
+    if not isinstance(intrinsic_data, dict):
+        raise ValueError(
+            f"Intrinsic JSON {intrinsics_path} must be an object, got "
+            f"{type(intrinsic_data).__name__}."
+        )
+    return intrinsics_path, camera_model, intrinsic_data
 
 
 def load_ground_points(path: Path) -> list[dict[str, Any]]:
@@ -576,6 +609,7 @@ def main() -> None:
     args = parse_args()
 
     session_dir = args.session.expanduser().resolve()
+    config_path = args.config.expanduser().resolve()
     image_path = (
         args.image.expanduser().resolve()
         if args.image is not None
@@ -591,16 +625,18 @@ def main() -> None:
         if args.correspondences is not None
         else session_dir / "correspondences.json"
     )
-    intrinsics_path = (
-        args.intrinsics.expanduser().resolve()
-        if args.intrinsics is not None
-        else find_latest_intrinsics().resolve()
-    )
 
     session_dir.mkdir(parents=True, exist_ok=True)
 
-    calibration, intrinsic_data = load_intrinsics(intrinsics_path)
-    camera_model = CameraModel(calibration)
+    if args.intrinsics is None:
+        intrinsics_path, camera_model, intrinsic_data = (
+            load_configured_intrinsics(config_path)
+        )
+    else:
+        intrinsics_path = args.intrinsics.expanduser().resolve()
+        calibration, intrinsic_data = load_intrinsics(intrinsics_path)
+        camera_model = CameraModel(calibration)
+    calibration = camera_model.calibration
     image_size = calibration.image_size
     new_camera_matrix = calibration.new_K
 
@@ -781,13 +817,40 @@ def main() -> None:
             }
         )
 
+    quality = {
+        "usable": not quality_failures,
+        "physically_valid": True,
+        "thresholds": thresholds,
+        "failures": quality_failures,
+    }
     result = {
         "calibration_id": calibration.calibration_id,
-        "quality": {
-            "usable": not quality_failures,
-            "physically_valid": True,
-            "thresholds": thresholds,
-            "failures": quality_failures,
+        "model_type": calibration.model.value,
+        "image_size": list(image_size),
+        "image_to_ground": image_to_ground.tolist(),
+        "quality": quality,
+        "extrinsics": {
+            "rotation_robot_to_camera": rotation_robot_to_camera.tolist(),
+            "translation_robot_to_camera_mm": (
+                tvec_robot_to_camera.reshape(3).tolist()
+            ),
+        },
+        "bev": {
+            "x_min_mm": float(args.bev_x_min_mm),
+            "x_max_mm": float(args.bev_x_max_mm),
+            "y_min_mm": float(args.bev_y_min_mm),
+            "y_max_mm": float(args.bev_y_max_mm),
+            "mm_per_pixel": float(args.bev_mm_per_pixel),
+        },
+    }
+    diagnostics = {
+        "calibration_id": calibration.calibration_id,
+        "model_type": calibration.model.value,
+        "image_size": list(image_size),
+        "source": {
+            "intrinsics": str(intrinsics_path),
+            "ground_image": str(image_path),
+            "correspondences": str(correspondences_path),
         },
         "coordinate_frames": {
             "robot": {
@@ -804,21 +867,11 @@ def main() -> None:
             },
             "image": "undistorted pixels produced with new_camera_matrix",
         },
-        "source": {
-            "intrinsics": str(intrinsics_path),
-            "ground_image": str(image_path),
-            "correspondences": str(correspondences_path),
-        },
         "intrinsics": {
-            "model_type": calibration.model.value,
-            "calibration_id": calibration.calibration_id,
             "quality": intrinsic_data.get("quality"),
+            "lens_position": intrinsic_data.get("lens_position"),
         },
-        "image_size": list(image_size),
-        "lens_position": intrinsic_data.get("lens_position"),
-        "image_to_ground": image_to_ground.tolist(),
-        "ground_to_image": ground_to_image.tolist(),
-        "direct_homography_error": {
+        "homography": {
             "ransac_threshold_mm": float(args.ransac_threshold_mm),
             "inlier_count": int(np.count_nonzero(inliers)),
             "total_count": int(len(inliers)),
@@ -851,10 +904,6 @@ def main() -> None:
             "mm_per_pixel": float(args.bev_mm_per_pixel),
             "width_px": bev_width,
             "height_px": bev_height,
-            "orientation": {
-                "top": "robot_forward",
-                "left": "robot_left",
-            },
             "ground_to_bev": ground_to_bev.tolist(),
             "image_to_bev": image_to_bev.tolist(),
         },
@@ -865,6 +914,10 @@ def main() -> None:
     npz_path = result_dir / f"{args.output_name}.npz"
 
     save_json(json_path, result)
+    save_json(
+        diagnostics_dir / "ground_mapping_diagnostics.json",
+        diagnostics,
+    )
     np.savez(
         npz_path,
         image_to_ground=image_to_ground,

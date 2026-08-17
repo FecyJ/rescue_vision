@@ -21,6 +21,18 @@ from rescue_vision.geometry.types import (
 
 
 FloatArray = npt.NDArray[np.float64]
+
+_CALIBRATION_JSON_FIELDS = frozenset(
+    {
+        "calibration_id",
+        "model_type",
+        "image_size",
+        "camera_matrix",
+        "distortion",
+        "new_camera_matrix",
+        "quality",
+    }
+)
 IMAGE_BORDER_FILL_VALUE = 114
 
 
@@ -52,6 +64,7 @@ class CameraModelType(str, Enum):
 class CameraCalibration:
     """固定分辨率下的一套相机内参标定结果。
 
+    ``calibration_id`` 是关联内参与地面映射的可读身份，不是版本号或校验和。
     ``image_size`` 的顺序为 ``(width, height)``。
 
     ``K`` 是原始畸变图像的内参矩阵；``new_K`` 是去畸变输出图像使用的
@@ -131,12 +144,29 @@ class CameraCalibration:
         *,
         allow_unusable: bool = False,
     ) -> CameraCalibration:
-        """从内参字典加载并执行统一校验。"""
+        """从运行时内参 JSON 的最小格式加载并执行统一校验。"""
 
-        quality = data.get("quality", {})
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"Calibration JSON must be an object, got {type(data).__name__}."
+            )
+        unknown = sorted(set(data) - _CALIBRATION_JSON_FIELDS)
+        if unknown:
+            raise ValueError(
+                f"Unknown keys in calibration JSON: {unknown}."
+            )
+
+        quality = data.get("quality")
         if not isinstance(quality, dict):
-            raise ValueError("Calibration quality must be a mapping when present.")
-        if not allow_unusable and quality.get("usable") is False:
+            raise ValueError(
+                "Calibration JSON must contain a quality mapping."
+            )
+        usable = quality.get("usable")
+        if not isinstance(usable, bool):
+            raise ValueError(
+                "Calibration JSON quality.usable must be a boolean."
+            )
+        if not allow_unusable and not usable:
             raise ValueError(
                 "Calibration result is marked unusable. Inspect comparison.json "
                 "and diagnostics before loading it."
@@ -161,8 +191,17 @@ class CameraCalibration:
             )
 
         image_size_value = data.get("image_size")
-        if not isinstance(image_size_value, (list, tuple)):
-            raise ValueError("Calibration image_size must be [width, height].")
+        if (
+            not isinstance(image_size_value, (list, tuple))
+            or len(image_size_value) != 2
+            or any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in image_size_value
+            )
+        ):
+            raise ValueError(
+                "Calibration image_size must be integer [width, height]."
+            )
 
         return cls(
             calibration_id=calibration_id,

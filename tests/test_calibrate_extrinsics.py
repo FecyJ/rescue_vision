@@ -10,6 +10,7 @@ import cv2
 import rescue_vision.calibration.calibrate_extrinsics_ground as ground_module
 from rescue_vision.calibration.calibrate_extrinsics_ground import (
     estimate_planar_pose,
+    load_configured_intrinsics,
     load_intrinsics,
     pose_ground_homography,
     validate_correspondence_source,
@@ -58,6 +59,64 @@ def test_ground_calibration_rejects_unusable_intrinsics(tmp_path) -> None:
     path.write_text(json.dumps(document), encoding="utf-8")
     with pytest.raises(ValueError, match="marked unusable"):
         load_intrinsics(path)
+
+
+def test_ground_calibration_uses_intrinsics_path_from_runtime_config(
+    tmp_path,
+) -> None:
+    intrinsics_document = {
+        "calibration_id": "runtime-selected",
+        "model_type": "pinhole",
+        "image_size": [32, 24],
+        "camera_matrix": np.eye(3).tolist(),
+        "distortion": [0, 0, 0, 0, 0],
+        "new_camera_matrix": np.eye(3).tolist(),
+        "quality": {"usable": True},
+    }
+    intrinsics_path = tmp_path / "selected_calibration.json"
+    intrinsics_path.write_text(
+        json.dumps(intrinsics_document),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "runtime.yaml"
+    config_path.write_text(
+        "camera:\n"
+        "  backend: rpicam_vid\n"
+        "  image_size: [32, 24]\n"
+        "  fps: 20\n"
+        "  lens_position: 1.0\n"
+        "geometry:\n"
+        "  intrinsics_enabled: true\n"
+        "  intrinsics_path: selected_calibration.json\n",
+        encoding="utf-8",
+    )
+
+    resolved_path, camera_model, loaded_document = load_configured_intrinsics(
+        config_path
+    )
+
+    assert resolved_path == intrinsics_path.resolve()
+    assert camera_model.calibration.calibration_id == "runtime-selected"
+    assert camera_model.image_size == (32, 24)
+    assert loaded_document == intrinsics_document
+
+
+def test_ground_calibration_rejects_disabled_runtime_intrinsics(tmp_path) -> None:
+    config_path = tmp_path / "runtime.yaml"
+    config_path.write_text(
+        "camera:\n"
+        "  backend: rpicam_vid\n"
+        "  image_size: [32, 24]\n"
+        "  fps: 20\n"
+        "  lens_position: 1.0\n"
+        "geometry:\n"
+        "  intrinsics_enabled: false\n"
+        "  intrinsics_path: null\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="intrinsics_enabled=false"):
+        load_configured_intrinsics(config_path)
 
 
 def test_planar_pose_and_homography_recover_known_geometry() -> None:

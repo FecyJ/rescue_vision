@@ -106,6 +106,27 @@ def test_unusable_calibration_is_rejected(tmp_path) -> None:
     assert loaded.model is CameraModelType.PINHOLE
 
 
+def test_calibration_json_requires_id_quality_and_current_fields(tmp_path) -> None:
+    document = {
+        "model_type": "pinhole",
+        "image_size": [32, 24],
+        "camera_matrix": calibration(CameraModelType.PINHOLE).K.tolist(),
+        "distortion": [0, 0, 0, 0, 0],
+        "new_camera_matrix": calibration(CameraModelType.PINHOLE).new_K.tolist(),
+        "quality": {"usable": True},
+    }
+    path = tmp_path / "intrinsics.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(ValueError, match="calibration_id"):
+        CameraCalibration.from_json(path)
+
+    document["calibration_id"] = "test"
+    document["schema_version"] = 3
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(ValueError, match="Unknown keys"):
+        CameraCalibration.from_json(path)
+
+
 def test_image_size_mismatch_is_rejected() -> None:
     camera = CameraModel(calibration(CameraModelType.PINHOLE))
     with pytest.raises(ValueError, match="does not match calibration"):

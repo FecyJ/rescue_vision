@@ -17,7 +17,7 @@
 | `GroundProjector.ground_to_bev_pixel()` / `ground_to_bev_pixels()` | 地面点转鸟瞰图像素 |
 | `GroundProjector.bev_pixel_to_ground()` / `bev_pixels_to_ground()` | 鸟瞰像素转地面点 |
 | `GroundProjector.make_bev_image()` | 按地面映射生成完整 BEV |
-| `CameraCalibration.calibration_id` | 关联当前内参与地面标定的可读标识 |
+| `CameraCalibration.calibration_id` | 内参参数集的非空可读身份；必须与地面映射一致 |
 
 坐标数据结构：
 

@@ -24,6 +24,33 @@ from rescue_vision.geometry.types import (
 
 FloatArray = npt.NDArray[np.float64]
 
+_GROUND_MAPPING_JSON_FIELDS = frozenset(
+    {
+        "calibration_id",
+        "model_type",
+        "image_size",
+        "image_to_ground",
+        "quality",
+        "extrinsics",
+        "bev",
+    }
+)
+_GROUND_EXTRINSICS_JSON_FIELDS = frozenset(
+    {
+        "rotation_robot_to_camera",
+        "translation_robot_to_camera_mm",
+    }
+)
+_GROUND_BEV_JSON_FIELDS = frozenset(
+    {
+        "x_min_mm",
+        "x_max_mm",
+        "y_min_mm",
+        "y_max_mm",
+        "mm_per_pixel",
+    }
+)
+
 
 def _validated_homography(value: npt.ArrayLike, name: str) -> FloatArray:
     matrix = np.ascontiguousarray(value, dtype=np.float64)
@@ -218,9 +245,20 @@ class GroundProjector:
         *,
         camera_calibration: CameraCalibration,
     ) -> GroundProjector:
-        """加载地面映射，并拒绝与当前内参不匹配的产物。"""
+        """加载当前最小地面映射 JSON，并校验内参身份。"""
 
         data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"Ground mapping JSON must be an object, got "
+                f"{type(data).__name__}."
+            )
+        unknown = sorted(set(data) - _GROUND_MAPPING_JSON_FIELDS)
+        if unknown:
+            raise ValueError(
+                f"Unknown keys in ground mapping JSON: {unknown}."
+            )
+
         quality = data.get("quality")
         if not isinstance(quality, dict) or quality.get("usable") is not True:
             raise ValueError(
@@ -232,30 +270,50 @@ class GroundProjector:
                 "Ground mapping pose must be marked physically_valid."
             )
 
-        image_size = tuple(int(value) for value in data["image_size"])
+        calibration_id = data.get("calibration_id")
+        if not isinstance(calibration_id, str) or not calibration_id.strip():
+            raise ValueError(
+                "Ground mapping is missing a non-empty calibration_id."
+            )
+        if calibration_id != camera_calibration.calibration_id:
+            raise ValueError(
+                "Ground mapping was produced with different intrinsic "
+                "parameters (calibration_id mismatch)."
+            )
+
+        model_type = data.get("model_type")
+        if model_type != camera_calibration.model.value:
+            raise ValueError(
+                f"Ground mapping model {model_type!r} does not match "
+                f"intrinsics {camera_calibration.model.value!r}."
+            )
+
+        image_size_value = data.get("image_size")
+        if (
+            not isinstance(image_size_value, (list, tuple))
+            or len(image_size_value) != 2
+            or any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in image_size_value
+            )
+        ):
+            raise ValueError(
+                "Ground mapping image_size must be integer [width, height]."
+            )
+        image_size = tuple(image_size_value)
         if image_size != camera_calibration.image_size:
             raise ValueError(
                 f"Ground mapping image_size {image_size} does not match "
                 f"intrinsics {camera_calibration.image_size}."
             )
 
-        intrinsic = data.get("intrinsics")
-        if not isinstance(intrinsic, dict):
-            raise ValueError("Ground mapping is missing intrinsics metadata.")
-        actual_model = str(intrinsic.get("model_type"))
-        if actual_model != camera_calibration.model.value:
-            raise ValueError(
-                f"Ground mapping model {actual_model!r} does not match "
-                f"intrinsics {camera_calibration.model.value!r}."
-            )
-        actual_calibration_id = intrinsic.get("calibration_id")
-        if actual_calibration_id != camera_calibration.calibration_id:
-            raise ValueError(
-                "Ground mapping was produced with different intrinsic "
-                "parameters (calibration_id mismatch)."
-            )
-
         bev_data = data.get("bev")
+        if isinstance(bev_data, dict):
+            unknown_bev = sorted(set(bev_data) - _GROUND_BEV_JSON_FIELDS)
+            if unknown_bev:
+                raise ValueError(
+                    f"Unknown keys in ground mapping bev: {unknown_bev}."
+                )
         bev_config = (
             BevConfig.from_dict(bev_data)
             if isinstance(bev_data, dict)
@@ -265,9 +323,13 @@ class GroundProjector:
         if extrinsics is not None and not isinstance(extrinsics, dict):
             raise ValueError("Ground mapping extrinsics must be a mapping.")
         if isinstance(extrinsics, dict):
-            if extrinsics.get("physically_valid") is not True:
+            unknown_extrinsics = sorted(
+                set(extrinsics) - _GROUND_EXTRINSICS_JSON_FIELDS
+            )
+            if unknown_extrinsics:
                 raise ValueError(
-                    "Ground mapping extrinsics.physically_valid must be true."
+                    "Unknown keys in ground mapping extrinsics: "
+                    f"{unknown_extrinsics}."
                 )
             rotation = extrinsics.get("rotation_robot_to_camera")
             translation = extrinsics.get(

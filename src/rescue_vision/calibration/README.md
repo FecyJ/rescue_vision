@@ -88,6 +88,31 @@ output/intrinsics_YYYYMMDD_HHMMSS/
 └── diagnostics/
 ```
 
+运行时只加载 `selected_calibration.json` 的以下字段：
+
+```json
+{
+  "calibration_id": "intrinsics_YYYYMMDD_HHMMSS",
+  "model_type": "pinhole_rational",
+  "image_size": [2304, 1296],
+  "camera_matrix": [[...], [...], [...]],
+  "distortion": [...],
+  "new_camera_matrix": [[...], [...], [...]],
+  "quality": {"usable": true}
+}
+```
+
+`calibration_id` 是内参参数集的非空、可读身份。内参标定脚本默认使用输出
+目录名生成它，也可通过 `--calibration-id` 指定。地面映射必须原样复制这个
+值；它用于阻止不同 `K/D/new_K`、模型、分辨率或焦点条件的标定产物混用。
+它不是 schema 版本、Git 提交、文件校验和、相机序列号或场地位置。
+JSON 重排不需要改变 ID；只要实际标定条件或参数改变，就必须生成新 ID 并
+重新制作地面映射。
+
+`comparison.json`、`models/` 和 `diagnostics/` 保存评测与求解细节，不是运行时
+内参 JSON。当前格式不再写入 `schema_version`；旧的缺少 `calibration_id` 或
+包含旧顶层字段的 JSON 必须重新生成，不做兼容猜测。
+
 部署前检查：
 
 - `selected_calibration.json` 中 `quality.usable` 必须为 `true`；
@@ -132,7 +157,27 @@ calibration_captures/ground_mapping/
 
 ## 4. 求解地面映射
 
-脚本复用 `CameraCalibration` / `CameraModel`，支持 pinhole、pinhole_rational 和 fisheye，默认拒绝 `quality.usable=false` 的内参。默认选择最新时间戳目录，也可显式指定：
+脚本默认读取仓库根目录的 `configs/runtime.yaml`，从
+`geometry.intrinsics_path` 获取内参，并通过 `load_runtime_config()` 与
+`CameraCalibration` 的同一套校验加载 JSON。支持 pinhole、pinhole_rational
+和 fisheye，默认拒绝 `quality.usable=false`、分辨率不匹配或配置未启用的内参。
+
+默认用法：
+
+```bash
+python -m rescue_vision.calibration.calibrate_extrinsics_ground \
+  --config configs/runtime.yaml
+```
+
+也可以显式指定另一份运行配置：
+
+```bash
+python -m rescue_vision.calibration.calibrate_extrinsics_ground \
+  --config configs/runtime.yaml \
+  --session src/rescue_vision/calibration/calibration_captures/ground_mapping
+```
+
+`--intrinsics` 仅作为诊断或临时覆盖；未指定时不得再按时间戳自动挑选内参：
 
 ```bash
 python -m rescue_vision.calibration.calibrate_extrinsics_ground \
@@ -154,9 +199,39 @@ output/ground_mapping_YYYYMMDD_HHMMSS_ffffff/
 ├── ground_mapping.json
 ├── ground_mapping.npz
 └── diagnostics/
+    ├── ground_mapping_diagnostics.json
     ├── undistorted_ground_image.png
     ├── undistorted_correspondences.png
     └── bev_preview.png
+```
+
+运行时 `ground_mapping.json` 只保留地面投影所需的标识、矩阵、质量、完整
+外参和 BEV 范围；`ground_to_image`、4×4 矩阵、姿态单应矩阵和逐点误差等可
+由现有字段计算或仅用于验收的内容放在 `ground_mapping_diagnostics.json`。
+其顶层 `calibration_id` 和 `model_type` 必须分别等于内参 JSON 的对应字段，
+不再重复嵌套 `intrinsics` 对象。
+
+运行时地面映射 JSON 的结构为：
+
+```json
+{
+  "calibration_id": "intrinsics_YYYYMMDD_HHMMSS",
+  "model_type": "pinhole_rational",
+  "image_size": [2304, 1296],
+  "image_to_ground": [[...], [...], [...]],
+  "quality": {"usable": true, "physically_valid": true},
+  "extrinsics": {
+    "rotation_robot_to_camera": [[...], [...], [...]],
+    "translation_robot_to_camera_mm": [...]
+  },
+  "bev": {
+    "x_min_mm": -300.0,
+    "x_max_mm": 2500.0,
+    "y_min_mm": -1200.0,
+    "y_max_mm": 1200.0,
+    "mm_per_pixel": 5.0
+  }
+}
 ```
 
 `image_to_ground` 表示去畸变像素到机器人地面毫米坐标。直接单应拟合用于

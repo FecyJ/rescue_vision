@@ -4,16 +4,19 @@ import numpy as np
 import pytest
 
 from rescue_vision.calibration.calibrate_intrinsics import (
+    CalibrationFit,
     MINIMUM_VIEWS,
     PATTERN_SIZE,
     create_object_template,
     make_folds,
+    make_runtime_calibration_document,
     view_rmse,
 )
 from rescue_vision.calibration.capture_chessboard_images import (
     detect_chessboard,
     make_preview,
 )
+from rescue_vision.geometry.camera_model import CameraCalibration
 
 
 def test_intrinsic_object_template_uses_mm_and_expected_corner_order() -> None:
@@ -37,6 +40,46 @@ def test_view_rmse_uses_euclidean_pixel_error() -> None:
     observed = np.array([[0.0, 0.0], [1.0, 1.0]])
     projected = np.array([[3.0, 4.0], [1.0, 1.0]])
     assert view_rmse(observed, projected) == pytest.approx(np.sqrt(12.5))
+
+
+def test_runtime_calibration_document_uses_minimal_current_schema() -> None:
+    fit = CalibrationFit(
+        model_type="pinhole",
+        rms_px=0.5,
+        K=np.eye(3),
+        D=np.zeros(5),
+        rvecs=(),
+        tvecs=(),
+        solver_variant="test",
+    )
+    quality = {
+        "usable": True,
+        "grade": "good",
+        "selection_score_px": 0.5,
+    }
+
+    document = make_runtime_calibration_document(
+        "intrinsics_test",
+        fit,
+        np.eye(3),
+        quality,
+    )
+
+    assert set(document) == {
+        "calibration_id",
+        "model_type",
+        "image_size",
+        "camera_matrix",
+        "distortion",
+        "new_camera_matrix",
+        "quality",
+    }
+    assert document["calibration_id"] == "intrinsics_test"
+    assert document["quality"] == quality
+    assert (
+        CameraCalibration.from_dict(document).calibration_id
+        == "intrinsics_test"
+    )
 
 
 def test_capture_preview_and_blank_detection_are_hardware_free() -> None:

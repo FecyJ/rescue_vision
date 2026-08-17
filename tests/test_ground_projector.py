@@ -180,10 +180,8 @@ def test_ground_mapping_rejects_intrinsic_mismatch(tmp_path) -> None:
     document = {
         "quality": {"usable": True, "physically_valid": True},
         "image_size": [32, 24],
-        "intrinsics": {
-            "model_type": "pinhole",
-            "calibration_id": calibration.calibration_id,
-        },
+        "calibration_id": calibration.calibration_id,
+        "model_type": "pinhole",
         "image_to_ground": np.eye(3).tolist(),
         "bev": {
             "x_min_mm": 0,
@@ -202,7 +200,6 @@ def test_ground_mapping_rejects_intrinsic_mismatch(tmp_path) -> None:
     document["extrinsics"] = {
         "rotation_robot_to_camera": np.eye(3).tolist(),
         "translation_robot_to_camera_mm": [0.0, 0.0, 1.0],
-        "physically_valid": True,
     }
     path.write_text(json.dumps(document), encoding="utf-8")
     assert GroundProjector.from_json(
@@ -210,18 +207,18 @@ def test_ground_mapping_rejects_intrinsic_mismatch(tmp_path) -> None:
         camera_calibration=calibration,
     ).supports_robot_projection
 
-    document["intrinsics"]["model_type"] = "fisheye"
+    document["model_type"] = "fisheye"
     path.write_text(json.dumps(document), encoding="utf-8")
     with pytest.raises(ValueError, match="does not match"):
         GroundProjector.from_json(path, camera_calibration=calibration)
 
-    document["intrinsics"]["model_type"] = "pinhole"
-    document["intrinsics"]["calibration_id"] = "wrong"
+    document["model_type"] = "pinhole"
+    document["calibration_id"] = "wrong"
     path.write_text(json.dumps(document), encoding="utf-8")
     with pytest.raises(ValueError, match="calibration_id"):
         GroundProjector.from_json(path, camera_calibration=calibration)
 
-    document["intrinsics"]["calibration_id"] = calibration.calibration_id
+    document["calibration_id"] = calibration.calibration_id
     document["quality"]["usable"] = False
     path.write_text(json.dumps(document), encoding="utf-8")
     with pytest.raises(ValueError, match="quality.usable"):

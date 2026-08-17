@@ -1082,6 +1082,25 @@ def make_model_document(
     }
 
 
+def make_runtime_calibration_document(
+    calibration_id: str,
+    fit: CalibrationFit,
+    new_K: np.ndarray,
+    quality: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the minimal JSON consumed by ``CameraCalibration.from_json``."""
+
+    return {
+        "calibration_id": calibration_id,
+        "model_type": fit.model_type,
+        "image_size": list(IMAGE_SIZE),
+        "camera_matrix": fit.K.tolist(),
+        "distortion": fit.D.reshape(-1).tolist(),
+        "new_camera_matrix": new_K.tolist(),
+        "quality": quality,
+    }
+
+
 def save_json(path: Path, data: Any) -> None:
     path.write_text(
         json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False),
@@ -1284,25 +1303,20 @@ def main() -> None:
         args.minimum_pose_success_rate,
     )
 
-    selected_document = dict(model_documents[selected_type])
-    selected_document["selection"] = {
-        "selected": True,
-        "candidate_models": list(MODEL_ORDER),
-        "method": "k_fold_cross_validation",
-        "fold_count": len(folds),
-        "seed": args.seed,
-        "metric": "validation_global_rmse_px",
-        "notes": selection_notes,
-    }
-    selected_document["quality"] = quality
-
+    selected_fit = final_fits[selected_type]
+    selected_new_K = np.asarray(
+        model_documents[selected_type]["new_camera_matrix"],
+        dtype=np.float64,
+    )
+    selected_document = make_runtime_calibration_document(
+        calibration_id,
+        selected_fit,
+        selected_new_K,
+        quality,
+    )
     selected_json_path = run_dir / "selected_calibration.json"
     save_json(selected_json_path, selected_document)
 
-    selected_fit = final_fits[selected_type]
-    selected_new_K = np.asarray(
-        selected_document["new_camera_matrix"], dtype=np.float64
-    )
     np.savez_compressed(
         run_dir / "selected_calibration.npz",
         model_type=np.asarray(selected_type),
