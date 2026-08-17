@@ -158,22 +158,22 @@ def gripper_command(
 def gripper_calibration() -> GripperCalibration:
     return GripperCalibration(
         open_left_angle_deg=20.0,
-        open_right_angle_deg=160.0,
+        open_right_angle_deg=174.0,
         closed_left_angle_deg=80.0,
-        closed_right_angle_deg=100.0,
+        closed_right_angle_deg=114.0,
         full_travel_time_s=1.0,
     )
 
 
 def test_gripper_calibration_rejects_unsafe_endpoints_and_travel_time() -> None:
     with pytest.raises(ValueError, match="Left gripper"):
-        GripperCalibration(20.0, 160.0, 20.0, 100.0, 1.0)
+        GripperCalibration(20.0, 174.0, 20.0, 174.0, 1.0)
     with pytest.raises(ValueError, match="Right gripper"):
-        GripperCalibration(20.0, 160.0, 80.0, 160.0, 1.0)
+        GripperCalibration(20.0, 174.0, 80.0, 174.0, 1.0)
     with pytest.raises(ValueError, match="full_travel_time_s"):
-        GripperCalibration(20.0, 160.0, 80.0, 100.0, 0.0)
-    with pytest.raises(ValueError, match="sum to 180"):
-        GripperCalibration(20.0, 150.0, 80.0, 100.0, 1.0)
+        GripperCalibration(20.0, 174.0, 80.0, 114.0, 0.0)
+    with pytest.raises(ValueError, match="sum to 194"):
+        GripperCalibration(20.0, 160.0, 80.0, 114.0, 1.0)
 
 
 def test_motion_functions_encode_differential_drive_and_stops() -> None:
@@ -655,7 +655,7 @@ def test_remote_gripper_advances_while_refreshed_and_stops_on_release() -> None:
             ReceivedUartLine(
                 sequence=0,
                 received_timestamp_ns=1_000_000_000,
-                payload=b"t1,0,0,0,0,20,160",
+                payload=b"t1,0,0,0,0,20,174",
             )
         ]
     )
@@ -686,14 +686,14 @@ def test_remote_gripper_advances_while_refreshed_and_stops_on_release() -> None:
     assert applied.deadline_timestamp_ns == 1_200_000_000
     assert stopped.result is RemoteGripperResult.STOPPED
     assert expired.result is RemoteGripperResult.EXPIRED
-    assert channel.sent == [b"g26,154"]
+    assert channel.sent == [b"g26,168"]
 
 
 def test_remote_gripper_uses_fixed_speed_and_stops_on_conflicting_triggers() -> None:
     clock = FakeClock(1_000_000_000)
     channel = FakeCarChannel()
     controller = MotionController(channel, limits(), monotonic_ns=clock)
-    controller.set_gripper_angles(50.0, 130.0)
+    controller.set_gripper_angles(50.0, 144.0)
     channel.sent.clear()
     executor = RemoteGripperExecutor(
         controller,
@@ -722,14 +722,14 @@ def test_remote_gripper_uses_fixed_speed_and_stops_on_conflicting_triggers() -> 
     )
 
     assert cancelled.result is RemoteGripperResult.STOPPED
-    assert channel.sent == [b"g38,142"]
+    assert channel.sent == [b"g38,156"]
 
 
 def test_remote_gripper_timeout_stops_at_last_target() -> None:
     clock = FakeClock(1_000_000_000)
     channel = FakeCarChannel()
     controller = MotionController(channel, limits(), monotonic_ns=clock)
-    controller.set_gripper_angles(20.0, 160.0)
+    controller.set_gripper_angles(20.0, 174.0)
     channel.sent.clear()
     executor = RemoteGripperExecutor(
         controller,
@@ -747,11 +747,11 @@ def test_remote_gripper_timeout_stops_at_last_target() -> None:
     assert executor.check_timeout() == "grip-1"
     clock.advance(0.1)
     assert not executor.update()
-    assert controller.gripper_target_angles_deg == pytest.approx((23.0, 157.0))
-    assert channel.sent == [b"g23,157"]
+    assert controller.gripper_target_angles_deg == pytest.approx((23.0, 171.0))
+    assert channel.sent == [b"g23,171"]
 
 
-def test_remote_gripper_projects_non_complementary_state_before_motion() -> None:
+def test_remote_gripper_projects_state_to_194_degree_sum_before_motion() -> None:
     clock = FakeClock(1_000_000_000)
     channel = FakeCarChannel()
     controller = MotionController(channel, limits(), monotonic_ns=clock)
@@ -771,10 +771,33 @@ def test_remote_gripper_projects_non_complementary_state_before_motion() -> None
     assert executor.update()
 
     left, right = controller.gripper_target_angles_deg or (0.0, 0.0)
-    assert left == pytest.approx(84.0)
-    assert right == pytest.approx(96.0)
-    assert left + right == pytest.approx(180.0)
-    assert channel.sent == [b"g84,96"]
+    assert left == pytest.approx(91.0)
+    assert right == pytest.approx(103.0)
+    assert left + right == pytest.approx(194.0)
+    assert channel.sent == [b"g91,103"]
+
+
+def test_remote_gripper_clamps_projected_state_to_valid_servo_range() -> None:
+    clock = FakeClock(1_000_000_000)
+    channel = FakeCarChannel()
+    controller = MotionController(channel, limits(), monotonic_ns=clock)
+    controller.set_gripper_angles(0.0, 180.0)
+    channel.sent.clear()
+    executor = RemoteGripperExecutor(
+        controller,
+        gripper_calibration(),
+        monotonic_ns=clock,
+    )
+    executor.execute(
+        gripper_message(gripper_command(valid_for_ms=500)),
+        now_ns=clock.timestamp_ns,
+    )
+
+    clock.advance(0.1)
+    assert executor.update()
+
+    assert controller.gripper_target_angles_deg == pytest.approx((20.0, 174.0))
+    assert channel.sent == [b"g20,174"]
 
 
 def test_invalid_remote_gripper_command_does_not_actuate() -> None:

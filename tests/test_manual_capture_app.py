@@ -196,9 +196,9 @@ def _config() -> SimpleNamespace:
 def _gripper_calibration() -> GripperCalibration:
     return GripperCalibration(
         open_left_angle_deg=20.0,
-        open_right_angle_deg=160.0,
+        open_right_angle_deg=174.0,
         closed_left_angle_deg=80.0,
-        closed_right_angle_deg=100.0,
+        closed_right_angle_deg=114.0,
         full_travel_time_s=1.0,
     )
 

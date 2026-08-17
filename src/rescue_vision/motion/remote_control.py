@@ -70,6 +70,9 @@ class RemoteGripperResult(str, Enum):
     EXPIRED = "expired"
 
 
+_GRIPPER_ANGLE_SUM_DEG = 194.0
+
+
 @dataclass(frozen=True, slots=True)
 class GripperCalibration:
     """远程连续控制所需的双舵机机械端点和速度标定。"""
@@ -120,12 +123,14 @@ class GripperCalibration:
             angle_sum = left + right
             if not math.isclose(
                 angle_sum,
-                180.0,
+                _GRIPPER_ANGLE_SUM_DEG,
                 rel_tol=1e-12,
                 abs_tol=1e-9,
             ):
                 raise ValueError(
-                    f"Gripper {state} angles must sum to 180 degrees, "
+                    "Gripper "
+                    f"{state} angles must sum to "
+                    f"{_GRIPPER_ANGLE_SUM_DEG:g} degrees, "
                     f"got {left} + {right} = {angle_sum}."
                 )
 
@@ -291,11 +296,17 @@ class RemoteGripperExecutor:
             )
             / self.calibration.full_travel_time_s
         )
-        # 把可能来自旧命令的非互补目标投影到 left + right = 180 的
-        # 对称线上，再只推进一个自由度；所有远程 UART 下发都重新构造右角。
-        current_left_angle = (
-            current_angles[0] + (180.0 - current_angles[1])
+        # 把可能来自旧命令且不满足 194° 和约束的目标投影到有效线段，
+        # 再只推进一个自由度；所有远程 UART 下发都重新构造右角。
+        minimum_left_angle = _GRIPPER_ANGLE_SUM_DEG - 180.0
+        projected_left_angle = (
+            current_angles[0]
+            + (_GRIPPER_ANGLE_SUM_DEG - current_angles[1])
         ) / 2.0
+        current_left_angle = min(
+            180.0,
+            max(minimum_left_angle, projected_left_angle),
+        )
         next_left_angle = _move_toward(
             current_left_angle,
             target_left_angle,
@@ -303,7 +314,7 @@ class RemoteGripperExecutor:
         )
         next_angles = (
             next_left_angle,
-            180.0 - next_left_angle,
+            _GRIPPER_ANGLE_SUM_DEG - next_left_angle,
         )
         if next_angles == current_angles:
             return False

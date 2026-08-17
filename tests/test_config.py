@@ -244,14 +244,12 @@ def test_strict_config_and_geometry_build(tmp_path) -> None:
         json.dumps(
             {
                 "quality": {
-                        "usable": True,
-                        "physically_valid": True,
+                    "usable": True,
+                    "physically_valid": True,
                 },
                 "image_size": [32, 24],
-                "intrinsics": {
-                    "model_type": "pinhole",
-                    "calibration_id": calibration.calibration_id,
-                },
+                "model_type": "pinhole",
+                "calibration_id": calibration.calibration_id,
                 "image_to_ground": np.eye(3).tolist(),
             }
         ),
@@ -721,9 +719,9 @@ def test_motion_config_builds_controller_without_opening_uart(tmp_path) -> None:
             """  gripper:
     enabled: true
     open_left_angle_deg: 20.0
-    open_right_angle_deg: 160.0
+    open_right_angle_deg: 174.0
     closed_left_angle_deg: 80.0
-    closed_right_angle_deg: 100.0
+    closed_right_angle_deg: 114.0
     full_travel_time_s: 1.5""",
         ),
         encoding="utf-8",

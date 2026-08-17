@@ -139,6 +139,7 @@ def main() -> None:
                     preview,
                     (
                         f"{observation.target_class.value}"
+                        f" conf={observation.detection_confidence:.2f}"
                         f" hsv={segmentation.candidate_class.value}"
                         f"/{segmentation.status.value}"
                         f" cov={segmentation.color_fraction:.2f}"

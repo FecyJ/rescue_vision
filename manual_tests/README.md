@@ -10,6 +10,7 @@
 - `picamera_minimal.py`：直接使用 Picamera2 的最小检查。
 - `geometry_projection.py`：使用本地测试图片人工检查 BEV 和点投影。
 - `hailo_pose.py`：从实际 `runtime.yaml` 加载 YOLO Pose 部署包，检查单张去畸变图像的框、K0、HSV 类别和 ROI 分割摘要；启用 `target_ground_geometry` 时同时输出中心、足迹、朝向、拟合分数和降级原因。
+- `target_ground_geometry.py`：从实际相机逐帧运行 YOLO Pose、HSV 分割和 `TargetGroundGeometryEstimator`，在去畸变画面叠加地面中心、足迹和质量信息，并按 JSONL 周期输出机器人地面系毫米坐标；按 `Q/Esc` 退出。
 - `dataset_perception.py`：按数据清单批量运行 Hailo，覆盖式写出观测 JSONL，保留 Pose 类别、HSV 候选/覆盖率、UNKNOWN 和质量信息。
 - `field_features.py`：从图片或视频离线检测安全区、无编号出发区、中心十字和低精度边界候选，写出 JSONL 及可选叠加图；不访问相机或 Hailo。
 - `camera_undistort_perception.py`：按实际 `runtime.yaml` 连续执行相机、去畸变、Hailo Pose、ROI HSV 掩码和 K0/地面点叠加预览，按 `Q/Esc` 退出；偶发过期帧会标红并丢弃，不会终止预览。
@@ -49,6 +50,21 @@ python manual_tests/field_features.py recordings/field_sample.mp4 \
 python manual_tests/camera_undistort_perception.py \
   --config configs/runtime.yaml
 ```
+
+检查目标地面中心和足迹：
+
+```bash
+python manual_tests/target_ground_geometry.py \
+  --config configs/runtime.yaml
+```
+
+运行前必须在实际配置中启用内参、带完整相机外参的地面映射、Hailo 和
+`perception.target_ground_geometry.enabled`。画面使用全尺寸去畸变图；中心和
+足迹叠加通过地面投影重新映射到该图像，坐标输出为机器人地面系毫米，`x`
+向前、`y` 向左。终端默认每 0.5 秒输出一次 JSONL；可用
+`--print-interval 0.1` 提高输出频率，或用 `--frames 20` 处理有限帧数。
+拟合失败会保留 `quality`、分数和 `center_ground_mm: null`，不会用检测框中心
+代替拟合结果。
 
 无人值守地检查 20 帧后退出：
 
@@ -138,4 +154,4 @@ rescue-vision-manual-capture \
 `motion.gripper` 后再启用。按住左/右扳机时持续发送张开/闭合按压状态，松开
 时发送两个状态均为 `false`；释放、命令超时或断线只停止角度继续变化，不会
 自动开合，也不能直接套用协议说明书中的示例角度。逐次核对 UART/车辆状态中
-的左右目标角之和始终为 180°，包括从旧的非互补目标首次开始运动时。
+的左右目标角之和始终为 194°，包括从不满足该和约束的旧目标首次开始运动时。
