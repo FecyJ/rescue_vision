@@ -238,6 +238,15 @@ class PerceptionFrameRenderer:
         with self._lock:
             return self._latest_frame
 
+    def clear_latest(self) -> None:
+        """丢弃模式切换前的结果和待处理帧，不影响 detector 生命周期。"""
+
+        self._require_started()
+        self._raise_worker_error()
+        with self._lock:
+            self._latest_frame = None
+            self._pending_frame = None
+
     def check_health(self) -> None:
         self._require_started()
         self._raise_worker_error()

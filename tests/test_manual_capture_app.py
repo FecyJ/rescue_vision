@@ -177,6 +177,32 @@ class FakePerceptionRenderer:
     def latest(self) -> CameraFrame | None:
         return self.latest_frame
 
+    def clear_latest(self) -> None:
+        self.latest_frame = None
+
+
+class LaggingFakePerceptionRenderer(FakePerceptionRenderer):
+    """模拟推理结果比当前相机帧落后一帧。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pending_frame: CameraFrame | None = None
+
+    def submit(self, frame: CameraFrame) -> None:
+        if self.pending_frame is not None:
+            self.latest_frame = self.pending_frame
+        image = frame.image_bgr.copy()
+        image[0, 0] = (255, 0, 255)
+        self.pending_frame = CameraFrame(
+            sequence=frame.sequence,
+            timestamp_ns=frame.timestamp_ns,
+            image_bgr=image,
+        )
+
+    def clear_latest(self) -> None:
+        self.latest_frame = None
+        self.pending_frame = None
+
 
 class PollingServer:
     def __init__(self, connection: object, *, timeouts_before_connection: int) -> None:
@@ -498,7 +524,7 @@ def test_manual_session_switches_between_raw_and_perception_video(tmp_path) -> N
             MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 500),
         )
     )
-    renderer = FakePerceptionRenderer()
+    renderer = LaggingFakePerceptionRenderer()
     status = build_session_status(
         config,
         server_instance_id="test-server",

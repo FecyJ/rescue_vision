@@ -29,7 +29,7 @@ K0、完整相机外参和可配置三维形状估计目标地面中心、朝向
 | `FieldFeatureConfig` | 场地颜色、形态学、尺寸、线段和角点阈值 |
 | `RealtimeDetectionResult` | 实时检测结果，并明确记录是否丢弃了过期帧 |
 | `render_target_observations()` | 在同坐标系图像副本上叠加框、颜色掩码、K0、置信度和质量 |
-| `PerceptionFrameRenderer` | 单槽最新帧后台推理与可视化旁路；不阻塞相机/运动循环 |
+| `PerceptionFrameRenderer` | 单槽最新帧后台推理与可视化旁路；不阻塞相机/运动循环；`clear_latest()` 用于切换模式时丢弃旧结果 |
 | `StaleObservationError` | 严格 `detect()` 在结果超过允许年龄时抛出的异常 |
 | `ModelDetection` | 后端输出；框和 K0 已反映射到去畸变原尺寸 |
 | `TargetObservation` | 下游跟踪、定位和评测消费的统一观测 |

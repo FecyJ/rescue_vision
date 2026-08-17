@@ -106,6 +106,7 @@ def main() -> None:
                     sent_frames = 0
                     active_mode = VideoFrameMode.RAW
                     last_sent_sequence: int | None = None
+                    minimum_perception_sequence: int | None = None
                     try:
                         while True:
                             frame = pipeline.prepare(
@@ -140,6 +141,15 @@ def main() -> None:
                                         )
                                     active_mode = command.mode
                                     last_sent_sequence = None
+                                    if active_mode is VideoFrameMode.PERCEPTION:
+                                        if perception_renderer is None:
+                                            raise RuntimeError(
+                                                "Perception video mode is not configured."
+                                            )
+                                        perception_renderer.clear_latest()
+                                        minimum_perception_sequence = frame.sequence
+                                    else:
+                                        minimum_perception_sequence = None
                                     print(
                                         f"video_mode={active_mode.value} "
                                         f"request_id={command.request_id}",
@@ -167,7 +177,11 @@ def main() -> None:
                                 if output_frame is None:
                                     next_video_ns = now_ns + video_period_ns
                                     continue
-                                if output_frame.sequence < frame.sequence:
+                                if (
+                                    minimum_perception_sequence is not None
+                                    and output_frame.sequence
+                                    < minimum_perception_sequence
+                                ):
                                     next_video_ns = now_ns + video_period_ns
                                     continue
                             if output_frame.sequence == last_sent_sequence:

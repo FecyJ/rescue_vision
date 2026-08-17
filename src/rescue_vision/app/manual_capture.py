@@ -614,6 +614,7 @@ class ManualCaptureRuntime:
         self.vehicle = VehicleState(safety_mode=safety_mode)
         self.video_mode = VideoFrameMode.RAW
         self.last_sent_video_sequence: int | None = None
+        self.minimum_perception_sequence: int | None = None
         self.latest_frame: CameraFrame | None = None
         self.last_camera_frame_ns = time.monotonic_ns()
         self.next_video_ns = 0
@@ -761,6 +762,16 @@ class ManualCaptureRuntime:
                 raise ValueError("Perception video mode is not configured.")
             self.video_mode = command.mode
             self.last_sent_video_sequence = None
+            if command.mode is VideoFrameMode.PERCEPTION:
+                assert self.perception_renderer is not None
+                self.perception_renderer.clear_latest()
+                self.minimum_perception_sequence = (
+                    None
+                    if self.latest_frame is None
+                    else self.latest_frame.sequence
+                )
+            else:
+                self.minimum_perception_sequence = None
             if (
                 command.mode is VideoFrameMode.PERCEPTION
                 and self.latest_frame is not None
@@ -800,10 +811,9 @@ class ManualCaptureRuntime:
             frame = self.perception_renderer.latest()
             if frame is None:
                 return
-            if (
-                self.latest_frame is not None
-                and frame.sequence < self.latest_frame.sequence
-            ):
+            if self.minimum_perception_sequence is None:
+                self.minimum_perception_sequence = frame.sequence
+            if frame.sequence < self.minimum_perception_sequence:
                 return
         if frame is None or frame.sequence == self.last_sent_video_sequence:
             return
