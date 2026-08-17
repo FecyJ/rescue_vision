@@ -448,10 +448,16 @@ class RemoteMotionExecutor:
                 # 共用树莓派单轮加速度限制。真机固件的 b0,0 会让实测轮速
                 # 直接归零，只保留给死手关闭、超时和异常等安全停车路径。
                 self.controller.drive(0.0, 0.0)
+                applied_linear = 0.0
+                applied_angular = 0.0
             else:
-                self.controller.drive(
-                    command.linear_velocity_m_s,
-                    command.angular_velocity_rad_s,
+                # 手柄两个轴分别合法时，差速合成仍可能让外侧轮超限。
+                # 同比缩放保留曲率，底层单轮硬上限仍由 controller 校验。
+                applied_linear, applied_angular = (
+                    self.controller.drive_wheel_limited(
+                        command.linear_velocity_m_s,
+                        command.angular_velocity_rad_s,
+                    )
                 )
         except BaseException as exc:
             try:
@@ -476,8 +482,8 @@ class RemoteMotionExecutor:
             message.received_timestamp_ns,
             deadline_ns,
             command.deadman_enabled,
-            command.linear_velocity_m_s,
-            command.angular_velocity_rad_s,
+            applied_linear,
+            applied_angular,
         )
 
     def check_timeout(self, *, now_ns: int | None = None) -> bool:

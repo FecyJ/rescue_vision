@@ -168,6 +168,51 @@ class MotionController:
     ) -> None:
         """执行车体 twist；角速度逆时针（左转）为正。"""
 
+        linear, angular = self._validate_twist(
+            linear_velocity_m_s,
+            angular_velocity_rad_s,
+        )
+        half_track = self.limits.wheel_track_m / 2.0
+        self.set_wheel_speeds(
+            linear - angular * half_track,
+            linear + angular * half_track,
+        )
+
+    def drive_wheel_limited(
+        self,
+        linear_velocity_m_s: float,
+        angular_velocity_rad_s: float,
+    ) -> tuple[float, float]:
+        """按比例缩放合法 twist，使差速合成不超过单轮硬上限。
+
+        返回实际采用的 ``(linear_velocity_m_s, angular_velocity_rad_s)``。
+        线速度或角速度自身超限时仍拒绝，不以缩放掩盖非法请求。
+        """
+
+        linear, angular = self._validate_twist(
+            linear_velocity_m_s,
+            angular_velocity_rad_s,
+        )
+        half_track = self.limits.wheel_track_m / 2.0
+        left = linear - angular * half_track
+        right = linear + angular * half_track
+        peak_wheel_speed = max(abs(left), abs(right))
+        maximum = self.limits.max_wheel_velocity_m_s
+        if peak_wheel_speed > maximum:
+            # 朝零取下一浮点数，避免除乘舍入让理论边界重新高出硬上限。
+            scale = math.nextafter(maximum / peak_wheel_speed, 0.0)
+            linear *= scale
+            angular *= scale
+            left *= scale
+            right *= scale
+        self.set_wheel_speeds(left, right)
+        return linear, angular
+
+    def _validate_twist(
+        self,
+        linear_velocity_m_s: float,
+        angular_velocity_rad_s: float,
+    ) -> tuple[float, float]:
         linear = _finite(linear_velocity_m_s, "linear_velocity_m_s")
         angular = _finite(angular_velocity_rad_s, "angular_velocity_rad_s")
         if abs(linear) > self.limits.max_linear_velocity_m_s:
@@ -180,11 +225,7 @@ class MotionController:
                 "angular_velocity_rad_s exceeds configured limit "
                 f"{self.limits.max_angular_velocity_rad_s}: {angular}."
             )
-        half_track = self.limits.wheel_track_m / 2.0
-        self.set_wheel_speeds(
-            linear - angular * half_track,
-            linear + angular * half_track,
-        )
+        return linear, angular
 
     def forward(self, speed_m_s: float) -> None:
         """以非负速度直行前进。"""

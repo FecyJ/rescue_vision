@@ -18,6 +18,7 @@
 | `MotionLimits` | 轮距、车体/车轮速度与单轮加速度上限、远程有效期上限 | 创建时严格校验 |
 | `MotionController` | UART 行通道、`MotionLimits` | Rescue Car 运动控制器 |
 | `MotionController.drive()` | 前进速度 m/s、逆时针角速度 rad/s | 差速换算后设置左右轮目标 |
+| `drive_wheel_limited()` | 分别合法的车体线速度和角速度 | 必要时同比缩放并返回实际 twist，使单轮不超限 |
 | `set_wheel_speeds()` | 左右轮速度 m/s | 绕过车体 twist 换算，仍执行轮速限幅校验 |
 | `update()` | 可选本机单调时间 ns | 按单轮最大加速度推进并下发目标；返回是否发送 |
 | `forward()` / `backward()` | 非负速度 m/s | 直行前进/后退 |
@@ -49,10 +50,12 @@ left  = linear - angular × wheel_track / 2
 right = linear + angular × wheel_track / 2
 ```
 
-超限命令会被拒绝，不会静默截断。合法目标则由
-`max_wheel_acceleration_m_s2` 限制每个轮子的速度变化率；这同时限制直线
-加速和转向跳变。`target_heading` 在定位或 IMU 尚未提供其显式参考系前也会
-被拒绝并停车。
+底层 `drive()` 的超限命令会被拒绝，不会静默截断。手动遥控执行器使用
+`drive_wheel_limited()`：当线速度和角速度分别合法、但二者合成使外侧轮超限
+时，会同比缩放两个分量以保持曲率，并在执行结果和运动日志中记录实际 twist。
+合法轮速目标则由 `max_wheel_acceleration_m_s2` 限制每个轮子的速度变化率；
+这同时限制直线加速和转向跳变。`target_heading` 在定位或 IMU 尚未提供其显式
+参考系前也会被拒绝并停车。
 
 ## 1. 从运行配置装配
 
@@ -283,8 +286,10 @@ with channel:
 ```
 
 `execute()` 只接受 `control/debug/motion`、`application/json`、空 attributes
-和 `TWIST`。非法、超限或不支持的命令会先尝试柔和停车，再抛出
-`RemoteMotionError`。
+和 `TWIST`。线速度或角速度自身超限、非法或不支持的命令会先尝试柔和停车，
+再抛出 `RemoteMotionError`。只有二者分别合法但差速合成超出单轮上限时，
+执行器才会保持曲率同比缩放；`outcome.linear_velocity_m_s` 和
+`outcome.angular_velocity_rad_s` 是实际采用值。
 
 夹爪 topic 由独立执行器处理；以下片段继续假设 UART 已打开，且
 `received_gripper` 来自同一远程连接：

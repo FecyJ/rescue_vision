@@ -310,6 +310,66 @@ def test_motion_limits_reject_instead_of_clamping() -> None:
     assert channel.sent == []
 
 
+@pytest.mark.parametrize(
+    ("linear", "angular"),
+    [
+        (0.2, -0.8),
+        (0.2, 0.8),
+        (-0.2, -0.8),
+        (-0.2, 0.8),
+    ],
+)
+def test_wheel_limited_drive_preserves_curvature_at_joystick_diagonal(
+    linear: float,
+    angular: float,
+) -> None:
+    channel = FakeCarChannel()
+    controller = MotionController(
+        channel,
+        MotionLimits(
+            wheel_track_m=0.275,
+            max_linear_velocity_m_s=0.25,
+            max_angular_velocity_rad_s=1.0,
+            max_wheel_velocity_m_s=0.30,
+            max_wheel_acceleration_m_s2=0.50,
+            max_remote_command_valid_for_ms=500,
+        ),
+    )
+
+    applied_linear, applied_angular = controller.drive_wheel_limited(
+        linear,
+        angular,
+    )
+
+    scale = 0.30 / 0.31
+    original_wheels = (
+        linear - angular * 0.275 / 2.0,
+        linear + angular * 0.275 / 2.0,
+    )
+    assert applied_linear == pytest.approx(linear * scale)
+    assert applied_angular == pytest.approx(angular * scale)
+    assert controller.target_wheel_speeds_m_s == pytest.approx(
+        tuple(wheel * scale for wheel in original_wheels)
+    )
+    assert max(map(abs, controller.target_wheel_speeds_m_s)) == pytest.approx(
+        0.30
+    )
+    assert applied_angular / applied_linear == pytest.approx(angular / linear)
+    assert channel.sent == []
+
+
+def test_wheel_limited_drive_still_rejects_body_velocity_limit() -> None:
+    channel = FakeCarChannel()
+    controller = MotionController(channel, limits())
+
+    with pytest.raises(ValueError, match="linear_velocity"):
+        controller.drive_wheel_limited(0.31, 0.0)
+    with pytest.raises(ValueError, match="angular_velocity"):
+        controller.drive_wheel_limited(0.0, 2.1)
+
+    assert channel.sent == []
+
+
 def test_parse_car_replies_telemetry_and_unknown_prefix() -> None:
     telemetry = parse_car_line(
         ReceivedUartLine(
@@ -425,6 +485,44 @@ def test_remote_twist_executes_and_expiry_uses_receive_clock() -> None:
     ) == pytest.approx(0.01)
     assert executor.check_timeout(now_ns=1_200_000_000)
     assert channel.sent == [b"m0.1,0.1", b"b0,0"]
+
+
+def test_remote_twist_scales_coupled_wheel_limit_instead_of_stopping() -> None:
+    channel = FakeCarChannel()
+    controller = MotionController(
+        channel,
+        MotionLimits(
+            wheel_track_m=0.275,
+            max_linear_velocity_m_s=0.25,
+            max_angular_velocity_rad_s=1.0,
+            max_wheel_velocity_m_s=0.30,
+            max_wheel_acceleration_m_s2=0.50,
+            max_remote_command_valid_for_ms=500,
+        ),
+    )
+    executor = RemoteMotionExecutor(
+        controller,
+        monotonic_ns=lambda: 1_050_000_000,
+    )
+
+    result = executor.execute(
+        remote_message(
+            twist_command(
+                linear_velocity_m_s=0.2,
+                angular_velocity_rad_s=-0.8,
+            )
+        )
+    )
+
+    scale = 0.30 / 0.31
+    assert result.result is RemoteMotionResult.APPLIED
+    assert result.linear_velocity_m_s == pytest.approx(0.2 * scale)
+    assert result.angular_velocity_rad_s == pytest.approx(-0.8 * scale)
+    assert controller.target_wheel_speeds_m_s == pytest.approx(
+        (0.30, 0.09 * scale)
+    )
+    assert executor.active_deadline_ns == 1_200_000_000
+    assert channel.sent == []
 
 
 def test_remote_zero_twist_slew_limits_to_zero_and_clears_deadline() -> None:
