@@ -15,7 +15,7 @@
 - `field_features.py`：从图片或视频离线检测安全区、无编号出发区、中心十字和低精度边界候选，写出 JSONL 及可选叠加图；不访问相机或 Hailo。
 - `camera_undistort_perception.py`：按实际 `runtime.yaml` 连续执行相机、去畸变、Hailo Pose、ROI HSV 掩码和 K0/地面点叠加预览，按 `Q/Esc` 退出；偶发过期帧会标红并丢弃，不会终止预览。
 - `remote_link.py --config PATH`：在树莓派侧以 `remote.role: server` 监听电脑端客户端，连接后发送协议要求的最小会话状态，并持续打印收到的 control；该状态有意声明所有业务能力不可用，所以正式客户端应保持控制禁用。仅验证连接可使用 `observe_only`；用自制底层客户端检查 control 帧时使用 `debug_control`。
-- `remote_video.py --config PATH`：发送真实相机的最新 JPEG 帧和周期会话状态，不接收或执行控制。
+- `remote_video.py --config PATH`：发送真实相机的最新 JPEG 帧和周期会话状态，接收电脑端的原图/perception 图像模式请求，但不接收或执行运动、夹爪和采集控制。
 - `remote_capture.py`：兼容旧人工命令的薄包装；正式入口为 `rescue-vision-manual-capture`。
 
 运行前先执行 `python -m pip install -e .`，并确保系统包和显示环境可用。
@@ -117,8 +117,10 @@ python manual_tests/remote_video.py \
   --jpeg-quality 80
 ```
 
-脚本先启动配置中的真实相机，客户端连接后首条发送会话状态，再按
-`observation/video/frame` 发送最新 JPEG。若单帧超过
+脚本先启动配置中的真实相机，客户端连接后首条发送会话状态，其中
+`video_modes` 声明当前是否配置 Hailo perception；电脑端通过
+`control/video/mode` 选择 `raw` 或 `perception`，再按
+`observation/video/frame` 发送带实际 `mode` 的最新 JPEG。若单帧超过
 `remote.max_payload_bytes` 会明确失败；应降低 JPEG quality、相机分辨率或
 合理提高双方一致的 payload 上限，不能静默截断。
 

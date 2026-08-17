@@ -35,6 +35,8 @@ from rescue_vision.communication import (
     RemoteTopic,
     VehicleSafetyMode,
     VehicleStateObservation,
+    VideoFrameMode,
+    VideoModeCommand,
 )
 from rescue_vision.data.check_recording import inspect_recording
 from rescue_vision.motion import (
@@ -115,14 +117,24 @@ class TelemetryAfterMotionChannel(FakeCarChannel):
 
 
 class FakeConnection:
-    def __init__(self, controls: list[ReceivedRemoteMessage]) -> None:
+    def __init__(
+        self,
+        controls: list[ReceivedRemoteMessage],
+        *,
+        empty_polls_before_disconnect: int = 0,
+    ) -> None:
         self.controls = list(controls)
+        self.empty_polls_before_disconnect = empty_polls_before_disconnect
         self.observations: list[tuple[str, bytes]] = []
+        self.observation_attributes: list[tuple[str, dict[str, object]]] = []
 
     def receive_control(self, timeout: float | None = None):
         del timeout
         if self.controls:
             return self.controls.pop(0)
+        if self.empty_polls_before_disconnect > 0:
+            self.empty_polls_before_disconnect -= 1
+            raise TimeoutError
         raise RemoteDisconnectedError("test disconnect")
 
     def send_reliable_observation(
@@ -137,9 +149,33 @@ class FakeConnection:
         self,
         topic: str,
         payload: bytes,
-        **_kwargs: object,
+        **kwargs: object,
     ) -> None:
         self.observations.append((topic, payload))
+        attributes = kwargs.get("attributes")
+        self.observation_attributes.append(
+            (
+                topic,
+                dict(attributes) if isinstance(attributes, dict) else {},
+            )
+        )
+
+
+class FakePerceptionRenderer:
+    def __init__(self) -> None:
+        self.latest_frame: CameraFrame | None = None
+
+    def submit(self, frame: CameraFrame) -> None:
+        image = frame.image_bgr.copy()
+        image[0, 0] = (255, 0, 255)
+        self.latest_frame = CameraFrame(
+            sequence=frame.sequence,
+            timestamp_ns=frame.timestamp_ns,
+            image_bgr=image,
+        )
+
+    def latest(self) -> CameraFrame | None:
+        return self.latest_frame
 
 
 class PollingServer:
@@ -425,6 +461,72 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
     assert second_vehicle.last_received_motion_command_id is None
     assert second_vehicle.last_applied_motion_command_id is None
     assert car.sent[-1] == b"b0,0"
+
+
+def test_manual_session_switches_between_raw_and_perception_video(tmp_path) -> None:
+    config = _config()
+    source_frame = CameraFrame(
+        sequence=4,
+        timestamp_ns=1,
+        image_bgr=np.zeros((3, 4, 3), dtype=np.uint8),
+    )
+    pipeline = CameraPipeline(
+        FakeSource(source_frame),
+        None,
+        ImageCoordinateSystem.RAW_PIXEL,
+        None,
+    )
+    capture = CaptureSession(
+        output_root=tmp_path,
+        config=config,
+        config_snapshot={},
+        pipeline=pipeline,
+    )
+    mode_command = VideoModeCommand(
+        request_id="video-1",
+        issued_timestamp_ns=1,
+        mode=VideoFrameMode.PERCEPTION,
+    )
+    connection = FakeConnection(
+        [_received(RemoteTopic.VIDEO_MODE, mode_command.to_payload(), 0)],
+        empty_polls_before_disconnect=100,
+    )
+    car = FakeCarChannel()
+    executor = RemoteMotionExecutor(
+        MotionController(
+            car,
+            MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 500),
+        )
+    )
+    renderer = FakePerceptionRenderer()
+    status = build_session_status(
+        config,
+        server_instance_id="test-server",
+        video_fps=1_000.0,
+        video_modes=(VideoFrameMode.RAW, VideoFrameMode.PERCEPTION),
+    )
+
+    with pytest.raises(RemoteDisconnectedError):
+        run_manual_capture_session(
+            connection,
+            executor,
+            None,
+            capture,
+            pipeline,
+            status,
+            video_fps=1_000.0,
+            jpeg_quality=80,
+            perception_renderer=renderer,  # type: ignore[arg-type]
+            safety_mode=VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP,
+        )
+
+    modes = [
+        attributes["mode"]
+        for topic, attributes in connection.observation_attributes
+        if topic == RemoteTopic.VIDEO_FRAME.value
+    ]
+    assert "raw" in modes
+    assert "perception" in modes
 
 
 def test_recording_queue_overflow_faults_capture_and_requires_stop(

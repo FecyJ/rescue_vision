@@ -45,6 +45,8 @@ from rescue_vision.communication import (
     VehicleStateObservation,
     VehicleStopReason,
     VideoFrameAttributes,
+    VideoFrameMode,
+    VideoModeCommand,
 )
 from rescue_vision.config import load_runtime_config
 from rescue_vision.config.runtime import AppConfig
@@ -68,6 +70,7 @@ from rescue_vision.motion import (
     RemoteMotionResult,
     run_remote_motion,
 )
+from rescue_vision.perception import PerceptionFrameRenderer
 SESSION_STATUS_PERIOD_MS = 1_000
 VEHICLE_STATUS_PERIOD_MS = 100
 CAPTURE_STATUS_PERIOD_MS = 500
@@ -594,6 +597,7 @@ class ManualCaptureRuntime:
         session_status: RemoteSessionStatus,
         video_fps: float,
         jpeg_quality: int,
+        perception_renderer: PerceptionFrameRenderer | None,
         stop_requested: Callable[[], bool],
         safety_mode: VehicleSafetyMode,
     ) -> None:
@@ -605,8 +609,11 @@ class ManualCaptureRuntime:
         self.session_status = session_status
         self.video_period_ns = int(1_000_000_000 / video_fps)
         self.jpeg_quality = jpeg_quality
+        self.perception_renderer = perception_renderer
         self.stop_requested = stop_requested
         self.vehicle = VehicleState(safety_mode=safety_mode)
+        self.video_mode = VideoFrameMode.RAW
+        self.last_sent_video_sequence: int | None = None
         self.latest_frame: CameraFrame | None = None
         self.last_camera_frame_ns = time.monotonic_ns()
         self.next_video_ns = 0
@@ -681,14 +688,15 @@ class ManualCaptureRuntime:
                 raise
             self.last_camera_frame_ns = time.monotonic_ns()
             self.capture.record(self.latest_frame)
+            if self.video_mode is VideoFrameMode.PERCEPTION:
+                if self.perception_renderer is None:
+                    raise RuntimeError(
+                        "Perception video mode is not available in this session."
+                    )
+                self.perception_renderer.submit(self.latest_frame)
         now_ns = time.monotonic_ns()
         if self.latest_frame is not None and now_ns >= self.next_video_ns:
-            _send_video_frame(
-                self.connection,
-                self.latest_frame,
-                self.pipeline,
-                jpeg_quality=self.jpeg_quality,
-            )
+            self._send_current_video()
             self.next_video_ns = now_ns + self.video_period_ns
         if now_ns >= self.next_session_status_ns:
             self.session_status = replace(
@@ -740,6 +748,26 @@ class ManualCaptureRuntime:
             raise ValueError(
                 f"Unsupported remote control message {message.topic!r}."
             )
+        if message.topic == RemoteTopic.VIDEO_MODE.value:
+            command = VideoModeCommand.from_payload(message.payload)
+            if command.mode not in self.session_status.video_modes:
+                raise ValueError(
+                    f"Video mode {command.mode.value!r} is not available."
+                )
+            if (
+                command.mode is VideoFrameMode.PERCEPTION
+                and self.perception_renderer is None
+            ):
+                raise ValueError("Perception video mode is not configured.")
+            self.video_mode = command.mode
+            self.last_sent_video_sequence = None
+            if (
+                command.mode is VideoFrameMode.PERCEPTION
+                and self.latest_frame is not None
+            ):
+                assert self.perception_renderer is not None
+                self.perception_renderer.submit(self.latest_frame)
+            return
         if message.topic == RemoteTopic.DEBUG_GRIPPER.value:
             if self.gripper_executor is None:
                 raise ValueError(
@@ -763,6 +791,30 @@ class ManualCaptureRuntime:
             raise RuntimeError(
                 f"Capture request {command.request_id!r} failed."
             )
+
+    def _send_current_video(self) -> None:
+        frame = self.latest_frame
+        if self.video_mode is VideoFrameMode.PERCEPTION:
+            if self.perception_renderer is None:
+                raise RuntimeError("Perception video mode is not configured.")
+            frame = self.perception_renderer.latest()
+            if frame is None:
+                return
+            if (
+                self.latest_frame is not None
+                and frame.sequence < self.latest_frame.sequence
+            ):
+                return
+        if frame is None or frame.sequence == self.last_sent_video_sequence:
+            return
+        _send_video_frame(
+            self.connection,
+            frame,
+            self.pipeline,
+            jpeg_quality=self.jpeg_quality,
+            mode=self.video_mode,
+        )
+        self.last_sent_video_sequence = frame.sequence
 
     def _send_capture_status(self) -> None:
         self.connection.send_reliable_observation(
@@ -805,6 +857,7 @@ def build_session_status(
     *,
     server_instance_id: str,
     video_fps: float,
+    video_modes: tuple[VideoFrameMode, ...] = (VideoFrameMode.RAW,),
 ) -> RemoteSessionStatus:
     return RemoteSessionStatus(
         session_id=f"session-{uuid.uuid4()}",
@@ -815,6 +868,7 @@ def build_session_status(
         gripper_control_available=config.motion.gripper.enabled,
         capture_control_available=True,
         video_stream_available=True,
+        video_modes=video_modes,
         map_snapshot_available=False,
         vehicle_state_available=True,
         capture_status_available=True,
@@ -842,6 +896,7 @@ def run_manual_capture_session(
     *,
     video_fps: float,
     jpeg_quality: int,
+    perception_renderer: PerceptionFrameRenderer | None = None,
     stop_requested: Callable[[], bool] = lambda: False,
     safety_mode: VehicleSafetyMode = VehicleSafetyMode.UNAVAILABLE,
 ) -> None:
@@ -854,6 +909,7 @@ def run_manual_capture_session(
         session_status=session_status,
         video_fps=video_fps,
         jpeg_quality=jpeg_quality,
+        perception_renderer=perception_renderer,
         stop_requested=stop_requested,
         safety_mode=safety_mode,
     )
@@ -902,6 +958,7 @@ def _send_video_frame(
     pipeline: CameraPipeline,
     *,
     jpeg_quality: int,
+    mode: VideoFrameMode = VideoFrameMode.RAW,
 ) -> None:
     ok, encoded = cv2.imencode(
         ".jpg",
@@ -918,6 +975,7 @@ def _send_video_frame(
         height=height,
         coordinate_system=pipeline.coordinate_system,
         calibration_id=pipeline.calibration_id,
+        mode=mode,
     )
     connection.send_observation(
         RemoteTopic.VIDEO_FRAME.value,
@@ -1023,6 +1081,16 @@ def main() -> None:
     assert channel is not None
     assert executor is not None
     pipeline = build_camera_pipeline(config)
+    perception_renderer = (
+        PerceptionFrameRenderer(config.build_target_pose_detector)
+        if config.hailo.enabled
+        else None
+    )
+    video_modes = (
+        (VideoFrameMode.RAW, VideoFrameMode.PERCEPTION)
+        if perception_renderer is not None
+        else (VideoFrameMode.RAW,)
+    )
     server_instance_id = f"manual-capture-{uuid.uuid4()}"
     shutdown_requested = threading.Event()
     previous_sigterm = signal.getsignal(signal.SIGTERM)
@@ -1033,8 +1101,10 @@ def main() -> None:
 
     try:
         with server, channel:
-            pipeline.source.start()
+            if perception_renderer is not None:
+                perception_renderer.start()
             try:
+                pipeline.source.start()
                 while not shutdown_requested.is_set():
                     connection = _accept_with_shutdown(
                         server,
@@ -1054,6 +1124,7 @@ def main() -> None:
                         config,
                         server_instance_id=server_instance_id,
                         video_fps=args.video_fps,
+                        video_modes=video_modes,
                     )
                     try:
                         with connection:
@@ -1066,6 +1137,7 @@ def main() -> None:
                                 status,
                                 video_fps=args.video_fps,
                                 jpeg_quality=args.jpeg_quality,
+                                perception_renderer=perception_renderer,
                                 stop_requested=shutdown_requested.is_set,
                                 safety_mode=(
                                     VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP
@@ -1085,7 +1157,11 @@ def main() -> None:
                 try:
                     executor.stop()
                 finally:
-                    pipeline.source.stop()
+                    try:
+                        pipeline.source.stop()
+                    finally:
+                        if perception_renderer is not None:
+                            perception_renderer.stop()
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
 

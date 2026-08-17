@@ -28,6 +28,8 @@ K0、完整相机外参和可配置三维形状估计目标地面中心、朝向
 | `BoundaryFeatureObservation` | 显式低置信度的围栏基线或场地角点候选 |
 | `FieldFeatureConfig` | 场地颜色、形态学、尺寸、线段和角点阈值 |
 | `RealtimeDetectionResult` | 实时检测结果，并明确记录是否丢弃了过期帧 |
+| `render_target_observations()` | 在同坐标系图像副本上叠加框、颜色掩码、K0、置信度和质量 |
+| `PerceptionFrameRenderer` | 单槽最新帧后台推理与可视化旁路；不阻塞相机/运动循环 |
 | `StaleObservationError` | 严格 `detect()` 在结果超过允许年龄时抛出的异常 |
 | `ModelDetection` | 后端输出；框和 K0 已反映射到去畸变原尺寸 |
 | `TargetObservation` | 下游跟踪、定位和评测消费的统一观测 |
@@ -123,6 +125,45 @@ with source, detector:
 `StaleObservationError`，返回空观测并通过 `stale_dropped` /
 `dropped_stale_age_ms` 记录原因。输入尺寸、类别映射、模型或硬件异常仍会抛出。
 离线评测和需要严格失败语义的工具可以直接调用 `detect()`。
+
+## 4.1 为远程图传创建 perception 可视化旁路
+
+远程图传使用当前 `runtime.yaml` 的 Hailo、类别和 HSV 配置，不在通信或应用
+模块另写模型路径、阈值或映射。以下片段承接第 1、2 节的 `config`、`geometry`
+和 `source`；它使用配置装配方法，因此不要同时复用第 3 节已经手工创建的
+`backend`：
+
+```python
+from rescue_vision.perception import PerceptionFrameRenderer
+
+renderer = PerceptionFrameRenderer(config.build_target_pose_detector)
+renderer.start()
+```
+
+创建并启动后，远程发布循环只提交最新的去畸变 `CameraFrame`，不等待推理：
+下例中的 `undistorted_frame` 由前文 `source` 读取并经过同一 `CameraModel` 准备。
+
+```python
+renderer.submit(undistorted_frame)
+visualized_frame = renderer.latest()
+if visualized_frame is not None:
+    # visualized_frame.image_bgr 与 undistorted_frame 使用同一
+    # (width, height) 和 UndistortedPixel 图像坐标；其 sequence/timestamp_ns
+    # 保留原相机帧身份，再交给 JPEG 图传发布器。
+    publish_jpeg(visualized_frame)
+```
+
+退出或断线时，调用方仍必须停止旁路；切回只传原图时可以保留已启动的旁路，
+但不再提交帧：
+
+```python
+renderer.stop()
+```
+
+旁路只保留一个待处理帧和一个最新结果；未产生第一张可视化图时返回 `None`，
+而不是把原图伪装成 perception 结果。推理过期时返回带红色 `STALE dropped`
+标记的图；Hailo、输入或渲染异常通过 `submit()`/`latest()` 抛出，调用方应关闭
+当前远程会话并按应用安全路径清理资源。
 
 若 `ground_mapping_enabled: false`，检测仍正常运行，但所有 `ground_point` 为 `None`。后续定位模块不能把 `None` 当作 `(0, 0)`。
 

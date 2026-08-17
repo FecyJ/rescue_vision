@@ -17,6 +17,7 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `load_runtime_config(path)` | 严格读取一次 YAML | 返回不可变 `AppConfig` |
 | `AppConfig.build_camera_model()` | 按内参开关创建 `CameraModel` | 内参关闭时返回 `None` |
 | `AppConfig.build_geometry()` | 创建相机模型和可选地面映射 | 内参关闭时返回 `None`；只有内参时 projector 为 `None` |
+| `AppConfig.build_target_pose_detector()` | 按当前 Hailo、类别和 HSV 配置创建任务目标检测器 | Hailo 关闭时返回 `None`；返回对象接管 backend 生命周期 |
 | `UartConfig.build_channel()` | 创建协议无关 UART 行通道 | UART 关闭时返回 `None`；创建时尚不打开设备 |
 | `RemoteConfig.build_server()` | 创建树莓派直接 TCP 服务端 | 远程关闭时返回 `None`；创建时尚不监听 |
 | `RemoteConfig.connect_client()` | 仓库内参考客户端建立直接 TCP 连接 | 只用于互操作/人工检查；独立电脑端不得依赖 |
@@ -142,6 +143,25 @@ color_classifier = config.perception.color_classifier
 
 `backend` 必须由调用方关闭；正常生产路径通常立即交给
 `TargetPoseDetector`，再由检测器上下文统一释放。
+
+需要把 detector 交给远程 perception 图传旁路时，优先使用同一 `AppConfig` 的
+装配方法；它不会在 Hailo 关闭时偷偷创建测试后端：
+
+```python
+detector = config.build_target_pose_detector()
+if detector is None:
+    raise RuntimeError("当前配置未启用 Hailo，不能提供 perception 图传")
+
+try:
+    # `frame` 是上游 FrameSource 已准备好的 CameraFrame；
+    # PerceptionFrameRenderer 或其他调用方在这里消费 detector。
+    observations = detector.detect_realtime(frame, frame.image_bgr)
+finally:
+    detector.close()
+```
+
+实时远程发布应把 detector 放入有界最新帧旁路，不要在运动安全循环中同步调用
+推理；`perception.PerceptionFrameRenderer` 已提供该生命周期和降级语义。
 
 ## 5. 装配纯逻辑对象
 

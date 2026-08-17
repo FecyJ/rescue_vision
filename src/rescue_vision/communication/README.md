@@ -24,14 +24,16 @@
 | `RemoteTcpServer` | 树莓派 TCP 服务端 | 单监听端点；`accept()` 返回一个消息连接 |
 | `connect_remote_client()` | 仓库内参考客户端 | 只用于互操作和人工检查 |
 | `RemoteMessageConnection` | 一个 TCP 会话的双向消息通道 | 启动两个后台线程，严格验证线路序号 |
-| `send_control()` | 提交可靠控制 | 仅 `debug_control` 客户端可用；队列满时失败 |
-| `receive_control()` | 接收控制 | 树莓派 `observe_only` 会在传输层拒绝控制 |
+| `send_control()` | 提交可靠控制或图像模式请求 | 运动/夹爪/采集仅 `debug_control` 可用；图像模式请求不执行动作；队列满时失败 |
+| `receive_control()` | 接收控制或图像模式请求 | `observe_only` 仍拒绝执行控制，但允许 `control/video/mode` |
 | `send_reliable_observation()` | 提交会话/采集等关键状态 | 队列满时失败，不静默覆盖 |
 | `send_observation()` | 提交视频、地图、车辆最新值 | 按 topic 合并，队列满时丢旧保新 |
 | `receive_observation()` | 接收观察消息 | 仓库参考客户端也按 topic 保留最新值 |
 | `DebugMotionCommand` | 调试运动 JSON schema | 死手、有效期、车体速度和可选目标朝向 |
 | `DebugGripperCommand` | 调试夹爪 JSON | 有效期和张开/闭合扳机按压布尔状态 |
 | `DebugCaptureCommand` | 调试采集 JSON schema | 开始、停止、抓拍和事件标记 |
+| `VideoModeCommand` | 图像模式请求 JSON schema | 客户端选择 `raw` 或 `perception`，不改变车辆动作 |
+| `VideoFrameMode` | 图像内容枚举 | `raw` 原图/当前图传；`perception` 推理叠加图 |
 | `RemoteSessionStatus` | 会话权限、能力、限值和周期 | TCP 建立后的首条业务消息 |
 | `VideoFrameAttributes` | JPEG 帧 header attributes | 严格尺寸、坐标系、时间和标定身份 |
 | `VehicleStateObservation` | 车辆观察 JSON | UART、轮速、夹爪角度、显式安全模式和命令 ID |
@@ -192,6 +194,7 @@ import uuid
 from rescue_vision.communication import (
     RemoteSessionStatus,
     RemoteTopic,
+    VideoFrameMode,
 )
 
 session_status = RemoteSessionStatus(
@@ -203,6 +206,7 @@ session_status = RemoteSessionStatus(
     gripper_control_available=False,
     capture_control_available=False,
     video_stream_available=True,
+    video_modes=(VideoFrameMode.RAW,),
     map_snapshot_available=False,
     vehicle_state_available=False,
     capture_status_available=False,
@@ -260,6 +264,7 @@ remote_connection.send_reliable_observation(
 from rescue_vision.communication import (
     ImageCoordinateSystem,
     RemoteTopic,
+    VideoFrameMode,
     VideoFrameAttributes,
 )
 
@@ -270,6 +275,7 @@ video_attributes = VideoFrameAttributes(
     height=frame.image_bgr.shape[0],
     coordinate_system=ImageCoordinateSystem.RAW_PIXEL,
     calibration_id=None,
+    mode=VideoFrameMode.RAW,
 )
 
 remote_connection.send_observation(
@@ -280,7 +286,9 @@ remote_connection.send_observation(
 )
 ```
 
-这里的 `frame` 和 `encoded_jpeg` 由尚待实现的正式车端发布器提供。
+这里的 `frame` 和 `encoded_jpeg` 由车端相机发布器提供；若选择
+`VideoFrameMode.PERCEPTION`，发布器应把 perception 叠加结果编码，并在
+attributes 写入同样的 `mode`。
 `send_observation()` 非阻塞提交；同 topic 新值覆盖旧值，容量不足时再丢弃
 最早等待的其他 topic，避免网络反压相机
 实时路径。地图和车辆最新状态使用相同入口。
@@ -303,8 +311,9 @@ remote_connection.send_reliable_observation(
 
 ## 9. 在树莓派接收和解析调试控制
 
-只有服务端配置为 `debug_control` 时，连接才允许收到 control。接收后先按
-topic 分派，再用相应 schema 解析：
+运动、夹爪和采集 control 只有服务端配置为 `debug_control` 时才允许。图像模式
+请求是唯一例外：它不产生车辆动作，在 `observe_only` 会话中也可收发。接收后
+先按 topic 分派，再用相应 schema 解析：
 
 ```python
 from rescue_vision.communication import (
@@ -312,11 +321,17 @@ from rescue_vision.communication import (
     DebugGripperCommand,
     DebugMotionCommand,
     RemoteTopic,
+    VideoModeCommand,
 )
 
 received = remote_connection.receive_control(timeout=0.1)
 
-if received.topic == RemoteTopic.DEBUG_MOTION.value:
+if received.topic == RemoteTopic.VIDEO_MODE.value:
+    mode_command = VideoModeCommand.from_payload(received.payload)
+    if mode_command.mode not in session_status.video_modes:
+        raise ValueError("服务端未声明该图像模式")
+    handle_video_mode(mode_command)
+elif received.topic == RemoteTopic.DEBUG_MOTION.value:
     motion_command = DebugMotionCommand.from_payload(received.payload)
     handle_motion_command(received, motion_command)
 elif received.topic == RemoteTopic.DEBUG_GRIPPER.value:
@@ -329,7 +344,7 @@ else:
     raise ValueError(f"unsupported control topic: {received.topic!r}")
 ```
 
-这里的三个 `handle_*` 是应用领域适配器。运动指令应直接交给
+这里的四个 `handle_*` 是应用领域适配器。运动指令应直接交给
 `RemoteMotionExecutor.execute(received)`，不要在 communication 层换算轮速。
 夹爪指令应交给 `RemoteGripperExecutor.execute(received)`，不要在此层拼接
 Rescue Car 的 `g` 字符串。
@@ -338,6 +353,40 @@ Rescue Car 的 `g` 字符串。
 `received.sender_timestamp_ns` 是电脑端单调时间，只用于电脑侧追踪；
 `received.received_timestamp_ns` 才是树莓派本机接收时间。两台机器的单调
 时钟零点不可直接比较。
+
+## 9.1 选择图像传输模式
+
+电脑端先解析首条 `RemoteSessionStatus` 的 `video_modes`，只从已声明的模式中
+选择。请求不改变运动、夹爪或采集权限，因此 `observe_only` 也可发送；车端
+下一帧会在 `VideoFrameAttributes.mode` 回显实际内容：
+
+```python
+import time
+
+from rescue_vision.communication import (
+    RemoteTopic,
+    VideoFrameMode,
+    VideoModeCommand,
+)
+
+mode = VideoFrameMode.PERCEPTION
+if mode not in session_status.video_modes:
+    raise RuntimeError("车端未声明 perception 图传")
+request = VideoModeCommand(
+    request_id=f"video-{time.monotonic_ns()}",
+    issued_timestamp_ns=time.monotonic_ns(),
+    mode=mode,
+)
+remote_connection.send_control(
+    RemoteTopic.VIDEO_MODE.value,
+    request.to_payload(),
+)
+```
+
+`raw` 是当前相机帧（已按车端配置决定是否去畸变）；`perception` 是同一坐标系
+图像上叠加目标框、颜色掩码、K0、置信度和质量信息的结果。车端只保留最新待
+推理帧，推理旁路故障会终止当前会话，不会把未经声明的原图伪装成
+`perception`。
 
 ## 10. 仓库内参考客户端
 
@@ -477,8 +526,9 @@ with remote_client:
     )
 ```
 
-本地 `runtime.client.yaml` 也必须设置 `access_mode: debug_control`，否则
-`send_control()` 会在客户端传输层拒绝发送。独立电脑端不得导入本仓库
+本地 `runtime.client.yaml` 只有发送运动、夹爪或采集命令时才必须设置
+`access_mode: debug_control`；图像模式请求在 `observe_only` 也允许发送。
+独立电脑端不得导入本仓库
 Python 包；其唯一跨项目依据是
 [电脑端通信协议](../../../docs/电脑端通信协议.md)。
 
@@ -490,7 +540,8 @@ Python 包；其唯一跨项目依据是
 | `control/debug/motion` | 电脑 → 树莓派 | `DebugMotionCommand` JSON |
 | `control/debug/gripper` | 电脑 → 树莓派 | `DebugGripperCommand` JSON |
 | `control/debug/capture` | 电脑 → 树莓派 | `DebugCaptureCommand` JSON |
-| `observation/video/frame` | 树莓派 → 电脑 | JPEG 与 `VideoFrameAttributes` |
+| `control/video/mode` | 电脑 → 树莓派 | `VideoModeCommand` JSON；不执行车辆动作 |
+| `observation/video/frame` | 树莓派 → 电脑 | JPEG 与含实际 `mode` 的 `VideoFrameAttributes` |
 | `observation/map/snapshot` | 树莓派 → 电脑 | PNG 与 `MapSnapshotAttributes` |
 | `observation/vehicle/state` | 树莓派 → 电脑 | `VehicleStateObservation` JSON |
 | `observation/capture/status` | 树莓派 → 电脑 | `CaptureStatusObservation` JSON |
@@ -510,7 +561,8 @@ Python 包；其唯一跨项目依据是
 - `send_observation()` 的发送队列以及参考客户端的观察接收队列均按 topic
   合并并丢旧保新；高频视频不会覆盖仍有槽位的最新车辆状态。
   独立客户端应按 topic 分开保存关键状态和大流量图像。
-- `observe_only` 在电脑侧禁止发送控制，在树莓派侧拒绝入站控制。
+- `observe_only` 在电脑侧和树莓派侧仍禁止运动、夹爪、采集 control；仅允许
+  `control/video/mode` 这一条不执行动作的图像模式请求。
 - TCP 帧提供长度边界、严格 header 和线路序号，但不提供认证、加密或防篡改。
   协议 v2 有意删除 PSK、HMAC、握手和密钥文件。
 - TCP EOF、连接复位和发送断管统一报告为 `RemoteDisconnectedError`。服务端

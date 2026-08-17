@@ -35,6 +35,10 @@ from rescue_vision.perception.target_ground_geometry import (
     TargetGroundGeometryConfig,
     TargetGroundGeometryEstimator,
 )
+from rescue_vision.perception.visualization import (
+    PerceptionFrameRenderer,
+    render_target_observations,
+)
 from rescue_vision.perception.types import (
     COLOR_TARGET_CLASSES,
     ClassProbabilities,
@@ -91,4 +95,6 @@ __all__ = [
     "TargetPoseDetector",
     "StartZoneObservation",
     "UndistortedBoundingBox",
+    "PerceptionFrameRenderer",
+    "render_target_observations",
 ]

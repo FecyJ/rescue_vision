@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import time
 
 import cv2
 import numpy as np
@@ -18,12 +19,14 @@ from rescue_vision.perception import (
     HsvRange,
     ModelDetection,
     ObservationQuality,
+    PerceptionFrameRenderer,
     RoiColorSegmentation,
     StaleObservationError,
     TargetClass,
     TargetObservation,
     TargetPoseDetector,
     UndistortedBoundingBox,
+    render_target_observations,
 )
 from rescue_vision.perception.evaluation_adapter import (
     TargetAnnotation,
@@ -358,6 +361,52 @@ def test_realtime_detector_preserves_non_stale_errors() -> None:
             image,
             result_timestamp_ns=1_010_000_000,
         )
+
+
+def test_perception_visualization_isolated_and_marks_stale_results() -> None:
+    image = image_with_regions()
+    observations = detector([[detection()]]).detect(
+        frame(image),
+        image,
+        result_timestamp_ns=1_010_000_000,
+    )
+    original = image.copy()
+
+    preview = render_target_observations(image, observations)
+    stale_preview = render_target_observations(
+        image,
+        (),
+        dropped_stale_age_ms=151.0,
+    )
+
+    assert np.array_equal(image, original)
+    assert preview.shape == image.shape
+    assert not np.array_equal(preview, image)
+    assert not np.array_equal(stale_preview, image)
+
+
+def test_perception_frame_renderer_keeps_latest_result_off_realtime_thread() -> None:
+    image = image_with_regions()
+    source_frame = CameraFrame(7, time.monotonic_ns() - 1_000_000, image)
+    renderer = PerceptionFrameRenderer(
+        lambda: detector([[detection()]]),
+    )
+    renderer.start()
+    try:
+        renderer.submit(source_frame)
+        deadline = time.monotonic() + 1.0
+        rendered = None
+        while time.monotonic() < deadline:
+            rendered = renderer.latest()
+            if rendered is not None:
+                break
+            time.sleep(0.001)
+        assert rendered is not None
+        assert rendered.sequence == source_frame.sequence
+        assert rendered.timestamp_ns == source_frame.timestamp_ns
+        assert not np.array_equal(rendered.image_bgr, source_frame.image_bgr)
+    finally:
+        renderer.stop()
 
 
 def test_invalid_observation_coordinates_fail() -> None:

@@ -18,9 +18,11 @@ from rescue_vision.communication import (
     RemoteSessionStatus,
     RemoteTopic,
     VideoFrameAttributes,
+    VideoFrameMode,
 )
 from rescue_vision.config.runtime import AppConfig
 from rescue_vision.geometry.camera_model import CameraModel
+from rescue_vision.perception import PerceptionFrameRenderer
 
 
 SESSION_STATUS_PERIOD_MS = 1000
@@ -79,6 +81,7 @@ def build_camera_session_status(
     server_instance_id: str,
     video_nominal_fps: float,
     capture_control_available: bool,
+    video_modes: tuple[VideoFrameMode, ...] = (VideoFrameMode.RAW,),
 ) -> RemoteSessionStatus:
     return RemoteSessionStatus(
         session_id=f"session-{uuid.uuid4()}",
@@ -89,6 +92,7 @@ def build_camera_session_status(
         gripper_control_available=False,
         capture_control_available=capture_control_available,
         video_stream_available=True,
+        video_modes=video_modes,
         map_snapshot_available=False,
         vehicle_state_available=False,
         capture_status_available=capture_control_available,
@@ -136,6 +140,7 @@ def send_video_frame(
     pipeline: RemoteCameraPipeline,
     *,
     jpeg_quality: int,
+    mode: VideoFrameMode = VideoFrameMode.RAW,
 ) -> int:
     ok, encoded = cv2.imencode(
         ".jpg",
@@ -153,6 +158,7 @@ def send_video_frame(
         height=height,
         coordinate_system=pipeline.coordinate_system,
         calibration_id=pipeline.calibration_id,
+        mode=mode,
     )
     connection.send_observation(
         RemoteTopic.VIDEO_FRAME.value,
@@ -162,3 +168,13 @@ def send_video_frame(
         sender_timestamp_ns=frame.timestamp_ns,
     )
     return len(payload)
+
+
+def build_perception_renderer(
+    config: AppConfig,
+) -> PerceptionFrameRenderer | None:
+    """按运行配置创建延迟 Hailo perception 图传旁路。"""
+
+    if not config.hailo.enabled:
+        return None
+    return PerceptionFrameRenderer(config.build_target_pose_detector)
