@@ -22,6 +22,7 @@ from rescue_vision.communication import (
     VideoFrameAttributes,
     VideoFrameMode,
 )
+from rescue_vision.geometry.types import FieldPoint, MapPixel
 
 
 def session_status(**overrides: object) -> RemoteSessionStatus:
@@ -173,6 +174,33 @@ def test_map_attributes_round_trip_and_bounds() -> None:
             field_max_y_mm=1.0,
             team_color=TeamColor.UNKNOWN,
         )
+
+
+def test_field_map_mapping_uses_center_cross_and_red_positive_y() -> None:
+    attributes = MapSnapshotAttributes(
+        snapshot_sequence=0,
+        timestamp_ns=0,
+        width=801,
+        height=601,
+        field_min_x_mm=-2000.0,
+        field_max_x_mm=2000.0,
+        field_min_y_mm=-1500.0,
+        field_max_y_mm=1500.0,
+        team_color=TeamColor.RED,
+    )
+
+    center = attributes.field_to_map_pixel(FieldPoint(0.0, 0.0))
+    right = attributes.field_to_map_pixel(FieldPoint(100.0, 0.0))
+    red_side = attributes.field_to_map_pixel(FieldPoint(0.0, 100.0))
+
+    assert center == MapPixel(400.0, 300.0)
+    assert right.u > center.u
+    assert right.v == center.v
+    assert red_side.u == center.u
+    assert red_side.v < center.v
+    assert attributes.map_pixel_to_field(center) == FieldPoint(0.0, 0.0)
+    assert attributes.map_pixel_to_field(right) == FieldPoint(100.0, 0.0)
+    assert attributes.map_pixel_to_field(red_side) == FieldPoint(0.0, 100.0)
 
 
 def test_vehicle_state_round_trip_and_safety_invariants() -> None:

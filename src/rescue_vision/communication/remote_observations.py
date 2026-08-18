@@ -22,6 +22,7 @@ from rescue_vision.communication.remote_messages import (
     _non_negative_int,
     _require_exact_keys,
 )
+from rescue_vision.geometry.types import FieldPoint, MapPixel
 
 
 class ImageCoordinateSystem(str, Enum):
@@ -531,7 +532,11 @@ class VideoFrameAttributes:
 
 @dataclass(frozen=True, slots=True)
 class MapSnapshotAttributes:
-    """PNG 场地地图的像素到 FieldPoint 映射。"""
+    """PNG 场地地图的像素到 FieldPoint 映射。
+
+    `FieldPoint` 的原点是场地中心十字交点，正 x 沿水平点划线向右，正 y
+    沿竖直点划线指向红色安全区。PNG 的 `MapPixel` 原点在左上角。
+    """
 
     MAX_DIMENSION: ClassVar[int] = 16_384
     MAX_PIXELS: ClassVar[int] = 33_554_432
@@ -570,6 +575,42 @@ class MapSnapshotAttributes:
             raise ValueError("field_min_y_mm must be less than field_max_y_mm.")
         if not isinstance(self.team_color, TeamColor):
             raise ValueError("team_color must be TeamColor.")
+
+    def field_to_map_pixel(self, point: FieldPoint) -> MapPixel:
+        """把场地全局点映射到 PNG 像素；正 y 指向红色安全区。"""
+
+        if not isinstance(point, FieldPoint):
+            raise ValueError(
+                f"point must be a FieldPoint, got {type(point).__name__}."
+            )
+        if not math.isfinite(point.x) or not math.isfinite(point.y):
+            raise ValueError(f"point must be finite, got {point!r}.")
+        return MapPixel(
+            u=(point.x - self.field_min_x_mm)
+            / (self.field_max_x_mm - self.field_min_x_mm)
+            * (self.width - 1),
+            v=(self.field_max_y_mm - point.y)
+            / (self.field_max_y_mm - self.field_min_y_mm)
+            * (self.height - 1),
+        )
+
+    def map_pixel_to_field(self, pixel: MapPixel) -> FieldPoint:
+        """把 PNG 像素反向映射为场地全局点。"""
+
+        if not isinstance(pixel, MapPixel):
+            raise ValueError(
+                f"pixel must be a MapPixel, got {type(pixel).__name__}."
+            )
+        if not math.isfinite(pixel.u) or not math.isfinite(pixel.v):
+            raise ValueError(f"pixel must be finite, got {pixel!r}.")
+        return FieldPoint(
+            x=self.field_min_x_mm
+            + pixel.u / (self.width - 1)
+            * (self.field_max_x_mm - self.field_min_x_mm),
+            y=self.field_max_y_mm
+            - pixel.v / (self.height - 1)
+            * (self.field_max_y_mm - self.field_min_y_mm),
+        )
 
     def to_attributes(self) -> dict[str, RemoteAttributeValue]:
         return {
