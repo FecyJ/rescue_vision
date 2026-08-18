@@ -14,3 +14,7 @@ models/*.hef
 
 *.log
 configs/runtime.yaml
+
+docs/reviews
+
+data/
