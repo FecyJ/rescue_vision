@@ -18,6 +18,8 @@
 | `GroundProjector.bev_pixel_to_ground()` / `bev_pixels_to_ground()` | 鸟瞰像素转地面点 |
 | `GroundProjector.make_bev_image()` | 按地面映射生成完整 BEV |
 | `CameraCalibration.calibration_id` | 内参参数集的非空可读身份；必须与地面映射一致 |
+| `CameraCalibration.lens_position` | 当前格式内参绑定的固定镜头位置；外参采集必须匹配 |
+| `CameraCalibration.camera_model` / `sensor_pixel_array_size` / `scaler_crop` | 当前格式内参绑定的相机型号、传感器尺寸与裁剪 |
 
 坐标数据结构：
 
@@ -25,10 +27,11 @@
 | --- | --- |
 | `RawPixel(u, v)` | 原始畸变图；`u` 向右、`v` 向下 |
 | `UndistortedPixel(u, v)` | 固定 `new_K` 的去畸变图 |
-| `GroundPoint(x, y)` | 机器人地面系；`x` 向前、`y` 向左，单位 mm |
-| `RobotPoint3D(x, y, z)` | 机器人三维系；`x` 向前、`y` 向左、`z` 向上，单位 mm |
+| `GroundPoint(x, y)` | 两驱动轮接地点中点为原点的机器人地面系；`x` 向前、`y` 向左，单位 mm |
+| `RobotPoint3D(x, y, z)` | 两驱动轮接地点中点为原点的机器人三维系；`x` 向前、`y` 向左、`z` 向上，单位 mm |
 | `BevPixel(u, v)` | 图像上方为机器人前方，左侧为机器人左方 |
-| `FieldPoint(x, y)` | 场地全局点；仅在全局坐标定义明确的模块中使用 |
+| `FieldPoint(x, y)` | 场地中心十字点划线交点为原点；`x` 向右，`y` 指向红色安全区，单位 mm |
+| `MapPixel(u, v)` | 场地图 PNG 左上角为原点；`u` 向右、`v` 向下，不属于相机或 BEV 像素 |
 
 ## 1. 从运行配置装配
 
@@ -119,6 +122,8 @@ recovered = ground_projector.pixel_to_horizontal_plane(
 `pixel_to_ground()` 只适用于 `z=0` 地面点。目标顶部、围栏顶部或其他离地
 像素不得强行走地面单应性；必须使用完整外参和已知高度平面。标定 JSON 中的
 外参仍只由 `GroundProjector.from_json()` 加载，业务模块不得自行读取矩阵。
+加载包含物理外参的地面标定时，还会验证 `image_to_ground` 确实由同一组
+`new_K/R/t` 推导；两套地面解释不一致的产物会被拒绝。
 
 ## 5. 检查去畸变边缘填充
 

@@ -42,8 +42,8 @@
 | `record_gripper_timeout()` | 命令 ID、单调时间 ns | 记录持续夹爪命令到期停止 |
 | `inspect_manual_motion_log()` | `motion.jsonl` 路径 | 严格校验 schema、事件序号和时间范围摘要 |
 
-机器人坐标系沿用项目约定：`x` 向前、`y` 向左、`z` 向上。左右轮速度正值
-均表示前进；车体角速度逆时针为正：
+机器人坐标系原点为两驱动轮接地点连线的中点，沿用项目约定：`x` 向前、`y`
+向左、`z` 向上。左右轮速度正值均表示前进；车体角速度逆时针为正：
 
 ```text
 left  = linear - angular × wheel_track / 2

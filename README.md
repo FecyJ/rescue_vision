@@ -52,7 +52,7 @@ python -m pytest
 | 模块 | 状态 | 责任 |
 | --- | --- | --- |
 | [`camera`](src/rescue_vision/camera/README.md) | 已实现 | 真机最新帧、离线回放和有界异步记录 |
-| [`calibration`](src/rescue_vision/calibration/README.md) | 已实现 | 棋盘采集、三模型内参比较和地面映射 |
+| [`calibration`](src/rescue_vision/calibration/README.md) | 已实现 | 棋盘/ChArUco 采集、三模型内参比较和固定机器人多位置地面映射 |
 | [`geometry`](src/rescue_vision/geometry/README.md) | 已实现 | 去畸变、显式坐标类型、地面/三维点投影与 BEV 转换 |
 | [`config`](src/rescue_vision/config/README.md) | 已实现 | 安全默认配置、UART/远程/motion/夹爪机械标定/几何/模型和感知算法装配 |
 | [`communication`](src/rescue_vision/communication/README.md) | 已实现基础设施 | UART、直接 TCP 远程消息、raw/perception 图传模式选择、运动/夹爪/采集严格 schema 和有界队列；比赛发布器待接入 |
@@ -102,6 +102,85 @@ RemoteMessageConnection → DebugGripperCommand → RemoteGripperExecutor
 - 场地特征检测只输出去畸变像素和可选机器人地面观测，不在定位完成前伪造 `FieldPoint` 或直接修改世界模型。
 - 目标地面几何估计保留 K0 接触锚点和中心的语义区别；拟合不充分时中心为 `None`，不会用检测框中心兜底。
 - 原始录像、批量图片、标定临时输出、正式数据集和模型权重不提交 Git。
+
+## 坐标系约定
+
+以下定义是当前仓库的统一约定。图像尺寸一律写作 `(width, height)`；NumPy
+数组形状一律为 `(height, width, channels)`。任何跨模块传递的点都应使用带
+坐标语义的类型，不能把没有说明坐标系的 `(u, v)` 或 `(x, y)` 当作通用点。
+
+### 公共坐标类型
+
+| 类型/坐标系 | 原点与轴方向 | 单位 | 主要用途 |
+| --- | --- | --- | --- |
+| `RawPixel(u, v)` 原始像素系 | 原始畸变图左上角为原点；`u` 向右增大，`v` 向下增大 | 像素 | 相机原始帧、地面标定采点输入；不能直接用于地面投影 |
+| `UndistortedPixel(u, v)` 去畸变像素系 | 全尺寸 `new_K` 去畸变图左上角为原点；`u` 向右增大，`v` 向下增大 | 像素 | 检测框、K0、场地特征和 `GroundProjector` 的图像侧输入；不裁剪、不改变尺寸 |
+| `RobotPoint3D(x, y, z)` 机器人三维系 | 原点为两驱动轮接地点连线的中点；`x` 向前，`y` 向左，`z` 向上 | mm | 完整外参下的离地目标、相机射线与已知高度平面求交 |
+| `GroundPoint(x, y)` 机器人地面系 | `RobotPoint3D` 的 `z = 0` 平面，原点仍为两驱动轮接地点中点；`x` 向前，`y` 向左 | mm | K0 接触点、目标地面几何、地面特征和局部跟踪；这是机器人相对坐标，不是场地全局坐标 |
+| `BevPixel(u, v)` 鸟瞰图像素系 | BEV 图左上角为原点；`u` 向右，`v` 向下；图像上方是机器人前方，左侧是机器人左方 | 像素 | 按 `BevConfig` 从机器人地面系生成的局部鸟瞰图 |
+| `FieldPoint(x, y)` 场地全局系 | 原点为场地中心十字点划线交点；`x` 沿水平点划线向右，`y` 沿竖直点划线指向红色安全区 | mm | 定位后的机器人/目标位置、静态区域和对手占据多边形 |
+| `MapPixel(u, v)` 场地图像素系 | 场地图 PNG 左上角为原点；`u` 向右，`v` 向下；不是相机像素或 `BevPixel` | 像素 | `MapSnapshotAttributes` 与 `FieldPoint` 之间的显示映射 |
+
+标定内部还使用 OpenCV 相机三维系：原点在相机光心，`x` 向图像右方、`y`
+向图像下方、`z` 沿光轴向前，单位 mm。它没有单独的公共点类型，只出现在
+地面标定的物理外参与诊断中，变换约定为
+`p_camera = R_robot_to_camera @ p_robot + t_robot_to_camera`。
+`CameraModel` 的 `K`/`new_K` 是内参矩阵，不代表又增加了一套像素坐标轴。
+
+### 映射关系
+
+```text
+RawPixel
+    │ CameraModel.undistort
+    ▼
+UndistortedPixel ── GroundProjector（z=0）──↔ GroundPoint ──↔ BevPixel
+    │
+    ├─ 已知 z + 完整物理外参 ──↔ RobotPoint3D
+    │
+    └─ Hailo letterbox（内部临时）↔ 模型输入像素
+
+GroundPoint ── 定位（当前未实现）──> FieldPoint ──↔ MapPixel
+```
+
+- `CameraModel` 是 `RawPixel → UndistortedPixel` 的唯一实现；`GroundProjector`
+  是去畸变像素与机器人地面/三维投影以及地面与 BEV 转换的唯一实现。
+- `pixel_to_ground()` 只表示与机器人地面 `z=0` 的交点。目标顶部、围栏顶部等
+  离地点必须在已知高度时使用完整外参求 `RobotPoint3D`，不能强行使用地面单应性。
+- BEV 的范围和分辨率来自 `BevConfig`。对 `GroundPoint(x, y)`，当前实现的
+  像素映射为 `u_bev = (y_max - y) / mm_per_pixel`、
+  `v_bev = (x_max - x) / mm_per_pixel`；因此 BEV 左上角对应
+  `(x_max, y_max)`，不是机器人坐标原点。
+- `FieldPoint` 的零点和方向固定对应官方《规则讲解》场地图（第 37 页）：中心
+  十字点划线交点为原点，`+x` 沿水平点划线向右，`+y` 沿竖直点划线指向红色
+  安全区；红蓝方抽签不改变这个物理坐标方向。
+- `FieldPoint` 与 `GroundPoint` 不能直接互换。定位尚未实现时，世界模型可以
+  保留缺失的 `FieldPoint`，但不能把当前机器人局部地面点伪装成场地全局点。
+
+### 内部和显示侧的局部像素
+
+- Hailo Pose 先把去畸变全尺寸图等比例缩放并居中填充为模型输入尺寸。模型
+  输出的框和 K0 会由 `LetterboxTransform` 反变换回
+  `UndistortedPixel`；模型输入像素只在推理后端内部存在，不能作为观测输出。
+- `UndistortedBoundingBox.x_min/y_min/x_max/y_max` 仍是全尺寸
+  `UndistortedPixel` 的水平矩形边界，其中 `x` 对应 `u`、`y` 对应 `v`。
+  `RoiColorSegmentation.mask` 则是该框左上角为原点的局部数组，访问顺序为
+  `mask[v_roi, u_roi]`，前景为 `255`、背景为 `0`；映射回整图时使用
+  `u = x_min + u_roi`、`v = y_min + v_roi`。
+- 通信中的 raw/perception JPEG 使用 `raw_pixel` 或 `undistorted_pixel` 标记，
+  后者必须携带匹配的 `calibration_id`；两种图像都遵循左上原点、`u` 右、`v`
+  下。场地图 PNG 使用 `MapPixel`，通过场地范围映射到 `FieldPoint`，它不是
+  相机像素，也不是 `BevPixel`：
+
+  ```text
+  u_map = (x - field_min_x_mm) / (field_max_x_mm - field_min_x_mm) * (width - 1)
+  v_map = (field_max_y_mm - y) / (field_max_y_mm - field_min_y_mm) * (height - 1)
+  ```
+
+完整类定义和投影 API 见 [`geometry` README](src/rescue_vision/geometry/README.md)；
+标定、Pose 标注和场地图通信的专项约束分别见
+[`calibration` README](src/rescue_vision/calibration/README.md)、
+[`Pose视觉模型约定`](docs/Pose视觉模型约定.md) 和
+[`电脑端通信协议`](docs/电脑端通信协议.md)。
 
 ## 命令行工具
 

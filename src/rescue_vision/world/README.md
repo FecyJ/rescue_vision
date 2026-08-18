@@ -67,7 +67,9 @@ for target in snapshot.targets:
 
 ## 4. 静态区域
 
-区域从 `runtime.yaml` 加载，顶点使用 `FieldPoint` 的 `[x_mm, y_mm]`：
+区域从 `runtime.yaml` 加载，顶点使用 `FieldPoint` 的 `[x_mm, y_mm]`。其原点是
+场地中心十字点划线交点，`+x` 沿水平点划线向右，`+y` 沿竖直点划线指向红色
+安全区；不要把机器人地面系的 `GroundPoint` 直接写入这里：
 
 ```yaml
 world:

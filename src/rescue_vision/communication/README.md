@@ -36,6 +36,7 @@
 | `VideoFrameMode` | 图像内容枚举 | `raw` 原图/当前图传；`perception` 推理叠加图 |
 | `RemoteSessionStatus` | 会话权限、能力、限值和周期 | TCP 建立后的首条业务消息 |
 | `VideoFrameAttributes` | JPEG 帧 header attributes | 严格尺寸、坐标系、时间和标定身份 |
+| `MapSnapshotAttributes` | PNG 场地图元数据 | `FieldPoint` 原点为中心十字交点；`field_to_map_pixel()` / `map_pixel_to_field()` 使用固定轴向 |
 | `VehicleStateObservation` | 车辆观察 JSON | UART、轮速、夹爪角度、显式安全模式和命令 ID |
 | `CaptureStatusObservation` | 采集观察 JSON schema | 当前记录状态及最近请求结果 |
 
@@ -546,9 +547,31 @@ Python 包；其唯一跨项目依据是
 | `observation/vehicle/state` | 树莓派 → 电脑 | `VehicleStateObservation` JSON |
 | `observation/capture/status` | 树莓派 → 电脑 | `CaptureStatusObservation` JSON |
 
+接收 `observation/map/snapshot` 后，调用方应沿用 header 中的同一组场地边界，
+把解码 PNG 的 `(u, v)` 明确包装为 `MapPixel`；不要把它当作相机像素或 BEV
+像素。以下函数承接已经解析好的 `map_attributes`，返回场地全局坐标：
+
+```python
+from rescue_vision.communication import MapSnapshotAttributes
+from rescue_vision.geometry.types import FieldPoint, MapPixel
+
+
+def map_pixel_to_field(
+    map_attributes: MapSnapshotAttributes,
+    u: float,
+    v: float,
+) -> FieldPoint:
+    return map_attributes.map_pixel_to_field(MapPixel(u=u, v=v))
+```
+
+在这套映射中，PNG 中心十字对应场地 `FieldPoint(0, 0)`；向右增大 `u` 对应
+场地 `+x`，向红色安全区方向增大场地 `+y` 对应减小 PNG `v`。映射的边界和
+反向转换由 `MapSnapshotAttributes` 统一执行。
+
 `DebugMotionCommand.linear_velocity_m_s` 正负表示前后，
 `angular_velocity_rad_s` 逆时针为正。`TARGET_HEADING` 必须声明 `field` 或
-`session_start` 参考系；当前没有 IMU/定位适配器，车端只能执行 `TWIST`。
+`session_start` 参考系；`field` 的零角是场地 `+x` 向右，正角朝红色安全区
+方向（`+y`）旋转。当前没有 IMU/定位适配器，车端只能执行 `TWIST`。
 `DebugGripperCommand` v2 是短有效期的持续扳机状态；超时、断线、全部松开
 或两个方向同时按下会停止继续改变舵机目标，但不会自动跳到开/闭端点。
 

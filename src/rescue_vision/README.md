@@ -149,14 +149,14 @@ with source, detector:
 | [`app`](app/README.md) | `run_manual_capture_session()`、`rescue-vision-manual-capture` | 赛外受监督手动驾驶和车载采集装配 |
 | [`config`](config/README.md) | `load_runtime_config()`、`GripperRuntimeConfig`、`AppConfig.build_geometry()`、`HailoConfig.build_backend()` | 启动时严格加载、机械标定和装配 |
 | [`camera`](camera/README.md) | `FrameSource`、`CameraFrame`、`Picamera2Source`、`RecordingSource` | 产生带时间和序号的最新帧 |
-| [`communication`](communication/README.md) | `UartLineChannel`、`RemoteMessageConnection`、`VideoModeCommand`、`VideoFrameAttributes`、`RemoteSessionStatus` | UART、直接 TCP 远程消息、可选择 raw/perception 图传与严格观察 schema |
+| [`communication`](communication/README.md) | `UartLineChannel`、`RemoteMessageConnection`、`VideoModeCommand`、`VideoFrameAttributes`、`MapSnapshotAttributes`、`RemoteSessionStatus` | UART、直接 TCP 远程消息、可选择 raw/perception 图传、FieldPoint/MapPixel 地图映射与严格观察 schema |
 | [`motion`](motion/README.md) | `MotionController`、`MotionLimits`、`GripperCalibration`、`RemoteMotionExecutor`、`RemoteGripperExecutor`、`run_remote_motion` | 差速运动、持续夹爪双舵机、Rescue Car 协议和远程调试执行 |
-| [`geometry`](geometry/README.md) | `CameraModel`、`GroundProjector`、显式坐标类型 | 去畸变及像素/地面/BEV 转换 |
+| [`geometry`](geometry/README.md) | `CameraModel`、`GroundProjector`、显式坐标类型（含 `MapPixel`） | 去畸变及像素/地面/BEV 转换 |
 | [`perception`](perception/README.md) | `TargetPoseDetector`、`PerceptionFrameRenderer`、`TargetGroundGeometryEstimator`、`FieldFeatureDetector` | 任务目标、最新帧可视化旁路、地面几何和静态场地特征观测 |
 | [`tracking`](tracking/README.md) | `MultiTargetTracker`、`TrackedTarget`、`TrackStatus` | 时间关联、遮挡和轨迹生命周期 |
 | [`world`](world/README.md) | `WorldModel`、`WorldSnapshot`、`HazardState` | 区域、动态目标、对手占据和不确定性 |
 | [`mission`](mission/README.md) | `MissionStateMachine`、`replay_mission()`、`MissionDecision` | 规则、安全降级和抽象动作 |
-| [`calibration`](calibration/README.md) | 三个 `python -m` 标定命令 | 生成内参与地面映射产物 |
+| [`calibration`](calibration/README.md) | 五个 `python -m` 标定命令 | 采集棋盘/ChArUco、生成内参与多图地面映射产物 |
 | [`data`](data/README.md) | `inspect_recording()`、`build_dataset_records()`、`split_records()` | 采集验收、清单和防泄漏划分 |
 | [`evaluation`](evaluation/README.md) | `observations_to_evaluation_records()`、`evaluate_records()` | 目标匹配适配和离线指标 |
 

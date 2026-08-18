@@ -77,7 +77,11 @@ class MotionLimits:
 
 
 class MotionController:
-    """通过同一行通道驱动 Rescue Car 底盘和夹爪。"""
+    """通过同一行通道驱动 Rescue Car 底盘和夹爪。
+
+    `drive()` 的车体 twist 参考点是两驱动轮接地点连线的中点，与机器人
+    地面坐标系原点一致。
+    """
 
     def __init__(
         self,

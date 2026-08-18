@@ -32,7 +32,11 @@ class MotionControlMode(str, Enum):
 
 
 class HeadingReference(str, Enum):
-    """目标朝向的零点；角度均为逆时针为正、单位 rad。"""
+    """目标朝向的零点；角度均为逆时针为正、单位 rad。
+
+    `field` 的零角沿场地中心水平点划线的 `+x` 向右，正角朝 `+y` 红色
+    安全区方向旋转；`session_start` 使用本轮启动时的车体前方。
+    """
 
     FIELD = "field"
     SESSION_START = "session_start"

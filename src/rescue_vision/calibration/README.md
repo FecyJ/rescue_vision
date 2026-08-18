@@ -8,21 +8,34 @@
 | --- | --- | --- |
 | `python -m rescue_vision.calibration.capture_chessboard_images` | 相机条件固定后采集内参样本 | 棋盘原图、检测图、逐帧元数据 |
 | `python -m rescue_vision.calibration.calibrate_intrinsics` | 比较三种模型并选择内参 | `selected_calibration.json`、诊断图 |
-| `python -m rescue_vision.calibration.calibrate_extrinsics_ground` | 相机安装姿态最终固定后 | `ground_mapping.json`、BEV 与误差诊断 |
+| `python -m rescue_vision.calibration.capture_extrinsics_ground` | 固定机器人、移动棋盘并交互采集外参图片 | `board_calibration.json`、图片和检测图 |
+| `python -m rescue_vision.calibration.capture_extrinsics_charuco` | 固定机器人、移动 ChArUco 板并采集局部角点 | `board_calibration.json`、图片和检测图 |
+| `python -m rescue_vision.calibration.calibrate_extrinsics_ground` | 相机和机器人安装姿态最终固定后 | `ground_mapping.json`、BEV 与多图误差诊断 |
 | `CameraModel.from_json()` | 独立检查标定产物 | 默认拒绝 `quality.usable=false` |
 | `load_runtime_config(...).build_geometry()` | 实际运行接入 | 联合验证内参、分辨率和地面映射 ID |
+
+多图外参流程的可测试入口包括 `load_board_calibration()`、
+`validate_capture_session()`、`fit_station_robust_homography()`、
+`board_points_field_mm()` 和 `field_points_to_robot_ground()`；它们负责严格加载
+JSON 与采集条件、站位均衡筛点和留一验证、按 11×8 内角点展开棋盘坐标，以及按
+声明的轴向转换到机器人地面系。最终
+求解仍通过 `calibrate_extrinsics_ground` 命令装配内参、图片和输出目录；当
+`board.board_type` 为 `charuco` 时，求解器按每张图片可见的 ChArUco ID 查找板坐标，
+不要求整板 88 个角点。ChArUco 相关可测试入口为
+`create_charuco_board()`、`detect_charuco_board()` 和
+`charuco_points_field_mm()`；采集稳定性使用 `charuco_detection_jitter_px()`。
 
 ## 完整工作流速览
 
 1. 固定相机、分辨率、裁剪和焦点后采集棋盘图；
 2. 用这批图片比较三种模型并选择内参；
-3. 固定最终安装位姿并准备地面对应点；
-4. 使用前一步内参求解地面映射；
+3. 固定机器人在场地全局原点，按定位模板把棋盘放到多个站位并拍照；
+4. 在 JSON 中记录每张照片的参考内角点全局坐标，运行脚本自动检测棋盘角点并求解地面映射；
 5. 验收产物后再写入 `configs/runtime.yaml`。
 
 每一步的实际命令在下文独立代码段给出，并承接上一步产物。前两步只依赖相机
-和棋盘；地面映射必须等相机安装姿态固定，并准备 `ground_image.png` 与
-`ground_points.json`。不要把不同焦点、分辨率或安装条件的产物混用。
+和棋盘；地面映射必须等相机和机器人安装姿态固定。不要把不同焦点、分辨率或
+安装条件的产物混用。
 
 ## 固定条件
 
@@ -33,7 +46,8 @@
 - 固定 `LensPosition`；
 - 相机安装位置和姿态；
 - 相机模型及 `new_camera_matrix`；
-- 地面点坐标定义。
+- 地面点坐标定义：原点为两驱动轮接地点连线的中点，`x` 向前、`y` 向左、
+  `z` 向上，单位 mm。
 
 分辨率、焦点、镜头或 `new_K` 改变时至少重新做内参验证；安装位姿改变时必须重新做地面映射。不要只凭肉眼观察去畸变图判断标定质量。
 
@@ -95,13 +109,19 @@ output/intrinsics_YYYYMMDD_HHMMSS/
   "calibration_id": "intrinsics_YYYYMMDD_HHMMSS",
   "model_type": "pinhole_rational",
   "image_size": [2304, 1296],
+  "camera_model": "imx708_wide",
+  "sensor_pixel_array_size": [4608, 2592],
+  "scaler_crop": [0, 0, 4608, 2592],
   "camera_matrix": [[...], [...], [...]],
   "distortion": [...],
   "new_camera_matrix": [[...], [...], [...]],
+  "lens_position": 1.0,
   "quality": {"usable": true}
 }
 ```
 
+`camera_model`、`sensor_pixel_array_size`、`scaler_crop` 和 `lens_position`
+共同绑定采集时的相机条件；外参会逐项核对，旧的缺字段内参必须重新生成。
 `calibration_id` 是内参参数集的非空、可读身份。内参标定脚本默认使用输出
 目录名生成它，也可通过 `--calibration-id` 指定。地面映射必须原样复制这个
 值；它用于阻止不同 `K/D/new_K`、模型、分辨率或焦点条件的标定产物混用。
@@ -141,21 +161,99 @@ python -m rescue_vision.calibration.calibrate_intrinsics \
 `calibration_id`，并重新制作所有依赖旧标定的地面映射和任务数据。不能只
 修改 `selected_calibration.json` 中的数值。
 
-## 3. 准备地面映射数据
+## 3. 固定机器人并采集多位置棋盘图
 
-此步骤只能在相机最终固定后进行。创建：
+此步骤只能在相机和机器人最终固定后进行。以两驱动轮接地点连线中点作为机器人
+地面原点，把该点停在场地全局系 `(0, 0)`；机器人
+`x` 正方向与场地全局 `y` 正方向重合；为保持右手系，机器人 `y` 正方向对应
+全局 `x` 负方向。棋盘长边平行全局 `x`，短边平行全局 `y`。
 
-```text
-calibration_captures/ground_mapping/
-├── ground_image.png
-└── ground_points.json
+推荐在地面铺设定位模板，标出 6 个站位，其中 5 个用于拟合、1 个用于独立验收。
+每个站位用两条垂直基准线约束平移和方向，并标出棋盘外框左下角的位置。棋盘
+必须贴地、不能翘曲；使用外框角点时必须同时提供对应边距，不能把外框角点直接
+当作第一个棋盘内角点。
+
+棋盘为 12×9 个实体方格、11×8 个内角点。棋盘外框通常有边距，必须实测并写入
+JSON；当使用外框左下角作为基准时，脚本会按 `left` 和 `bottom` 边距自动换算首个
+内角点；`right` 和 `top` 同时保留用于尺寸核对。普通黑白
+棋盘有 180° 朝向歧义，必须在参考角做不干扰角点检测的标记，或在定位模板上明确
+标记参考角，并在 JSON 正确填写 `detected_corner_order`。
+
+使用交互式外参采集命令：
+
+```bash
+python -m rescue_vision.calibration.capture_extrinsics_ground \
+  --lens-position 1.0 \
+  --square-size-mm 15.0 \
+  --max-detection-scale 2.0 \
+  --session src/rescue_vision/calibration/calibration_captures/ground_mapping_YYYYMMDD_HHMMSS
 ```
 
-`ground_image.png` 是固定安装条件下的原始畸变图。参考 `ground_points.example.json` 建立 12～20 个分布均匀、易准确点击的地面点，覆盖实际工作区域和远近范围，避免共线或集中于局部。
+脚本启动后依次询问长边方向边距、短边方向边距和采集张数。这里假设左右长边
+边距相同、上下短边边距相同；最后一张自动标记为 `holdout`，前面的图片标记为
+`fit`。每个站位先输入外框左下角全局坐标，再把棋盘放到定位模板对应位置，按
+Enter/Space 拍摄；11×8 内角点检测失败时不会计入张数，可调整棋盘后重拍。
+每次成功采集都会立即更新 `board_calibration.json`，按 Q/Esc 退出也会保留已完成记录。
+`--max-detection-scale` 默认是 `2.0`，只用于检测时临时放大图像，不改变保存的原始图像
+坐标；必要时可提高到 `3.0`，但会增加单次按键后的检测时间和内存占用。
+检测回退包括原图高精度 SB、放大后的完整棋盘 SB、`CALIB_CB_LARGER` 和传统自适应阈值；
+只有完整 11×8（88 个）角点才会接受。任意局部角点无法确定其在整块棋盘中的绝对行列偏移，
+贸然使用会产生看似合理但错误的外参，因此当前仍拒绝不完整角点结果。
 
-坐标约定为机器人地面系 `x` 向前、`y` 向左、`z` 向上，单位 mm。
+如果换用 ChArUco 板，使用独立命令：
 
-## 4. 求解地面映射
+```bash
+python -m rescue_vision.calibration.capture_extrinsics_charuco \
+  --squares-x 12 --squares-y 9 \
+  --square-size-mm 15.0 --marker-size-mm 10.0 \
+  --dictionary DICT_4X4_100 \
+  --minimum-charuco-corners 8 \
+  --board-rotation-degrees 0 \
+  --max-detection-scale 2.0 \
+  --session src/rescue_vision/calibration/calibration_captures/charuco_YYYYMMDD_HHMMSS
+```
+
+ChArUco 板必须打印面朝向相机，并在 OpenCV 板坐标原点侧的外框角做永久物理标记；
+`--board-rotation-degrees` 表示 OpenCV 板坐标相对场地坐标逆时针旋转的
+`0/90/180/270` 度。每站输入的是这个已标记外框角的场地坐标。一张图必须检测到
+至少 8 个角点，覆盖至少 3 行和 3 列 ID，并通过连续帧稳定性和清晰度门槛才会保存。
+最后一张仍为 `holdout`。
+随后仍使用 `calibrate_extrinsics_ground`，无需换求解命令：
+它会读取 `board_type: "charuco"`、字典和角点 ID，并用可见角点拟合。
+
+## 4. 编写多图棋盘 JSON
+
+复制 [`board_calibration.example.json`](board_calibration.example.json)（普通棋盘）或
+[`board_calibration_charuco.example.json`](board_calibration_charuco.example.json)（ChArUco），将图片路径和
+实体参考角场地坐标替换为实测值。路径相对于 JSON 文件所在目录。ChArUco 使用
+`reference: "opencv_board_origin_outer_corner"`、
+`board_origin_outer_corner_global_mm`、`printed_face: "camera"` 和显式旋转角；
+旧的含糊外框左下角格式会被拒绝。
+
+```text
+calibration_captures/ground_mapping_<timestamp>/
+├── board_calibration.json
+└── images/
+    ├── board_001.png
+    └── ...
+```
+
+`coordinate_frame` 必须描述机器人起始位置为全局 `(0, 0)`，并声明两套坐标轴的方向。
+`board.reference` 可取 `lower_left_outer_corner` 或
+`lower_left_inner_corner`。使用外框基准时，图片字段名为
+`reference_outer_corner_global_mm`；使用内角点基准时字段名为
+`reference_inner_corner_global_mm`。`board.edge_margin_mm` 依次记录左、右、下、上边距；
+其中左、下边距用于外框角到首个内角点的换算。`reference_corner_marked` 必须为
+`true`，表示参考角已在棋盘或定位模板上做物理标记；`detected_corner_order` 取
+`reference_first` 或 `reference_last`，用于消除检测角点顺序的 180° 歧义。至少需要
+3 张 `fit` 图片和 1 张 `holdout` 图片；推荐 5+1 张，覆盖近、远、左、右区域。
+ChArUco 配置另需 `chessboard_size_squares`、`marker_size_mm`、`dictionary` 和
+`minimum_charuco_corners`；ChArUco 由 ID 固定角点身份，不需要
+`reference_corner_marked` 或 `detected_corner_order`。
+ChArUco 采集要求当前 OpenCV 构建提供 `cv2.aruco.CharucoBoard` 和
+`cv2.aruco.CharucoDetector`；若构建不含 ArUco 模块，脚本会在打开相机前报错。
+
+## 5. 求解地面映射
 
 脚本默认读取仓库根目录的 `configs/runtime.yaml`，从
 `geometry.intrinsics_path` 获取内参，并通过 `load_runtime_config()` 与
@@ -166,7 +264,8 @@ calibration_captures/ground_mapping/
 
 ```bash
 python -m rescue_vision.calibration.calibrate_extrinsics_ground \
-  --config configs/runtime.yaml
+  --config configs/runtime.yaml \
+  --session src/rescue_vision/calibration/calibration_captures/ground_mapping_YYYYMMDD_HHMMSS
 ```
 
 也可以显式指定另一份运行配置：
@@ -174,7 +273,7 @@ python -m rescue_vision.calibration.calibrate_extrinsics_ground \
 ```bash
 python -m rescue_vision.calibration.calibrate_extrinsics_ground \
   --config configs/runtime.yaml \
-  --session src/rescue_vision/calibration/calibration_captures/ground_mapping
+  --board-calibration src/rescue_vision/calibration/calibration_captures/ground_mapping_YYYYMMDD_HHMMSS/board_calibration.json
 ```
 
 `--intrinsics` 仅作为诊断或临时覆盖；未指定时不得再按时间戳自动挑选内参：
@@ -184,13 +283,10 @@ python -m rescue_vision.calibration.calibrate_extrinsics_ground \
   --intrinsics src/rescue_vision/calibration/output/intrinsics_YYYYMMDD_HHMMSS/selected_calibration.json
 ```
 
-首次运行按 `ground_points.json` 顺序点击原图中的点：
-
-- 鼠标左键选择；
-- `Enter` / `Space` 确认；
-- `Backspace` 撤销；
-- `Q` / `Esc` 退出；
-- `--recollect` 强制重新选点。
+脚本会逐张读取 JSON 中的原始图片并自动寻找角点。检测失败、图片尺寸或焦点与内参
+不匹配、站位重复/共线、holdout 位于 fit 覆盖外、站位数量不足或参考角顺序未声明时
+直接停止，不生成可部署标定。求解必须读取采集目录相邻的 `session.json`。
+求解命令同样支持 `--max-detection-scale`；采集和求解应使用相同或更大的值。
 
 脚本每次运行创建新的时间戳目录，不覆盖已部署结果：
 
@@ -200,8 +296,7 @@ output/ground_mapping_YYYYMMDD_HHMMSS_ffffff/
 ├── ground_mapping.npz
 └── diagnostics/
     ├── ground_mapping_diagnostics.json
-    ├── undistorted_ground_image.png
-    ├── undistorted_correspondences.png
+    ├── *_corners.png
     └── bev_preview.png
 ```
 
@@ -218,6 +313,13 @@ output/ground_mapping_YYYYMMDD_HHMMSS_ffffff/
   "calibration_id": "intrinsics_YYYYMMDD_HHMMSS",
   "model_type": "pinhole_rational",
   "image_size": [2304, 1296],
+  "coordinate_frame": {
+    "origin": "midpoint_between_drive_wheel_contact_points",
+    "x": "robot_forward",
+    "y": "robot_left",
+    "z": "up",
+    "unit": "mm"
+  },
   "image_to_ground": [[...], [...], [...]],
   "quality": {"usable": true, "physically_valid": true},
   "extrinsics": {
@@ -234,24 +336,29 @@ output/ground_mapping_YYYYMMDD_HHMMSS_ffffff/
 }
 ```
 
-`image_to_ground` 表示去畸变像素到机器人地面毫米坐标。直接单应拟合用于
-地面点定位；PnP 外参除交叉诊断外，还由 `GroundProjector` 统一用于机器人系
+`coordinate_frame` 是运行时强校验的一部分；缺少它、原点不匹配或轴定义不匹配
+的旧标定产物必须重新生成。`image_to_ground` 表示去畸变像素到机器人地面毫米坐标，
+由站位均衡筛点后优化得到的物理外参唯一推导。直接单应拟合只用于异常点筛选、初始化
+和一致性诊断；PnP 外参同时由 `GroundProjector` 统一用于机器人系
 三维点重投影和像素射线与已知高度平面求交。部署前必须使用未参与拟合的
 保留点实测地面误差、复核 BEV 有效范围，并检查
 `pose_reprojection_rmse_px`；只验证地面单应性不足以启用目标三维模板拟合。
 
-对应点文件绑定原图文件名与尺寸；更换原图或分辨率后必须
-`--recollect`。输出同时保存物理有效性、误差门限、
+多图 JSON 绑定每张原图文件名、尺寸条件和站位坐标；更换任一图片、分辨率、焦点或
+棋盘规格后必须重新生成标定。输出同时保存物理有效性、误差门限、
 `quality.usable`、`model_type` 与可读 `calibration_id`。内参命令可用
 `--calibration-id` 显式命名，未指定时使用输出目录名。默认门限可通过
-`--maximum-mean-inlier-error-mm`、`--maximum-inlier-error-mm` 和
-`--maximum-pose-rmse-px` 显式调整并落盘。运行时
+`--maximum-mean-inlier-error-mm`、`--maximum-inlier-error-mm`、
+`--maximum-pose-rmse-px`、`--maximum-holdout-mean-error-mm` 和
+`--maximum-holdout-error-mm`、`--maximum-leave-one-out-mean-error-mm`、
+`--maximum-mapping-disagreement-mm` 显式调整并落盘。RANSAC 使用去畸变像素阈值；
+每站空间均衡取样并要求至少 60% 内点，同时报告逐站和留一站位误差。运行时
 `GroundProjector.from_json(...)` 会拒绝 `quality.usable=false`、非物理
 有效位姿、错误图像尺寸、模型或 `calibration_id` 不匹配的产物。
 基础矩阵往返和 BEV 四角方向已有自动测试；实际安装仍必须使用独立保留点
 测量地面误差。
 
-## 5. 产物管理
+## 6. 产物管理
 
 原始采集和临时输出不提交 Git。最终部署应保留一份经过验收的配置，并同时记录：
 
@@ -262,7 +369,7 @@ output/ground_mapping_YYYYMMDD_HHMMSS_ffffff/
 
 如果这些元数据无法对应，宁可重新标定，也不要混用两次标定产物。
 
-## 6. 接入 `configs/runtime.yaml`
+## 7. 接入 `configs/runtime.yaml`
 
 内参验收后先启用去畸变；地面映射完成并通过保留点验证后再单独启用：
 

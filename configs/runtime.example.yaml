@@ -88,7 +88,8 @@ world:
   danger_confirm_threshold: 0.60
   danger_suspect_threshold: 0.15
   unknown_suspect_threshold: 0.50
-  # P3 场地区域冻结前保持为空；坐标为 FieldPoint 的 [x_mm, y_mm]。
+  # P3 场地区域冻结前保持为空；坐标为 FieldPoint 的 [x_mm, y_mm]：原点是
+  # 中心十字点划线交点，+x 向右，+y 指向红色安全区。
   regions: []
 
 mission:
