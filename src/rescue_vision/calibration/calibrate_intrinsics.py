@@ -1087,6 +1087,8 @@ def make_runtime_calibration_document(
     fit: CalibrationFit,
     new_K: np.ndarray,
     quality: dict[str, Any],
+    lens_position: float | None,
+    camera_binding: dict[str, Any],
 ) -> dict[str, Any]:
     """Build the minimal JSON consumed by ``CameraCalibration.from_json``."""
 
@@ -1097,6 +1099,10 @@ def make_runtime_calibration_document(
         "camera_matrix": fit.K.tolist(),
         "distortion": fit.D.reshape(-1).tolist(),
         "new_camera_matrix": new_K.tolist(),
+        "lens_position": lens_position,
+        "camera_model": camera_binding.get("camera_model"),
+        "sensor_pixel_array_size": camera_binding.get("sensor_pixel_array_size"),
+        "scaler_crop": camera_binding.get("scaler_crop"),
         "quality": quality,
     }
 
@@ -1313,6 +1319,8 @@ def main() -> None:
         selected_fit,
         selected_new_K,
         quality,
+        session_metadata.get("lens_position"),
+        session_metadata,
     )
     selected_json_path = run_dir / "selected_calibration.json"
     save_json(selected_json_path, selected_document)

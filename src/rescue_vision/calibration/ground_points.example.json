@@ -1,5 +1,6 @@
 {
   "coordinate_frame": {
+    "origin": "midpoint_between_drive_wheel_contact_points",
     "x": "robot_forward",
     "y": "robot_left",
     "z": "up",

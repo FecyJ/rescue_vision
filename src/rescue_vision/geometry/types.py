@@ -11,6 +11,34 @@ import numpy.typing as npt
 
 FloatArray = npt.NDArray[np.float64]
 
+# These identifiers are written into calibration metadata.  Keep the origin
+# definition here so calibration and runtime loading cannot silently diverge.
+ROBOT_FRAME_ORIGIN = "midpoint_between_drive_wheel_contact_points"
+FIELD_FRAME_ORIGIN = "center_cross_intersection"
+
+
+def robot_frame_metadata() -> dict[str, str]:
+    """Return the canonical robot-frame metadata for calibration artifacts."""
+
+    return {
+        "origin": ROBOT_FRAME_ORIGIN,
+        "x": "robot_forward",
+        "y": "robot_left",
+        "z": "up",
+        "unit": "mm",
+    }
+
+
+def field_frame_metadata() -> dict[str, str]:
+    """Return the canonical field-frame metadata used by map consumers."""
+
+    return {
+        "origin": FIELD_FRAME_ORIGIN,
+        "x": "right_along_horizontal_center_marking",
+        "y": "red_safe_zone_along_vertical_center_marking",
+        "unit": "mm",
+    }
+
 @dataclass(frozen=True, slots=True)
 class RawPixel:
     """
@@ -41,6 +69,7 @@ class GroundPoint:
     """
     机器人地面坐标系中的二维点，单位 mm
     坐标约定：
+        原点为两驱动轮接地点连线的中点
         x 向机器人前方增大
         y 向机器人左方增大
     """
@@ -54,6 +83,7 @@ class RobotPoint3D:
     机器人坐标系中的三维点，单位 mm。
 
     坐标约定：
+        原点为两驱动轮接地点连线的中点
         x 向机器人前方增大
         y 向机器人左方增大
         z 向上增大
@@ -69,9 +99,9 @@ class FieldPoint:
     """
     场地全局坐标系中的二维点，单位 mm
     坐标约定：
-        原点定义为场地中心
-        x 右方增大
-        y 上方增大
+        原点为场地中心十字点划线的交点
+        x 沿水平点划线向右增大
+        y 沿竖直点划线指向红色安全区增大
     """
     x: float
     y: float
@@ -91,7 +121,23 @@ class BevPixel:
         return np.array([self.u, self.v], dtype=np.float64)
 
 
-PixelPoint = RawPixel | UndistortedPixel | BevPixel
+@dataclass(frozen=True, slots=True)
+class MapPixel:
+    """
+    场地图 PNG 中的显示像素坐标。
+
+    原点在 PNG 左上角，``u`` 向右、``v`` 向下；它不是相机像素，也不是
+    `BevPixel`。`MapSnapshotAttributes` 负责它与 `FieldPoint` 的映射。
+    """
+
+    u: float
+    v: float
+
+    def as_array(self) -> FloatArray:
+        return np.array([self.u, self.v], dtype=np.float64)
+
+
+PixelPoint = RawPixel | UndistortedPixel | BevPixel | MapPixel
 Point2D = PixelPoint | GroundPoint | FieldPoint
 PointT = TypeVar("PointT", bound=Point2D)
 

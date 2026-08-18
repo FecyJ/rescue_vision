@@ -10,6 +10,7 @@ from rescue_vision.geometry.camera_model import CameraCalibration, CameraModelTy
 from rescue_vision.geometry.ground_projector import BevConfig, GroundProjector
 from rescue_vision.geometry.types import (
     BevPixel,
+    robot_frame_metadata,
     GroundPoint,
     RobotPoint3D,
     UndistortedPixel,
@@ -182,6 +183,7 @@ def test_ground_mapping_rejects_intrinsic_mismatch(tmp_path) -> None:
         "image_size": [32, 24],
         "calibration_id": calibration.calibration_id,
         "model_type": "pinhole",
+        "coordinate_frame": robot_frame_metadata(),
         "image_to_ground": np.eye(3).tolist(),
         "bev": {
             "x_min_mm": 0,
@@ -207,6 +209,12 @@ def test_ground_mapping_rejects_intrinsic_mismatch(tmp_path) -> None:
         camera_calibration=calibration,
     ).supports_robot_projection
 
+    document["image_to_ground"][0][2] = 2.0
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(ValueError, match="derived from"):
+        GroundProjector.from_json(path, camera_calibration=calibration)
+    document["image_to_ground"] = np.eye(3).tolist()
+
     document["model_type"] = "fisheye"
     path.write_text(json.dumps(document), encoding="utf-8")
     with pytest.raises(ValueError, match="does not match"):
@@ -222,4 +230,30 @@ def test_ground_mapping_rejects_intrinsic_mismatch(tmp_path) -> None:
     document["quality"]["usable"] = False
     path.write_text(json.dumps(document), encoding="utf-8")
     with pytest.raises(ValueError, match="quality.usable"):
+        GroundProjector.from_json(path, camera_calibration=calibration)
+
+
+def test_ground_mapping_rejects_wrong_robot_frame_origin(tmp_path) -> None:
+    calibration = CameraCalibration(
+        calibration_id="test",
+        model=CameraModelType.PINHOLE,
+        image_size=(32, 24),
+        K=np.eye(3),
+        D=np.zeros(5),
+        new_K=np.eye(3),
+    )
+    document = {
+        "quality": {"usable": True, "physically_valid": True},
+        "image_size": [32, 24],
+        "calibration_id": calibration.calibration_id,
+        "model_type": "pinhole",
+        "coordinate_frame": {
+            **robot_frame_metadata(),
+            "origin": "robot_body_center",
+        },
+        "image_to_ground": np.eye(3).tolist(),
+    }
+    path = tmp_path / "wrong-origin-ground.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(ValueError, match="coordinate_frame"):
         GroundProjector.from_json(path, camera_calibration=calibration)

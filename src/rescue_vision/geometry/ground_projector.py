@@ -19,6 +19,7 @@ from rescue_vision.geometry.types import (
     UndistortedPixel,
     array_to_points,
     pixels_to_array,
+    robot_frame_metadata,
 )
 
 
@@ -29,6 +30,7 @@ _GROUND_MAPPING_JSON_FIELDS = frozenset(
         "calibration_id",
         "model_type",
         "image_size",
+        "coordinate_frame",
         "image_to_ground",
         "quality",
         "extrinsics",
@@ -113,7 +115,7 @@ def _validated_translation(value: npt.ArrayLike) -> FloatArray:
 
 @dataclass(frozen=True, slots=True)
 class BevConfig:
-    """BEV 覆盖的机器人地面范围，所有长度单位为 mm。"""
+    """BEV 覆盖的机器人地面范围，原点为两轮接地点中点，单位为 mm。"""
 
     x_min: float
     x_max: float
@@ -259,6 +261,14 @@ class GroundProjector:
                 f"Unknown keys in ground mapping JSON: {unknown}."
             )
 
+        coordinate_frame = data.get("coordinate_frame")
+        expected_frame = robot_frame_metadata()
+        if coordinate_frame != expected_frame:
+            raise ValueError(
+                "Ground mapping coordinate_frame must use the robot frame "
+                f"origin={expected_frame['origin']!r}, got {coordinate_frame!r}."
+            )
+
         quality = data.get("quality")
         if not isinstance(quality, dict) or quality.get("usable") is not True:
             raise ValueError(
@@ -340,6 +350,34 @@ class GroundProjector:
                     "Ground mapping extrinsics must contain "
                     "rotation_robot_to_camera and "
                     "translation_robot_to_camera_mm."
+                )
+            rotation_value = _validated_rotation(rotation)
+            translation_value = _validated_translation(translation)
+            pose_ground_to_image = camera_calibration.new_K @ np.column_stack(
+                (
+                    rotation_value[:, 0],
+                    rotation_value[:, 1],
+                    translation_value,
+                )
+            )
+            if abs(float(np.linalg.det(pose_ground_to_image))) < 1e-12:
+                raise ValueError("Ground mapping physical pose is singular on z=0.")
+            pose_image_to_ground = np.linalg.inv(pose_ground_to_image)
+            pose_image_to_ground /= pose_image_to_ground[2, 2]
+            stored_image_to_ground = _validated_homography(
+                data["image_to_ground"],
+                "image_to_ground",
+            )
+            stored_image_to_ground /= stored_image_to_ground[2, 2]
+            if not np.allclose(
+                stored_image_to_ground,
+                pose_image_to_ground,
+                rtol=1e-7,
+                atol=1e-7,
+            ):
+                raise ValueError(
+                    "Ground mapping image_to_ground must be derived from its "
+                    "physical extrinsics."
                 )
         else:
             rotation = None

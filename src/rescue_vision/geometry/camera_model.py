@@ -30,6 +30,10 @@ _CALIBRATION_JSON_FIELDS = frozenset(
         "camera_matrix",
         "distortion",
         "new_camera_matrix",
+        "lens_position",
+        "camera_model",
+        "sensor_pixel_array_size",
+        "scaler_crop",
         "quality",
     }
 )
@@ -78,6 +82,10 @@ class CameraCalibration:
     K: FloatArray
     D: FloatArray
     new_K: FloatArray
+    lens_position: float | None = None
+    camera_model: str | None = None
+    sensor_pixel_array_size: tuple[int, int] | None = None
+    scaler_crop: tuple[int, int, int, int] | None = None
 
     def __post_init__(self) -> None:
         calibration_id = str(self.calibration_id).strip()
@@ -86,6 +94,22 @@ class CameraCalibration:
         K = np.ascontiguousarray(self.K, dtype=np.float64)
         D = np.ascontiguousarray(self.D, dtype=np.float64).reshape(-1, 1)
         new_K = np.ascontiguousarray(self.new_K, dtype=np.float64)
+        lens_position = (
+            None if self.lens_position is None else float(self.lens_position)
+        )
+        camera_model = (
+            None if self.camera_model is None else str(self.camera_model).strip()
+        )
+        sensor_pixel_array_size = (
+            None
+            if self.sensor_pixel_array_size is None
+            else tuple(int(value) for value in self.sensor_pixel_array_size)
+        )
+        scaler_crop = (
+            None
+            if self.scaler_crop is None
+            else tuple(int(value) for value in self.scaler_crop)
+        )
 
         if not calibration_id:
             raise ValueError("calibration_id must be a non-empty string.")
@@ -101,6 +125,40 @@ class CameraCalibration:
             raise ValueError("K and new_K must contain only finite values.")
         if not np.all(np.isfinite(D)):
             raise ValueError("D must contain only finite values.")
+        if lens_position is not None and not np.isfinite(lens_position):
+            raise ValueError("lens_position must be finite when provided.")
+        binding_values = (camera_model, sensor_pixel_array_size, scaler_crop)
+        if any(value is not None for value in binding_values) and not all(
+            value is not None for value in binding_values
+        ):
+            raise ValueError(
+                "camera_model, sensor_pixel_array_size and scaler_crop must be "
+                "provided together."
+            )
+        if camera_model is not None:
+            if not camera_model:
+                raise ValueError("camera_model must be non-empty.")
+            assert sensor_pixel_array_size is not None
+            assert scaler_crop is not None
+            if (
+                len(sensor_pixel_array_size) != 2
+                or any(value <= 0 for value in sensor_pixel_array_size)
+            ):
+                raise ValueError(
+                    "sensor_pixel_array_size must contain two positive integers."
+                )
+            if (
+                len(scaler_crop) != 4
+                or scaler_crop[0] < 0
+                or scaler_crop[1] < 0
+                or scaler_crop[2] <= 0
+                or scaler_crop[3] <= 0
+                or scaler_crop[0] + scaler_crop[2] > sensor_pixel_array_size[0]
+                or scaler_crop[1] + scaler_crop[3] > sensor_pixel_array_size[1]
+            ):
+                raise ValueError(
+                    "scaler_crop must be [x, y, width, height] inside the sensor array."
+                )
         if model is CameraModelType.FISHEYE and D.size != 4:
             raise ValueError("Fisheye D must contain exactly 4 parameters.")
         if model is not CameraModelType.FISHEYE and D.size not in {
@@ -120,6 +178,10 @@ class CameraCalibration:
         object.__setattr__(self, "K", K)
         object.__setattr__(self, "D", D)
         object.__setattr__(self, "new_K", new_K)
+        object.__setattr__(self, "lens_position", lens_position)
+        object.__setattr__(self, "camera_model", camera_model)
+        object.__setattr__(self, "sensor_pixel_array_size", sensor_pixel_array_size)
+        object.__setattr__(self, "scaler_crop", scaler_crop)
 
     @classmethod
     def from_json(
@@ -210,6 +272,10 @@ class CameraCalibration:
             K=np.asarray(K_value, dtype=np.float64),
             D=np.asarray(D_value, dtype=np.float64),
             new_K=np.asarray(new_K_value, dtype=np.float64),
+            lens_position=data.get("lens_position"),
+            camera_model=data.get("camera_model"),
+            sensor_pixel_array_size=data.get("sensor_pixel_array_size"),
+            scaler_crop=data.get("scaler_crop"),
         )
 
 class CameraModel:

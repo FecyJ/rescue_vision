@@ -1,0 +1,67 @@
+{
+  "coordinate_frame": {
+    "origin": "robot_start_position",
+    "x": "field_x",
+    "y": "field_y",
+    "z": "up",
+    "unit": "mm",
+    "robot_origin_global_mm": [0.0, 0.0],
+    "robot_x_positive": "field_y_positive",
+    "robot_y_positive": "field_x_negative"
+  },
+  "board": {
+    "board_type": "charuco",
+    "chessboard_size_squares": [12, 9],
+    "square_size_mm": 15.0,
+    "marker_size_mm": 10.0,
+    "dictionary": "DICT_4X4_100",
+    "minimum_charuco_corners": 8,
+    "reference": "opencv_board_origin_outer_corner",
+    "printed_face": "camera",
+    "board_rotation_degrees": 0,
+    "edge_margin_mm": {
+      "left": 20.0,
+      "right": 20.0,
+      "bottom": 20.0,
+      "top": 20.0
+    }
+  },
+  "images": [
+    {
+      "name": "station_01_near_left",
+      "image": "images/charuco_001.png",
+      "board_origin_outer_corner_global_mm": [-520.0, 380.0],
+      "role": "fit"
+    },
+    {
+      "name": "station_02_near_right",
+      "image": "images/charuco_002.png",
+      "board_origin_outer_corner_global_mm": [280.0, 380.0],
+      "role": "fit"
+    },
+    {
+      "name": "station_03_middle_left",
+      "image": "images/charuco_003.png",
+      "board_origin_outer_corner_global_mm": [-520.0, 880.0],
+      "role": "fit"
+    },
+    {
+      "name": "station_04_middle_right",
+      "image": "images/charuco_004.png",
+      "board_origin_outer_corner_global_mm": [280.0, 880.0],
+      "role": "fit"
+    },
+    {
+      "name": "station_05_far_center",
+      "image": "images/charuco_005.png",
+      "board_origin_outer_corner_global_mm": [-120.0, 1380.0],
+      "role": "fit"
+    },
+    {
+      "name": "station_06_holdout",
+      "image": "images/charuco_006.png",
+      "board_origin_outer_corner_global_mm": [-120.0, 680.0],
+      "role": "holdout"
+    }
+  ]
+}

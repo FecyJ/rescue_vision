@@ -9,6 +9,7 @@ import pytest
 from rescue_vision.config.runtime import load_runtime_config
 from rescue_vision.geometry.camera_model import CameraCalibration, CameraModelType
 from rescue_vision.geometry.ground_projector import GroundProjector
+from rescue_vision.geometry.types import robot_frame_metadata
 
 
 def write_intrinsics(path, *, usable: bool = True) -> CameraCalibration:
@@ -250,6 +251,7 @@ def test_strict_config_and_geometry_build(tmp_path) -> None:
                 "image_size": [32, 24],
                 "model_type": "pinhole",
                 "calibration_id": calibration.calibration_id,
+                "coordinate_frame": robot_frame_metadata(),
                 "image_to_ground": np.eye(3).tolist(),
             }
         ),

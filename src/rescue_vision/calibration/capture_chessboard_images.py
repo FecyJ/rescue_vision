@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import cv2
+import numpy as np
 
 
 CALIBRATION_DIR = Path(__file__).resolve().parent
@@ -72,6 +73,15 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="Preview window scale relative to 2304x1296, default: 0.5.",
     )
+    parser.add_argument(
+        "--max-detection-scale",
+        type=float,
+        default=2.0,
+        help=(
+            "Maximum temporary image enlargement used when the board is "
+            "small in the frame; default: 2.0."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -111,15 +121,229 @@ def lock_focus(camera: Any, requested_position: float | None) -> float:
     return actual
 
 
-def detect_chessboard(frame_bgr):
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    found, corners = cv2.findChessboardCornersSB(
+def _integer_camera_sequence(
+    value: Any,
+    *,
+    attributes: tuple[str, ...],
+    name: str,
+) -> list[int]:
+    if all(hasattr(value, attribute) for attribute in attributes):
+        values = [getattr(value, attribute) for attribute in attributes]
+    else:
+        try:
+            values = list(value)
+        except TypeError as error:
+            raise RuntimeError(
+                f"Camera {name} must contain {len(attributes)} integers, got {value!r}."
+            ) from error
+    if len(values) != len(attributes) or any(
+        isinstance(item, bool) or not isinstance(item, (int, np.integer))
+        for item in values
+    ):
+        raise RuntimeError(
+            f"Camera {name} must contain {len(attributes)} integers, got {value!r}."
+        )
+    return [int(item) for item in values]
+
+
+def camera_binding_metadata(camera: Any) -> dict[str, Any]:
+    """Read stable camera identity, sensor size and active scaler crop."""
+
+    properties = getattr(camera, "camera_properties", None)
+    if not isinstance(properties, dict):
+        raise RuntimeError("Picamera2 camera_properties must be available.")
+    model = properties.get("Model")
+    if not isinstance(model, str) or not model.strip():
+        raise RuntimeError(
+            f"Camera properties do not provide a non-empty Model: {properties!r}."
+        )
+    pixel_array_size = _integer_camera_sequence(
+        properties.get("PixelArraySize"),
+        attributes=("width", "height"),
+        name="PixelArraySize",
+    )
+    metadata = camera.capture_metadata()
+    if not isinstance(metadata, dict):
+        raise RuntimeError("Picamera2 capture_metadata() must return a mapping.")
+    scaler_crop = _integer_camera_sequence(
+        metadata.get("ScalerCrop"),
+        attributes=("x", "y", "width", "height"),
+        name="ScalerCrop",
+    )
+    return {
+        "camera_model": model.strip(),
+        "sensor_pixel_array_size": pixel_array_size,
+        "scaler_crop": scaler_crop,
+    }
+
+
+def _detection_scales(max_scale: float) -> tuple[float, ...]:
+    if not np.isfinite(max_scale) or max_scale < 1.0 or max_scale > 4.0:
+        raise ValueError(
+            f"max_detection_scale must be in [1.0, 4.0], got {max_scale!r}."
+        )
+    candidates = [1.0, 1.5, 2.0, 3.0, max_scale]
+    return tuple(
+        sorted(
+            {
+                round(float(scale), 6)
+                for scale in candidates
+                if scale <= max_scale
+            }
+        )
+    )
+
+
+def _scaled_gray(gray: np.ndarray, scale: float) -> np.ndarray:
+    if scale == 1.0:
+        return gray
+    return cv2.resize(
         gray,
+        None,
+        fx=scale,
+        fy=scale,
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+
+def _normalize_detected_corners(
+    corners: np.ndarray | None,
+    scale: float,
+) -> np.ndarray | None:
+    if corners is None:
+        return None
+    values = np.asarray(corners, dtype=np.float64).reshape(-1, 2)
+    if len(values) != PATTERN_SIZE[0] * PATTERN_SIZE[1]:
+        return None
+    if scale != 1.0:
+        values /= scale
+    if not np.all(np.isfinite(values)):
+        return None
+    return values.reshape(-1, 1, 2).astype(np.float32)
+
+
+def _find_full_pattern(
+    gray: np.ndarray,
+    *,
+    scale: float,
+    flags: int,
+) -> np.ndarray | None:
+    found, corners = cv2.findChessboardCornersSB(
+        _scaled_gray(gray, scale),
         PATTERN_SIZE,
+        flags=flags,
+    )
+    if not found:
+        return None
+    return _normalize_detected_corners(corners, scale)
+
+
+def _find_larger_pattern(
+    gray: np.ndarray,
+    *,
+    scale: float,
+) -> np.ndarray | None:
+    """Use SB's larger-pattern mode to recover a full board at small scale.
+
+    A smaller requested pattern lets OpenCV search an oversized board.  We
+    accept the result only when all 11x8 physical internal corners are
+    returned; accepting an arbitrary partial lattice would lose its absolute
+    row/column offset and could produce a plausible but wrong extrinsic pose.
+    """
+
+    larger_flags = CHESSBOARD_FLAGS | cv2.CALIB_CB_LARGER
+    detection_gray = _scaled_gray(gray, scale)
+    for requested_pattern in ((7, 5), (5, 4), (3, 3)):
+        if hasattr(cv2, "findChessboardCornersSBWithMeta"):
+            found, corners, _meta = cv2.findChessboardCornersSBWithMeta(
+                detection_gray,
+                requested_pattern,
+                flags=larger_flags,
+            )
+        else:
+            found, corners = cv2.findChessboardCornersSB(
+                detection_gray,
+                requested_pattern,
+                flags=larger_flags,
+            )
+        if not found:
+            continue
+        normalized = _normalize_detected_corners(corners, scale)
+        if normalized is not None:
+            return normalized
+    return None
+
+
+def _find_legacy_pattern(
+    gray: np.ndarray,
+    *,
+    scale: float,
+) -> np.ndarray | None:
+    detection_gray = _scaled_gray(gray, scale)
+    found, corners = cv2.findChessboardCorners(
+        detection_gray,
+        PATTERN_SIZE,
+        flags=cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE,
+    )
+    normalized = _normalize_detected_corners(corners, scale) if found else None
+    if normalized is None:
+        return None
+    refined_gray = detection_gray
+    refined = cv2.cornerSubPix(
+        refined_gray,
+        normalized * scale,
+        winSize=(5, 5),
+        zeroZone=(-1, -1),
+        criteria=(
+            cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER,
+            30,
+            0.01,
+        ),
+    )
+    return _normalize_detected_corners(refined, scale)
+
+
+def detect_chessboard(frame_bgr, *, max_detection_scale: float = 2.0):
+    """Detect the complete 11x8 board, using safe small-board fallbacks.
+
+    The primary detector is unchanged.  If a distant board is too small for
+    the original pass, the same full pattern is retried on 1.5x/2x images,
+    then OpenCV's ``CALIB_CB_LARGER`` and legacy adaptive-threshold detector
+    are tried.  Every accepted result still contains all 88 corners.
+    """
+
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    scales = _detection_scales(max_detection_scale)
+
+    corners = _find_full_pattern(
+        gray,
+        scale=1.0,
         flags=CHESSBOARD_FLAGS,
     )
-    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-    return found, corners, sharpness
+    if corners is not None:
+        return True, corners, sharpness
+
+    for scale in scales[1:]:
+        corners = _find_full_pattern(
+            gray,
+            scale=scale,
+            flags=CHESSBOARD_FLAGS,
+        )
+        if corners is not None:
+            return True, corners, sharpness
+
+    for scale in scales:
+        corners = _find_larger_pattern(gray, scale=scale)
+        if corners is not None:
+            return True, corners, sharpness
+
+    for scale in scales:
+        corners = _find_legacy_pattern(gray, scale=scale)
+        if corners is not None:
+            return True, corners, sharpness
+
+    return False, None, sharpness
 
 
 def make_preview(
@@ -174,6 +398,7 @@ def main() -> None:
     from picamera2 import Picamera2
 
     args = parse_args()
+    _detection_scales(args.max_detection_scale)
     session_dir = create_session_directory(args.output)
     images_dir = session_dir / "images"
     detected_dir = session_dir / "detected"
@@ -198,6 +423,7 @@ def main() -> None:
         time.sleep(2.0)
 
         lens_position = lock_focus(camera, args.lens_position)
+        binding_metadata = camera_binding_metadata(camera)
 
         session_info = {
             "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -206,6 +432,7 @@ def main() -> None:
             "pattern_size_internal_corners": list(PATTERN_SIZE),
             "physical_square_count": [12, 9],
             "lens_position": lens_position,
+            **binding_metadata,
             "target_valid_images": args.target,
             "preview_scale": args.preview_scale,
         }
@@ -242,7 +469,10 @@ def main() -> None:
 
             attempt_count += 1
             metadata = camera.capture_metadata()
-            found, corners, sharpness = detect_chessboard(frame)
+            found, corners, sharpness = detect_chessboard(
+                frame,
+                max_detection_scale=args.max_detection_scale,
+            )
 
             if not found:
                 status = (

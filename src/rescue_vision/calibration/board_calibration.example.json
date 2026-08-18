@@ -1,0 +1,64 @@
+{
+  "coordinate_frame": {
+    "origin": "robot_start_position",
+    "x": "field_x",
+    "y": "field_y",
+    "z": "up",
+    "unit": "mm",
+    "robot_origin_global_mm": [0.0, 0.0],
+    "robot_x_positive": "field_y_positive",
+    "robot_y_positive": "field_x_negative"
+  },
+  "board": {
+    "pattern_size_internal_corners": [11, 8],
+    "physical_square_count": [12, 9],
+    "square_size_mm": 15.0,
+    "reference": "lower_left_outer_corner",
+    "reference_corner_marked": true,
+    "edge_margin_mm": {
+      "left": 20.0,
+      "right": 20.0,
+      "bottom": 20.0,
+      "top": 20.0
+    },
+    "detected_corner_order": "reference_first"
+  },
+  "images": [
+    {
+      "name": "station_01_near_left",
+      "image": "images/board_001.png",
+      "reference_outer_corner_global_mm": [-520.0, 380.0],
+      "role": "fit"
+    },
+    {
+      "name": "station_02_near_right",
+      "image": "images/board_002.png",
+      "reference_outer_corner_global_mm": [280.0, 380.0],
+      "role": "fit"
+    },
+    {
+      "name": "station_03_middle_left",
+      "image": "images/board_003.png",
+      "reference_outer_corner_global_mm": [-520.0, 880.0],
+      "role": "fit"
+    },
+    {
+      "name": "station_04_middle_right",
+      "image": "images/board_004.png",
+      "reference_outer_corner_global_mm": [280.0, 880.0],
+      "role": "fit"
+    },
+    {
+      "name": "station_05_far_center",
+      "image": "images/board_005.png",
+      "reference_outer_corner_global_mm": [-120.0, 1380.0],
+      "role": "fit"
+    },
+    {
+      "name": "station_06_holdout",
+      "image": "images/board_006.png",
+      "reference_outer_corner_global_mm": [-120.0, 680.0],
+      "role": "holdout"
+    }
+  ]
+}
