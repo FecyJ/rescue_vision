@@ -32,8 +32,8 @@
 | `DebugMotionCommand` | 调试运动 JSON schema | 死手、有效期、车体速度和可选目标朝向 |
 | `DebugGripperCommand` | 调试夹爪 JSON | 有效期和张开/闭合扳机按压布尔状态 |
 | `DebugCaptureCommand` | 调试采集 JSON schema | 开始、停止、抓拍和事件标记 |
-| `VideoModeCommand` | 图像模式请求 JSON schema | 客户端选择 `raw` 或 `perception`，不改变车辆动作 |
-| `VideoFrameMode` | 图像内容枚举 | `raw` 原图/当前图传；`perception` 推理叠加图 |
+| `VideoModeCommand` | 图像模式请求 JSON schema | 客户端选择 `raw`、`perception` 或 `bev`，不改变车辆动作 |
+| `VideoFrameMode` | 图像内容枚举 | 原图、推理叠加图或机器人局部地面 BEV |
 | `RemoteSessionStatus` | 会话权限、能力、限值和周期 | TCP 建立后的首条业务消息 |
 | `VideoFrameAttributes` | JPEG 帧 header attributes | 严格尺寸、坐标系、时间和标定身份 |
 | `MapSnapshotAttributes` | PNG 场地图元数据 | `FieldPoint` 原点为中心十字交点；`field_to_map_pixel()` / `map_pixel_to_field()` 使用固定轴向 |
@@ -288,8 +288,9 @@ remote_connection.send_observation(
 ```
 
 这里的 `frame` 和 `encoded_jpeg` 由车端相机发布器提供；若选择
-`VideoFrameMode.PERCEPTION`，发布器应把 perception 叠加结果编码，并在
-attributes 写入同样的 `mode`。
+`VideoFrameMode.PERCEPTION`，发布器应把 perception 叠加结果编码；选择
+`VideoFrameMode.BEV` 时必须发送 `bev_pixel` 坐标系和完整地面范围/
+`mm_per_pixel` attributes。两者都要在 attributes 回显实际 `mode`。
 `send_observation()` 非阻塞提交；同 topic 新值覆盖旧值，容量不足时再丢弃
 最早等待的其他 topic，避免网络反压相机
 实时路径。地图和车辆最新状态使用相同入口。
@@ -387,7 +388,8 @@ remote_connection.send_control(
 `raw` 是当前相机帧（已按车端配置决定是否去畸变）；`perception` 是同一坐标系
 图像上叠加目标框、颜色掩码、K0、置信度和质量信息的结果。车端只保留最新待
 推理帧，推理旁路故障会终止当前会话，不会把未经声明的原图伪装成
-`perception`。
+`perception`。`bev` 仅在可用地面映射包含 BEV 配置时声明；它在独立最新帧
+后台旁路生成，坐标为机器人局部 `BevPixel`，不是场地地图或定位结果。
 
 ## 10. 仓库内参考客户端
 

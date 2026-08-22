@@ -9,9 +9,10 @@
 | 入口 | 输入与生命周期 | 输出或语义 |
 | --- | --- | --- |
 | `rescue-vision-manual-capture` | `runtime.yaml`、车端输出根目录和显式监督确认 | 完整装配 TCP/UART/相机/运动/夹爪/记录；推荐生产入口 |
-| `build_camera_pipeline()` | 已加载的 `AppConfig` | 创建但不启动配置选择的真机源和可选去畸变 |
+| `build_camera_pipeline()` | 已加载的 `AppConfig` | 创建但不启动配置选择的真机源、可选去畸变和地面映射 |
 | `build_session_status()` | 同一 `AppConfig`、服务实例 ID、视频 FPS 和可用模式 | 创建声明运动、夹爪、视频模式、车辆和采集能力的会话状态 |
-| `run_manual_capture_session()` | 已启动连接、运动执行器、可选夹爪执行器、采集会话、相机管线和可选 perception 旁路 | 运行单个 TCP 会话；断线/故障时停止运动与夹爪推进并清理当前记录 |
+| `run_manual_capture_session()` | 已启动连接、运动执行器、可选夹爪执行器、采集会话、相机管线和可选 perception/BEV 旁路 | 运行单个 TCP 会话；断线/故障时停止运动与夹爪推进并清理当前记录 |
+| `BevFrameRenderer` | 已加载且包含 BEV 配置的 `GroundProjector`；显式 `start/stop` | 有界丢旧保新的后台 BEV 生成旁路；输出保留源帧号和采集时间 |
 
 `run_manual_capture_session()` 不创建或打开硬件资源。调用方传入
 `RemoteMotionExecutor`，并在 `motion.gripper.enabled=true` 时传入共享同一个
@@ -39,9 +40,10 @@ rescue-vision-manual-capture \
 `RemoteMotionExecutor` 校验死手、有效期和限速；夹爪命令由
 `RemoteGripperExecutor` 校验有效期和布尔扳机状态，再按配置机械端点与
 全行程时间渐进下发；采集命令可独立
-开始/停止统一 recording 会话。电脑端通过 `video_modes` 选择 `raw` 或
-`perception`；后者由 `PerceptionFrameRenderer` 在最新帧后台旁路运行
-`TargetPoseDetector`，只发布带实际模式标记的 JPEG，不阻塞运动安全循环。手动会话的 `motion.jsonl` 逐条
+开始/停止统一 recording 会话。电脑端通过 `video_modes` 选择 `raw`、
+`perception` 或 `bev`；perception 由 `PerceptionFrameRenderer` 在最新帧后台
+旁路运行 `TargetPoseDetector`，BEV 只在当前地面映射包含 BEV 配置时由独立
+最新帧旁路生成。两者只发布带实际模式和坐标元数据的 JPEG，不阻塞运动安全循环。手动会话的 `motion.jsonl` 逐条
 保存运动/夹爪执行结果、轮速与舵机遥测、未知 UART 扩展报文和停车原因；
 这些事件与图像帧统一使用树莓派应用单调时间。
 等待首个客户端及断线重连期间，入口仍以有界周期排空 STM32 主动遥测，避免

@@ -28,6 +28,7 @@ from rescue_vision.geometry.types import FieldPoint, MapPixel
 class ImageCoordinateSystem(str, Enum):
     RAW_PIXEL = "raw_pixel"
     UNDISTORTED_PIXEL = "undistorted_pixel"
+    BEV_PIXEL = "bev_pixel"
 
 
 class TeamColor(str, Enum):
@@ -463,6 +464,11 @@ class VideoFrameAttributes:
     coordinate_system: ImageCoordinateSystem
     calibration_id: str | None
     mode: VideoFrameMode = VideoFrameMode.RAW
+    bev_x_min_mm: float | None = None
+    bev_x_max_mm: float | None = None
+    bev_y_min_mm: float | None = None
+    bev_y_max_mm: float | None = None
+    bev_mm_per_pixel: float | None = None
 
     def __post_init__(self) -> None:
         _non_negative_int(self.frame_sequence, "frame_sequence")
@@ -483,8 +489,41 @@ class VideoFrameAttributes:
                 raise ValueError("raw_pixel video must not declare intrinsics.")
         elif not isinstance(calibration_id, str) or not calibration_id.strip():
             raise ValueError(
-                "undistorted_pixel video requires a non-empty calibration_id."
+                "undistorted_pixel and bev_pixel video requires a non-empty "
+                "calibration_id."
             )
+        bev_values = (
+            self.bev_x_min_mm,
+            self.bev_x_max_mm,
+            self.bev_y_min_mm,
+            self.bev_y_max_mm,
+            self.bev_mm_per_pixel,
+        )
+        if self.mode is VideoFrameMode.BEV:
+            if self.coordinate_system is not ImageCoordinateSystem.BEV_PIXEL:
+                raise ValueError("bev mode requires bev_pixel coordinates.")
+            if any(value is None for value in bev_values):
+                raise ValueError("bev mode requires all BEV mapping attributes.")
+            x_min, x_max, y_min, y_max, mm_per_pixel = (
+                _finite_float(value, "BEV mapping attribute")
+                for value in bev_values
+            )
+            if x_max <= x_min or y_max <= y_min or mm_per_pixel <= 0.0:
+                raise ValueError("BEV ranges and mm_per_pixel must be positive.")
+            expected_width = (y_max - y_min) / mm_per_pixel
+            expected_height = (x_max - x_min) / mm_per_pixel
+            if not math.isclose(expected_width, width, abs_tol=1e-9) or not math.isclose(
+                expected_height,
+                height,
+                abs_tol=1e-9,
+            ):
+                raise ValueError(
+                    "BEV dimensions must match ranges and bev_mm_per_pixel."
+                )
+        elif self.coordinate_system is ImageCoordinateSystem.BEV_PIXEL:
+            raise ValueError("bev_pixel coordinates require bev mode.")
+        elif any(value is not None for value in bev_values):
+            raise ValueError("Non-BEV video must not declare BEV mapping attributes.")
 
     def to_attributes(self) -> dict[str, RemoteAttributeValue]:
         return {
@@ -495,6 +534,11 @@ class VideoFrameAttributes:
             "coordinate_system": self.coordinate_system.value,
             "calibration_id": self.calibration_id,
             "mode": self.mode.value,
+            "bev_x_min_mm": self.bev_x_min_mm,
+            "bev_x_max_mm": self.bev_x_max_mm,
+            "bev_y_min_mm": self.bev_y_min_mm,
+            "bev_y_max_mm": self.bev_y_max_mm,
+            "bev_mm_per_pixel": self.bev_mm_per_pixel,
         }
 
     @classmethod
@@ -512,6 +556,11 @@ class VideoFrameAttributes:
                 "coordinate_system",
                 "calibration_id",
                 "mode",
+                "bev_x_min_mm",
+                "bev_x_max_mm",
+                "bev_y_min_mm",
+                "bev_y_max_mm",
+                "bev_mm_per_pixel",
             },
             "VideoFrameAttributes",
         )
@@ -527,6 +576,11 @@ class VideoFrameAttributes:
             ),
             calibration_id=attributes["calibration_id"],
             mode=_enum_value(VideoFrameMode, attributes["mode"], "mode"),
+            bev_x_min_mm=attributes["bev_x_min_mm"],
+            bev_x_max_mm=attributes["bev_x_max_mm"],
+            bev_y_min_mm=attributes["bev_y_min_mm"],
+            bev_y_max_mm=attributes["bev_y_max_mm"],
+            bev_mm_per_pixel=attributes["bev_mm_per_pixel"],
         )
 
 

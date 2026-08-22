@@ -178,7 +178,7 @@ def test_video_mode_command_round_trip_and_strict_values() -> None:
                 {
                     "request_id": "video-002",
                     "issued_timestamp_ns": 0,
-                    "mode": "bev",
+                    "mode": "thermal",
                 }
             ).encode("utf-8")
         )

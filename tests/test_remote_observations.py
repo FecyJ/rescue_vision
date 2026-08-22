@@ -120,12 +120,27 @@ def test_video_attributes_round_trip_and_coordinate_binding() -> None:
         calibration_id="camera-front-20260729",
         mode=VideoFrameMode.PERCEPTION,
     )
+    bev = VideoFrameAttributes(
+        frame_sequence=5,
+        timestamp_ns=400,
+        width=40,
+        height=30,
+        coordinate_system=ImageCoordinateSystem.BEV_PIXEL,
+        calibration_id="camera-front-20260729",
+        mode=VideoFrameMode.BEV,
+        bev_x_min_mm=0.0,
+        bev_x_max_mm=300.0,
+        bev_y_min_mm=-200.0,
+        bev_y_max_mm=200.0,
+        bev_mm_per_pixel=10.0,
+    )
 
     assert VideoFrameAttributes.from_attributes(raw.to_attributes()) == raw
     assert (
         VideoFrameAttributes.from_attributes(undistorted.to_attributes())
         == undistorted
     )
+    assert VideoFrameAttributes.from_attributes(bev.to_attributes()) == bev
     with pytest.raises(ValueError, match="requires"):
         VideoFrameAttributes(
             frame_sequence=0,
@@ -134,6 +149,21 @@ def test_video_attributes_round_trip_and_coordinate_binding() -> None:
             height=480,
             coordinate_system=ImageCoordinateSystem.UNDISTORTED_PIXEL,
             calibration_id=None,
+        )
+    with pytest.raises(ValueError, match="dimensions"):
+        VideoFrameAttributes(
+            frame_sequence=0,
+            timestamp_ns=0,
+            width=41,
+            height=30,
+            coordinate_system=ImageCoordinateSystem.BEV_PIXEL,
+            calibration_id="test",
+            mode=VideoFrameMode.BEV,
+            bev_x_min_mm=0.0,
+            bev_x_max_mm=300.0,
+            bev_y_min_mm=-200.0,
+            bev_y_max_mm=200.0,
+            bev_mm_per_pixel=10.0,
         )
     unexpected = raw.to_attributes()
     unexpected["legacy_field"] = True

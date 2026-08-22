@@ -9,6 +9,7 @@ import pytest
 
 import rescue_vision.app.manual_capture as manual_capture_module
 from rescue_vision.app.manual_capture import (
+    BevFrameRenderer,
     CameraPipeline,
     CaptureSession,
     VehicleState,
@@ -50,6 +51,7 @@ from rescue_vision.motion import (
     RemoteMotionExecutor,
     RemoteMotionResult,
 )
+from rescue_vision.geometry.ground_projector import BevConfig, GroundProjector
 
 
 class FakeSource:
@@ -179,6 +181,10 @@ class FakePerceptionRenderer:
 
     def clear_latest(self) -> None:
         self.latest_frame = None
+
+
+class FakeBevRenderer(FakePerceptionRenderer):
+    pass
 
 
 class LaggingFakePerceptionRenderer(FakePerceptionRenderer):
@@ -553,6 +559,110 @@ def test_manual_session_switches_between_raw_and_perception_video(tmp_path) -> N
     ]
     assert "raw" in modes
     assert "perception" in modes
+
+
+def test_bev_renderer_keeps_latest_result_off_motion_loop() -> None:
+    projector = GroundProjector(
+        np.eye(3),
+        BevConfig(0.0, 30.0, 0.0, 40.0, 10.0),
+    )
+    renderer = BevFrameRenderer(projector)
+    source = CameraFrame(
+        sequence=7,
+        timestamp_ns=11,
+        image_bgr=np.zeros((30, 40, 3), dtype=np.uint8),
+    )
+    renderer.start()
+    try:
+        renderer.submit(source)
+        deadline = time.monotonic() + 1.0
+        rendered = None
+        while time.monotonic() < deadline:
+            rendered = renderer.latest()
+            if rendered is not None:
+                break
+            time.sleep(0.001)
+        assert rendered is not None
+        assert rendered.sequence == source.sequence
+        assert rendered.timestamp_ns == source.timestamp_ns
+        assert rendered.image_bgr.shape == (3, 4, 3)
+    finally:
+        renderer.stop()
+
+
+def test_manual_session_publishes_bev_with_robot_ground_mapping(tmp_path) -> None:
+    config = _config()
+    source_frame = CameraFrame(
+        sequence=4,
+        timestamp_ns=1,
+        image_bgr=np.zeros((3, 4, 3), dtype=np.uint8),
+    )
+    projector = GroundProjector(
+        np.eye(3),
+        BevConfig(0.0, 30.0, 0.0, 40.0, 10.0),
+    )
+    pipeline = CameraPipeline(
+        FakeSource(source_frame),
+        None,
+        ImageCoordinateSystem.UNDISTORTED_PIXEL,
+        "test-calibration",
+        projector,
+    )
+    capture = CaptureSession(
+        output_root=tmp_path,
+        config=config,
+        config_snapshot={},
+        pipeline=pipeline,
+    )
+    command = VideoModeCommand(
+        request_id="video-bev",
+        issued_timestamp_ns=1,
+        mode=VideoFrameMode.BEV,
+    )
+    connection = FakeConnection(
+        [_received(RemoteTopic.VIDEO_MODE, command.to_payload(), 0)],
+        empty_polls_before_disconnect=100,
+    )
+    executor = RemoteMotionExecutor(
+        MotionController(
+            FakeCarChannel(),
+            MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 500),
+        )
+    )
+    renderer = FakeBevRenderer()
+    status = build_session_status(
+        config,
+        server_instance_id="test-server",
+        video_fps=1_000.0,
+        video_modes=(VideoFrameMode.RAW, VideoFrameMode.BEV),
+    )
+
+    with pytest.raises(RemoteDisconnectedError):
+        run_manual_capture_session(
+            connection,
+            executor,
+            None,
+            capture,
+            pipeline,
+            status,
+            video_fps=1_000.0,
+            jpeg_quality=80,
+            bev_renderer=renderer,  # type: ignore[arg-type]
+            safety_mode=VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP,
+        )
+
+    bev_attributes = next(
+        attributes
+        for topic, attributes in connection.observation_attributes
+        if topic == RemoteTopic.VIDEO_FRAME.value
+        and attributes.get("mode") == "bev"
+    )
+    assert bev_attributes["coordinate_system"] == "bev_pixel"
+    assert bev_attributes["width"] == 4
+    assert bev_attributes["height"] == 3
+    assert bev_attributes["bev_x_max_mm"] == pytest.approx(30.0)
+    assert bev_attributes["bev_y_max_mm"] == pytest.approx(40.0)
+    assert bev_attributes["bev_mm_per_pixel"] == pytest.approx(10.0)
 
 
 def test_recording_queue_overflow_faults_capture_and_requires_stop(

@@ -55,6 +55,7 @@ from rescue_vision.geometry.camera_model import (
     IMAGE_BORDER_FILL_VALUE,
     CameraModel,
 )
+from rescue_vision.geometry.ground_projector import BevConfig, GroundProjector
 from rescue_vision.motion import (
     CarTelemetry,
     ExecutedRemoteGripper,
@@ -84,11 +85,120 @@ class CameraPipeline:
     camera_model: CameraModel | None
     coordinate_system: ImageCoordinateSystem
     calibration_id: str | None
+    ground_projector: GroundProjector | None = None
 
     def prepare(self, frame: CameraFrame) -> CameraFrame:
         if self.camera_model is None:
             return frame
         return undistort_camera_frame(frame, camera_model=self.camera_model)
+
+
+class BevFrameRenderer:
+    """在有界最新帧后台旁路中生成 BEV，不阻塞运动安全循环。"""
+
+    def __init__(self, ground_projector: GroundProjector) -> None:
+        if ground_projector.bev_config is None:
+            raise ValueError("BEV renderer requires a projector with BEV config.")
+        self._ground_projector = ground_projector
+        self._condition = threading.Event()
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._pending_frame: CameraFrame | None = None
+        self._latest_frame: CameraFrame | None = None
+        self._worker_error: BaseException | None = None
+        self._thread: threading.Thread | None = None
+        self._started = False
+
+    def start(self) -> None:
+        if self._started:
+            raise RuntimeError("BevFrameRenderer is already started.")
+        self._stop_event.clear()
+        self._condition.clear()
+        with self._lock:
+            self._pending_frame = None
+            self._latest_frame = None
+            self._worker_error = None
+        self._thread = threading.Thread(
+            target=self._worker_loop,
+            name="rescue-bev-video",
+            daemon=True,
+        )
+        self._started = True
+        try:
+            self._thread.start()
+        except BaseException:
+            self._started = False
+            self._thread = None
+            raise
+
+    def submit(self, frame: CameraFrame) -> None:
+        self._require_started()
+        self._raise_worker_error()
+        with self._lock:
+            self._pending_frame = frame
+        self._condition.set()
+
+    def latest(self) -> CameraFrame | None:
+        self._require_started()
+        self._raise_worker_error()
+        with self._lock:
+            return self._latest_frame
+
+    def clear_latest(self) -> None:
+        self._require_started()
+        self._raise_worker_error()
+        with self._lock:
+            self._pending_frame = None
+            self._latest_frame = None
+
+    def stop(self) -> None:
+        if not self._started:
+            return
+        self._stop_event.set()
+        self._condition.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=5.0)
+        if thread is not None and thread.is_alive():
+            raise RuntimeError("BevFrameRenderer worker did not stop.")
+        self._thread = None
+        self._started = False
+        self._condition.clear()
+        self._raise_worker_error()
+
+    def _require_started(self) -> None:
+        if not self._started:
+            raise RuntimeError("BevFrameRenderer is not started.")
+
+    def _raise_worker_error(self) -> None:
+        if self._worker_error is not None:
+            raise RuntimeError("BEV video renderer failed.") from self._worker_error
+
+    def _worker_loop(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                self._condition.wait()
+                if self._stop_event.is_set():
+                    break
+                with self._lock:
+                    frame = self._pending_frame
+                    self._pending_frame = None
+                    self._condition.clear()
+                if frame is None:
+                    continue
+                image_bgr = self._ground_projector.make_bev_image(frame.image_bgr)
+                rendered = CameraFrame(
+                    sequence=frame.sequence,
+                    timestamp_ns=frame.timestamp_ns,
+                    image_bgr=image_bgr,
+                    metadata=frame.metadata,
+                )
+                with self._lock:
+                    self._latest_frame = rendered
+        except BaseException as exc:
+            self._worker_error = exc
+            self._stop_event.set()
+            self._condition.set()
 
 
 @dataclass(frozen=True, slots=True)
@@ -598,6 +708,7 @@ class ManualCaptureRuntime:
         video_fps: float,
         jpeg_quality: int,
         perception_renderer: PerceptionFrameRenderer | None,
+        bev_renderer: BevFrameRenderer | None,
         stop_requested: Callable[[], bool],
         safety_mode: VehicleSafetyMode,
     ) -> None:
@@ -610,11 +721,12 @@ class ManualCaptureRuntime:
         self.video_period_ns = int(1_000_000_000 / video_fps)
         self.jpeg_quality = jpeg_quality
         self.perception_renderer = perception_renderer
+        self.bev_renderer = bev_renderer
         self.stop_requested = stop_requested
         self.vehicle = VehicleState(safety_mode=safety_mode)
         self.video_mode = VideoFrameMode.RAW
         self.last_sent_video_sequence: int | None = None
-        self.minimum_perception_sequence: int | None = None
+        self.minimum_rendered_sequence: int | None = None
         self.latest_frame: CameraFrame | None = None
         self.last_camera_frame_ns = time.monotonic_ns()
         self.next_video_ns = 0
@@ -695,6 +807,10 @@ class ManualCaptureRuntime:
                         "Perception video mode is not available in this session."
                     )
                 self.perception_renderer.submit(self.latest_frame)
+            elif self.video_mode is VideoFrameMode.BEV:
+                if self.bev_renderer is None:
+                    raise RuntimeError("BEV video mode is not available in this session.")
+                self.bev_renderer.submit(self.latest_frame)
         now_ns = time.monotonic_ns()
         if self.latest_frame is not None and now_ns >= self.next_video_ns:
             self._send_current_video()
@@ -760,24 +876,31 @@ class ManualCaptureRuntime:
                 and self.perception_renderer is None
             ):
                 raise ValueError("Perception video mode is not configured.")
+            if command.mode is VideoFrameMode.BEV and self.bev_renderer is None:
+                raise ValueError("BEV video mode is not configured.")
             self.video_mode = command.mode
             self.last_sent_video_sequence = None
+            if command.mode in (VideoFrameMode.PERCEPTION, VideoFrameMode.BEV):
+                renderer = (
+                    self.perception_renderer
+                    if command.mode is VideoFrameMode.PERCEPTION
+                    else self.bev_renderer
+                )
+                assert renderer is not None
+                renderer.clear_latest()
+                self.minimum_rendered_sequence = (
+                    None if self.latest_frame is None else self.latest_frame.sequence
+                )
             if command.mode is VideoFrameMode.PERCEPTION:
                 assert self.perception_renderer is not None
-                self.perception_renderer.clear_latest()
-                self.minimum_perception_sequence = (
-                    None
-                    if self.latest_frame is None
-                    else self.latest_frame.sequence
-                )
+                if self.latest_frame is not None:
+                    self.perception_renderer.submit(self.latest_frame)
+            elif command.mode is VideoFrameMode.BEV:
+                assert self.bev_renderer is not None
+                if self.latest_frame is not None:
+                    self.bev_renderer.submit(self.latest_frame)
             else:
-                self.minimum_perception_sequence = None
-            if (
-                command.mode is VideoFrameMode.PERCEPTION
-                and self.latest_frame is not None
-            ):
-                assert self.perception_renderer is not None
-                self.perception_renderer.submit(self.latest_frame)
+                self.minimum_rendered_sequence = None
             return
         if message.topic == RemoteTopic.DEBUG_GRIPPER.value:
             if self.gripper_executor is None:
@@ -811,9 +934,19 @@ class ManualCaptureRuntime:
             frame = self.perception_renderer.latest()
             if frame is None:
                 return
-            if self.minimum_perception_sequence is None:
-                self.minimum_perception_sequence = frame.sequence
-            if frame.sequence < self.minimum_perception_sequence:
+            if self.minimum_rendered_sequence is None:
+                self.minimum_rendered_sequence = frame.sequence
+            if frame.sequence < self.minimum_rendered_sequence:
+                return
+        elif self.video_mode is VideoFrameMode.BEV:
+            if self.bev_renderer is None:
+                raise RuntimeError("BEV video mode is not configured.")
+            frame = self.bev_renderer.latest()
+            if frame is None:
+                return
+            if self.minimum_rendered_sequence is None:
+                self.minimum_rendered_sequence = frame.sequence
+            if frame.sequence < self.minimum_rendered_sequence:
                 return
         if frame is None or frame.sequence == self.last_sent_video_sequence:
             return
@@ -835,7 +968,9 @@ class ManualCaptureRuntime:
 
 
 def build_camera_pipeline(config: AppConfig) -> CameraPipeline:
-    camera_model = config.build_camera_model()
+    geometry = config.build_geometry()
+    camera_model = None if geometry is None else geometry.camera_model
+    ground_projector = None if geometry is None else geometry.ground_projector
     source_class = (
         Picamera2Source
         if config.camera.backend == "picamera2"
@@ -859,6 +994,7 @@ def build_camera_pipeline(config: AppConfig) -> CameraPipeline:
             if camera_model is None
             else camera_model.calibration.calibration_id
         ),
+        ground_projector,
     )
 
 
@@ -907,6 +1043,7 @@ def run_manual_capture_session(
     video_fps: float,
     jpeg_quality: int,
     perception_renderer: PerceptionFrameRenderer | None = None,
+    bev_renderer: BevFrameRenderer | None = None,
     stop_requested: Callable[[], bool] = lambda: False,
     safety_mode: VehicleSafetyMode = VehicleSafetyMode.UNAVAILABLE,
 ) -> None:
@@ -920,6 +1057,7 @@ def run_manual_capture_session(
         video_fps=video_fps,
         jpeg_quality=jpeg_quality,
         perception_renderer=perception_renderer,
+        bev_renderer=bev_renderer,
         stop_requested=stop_requested,
         safety_mode=safety_mode,
     )
@@ -978,14 +1116,30 @@ def _send_video_frame(
     if not ok:
         raise RuntimeError("OpenCV failed to encode the remote JPEG frame.")
     height, width = frame.image_bgr.shape[:2]
+    bev_config: BevConfig | None = None
+    coordinate_system = pipeline.coordinate_system
+    if mode is VideoFrameMode.BEV:
+        if pipeline.ground_projector is None:
+            raise RuntimeError("BEV video requires a configured ground projector.")
+        bev_config = pipeline.ground_projector.bev_config
+        if bev_config is None:
+            raise RuntimeError("BEV video requires a configured BEV mapping.")
+        coordinate_system = ImageCoordinateSystem.BEV_PIXEL
     attributes = VideoFrameAttributes(
         frame_sequence=frame.sequence,
         timestamp_ns=frame.timestamp_ns,
         width=width,
         height=height,
-        coordinate_system=pipeline.coordinate_system,
+        coordinate_system=coordinate_system,
         calibration_id=pipeline.calibration_id,
         mode=mode,
+        bev_x_min_mm=None if bev_config is None else bev_config.x_min,
+        bev_x_max_mm=None if bev_config is None else bev_config.x_max,
+        bev_y_min_mm=None if bev_config is None else bev_config.y_min,
+        bev_y_max_mm=None if bev_config is None else bev_config.y_max,
+        bev_mm_per_pixel=(
+            None if bev_config is None else bev_config.mm_per_pixel
+        ),
     )
     connection.send_observation(
         RemoteTopic.VIDEO_FRAME.value,
@@ -1096,11 +1250,15 @@ def main() -> None:
         if config.hailo.enabled
         else None
     )
-    video_modes = (
-        (VideoFrameMode.RAW, VideoFrameMode.PERCEPTION)
-        if perception_renderer is not None
-        else (VideoFrameMode.RAW,)
+    bev_renderer = (
+        BevFrameRenderer(pipeline.ground_projector)
+        if pipeline.ground_projector is not None
+        and pipeline.ground_projector.bev_config is not None
+        else None
     )
+    video_modes = (VideoFrameMode.RAW,) + (
+        (VideoFrameMode.PERCEPTION,) if perception_renderer is not None else ()
+    ) + ((VideoFrameMode.BEV,) if bev_renderer is not None else ())
     server_instance_id = f"manual-capture-{uuid.uuid4()}"
     shutdown_requested = threading.Event()
     previous_sigterm = signal.getsignal(signal.SIGTERM)
@@ -1111,9 +1269,11 @@ def main() -> None:
 
     try:
         with server, channel:
-            if perception_renderer is not None:
-                perception_renderer.start()
             try:
+                if perception_renderer is not None:
+                    perception_renderer.start()
+                if bev_renderer is not None:
+                    bev_renderer.start()
                 pipeline.source.start()
                 while not shutdown_requested.is_set():
                     connection = _accept_with_shutdown(
@@ -1148,6 +1308,7 @@ def main() -> None:
                                 video_fps=args.video_fps,
                                 jpeg_quality=args.jpeg_quality,
                                 perception_renderer=perception_renderer,
+                                bev_renderer=bev_renderer,
                                 stop_requested=shutdown_requested.is_set,
                                 safety_mode=(
                                     VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP
@@ -1170,8 +1331,12 @@ def main() -> None:
                     try:
                         pipeline.source.stop()
                     finally:
-                        if perception_renderer is not None:
-                            perception_renderer.stop()
+                        try:
+                            if perception_renderer is not None:
+                                perception_renderer.stop()
+                        finally:
+                            if bev_renderer is not None:
+                                bev_renderer.stop()
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
 

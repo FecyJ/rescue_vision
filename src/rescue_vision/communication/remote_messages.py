@@ -56,6 +56,7 @@ class VideoFrameMode(str, Enum):
 
     RAW = "raw"
     PERCEPTION = "perception"
+    BEV = "bev"
 
 
 def _non_negative_int(value: object, location: str) -> int:
@@ -455,7 +456,7 @@ class DebugCaptureCommand:
 
 @dataclass(frozen=True, slots=True)
 class VideoModeCommand:
-    """电脑端选择车端发送原图或 perception 可视化图像。"""
+    """电脑端选择车端发送原图、perception 或 BEV 图像。"""
 
     request_id: str
     issued_timestamp_ns: int
