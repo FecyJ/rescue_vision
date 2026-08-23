@@ -1095,7 +1095,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "remote.control_queue_capacity",
         ),
         observation_queue_capacity=_positive_int(
-            remote_raw.get("observation_queue_capacity", 2),
+            remote_raw.get("observation_queue_capacity", 3),
             "remote.observation_queue_capacity",
         ),
         max_header_bytes=_positive_int(

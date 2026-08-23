@@ -323,7 +323,7 @@ def test_camera_only_status_disables_actuators_but_keeps_vehicle_heartbeat() -> 
     assert not status.motion_control_available
     assert not status.gripper_control_available
     assert status.vehicle_state_available
-    assert status.vehicle_state_period_ms == 100
+    assert status.vehicle_state_period_ms == 500
     assert status.max_linear_velocity_m_s is None
     assert status.max_angular_velocity_rad_s is None
     assert status.capture_control_available
@@ -1122,6 +1122,37 @@ def test_camera_only_mode_does_not_require_uart_or_physical_stop() -> None:
     config.uart = SimpleNamespace(enabled=False)
     config.motion.enabled = False
 
+    _validate_mode(
+        config,
+        video_fps=10.0,
+        supervised_physical_stop_ready=False,
+        camera_only=True,
+    )
+
+
+def test_manual_capture_requires_latest_queue_slot_for_each_image_topic() -> None:
+    config = _config()
+    config.remote = SimpleNamespace(
+        enabled=True,
+        role=RemoteRole.SERVER,
+        access_mode=RemoteAccessMode.DEBUG_CONTROL,
+        observation_queue_capacity=2,
+    )
+    config.uart = SimpleNamespace(enabled=False)
+    config.motion.enabled = False
+    config.world = SimpleNamespace(
+        static_map=SimpleNamespace(regions=(object(),)),
+    )
+
+    with pytest.raises(RuntimeError, match="at least 3"):
+        _validate_mode(
+            config,
+            video_fps=10.0,
+            supervised_physical_stop_ready=False,
+            camera_only=True,
+        )
+
+    config.remote.observation_queue_capacity = 3
     _validate_mode(
         config,
         video_fps=10.0,

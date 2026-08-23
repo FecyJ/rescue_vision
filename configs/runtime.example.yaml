@@ -49,7 +49,8 @@ remote:
   io_timeout_ms: 100.0
   # 控制消息不能静默丢弃；观察消息按 topic 合并并丢旧保新。
   control_queue_capacity: 32
-  observation_queue_capacity: 2
+  # manual-capture 同时保留视频、车辆状态和地图三个最新 topic。
+  observation_queue_capacity: 3
   max_header_bytes: 4096
   # 默认容纳单帧 JPEG/地图快照；仍需按实际分辨率和网络验证。
   max_payload_bytes: 2097152

@@ -294,6 +294,8 @@ remote_connection.send_observation(
 `send_observation()` 非阻塞提交；同 topic 新值覆盖旧值，容量不足时再丢弃
 最早等待的其他 topic，避免网络反压相机
 实时路径。地图和车辆最新状态使用相同入口。
+运行应用必须为所有需要同时保留的最新值 topic 预留槽位；当前手动采集同时
+发布视频、车辆状态和地图，因此 `observation_queue_capacity` 至少为 `3`。
 
 会话状态、采集状态等不可被覆盖的关键消息应使用
 `send_reliable_observation()`：

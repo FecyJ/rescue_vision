@@ -81,6 +81,7 @@ from rescue_vision.app.field_map import (
 )
 SESSION_STATUS_PERIOD_MS = 1_000
 VEHICLE_STATUS_PERIOD_MS = 100
+CAMERA_ONLY_VEHICLE_STATUS_PERIOD_MS = 500
 CAPTURE_STATUS_PERIOD_MS = 500
 MAP_SNAPSHOT_PERIOD_MS = 500
 CAMERA_ONLY_CONTROL_BATCH_LIMIT = 32
@@ -1132,7 +1133,11 @@ def build_session_status(
         capture_status_available=True,
         target_heading_control_available=False,
         session_status_period_ms=SESSION_STATUS_PERIOD_MS,
-        vehicle_state_period_ms=VEHICLE_STATUS_PERIOD_MS,
+        vehicle_state_period_ms=(
+            CAMERA_ONLY_VEHICLE_STATUS_PERIOD_MS
+            if camera_only
+            else VEHICLE_STATUS_PERIOD_MS
+        ),
         map_snapshot_period_ms=(
             MAP_SNAPSHOT_PERIOD_MS if map_snapshot_available else None
         ),
@@ -1324,6 +1329,24 @@ def _validate_mode(
         )
     if video_fps > config.camera.fps:
         raise RuntimeError("--video-fps must not exceed camera.fps.")
+    observation_capacity = getattr(
+        config.remote,
+        "observation_queue_capacity",
+        None,
+    )
+    static_map = getattr(getattr(config, "world", None), "static_map", None)
+    map_available = bool(getattr(static_map, "regions", ()))
+    required_observation_capacity = 3 if map_available else 2
+    if (
+        observation_capacity is not None
+        and observation_capacity < required_observation_capacity
+    ):
+        raise RuntimeError(
+            "remote.observation_queue_capacity must be at least "
+            f"{required_observation_capacity} for video, vehicle state"
+            f"{' and map' if map_available else ''}; got "
+            f"{observation_capacity}."
+        )
 
 
 def main() -> None:

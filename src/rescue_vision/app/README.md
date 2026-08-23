@@ -76,12 +76,17 @@ rescue-vision-manual-capture \
 此模式不打开 UART，也不要求 `uart.enabled`、`motion.enabled` 或
 `--supervised-physical-stop-ready`。会话仍提供 raw/perception/BEV 图传和采集
 控制，但明确声明 `motion_control=false`、`gripper_control=false`。车端继续按
-100 ms 周期发布新鲜车辆状态，固定报告 `control_ready=false`、
+实际循环通常每 100 ms 发布车辆状态，并把协议最大发布周期声明为 500 ms，
+使客户端陈旧阈值为 1500 ms。状态固定报告 `control_ready=false`、
 `uart_connected=false`、`safety_mode=unavailable` 和 `stop_reason=uart_fault`，
 避免现有客户端因车辆状态陈旧而反复重连，同时不会伪装单片机在线。
 若旧客户端没有按 capability 停止周期运动/夹爪心跳，车端会严格解析并安全
 丢弃这些合法消息，不会因此关闭仅相机会话；消息不会写 UART 或更新“已应用”
 命令 ID。畸形 payload 和未知 control 仍按协议错误处理。
+
+视频、车辆状态和地图是三个独立的最新值 topic，因此
+`remote.observation_queue_capacity` 必须至少为 `3`；入口会在启动时拒绝更小
+容量，避免图像流把车辆心跳挤出队列。
 
 该模式产生的录像使用已有 `recording_kind=camera`，不创建 `motion.jsonl`；切回
 完整车辆调试时不要带 `--camera-only`，并继续满足物理急停和全程监督要求。
