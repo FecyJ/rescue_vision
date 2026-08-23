@@ -361,10 +361,21 @@ for safe_zone in field_result.safe_zones if field_result is not None else ():
 地面方向均成立时才生成两个 `halves`。证据不足时保留整区并标记
 `entrance_unresolved`、`divider_unresolved` 或 `side_unresolved`。
 
-出发区只输出洋红轮廓和角点，不做数字 OCR，也不包含 1–4 编号。中心十字的
-两条点划线轴在地图匹配前保持无序；只有单条满足间断结构的轴时标记
-`partial`，普通实线不会作为中心轴。围栏基线和角点始终带
+出发区只输出洋红轮廓和角点，不做数字 OCR，也不包含 1–4 编号。中心十字先
+合并两类证据：HSV 深色点划线，以及比局部地面更暗、低饱和的连续细线；后者
+用于真实 BEV 中因材料、曝光和缩放而呈灰色实线的中心标记。Hough 重复线会按
+方向和偏移折叠，再要求两轴近似垂直、交点远离 BEV 无效边缘，并且交点位于
+每条轴的内部而非端点。只有一条有效轴时标记 `partial`；有效区边缘形成的 L 形
+交点不会作为中心十字。两条轴在地图匹配前仍保持无序。围栏基线和角点始终带
 `low_confidence_boundary`，单帧结果不能直接当作闭合场界。
+
+`center_cross.local_window_fraction` 控制局部背景尺度，
+`local_contrast_threshold` 与 `max_saturation` 控制灰色细线响应；
+`min_line_support_fraction`、`min_axis_balance_fraction` 和
+`min_intersection_margin_fraction` 分别限制沿轴支撑、交点两侧覆盖和距无效边缘
+的距离。完整十字置信度由垂直度、两侧平衡和局部线支撑共同计算，不再使用固定
+常数。上述值仍是基于当前真实 BEV 样例的启动参数，必须通过不同距离、曝光、
+遮挡和场地材料的录像分层校准。
 
 中心十字的四向对称、红蓝安全区终端关联、先验门控和 `FieldPose2D` 约定由
 [`localization` README](../localization/README.md) 统一定义；感知层不把

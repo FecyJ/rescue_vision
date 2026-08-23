@@ -242,6 +242,12 @@ perception:
       max_gap_fraction: 0.06
       min_gap_count: 2
       perpendicular_tolerance_deg: 15.0
+      local_window_fraction: 0.015
+      local_contrast_threshold: 10
+      max_saturation: 80
+      min_line_support_fraction: 0.10
+      min_axis_balance_fraction: 0.08
+      min_intersection_margin_fraction: 0.02
     boundary:
       canny_low_threshold: 50
       canny_high_threshold: 150
@@ -642,6 +648,16 @@ def test_target_ground_geometry_config_rejects_invalid_values(
             "      perpendicular_tolerance_deg: 15.0",
             "      perpendicular_tolerance_deg: 45.0",
             "perpendicular_tolerance_deg",
+        ),
+        (
+            "      max_saturation: 80",
+            "      max_saturation: 256",
+            "center_max_saturation",
+        ),
+        (
+            "      min_axis_balance_fraction: 0.08",
+            "      min_axis_balance_fraction: 0.50",
+            "center_min_axis_balance_fraction",
         ),
         (
             "      canny_low_threshold: 50",

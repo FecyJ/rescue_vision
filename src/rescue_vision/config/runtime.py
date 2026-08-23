@@ -360,6 +360,12 @@ def _perception_defaults() -> dict[str, Any]:
                 "max_gap_fraction": 0.06,
                 "min_gap_count": 2,
                 "perpendicular_tolerance_deg": 15.0,
+                "local_window_fraction": 0.015,
+                "local_contrast_threshold": 10,
+                "max_saturation": 80,
+                "min_line_support_fraction": 0.10,
+                "min_axis_balance_fraction": 0.08,
+                "min_intersection_margin_fraction": 0.02,
             },
             "boundary": {
                 "canny_low_threshold": 50,
@@ -2023,6 +2029,12 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "max_gap_fraction",
             "min_gap_count",
             "perpendicular_tolerance_deg",
+            "local_window_fraction",
+            "local_contrast_threshold",
+            "max_saturation",
+            "min_line_support_fraction",
+            "min_axis_balance_fraction",
+            "min_intersection_margin_fraction",
         },
         "perception.field_features.center_cross",
     )
@@ -2144,6 +2156,55 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             ),
             "perception.field_features.center_cross.perpendicular_tolerance_deg",
             minimum=0.001,
+        ),
+        center_local_window_fraction=_threshold(
+            _required(
+                center_raw,
+                "local_window_fraction",
+                "perception.field_features.center_cross",
+            ),
+            "perception.field_features.center_cross.local_window_fraction",
+        ),
+        center_local_contrast_threshold=_positive_int(
+            _required(
+                center_raw,
+                "local_contrast_threshold",
+                "perception.field_features.center_cross",
+            ),
+            "perception.field_features.center_cross.local_contrast_threshold",
+        ),
+        center_max_saturation=_nonnegative_int(
+            _required(
+                center_raw,
+                "max_saturation",
+                "perception.field_features.center_cross",
+            ),
+            "perception.field_features.center_cross.max_saturation",
+        ),
+        center_min_line_support_fraction=_threshold(
+            _required(
+                center_raw,
+                "min_line_support_fraction",
+                "perception.field_features.center_cross",
+            ),
+            "perception.field_features.center_cross.min_line_support_fraction",
+        ),
+        center_min_axis_balance_fraction=_threshold(
+            _required(
+                center_raw,
+                "min_axis_balance_fraction",
+                "perception.field_features.center_cross",
+            ),
+            "perception.field_features.center_cross.min_axis_balance_fraction",
+        ),
+        center_min_intersection_margin_fraction=_threshold(
+            _required(
+                center_raw,
+                "min_intersection_margin_fraction",
+                "perception.field_features.center_cross",
+            ),
+            "perception.field_features.center_cross."
+            "min_intersection_margin_fraction",
         ),
         boundary_canny_low_threshold=_nonnegative_int(
             _required(

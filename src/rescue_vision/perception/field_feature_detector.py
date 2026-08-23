@@ -50,6 +50,13 @@ class _MappedPoints:
     ground: tuple[GroundPoint, ...] | None
 
 
+@dataclass(frozen=True, slots=True)
+class _CenterAxisCandidate:
+    segment: FloatPoint
+    local_support: float
+    gap_count: int
+
+
 def _mask_for_ranges(
     image_hsv: Uint8Array,
     ranges: tuple[HsvRange, ...],
@@ -157,32 +164,120 @@ def _hough_segments(
 
 
 def _line_gap_count(mask: Uint8Array, segment: FloatPoint) -> int:
-    """沿候选轴统计内部背景段，拒绝把实线围栏当作点划线。"""
+    """沿候选轴统计内部背景段；调用方先按允许线宽膨胀掩码。"""
 
     length = max(2, round(_line_length(segment)))
     samples = np.linspace(segment[0], segment[1], length + 1)
-    foreground: list[bool] = []
     height, width = mask.shape
-    for u_float, v_float in samples:
-        u = min(width - 1, max(0, round(float(u_float))))
-        v = min(height - 1, max(0, round(float(v_float))))
-        neighborhood = mask[
-            max(0, v - 1) : min(height, v + 2),
-            max(0, u - 1) : min(width, u + 2),
-        ]
-        foreground.append(bool(np.any(neighborhood)))
-    gaps = 0
-    in_gap = False
-    seen_foreground = False
-    for value in foreground:
-        if value:
-            if in_gap and seen_foreground:
-                gaps += 1
-            seen_foreground = True
-            in_gap = False
-        elif seen_foreground:
-            in_gap = True
-    return gaps
+    u = np.clip(np.rint(samples[:, 0]).astype(np.intp), 0, width - 1)
+    v = np.clip(np.rint(samples[:, 1]).astype(np.intp), 0, height - 1)
+    foreground = mask[v, u] != 0
+    indices = np.flatnonzero(foreground)
+    if indices.size < 2:
+        return 0
+    internal = foreground[indices[0] : indices[-1] + 1]
+    return int(np.count_nonzero(internal[:-1] & ~internal[1:]))
+
+
+def _line_sample_fraction(mask: Uint8Array, segment: FloatPoint) -> float:
+    """在已按允许线宽膨胀的掩码上计算候选轴支撑比例。"""
+
+    length = max(2, round(_line_length(segment)))
+    samples = np.linspace(segment[0], segment[1], length + 1)
+    height, width = mask.shape
+    u = np.clip(np.rint(samples[:, 0]).astype(np.intp), 0, width - 1)
+    v = np.clip(np.rint(samples[:, 1]).astype(np.intp), 0, height - 1)
+    return float(np.count_nonzero(mask[v, u])) / len(samples)
+
+
+def _segment_angle(segment: FloatPoint) -> float:
+    direction = segment[1] - segment[0]
+    return math.atan2(float(direction[1]), float(direction[0])) % math.pi
+
+
+def _angle_difference(first: float, second: float) -> float:
+    difference = abs(first - second) % math.pi
+    return min(difference, math.pi - difference)
+
+
+def _deduplicate_center_axes(
+    candidates: list[_CenterAxisCandidate],
+    *,
+    diagonal: float,
+    angle_tolerance_deg: float,
+    limit: int = 20,
+) -> list[_CenterAxisCandidate]:
+    """折叠同一物理轴产生的平行 Hough 重复线。"""
+
+    selected: list[_CenterAxisCandidate] = []
+    angle_tolerance = math.radians(max(1.0, angle_tolerance_deg / 3.0))
+    distance_tolerance = max(2.0, diagonal * 0.01)
+    for candidate in sorted(
+        candidates,
+        key=lambda item: _line_length(item.segment),
+        reverse=True,
+    ):
+        midpoint = np.mean(candidate.segment, axis=0)
+        if any(
+            _angle_difference(
+                _segment_angle(candidate.segment),
+                _segment_angle(existing.segment),
+            )
+            <= angle_tolerance
+            and _point_to_line_distance(midpoint, existing.segment)
+            <= distance_tolerance
+            for existing in selected
+        ):
+            continue
+        selected.append(candidate)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _axis_balance(segment: FloatPoint, intersection: FloatPoint) -> float:
+    length = _line_length(segment)
+    if length == 0.0:
+        return 0.0
+    return min(
+        float(np.linalg.norm(intersection - segment[0])),
+        float(np.linalg.norm(segment[1] - intersection)),
+    ) / length
+
+
+def _mask_distance_at(distance: npt.NDArray[np.float32], point: FloatPoint) -> float:
+    height, width = distance.shape
+    u = min(width - 1, max(0, round(float(point[0]))))
+    v = min(height - 1, max(0, round(float(point[1]))))
+    return float(distance[v, u])
+
+
+def _local_dark_line_mask(
+    image_bgr: Uint8Array,
+    valid_mask: Uint8Array,
+    config: FieldFeatureConfig,
+) -> Uint8Array:
+    """提取比局部地面更暗的低饱和细线，适应灰色连续场地标线。"""
+
+    height, width = valid_mask.shape
+    diagonal = math.hypot(width, height)
+    window = max(3, round(diagonal * config.center_local_window_fraction))
+    if window % 2 == 0:
+        window += 1
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    local_background = cv2.morphologyEx(
+        gray,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (window, window)),
+    )
+    contrast = cv2.subtract(local_background, gray)
+    selected = (
+        (contrast >= config.center_local_contrast_threshold)
+        & (hsv[:, :, 1] <= config.center_max_saturation)
+        & (valid_mask != 0)
+    )
+    return np.where(selected, 255, 0).astype(np.uint8)
 
 
 def _perpendicular(
@@ -647,26 +742,77 @@ class FieldFeatureDetector:
     def _center_cross(
         self,
         dark_mask: Uint8Array,
+        local_line_mask: Uint8Array,
+        valid_mask: Uint8Array,
         *,
         is_bev: bool,
     ) -> CenterCrossObservation | None:
-        segments = _hough_segments(
-            dark_mask,
+        candidate_mask = cv2.bitwise_or(dark_mask, local_line_mask)
+        raw_segments = _hough_segments(
+            candidate_mask,
             min_length_fraction=self._config.center_min_axis_span_fraction,
             max_gap_fraction=self._config.center_max_gap_fraction,
         )
-        segments = [
-            segment
-            for segment in segments
-            if _line_gap_count(dark_mask, segment)
-            >= self._config.center_min_gap_count
-        ]
-        if not segments:
+        height, width = candidate_mask.shape
+        diagonal = math.hypot(width, height)
+        distance_from_invalid = cv2.distanceTransform(
+            np.where(valid_mask != 0, 255, 0).astype(np.uint8),
+            cv2.DIST_L2,
+            3,
+        )
+        min_margin = diagonal * self._config.center_min_intersection_margin_fraction
+        support_thickness = max(1, round(diagonal * 0.003))
+        gap_mask = cv2.dilate(
+            dark_mask,
+            np.ones((3, 3), dtype=np.uint8),
+            iterations=1,
+        )
+        support_mask = cv2.dilate(
+            local_line_mask,
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (support_thickness, support_thickness),
+            ),
+            iterations=1,
+        )
+        candidates: list[_CenterAxisCandidate] = []
+        for segment in raw_segments:
+            gap_count = _line_gap_count(gap_mask, segment)
+            local_support = _line_sample_fraction(support_mask, segment)
+            if (
+                gap_count < self._config.center_min_gap_count
+                and local_support
+                < self._config.center_min_line_support_fraction
+            ):
+                continue
+            if _mask_distance_at(
+                distance_from_invalid,
+                np.mean(segment, axis=0),
+            ) < min_margin:
+                continue
+            candidates.append(
+                _CenterAxisCandidate(segment, local_support, gap_count)
+            )
+        candidates = _deduplicate_center_axes(
+            candidates,
+            diagonal=diagonal,
+            angle_tolerance_deg=(
+                self._config.center_perpendicular_tolerance_deg
+            ),
+        )
+        if not candidates:
             return None
-        best_pair: tuple[FloatPoint, FloatPoint, FloatPoint] | None = None
+        best_pair: tuple[
+            _CenterAxisCandidate,
+            _CenterAxisCandidate,
+            FloatPoint,
+        ] | None = None
         best_score = -1.0
-        for first_index, first in enumerate(segments[:20]):
-            for second in segments[first_index + 1 : 20]:
+        rejected_intersecting_pair = False
+        for first_index, first_candidate in enumerate(candidates):
+            for second_candidate in candidates[first_index + 1 :]:
+                first = first_candidate.segment
+                second = second_candidate.segment
                 if not _perpendicular(
                     first,
                     second,
@@ -676,26 +822,58 @@ class FieldFeatureDetector:
                 intersection = _segment_intersection(first, second)
                 if intersection is None:
                     continue
-                score = _line_length(first) + _line_length(second)
+                first_balance = _axis_balance(first, intersection)
+                second_balance = _axis_balance(second, intersection)
+                if (
+                    min(first_balance, second_balance)
+                    < self._config.center_min_axis_balance_fraction
+                    or _mask_distance_at(distance_from_invalid, intersection)
+                    < min_margin
+                ):
+                    rejected_intersecting_pair = True
+                    continue
+                support = 0.5 * (
+                    first_candidate.local_support
+                    + second_candidate.local_support
+                )
+                score = (
+                    _line_length(first) + _line_length(second)
+                ) * (0.5 + support) * min(first_balance, second_balance)
                 if score > best_score:
                     best_score = score
-                    best_pair = (first, second, intersection)
+                    best_pair = (
+                        first_candidate,
+                        second_candidate,
+                        intersection,
+                    )
 
         quality: set[FieldFeatureQuality] = set()
         if best_pair is None:
+            if rejected_intersecting_pair:
+                return None
             quality.add(FieldFeatureQuality.PARTIAL)
-            axis = self._line_observation(segments[0], is_bev=is_bev)
+            candidate = candidates[0]
+            axis = self._line_observation(
+                candidate.segment,
+                is_bev=is_bev,
+            )
             if axis.start_ground is None:
                 quality.add(FieldFeatureQuality.NO_GROUND_PROJECTION)
+            confidence = min(
+                0.50,
+                0.25 + 0.5 * candidate.local_support,
+            )
             return CenterCrossObservation(
                 axes=(axis,),
                 intersection_undistorted=None,
                 intersection_ground=None,
-                confidence=0.30,
+                confidence=confidence,
                 quality=frozenset(quality),
             )
 
-        first, second, intersection = best_pair
+        first_candidate, second_candidate, intersection = best_pair
+        first = first_candidate.segment
+        second = second_candidate.segment
         axes = (
             self._line_observation(first, is_bev=is_bev),
             self._line_observation(second, is_bev=is_bev),
@@ -703,6 +881,60 @@ class FieldFeatureDetector:
         mapped_intersection = self._map_points((intersection,), is_bev=is_bev)
         if mapped_intersection.ground is None:
             quality.add(FieldFeatureQuality.NO_GROUND_PROJECTION)
+        first_direction = first[1] - first[0]
+        second_direction = second[1] - second[0]
+        absolute_cosine = abs(
+            float(
+                np.dot(first_direction, second_direction)
+                / (
+                    np.linalg.norm(first_direction)
+                    * np.linalg.norm(second_direction)
+                )
+            )
+        )
+        angle_quality = 1.0 - min(
+            1.0,
+            absolute_cosine
+            / math.sin(
+                math.radians(
+                    self._config.center_perpendicular_tolerance_deg
+                )
+            ),
+        )
+        balance_quality = min(
+            1.0,
+            2.0 * min(
+                _axis_balance(first, intersection),
+                _axis_balance(second, intersection),
+            ),
+        )
+        support_quality = min(
+            1.0,
+            (
+                first_candidate.local_support
+                + second_candidate.local_support
+            )
+            / max(
+                2.0 * self._config.center_min_line_support_fraction,
+                1e-9,
+            ),
+        )
+        gap_quality = min(
+            1.0,
+            (
+                first_candidate.gap_count
+                + second_candidate.gap_count
+            )
+            / (2.0 * self._config.center_min_gap_count),
+        )
+        structure_quality = max(support_quality, gap_quality)
+        confidence = min(
+            0.95,
+            0.45
+            + 0.20 * angle_quality
+            + 0.15 * balance_quality
+            + 0.15 * structure_quality,
+        )
         return CenterCrossObservation(
             axes=axes,
             intersection_undistorted=mapped_intersection.pixels[0],
@@ -711,7 +943,7 @@ class FieldFeatureDetector:
                 if mapped_intersection.ground is not None
                 else None
             ),
-            confidence=0.80,
+            confidence=confidence,
             quality=frozenset(quality),
         )
 
@@ -992,8 +1224,18 @@ class FieldFeatureDetector:
             masks["dark_marking"],
             cv2.bitwise_not(exclusion),
         )
+        local_line_mask = cv2.bitwise_and(
+            _local_dark_line_mask(
+                working.image_bgr,
+                working.valid_mask,
+                self._config,
+            ),
+            cv2.bitwise_not(exclusion),
+        )
         center_cross = self._center_cross(
             center_mask,
+            local_line_mask,
+            working.valid_mask,
             is_bev=working.is_bev,
         )
         boundary_features = self._boundary_features(

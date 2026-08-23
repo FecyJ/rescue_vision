@@ -130,6 +130,12 @@ class FieldFeatureConfig:
     center_max_gap_fraction: float
     center_min_gap_count: int
     center_perpendicular_tolerance_deg: float
+    center_local_window_fraction: float
+    center_local_contrast_threshold: int
+    center_max_saturation: int
+    center_min_line_support_fraction: float
+    center_min_axis_balance_fraction: float
+    center_min_intersection_margin_fraction: float
     boundary_canny_low_threshold: int
     boundary_canny_high_threshold: int
     boundary_min_line_length_fraction: float
@@ -177,6 +183,8 @@ class FieldFeatureConfig:
         ):
             raise ValueError("center_min_gap_count must be a positive integer.")
         for name in (
+            "center_local_contrast_threshold",
+            "center_max_saturation",
             "boundary_canny_low_threshold",
             "boundary_canny_high_threshold",
         ):
@@ -200,9 +208,27 @@ class FieldFeatureConfig:
             "divider_dark_fraction",
             "center_min_axis_span_fraction",
             "center_max_gap_fraction",
+            "center_local_window_fraction",
+            "center_min_line_support_fraction",
+            "center_min_axis_balance_fraction",
+            "center_min_intersection_margin_fraction",
             "boundary_min_line_length_fraction",
         ):
             _probability(getattr(self, name), name)
+        if self.center_local_window_fraction <= 0.0:
+            raise ValueError("center_local_window_fraction must be positive.")
+        if self.center_min_line_support_fraction <= 0.0:
+            raise ValueError(
+                "center_min_line_support_fraction must be positive."
+            )
+        if not 0.0 < self.center_min_axis_balance_fraction < 0.5:
+            raise ValueError(
+                "center_min_axis_balance_fraction must be in (0, 0.5)."
+            )
+        if self.center_min_intersection_margin_fraction <= 0.0:
+            raise ValueError(
+                "center_min_intersection_margin_fraction must be positive."
+            )
         if self.dimension_tolerance_fraction >= 1.0:
             raise ValueError("dimension_tolerance_fraction must be less than 1.")
         for name in (

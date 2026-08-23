@@ -52,6 +52,12 @@ def config(**overrides) -> FieldFeatureConfig:
         "center_max_gap_fraction": 0.06,
         "center_min_gap_count": 2,
         "center_perpendicular_tolerance_deg": 15.0,
+        "center_local_window_fraction": 0.015,
+        "center_local_contrast_threshold": 10,
+        "center_max_saturation": 80,
+        "center_min_line_support_fraction": 0.10,
+        "center_min_axis_balance_fraction": 0.08,
+        "center_min_intersection_margin_fraction": 0.02,
         "boundary_canny_low_threshold": 50,
         "boundary_canny_high_threshold": 150,
         "boundary_min_line_length_fraction": 0.20,
@@ -261,6 +267,51 @@ def test_center_cross_recovers_two_dashed_perpendicular_axes() -> None:
     assert len(result.center_cross.axes) == 2
     assert result.center_cross.intersection_ground is not None
     assert FieldFeatureQuality.PARTIAL not in result.center_cross.quality
+
+
+def test_center_cross_recovers_low_contrast_rotated_axes_with_clutter() -> None:
+    image = np.zeros((600, 640, 3), dtype=np.uint8)
+    field_polygon = np.asarray(
+        ((45, 70), (600, 45), (625, 545), (35, 565)),
+        dtype=np.int32,
+    )
+    cv2.fillConvexPoly(image, field_polygon, (190, 190, 190))
+    center = np.asarray((330.0, 305.0))
+    angle = np.deg2rad(28.0)
+    directions = (
+        np.asarray((np.cos(angle), np.sin(angle))),
+        np.asarray((-np.sin(angle), np.cos(angle))),
+    )
+    for direction in directions:
+        start = tuple(np.rint(center - 255.0 * direction).astype(int))
+        end = tuple(np.rint(center + 255.0 * direction).astype(int))
+        cv2.line(image, start, end, (145, 145, 145), thickness=2)
+
+    # 模拟真实 BEV 中物体遮挡轴线；高饱和物体不应成为灰色中心轴。
+    cv2.rectangle(image, (175, 205), (225, 285), bgr(105), thickness=-1)
+    cv2.rectangle(image, (445, 350), (495, 440), bgr(15), thickness=-1)
+    mask = np.zeros(image.shape[:2], dtype=np.uint8)
+    cv2.fillConvexPoly(mask, field_polygon, 255)
+    detector = FieldFeatureDetector(
+        config(),
+        static_map=static_map(),
+        max_observation_age_ms=100.0,
+    )
+
+    result = detector.detect(
+        frame(image),
+        image,
+        valid_mask=mask,
+        result_timestamp_ns=1_100_000,
+    )
+
+    assert result.center_cross is not None
+    assert len(result.center_cross.axes) == 2
+    intersection = result.center_cross.intersection_undistorted
+    assert intersection is not None
+    assert intersection.u == pytest.approx(center[0], abs=12.0)
+    assert intersection.v == pytest.approx(center[1], abs=12.0)
+    assert result.center_cross.confidence > 0.60
 
 
 def test_single_long_marking_is_only_partial_center_evidence() -> None:

@@ -293,6 +293,13 @@ perception:
       max_gap_fraction: 0.06
       min_gap_count: 2
       perpendicular_tolerance_deg: 15.0
+      # 真实 BEV 中中心线常呈低对比灰色连续细线；局部暗线与点划线证据并用。
+      local_window_fraction: 0.015
+      local_contrast_threshold: 10
+      max_saturation: 80
+      min_line_support_fraction: 0.10
+      min_axis_balance_fraction: 0.08
+      min_intersection_margin_fraction: 0.02
     boundary:
       canny_low_threshold: 50
       canny_high_threshold: 150
