@@ -13,6 +13,7 @@
 - `target_ground_geometry.py`：从实际相机逐帧运行 YOLO Pose、HSV 分割和 `TargetGroundGeometryEstimator`，在去畸变画面叠加地面中心、足迹和质量信息，并按 JSONL 周期输出机器人地面系毫米坐标；按 `Q/Esc` 退出。
 - `dataset_perception.py`：按数据清单批量运行 Hailo，覆盖式写出观测 JSONL，保留 Pose 类别、HSV 候选/覆盖率、UNKNOWN 和质量信息。
 - `field_features.py`：从图片或视频离线检测安全区、无编号出发区、中心十字和低精度边界候选，写出 JSONL 及可选叠加图；不访问相机或 Hailo。
+- `cross_localization.py`：在场地特征检测后运行中心十字绝对定位，输出四候选、同帧终端锚点、可选唯一位姿、JSONL 及去畸变/BEV 双叠加图；不访问相机、串口或 Hailo。
 - `camera_undistort_perception.py`：按实际 `runtime.yaml` 连续执行相机、去畸变、Hailo Pose、ROI HSV 掩码和 K0/地面点叠加预览，按 `Q/Esc` 退出；偶发过期帧会标红并丢弃，不会终止预览。
 - `remote_link.py --config PATH`：在树莓派侧以 `remote.role: server` 监听电脑端客户端，连接后发送协议要求的最小会话状态，并持续打印收到的 control；该状态有意声明所有业务能力不可用，所以正式客户端应保持控制禁用。仅验证连接可使用 `observe_only`；用自制底层客户端检查 control 帧时使用 `debug_control`。
 - `remote_video.py --config PATH`：发送真实相机的最新 JPEG 帧和周期会话状态，接收电脑端的原图/perception 图像模式请求，但不接收或执行运动、夹爪和采集控制。
@@ -47,6 +48,39 @@ python manual_tests/field_features.py recordings/field_sample.mp4 \
 取得全范围可用标定和真实场地录像后，应在同帧输出中核对：十字交点位置误差、
 航向误差、红/蓝锚点成功率、普通场界导致的 180° 歧义保留，以及遮挡、模糊和
 颜色偏差失败样例；不得用合成 BEV 关闭这些验收项。
+
+## 中心十字定位离线检查
+
+运行前必须在同一份配置中启用可用的远场地面映射、
+`perception.field_features.enabled` 和 `localization.enabled`，并完整定义
+`world.static_map`。处理原始相机录像：
+
+```bash
+python manual_tests/cross_localization.py recordings/field_sample.mp4 \
+  --config configs/runtime.yaml \
+  --output-jsonl output/cross_localization.jsonl \
+  --overlay-dir output/cross_localization_overlays \
+  --display
+```
+
+如果输入已经由当前 `CameraModel` 去畸变，额外传
+`--already-undistorted`。叠加目录每帧写出 `_undistorted.jpg` 和 `_bev.jpg`；
+JSONL 保留中心十字摘要、四个位姿候选、终端类别/距离、唯一位姿、选择来源和
+全部降级原因。按 `Q` 或 `Esc` 结束显示；无人值守抽查可使用
+`--max-frames 100`。
+
+固定机器人或已知单帧姿态时，可以注入场地先验：
+
+```bash
+python manual_tests/cross_localization.py recordings/stationary_cross.mp4 \
+  --config configs/runtime.yaml \
+  --output-jsonl output/cross_with_prior.jsonl \
+  --prior-field-pose 0 0 90
+```
+
+三个数依次是场地 `x_mm`、`y_mm` 和航向角 degree。该先验会原样用于每一帧，
+因此只适合静止录像或逐帧先验相同的受控检查；不得用于运动车辆视频冒充尚未
+实现的 IMU/编码器连续推算。
 
 ## 相机、去畸变和 Hailo 联调
 

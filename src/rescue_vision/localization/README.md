@@ -109,3 +109,6 @@ else:
 
 后续短时跨帧关联应放在融合层：由它按时间对齐历史锚点和连续推算状态，再复用
 本包的终端语义及 `FieldPose2D`，不能把状态缓存塞回 `FieldFeatureDetector`。
+
+离线图片/视频人工检查使用 `manual_tests/cross_localization.py`；命令、JSONL、
+双坐标叠加图和固定先验限制见 [`manual_tests` README](../../../manual_tests/README.md)。
