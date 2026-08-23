@@ -30,6 +30,8 @@ from rescue_vision.communication import (
     CaptureStatusObservation,
     CaptureStopReason,
     DebugCaptureCommand,
+    DebugGripperCommand,
+    DebugMotionCommand,
     ImageCoordinateSystem,
     ReceivedRemoteMessage,
     RemoteAccessMode,
@@ -81,6 +83,7 @@ SESSION_STATUS_PERIOD_MS = 1_000
 VEHICLE_STATUS_PERIOD_MS = 100
 CAPTURE_STATUS_PERIOD_MS = 500
 MAP_SNAPSHOT_PERIOD_MS = 500
+CAMERA_ONLY_CONTROL_BATCH_LIMIT = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -806,6 +809,12 @@ class ManualCaptureRuntime:
             except TimeoutError:
                 continue
             self._handle_other_control(message)
+            for _ in range(CAMERA_ONLY_CONTROL_BATCH_LIMIT - 1):
+                try:
+                    message = self.connection.receive_control(timeout=0)
+                except TimeoutError:
+                    break
+                self._handle_other_control(message)
 
     def _on_car_message(self, message: ParsedCarMessage) -> None:
         self.vehicle.on_car_message(message)
@@ -967,9 +976,19 @@ class ManualCaptureRuntime:
                 self.minimum_rendered_sequence = None
             return
         if message.topic == RemoteTopic.DEBUG_MOTION.value:
-            raise ValueError("Remote motion control is disabled in camera-only mode.")
+            if self.executor is None:
+                # 部分旧客户端即使 capability=false 仍会周期发送运动心跳。
+                # 严格解析后安全丢弃，避免仅相机调试会话被无动作消息断开。
+                DebugMotionCommand.from_payload(message.payload)
+                return
+            raise ValueError("Unexpected motion command outside the motion loop.")
         if message.topic == RemoteTopic.DEBUG_GRIPPER.value:
             if self.gripper_executor is None:
+                if self.executor is None:
+                    # 与运动心跳相同：仅相机模式没有 UART，合法夹爪状态不会
+                    # 产生任何物理动作，可以兼容性丢弃；畸形 payload 仍会报错。
+                    DebugGripperCommand.from_payload(message.payload)
+                    return
                 raise ValueError(
                     "Remote gripper control is disabled by runtime config."
                 )

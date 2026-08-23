@@ -659,6 +659,78 @@ def test_camera_only_session_keeps_video_and_offline_vehicle_heartbeat(tmp_path)
     assert vehicle.stop_reason.value == "uart_fault"
 
 
+def test_camera_only_session_ignores_valid_legacy_actuator_heartbeats(tmp_path) -> None:
+    config = _config()
+    frame = CameraFrame(
+        sequence=0,
+        timestamp_ns=0,
+        image_bgr=np.zeros((3, 4, 3), dtype=np.uint8),
+    )
+    pipeline = CameraPipeline(
+        FakeSource(frame),
+        None,
+        ImageCoordinateSystem.RAW_PIXEL,
+        None,
+    )
+    capture = CaptureSession(
+        output_root=tmp_path,
+        config=config,
+        config_snapshot={},
+        pipeline=pipeline,
+        motion_logging_enabled=False,
+    )
+    motion = DebugMotionCommand(
+        command_id="legacy-drive",
+        issued_timestamp_ns=1,
+        valid_for_ms=500,
+        deadman_enabled=True,
+        control_mode=MotionControlMode.TWIST,
+        linear_velocity_m_s=0.1,
+        angular_velocity_rad_s=0.0,
+    )
+    gripper = DebugGripperCommand(
+        command_id="legacy-grip",
+        issued_timestamp_ns=2,
+        valid_for_ms=500,
+        open_pressed=True,
+        close_pressed=False,
+    )
+    connection = FakeConnection(
+        [
+            _received(RemoteTopic.DEBUG_MOTION, motion.to_payload(), 0),
+            _received(RemoteTopic.DEBUG_GRIPPER, gripper.to_payload(), 1),
+        ]
+    )
+    status = build_session_status(
+        config,
+        server_instance_id="camera-only-server",
+        video_fps=10.0,
+        camera_only=True,
+    )
+
+    with pytest.raises(RemoteDisconnectedError):
+        run_manual_capture_session(
+            connection,
+            None,
+            None,
+            capture,
+            pipeline,
+            status,
+            video_fps=10.0,
+            jpeg_quality=80,
+            safety_mode=VehicleSafetyMode.UNAVAILABLE,
+        )
+
+    vehicle_payload = next(
+        payload
+        for topic, payload in connection.observations
+        if topic == RemoteTopic.VEHICLE_STATE.value
+    )
+    vehicle = VehicleStateObservation.from_payload(vehicle_payload)
+    assert vehicle.last_received_motion_command_id is None
+    assert vehicle.last_received_gripper_command_id is None
+
+
 def test_camera_only_recording_uses_camera_schema_without_motion_log(tmp_path) -> None:
     config = _config()
     frame = CameraFrame(

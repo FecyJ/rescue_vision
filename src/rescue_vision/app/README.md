@@ -79,6 +79,9 @@ rescue-vision-manual-capture \
 100 ms 周期发布新鲜车辆状态，固定报告 `control_ready=false`、
 `uart_connected=false`、`safety_mode=unavailable` 和 `stop_reason=uart_fault`，
 避免现有客户端因车辆状态陈旧而反复重连，同时不会伪装单片机在线。
+若旧客户端没有按 capability 停止周期运动/夹爪心跳，车端会严格解析并安全
+丢弃这些合法消息，不会因此关闭仅相机会话；消息不会写 UART 或更新“已应用”
+命令 ID。畸形 payload 和未知 control 仍按协议错误处理。
 
 该模式产生的录像使用已有 `recording_kind=camera`，不创建 `motion.jsonl`；切回
 完整车辆调试时不要带 `--camera-only`，并继续满足物理急停和全程监督要求。
