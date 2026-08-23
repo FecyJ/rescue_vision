@@ -19,6 +19,7 @@ from rescue_vision.localization import (
     CenterCrossSelectionSource,
     FieldPose2D,
 )
+from rescue_vision.perception import RealtimeFieldFeatureResult
 from rescue_vision.world import (
     PhysicalRegionKind,
     PhysicalStaticRegion,
@@ -89,9 +90,24 @@ def test_field_map_without_unique_pose_explicitly_reports_unlocalized() -> None:
 
 
 class FakeDetector:
-    def detect(self, frame, image, *, valid_mask):
+    def detect_realtime(self, frame, image, *, valid_mask):
         del image, valid_mask
-        return frame
+        return RealtimeFieldFeatureResult(result=frame)
+
+
+class OneStaleFrameDetector:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def detect_realtime(self, frame, image, *, valid_mask):
+        del image, valid_mask
+        self.calls += 1
+        if self.calls == 1:
+            return RealtimeFieldFeatureResult(
+                result=None,
+                dropped_stale_age_ms=465.0,
+            )
+        return RealtimeFieldFeatureResult(result=frame)
 
 
 class FakeLocalizer:
@@ -140,4 +156,37 @@ def test_latest_localization_drops_stale_pose() -> None:
         assert robot.pose.position == FieldPoint(20.0, -30.0)
         assert localizer.latest_robot_pose(frame.timestamp_ns + 10_000_001) is None
     finally:
+        localizer.stop()
+
+
+def test_stale_feature_detection_does_not_fail_localization_worker() -> None:
+    detector = OneStaleFrameDetector()
+    localizer = LatestCenterCrossLocalization(
+        detector,  # type: ignore[arg-type]
+        FakeLocalizer(),  # type: ignore[arg-type]
+        valid_mask=np.full((3, 4), 255, np.uint8),
+        max_pose_age_ms=1_000.0,
+    )
+    first = CameraFrame(1, 1_000_000_000, np.zeros((3, 4, 3), np.uint8))
+    second = CameraFrame(2, 1_010_000_000, np.zeros((3, 4, 3), np.uint8))
+    localizer.start()
+    try:
+        localizer.submit(first)
+        deadline = time.monotonic() + 1.0
+        while detector.calls < 1 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert detector.calls == 1
+        assert localizer.latest_robot_pose(first.timestamp_ns) is None
+
+        localizer.submit(second)
+        robot = None
+        deadline = time.monotonic() + 1.0
+        while robot is None and time.monotonic() < deadline:
+            robot = localizer.latest_robot_pose(second.timestamp_ns)
+            time.sleep(0.005)
+        assert robot is not None
+        assert robot.pose.position == FieldPoint(20.0, -30.0)
+    finally:
+        # This is the regression assertion: stale detection must not surface
+        # as "Center-cross map localization failed" during shutdown.
         localizer.stop()

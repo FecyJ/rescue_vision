@@ -407,11 +407,19 @@ class LatestCenterCrossLocalization:
                     self._pending = None
                 if frame is None:
                     continue
-                result = self._detector.detect(
+                realtime_result = self._detector.detect_realtime(
                     frame,
                     frame.image_bgr,
                     valid_mask=self._valid_mask,
                 )
+                result = realtime_result.result
+                if result is None:
+                    # A slow field-feature pass is an expected real-time drop,
+                    # not a worker fault.  Clear any previous pose so the map
+                    # cannot keep displaying stale localization.
+                    with self._lock:
+                        self._latest = None
+                    continue
                 observation = self._localizer.localize(result)
                 with self._lock:
                     self._latest = observation
