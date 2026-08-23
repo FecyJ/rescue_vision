@@ -1,7 +1,8 @@
 # `app`：可运行应用装配
 
 本包只放跨相机、通信和运动模块的实际运行入口。当前实现
-`rescue-vision-manual-capture`，用于赛外、人员全程监督的低速车载运动采集；
+`rescue-vision-manual-capture`，用于赛外、人员全程监督的低速车载运动采集，
+也支持单片机未上电时的仅相机远程调试；
 比赛自主应用仍未实现。
 
 ## 常用入口
@@ -11,12 +12,14 @@
 | `rescue-vision-manual-capture` | `runtime.yaml`、车端输出根目录和显式监督确认 | 完整装配 TCP/UART/相机/运动/夹爪/记录；推荐生产入口 |
 | `build_camera_pipeline()` | 已加载的 `AppConfig` | 创建但不启动配置选择的真机源、可选去畸变和地面映射 |
 | `build_session_status()` | 同一 `AppConfig`、服务实例 ID、视频 FPS 和可用模式 | 创建声明运动、夹爪、视频模式、车辆和采集能力的会话状态 |
-| `run_manual_capture_session()` | 已启动连接、运动执行器、可选夹爪执行器、采集会话、相机管线和可选 perception/BEV 旁路 | 运行单个 TCP 会话；断线/故障时停止运动与夹爪推进并清理当前记录 |
+| `run_manual_capture_session()` | 已启动连接、可选运动/夹爪执行器、采集会话、相机管线和可选 perception/BEV 旁路 | 运行单个完整车辆或仅相机 TCP 会话；断线/故障时清理当前记录 |
 | `BevFrameRenderer` | 已加载且包含 BEV 配置的 `GroundProjector`；显式 `start/stop` | 有界丢旧保新的后台 BEV 生成旁路；输出保留源帧号和采集时间 |
 
 `run_manual_capture_session()` 不创建或打开硬件资源。调用方传入
 `RemoteMotionExecutor`，并在 `motion.gripper.enabled=true` 时传入共享同一个
 `MotionController` 的 `RemoteGripperExecutor`；关闭夹爪能力时传入 `None`。
+仅相机会话把两个执行器都传为 `None`，并使用
+`build_session_status(camera_only=True)`；两者不得与会话 capability 矛盾。
 正式装配由下文 CLI 从运行配置完成，普通调用方不应另写一套设备、限值、
 机械端点或协议参数。
 
@@ -50,9 +53,33 @@ rescue-vision-manual-capture \
 未连接时填满 UART 接收队列；等待达到 `--accept-timeout-seconds` 后会先
 停车并正常退出，不创建空 recording。
 
+### 仅相机远程调试
+
+只给树莓派和相机上电、STM32/UART/电机均不可用时，使用：
+
+```bash
+rescue-vision-manual-capture \
+  --config configs/runtime.yaml \
+  --output-root /data/rescue-targets/camera-only \
+  --camera-only \
+  --video-fps 10
+```
+
+此模式不打开 UART，也不要求 `uart.enabled`、`motion.enabled` 或
+`--supervised-physical-stop-ready`。会话仍提供 raw/perception/BEV 图传和采集
+控制，但明确声明 `motion_control=false`、`gripper_control=false`。车端继续按
+100 ms 周期发布新鲜车辆状态，固定报告 `control_ready=false`、
+`uart_connected=false`、`safety_mode=unavailable` 和 `stop_reason=uart_fault`，
+避免现有客户端因车辆状态陈旧而反复重连，同时不会伪装单片机在线。
+
+该模式产生的录像使用已有 `recording_kind=camera`，不创建 `motion.jsonl`；切回
+完整车辆调试时不要带 `--camera-only`，并继续满足物理急停和全程监督要求。
+
 录像写盘队列满、写盘失败、相机异常、UART 异常、远程断线、非法控制或应用
 退出都会离开统一运动循环，并在 UART 尚可写时先发送柔和制动。断电、
 `SIGKILL` 和 UART 物理断开仍只能由固件看门狗停车。
+完整车辆模式中的 UART 异常同样会退出；仅相机模式根本不打开 UART，因此不受
+未上电单片机影响。
 
 ## 安全边界
 

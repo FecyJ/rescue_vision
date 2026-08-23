@@ -10,6 +10,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -220,11 +221,15 @@ class CaptureSession:
         config: AppConfig,
         config_snapshot: dict[str, object],
         pipeline: CameraPipeline,
+        motion_logging_enabled: bool = True,
     ) -> None:
         self.output_root = output_root
         self.config = config
         self.config_snapshot = config_snapshot
         self.pipeline = pipeline
+        if not isinstance(motion_logging_enabled, bool):
+            raise TypeError("motion_logging_enabled must be a boolean.")
+        self.motion_logging_enabled = motion_logging_enabled
         self.recorder: FrameRecorder | None = None
         self.motion_log: ManualMotionLogWriter | None = None
         self.recording_id: str | None = None
@@ -380,27 +385,35 @@ class CaptureSession:
             undistort_fill_value=(
                 IMAGE_BORDER_FILL_VALUE if camera_model is not None else None
             ),
-            auxiliary_streams={
-                MANUAL_MOTION_STREAM_NAME: MANUAL_MOTION_LOG_FILENAME
-            },
-            recording_kind="supervised_manual_motion",
+            auxiliary_streams=(
+                {MANUAL_MOTION_STREAM_NAME: MANUAL_MOTION_LOG_FILENAME}
+                if self.motion_logging_enabled
+                else {}
+            ),
+            recording_kind=(
+                "supervised_manual_motion"
+                if self.motion_logging_enabled
+                else "camera"
+            ),
         )
         recorder.start()
-        motion_log = ManualMotionLogWriter(
-            directory / MANUAL_MOTION_LOG_FILENAME
-        )
-        try:
-            motion_log.start(timestamp_ns=time.monotonic_ns())
-        except BaseException as exc:
+        motion_log: ManualMotionLogWriter | None = None
+        if self.motion_logging_enabled:
+            motion_log = ManualMotionLogWriter(
+                directory / MANUAL_MOTION_LOG_FILENAME
+            )
             try:
-                recorder.stop()
-            except BaseException as cleanup_error:
-                add_exception_note(
-                    exc,
-                    "Frame recorder cleanup after motion log start failure "
-                    f"also failed: {cleanup_error!r}",
-                )
-            raise
+                motion_log.start(timestamp_ns=time.monotonic_ns())
+            except BaseException as exc:
+                try:
+                    recorder.stop()
+                except BaseException as cleanup_error:
+                    add_exception_note(
+                        exc,
+                        "Frame recorder cleanup after motion log start failure "
+                        f"also failed: {cleanup_error!r}",
+                    )
+                raise
         self.recorder = recorder
         self.motion_log = motion_log
         self.recording_id = recording_id
@@ -592,17 +605,25 @@ class VehicleState:
     """把运动/夹爪执行结果和最新 UART 遥测汇总为协议观察。"""
 
     def __init__(self, *, safety_mode: VehicleSafetyMode) -> None:
-        if safety_mode is not VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP:
+        if safety_mode is VehicleSafetyMode.FIRMWARE_WATCHDOG:
             raise ValueError(
-                "Manual capture currently requires "
-                "supervised_physical_stop; firmware_watchdog needs fresh "
+                "Manual capture firmware_watchdog needs fresh "
                 "CarSafetyStatus gating before it can be selected."
             )
+        if safety_mode not in {
+            VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP,
+            VehicleSafetyMode.UNAVAILABLE,
+        }:
+            raise ValueError(f"Unsupported safety_mode {safety_mode!r}.")
         self.safety_mode = safety_mode
         self.sequence = 0
         self.telemetry: CarTelemetry | None = None
         self.motion_state = VehicleMotionState.STOPPED
-        self.stop_reason = VehicleStopReason.DEADMAN_RELEASE
+        self.stop_reason = (
+            VehicleStopReason.UART_FAULT
+            if safety_mode is VehicleSafetyMode.UNAVAILABLE
+            else VehicleStopReason.DEADMAN_RELEASE
+        )
         self.last_received_command_id: str | None = None
         self.last_applied_command_id: str | None = None
         self.last_received_gripper_command_id: str | None = None
@@ -645,12 +666,13 @@ class VehicleState:
 
     def observation(self) -> VehicleStateObservation:
         telemetry = self.telemetry
+        uart_connected = self.safety_mode is not VehicleSafetyMode.UNAVAILABLE
         observation = VehicleStateObservation(
             state_sequence=self.sequence,
             timestamp_ns=time.monotonic_ns(),
-            control_ready=True,
+            control_ready=uart_connected,
             safety_mode=self.safety_mode,
-            uart_connected=True,
+            uart_connected=uart_connected,
             watchdog_armed=(
                 self.safety_mode is VehicleSafetyMode.FIRMWARE_WATCHDOG
             ),
@@ -700,7 +722,7 @@ class ManualCaptureRuntime:
         self,
         *,
         connection: RemoteMessageConnection,
-        executor: RemoteMotionExecutor,
+        executor: RemoteMotionExecutor | None,
         gripper_executor: RemoteGripperExecutor | None,
         capture: CaptureSession,
         pipeline: CameraPipeline,
@@ -723,6 +745,12 @@ class ManualCaptureRuntime:
         self.perception_renderer = perception_renderer
         self.bev_renderer = bev_renderer
         self.stop_requested = stop_requested
+        if (executor is None) != (not session_status.motion_control_available):
+            raise ValueError(
+                "executor presence must match motion_control_available."
+            )
+        if gripper_executor is not None and executor is None:
+            raise ValueError("gripper_executor requires a motion executor.")
         self.vehicle = VehicleState(safety_mode=safety_mode)
         self.video_mode = VideoFrameMode.RAW
         self.last_sent_video_sequence: int | None = None
@@ -738,20 +766,32 @@ class ManualCaptureRuntime:
     def run(self) -> None:
         self._send_initial_status()
         try:
-            run_remote_motion(
-                self.connection,
-                self.executor,
-                stop_requested=self.stop_requested,
-                on_car_message=self._on_car_message,
-                on_motion_executed=self._on_motion,
-                on_motion_timeout=self._on_motion_timeout,
-                on_other_control=self._handle_other_control,
-                on_cycle=self._cycle,
-                poll_interval_s=0.02,
-            )
+            if self.executor is None:
+                self._run_camera_only()
+            else:
+                run_remote_motion(
+                    self.connection,
+                    self.executor,
+                    stop_requested=self.stop_requested,
+                    on_car_message=self._on_car_message,
+                    on_motion_executed=self._on_motion,
+                    on_motion_timeout=self._on_motion_timeout,
+                    on_other_control=self._handle_other_control,
+                    on_cycle=self._cycle,
+                    poll_interval_s=0.02,
+                )
         finally:
             if self.gripper_executor is not None:
                 self.gripper_executor.stop()
+
+    def _run_camera_only(self) -> None:
+        while not self.stop_requested():
+            self._cycle()
+            try:
+                message = self.connection.receive_control(timeout=0.02)
+            except TimeoutError:
+                continue
+            self._handle_other_control(message)
 
     def _on_car_message(self, message: ParsedCarMessage) -> None:
         self.vehicle.on_car_message(message)
@@ -829,11 +869,12 @@ class ManualCaptureRuntime:
                 now_ns + SESSION_STATUS_PERIOD_MS * 1_000_000
             )
         if now_ns >= self.next_vehicle_status_ns:
-            self.connection.send_observation(
-                RemoteTopic.VEHICLE_STATE.value,
-                self.vehicle.observation().to_payload(),
-                content_type="application/json",
-            )
+            if self.session_status.vehicle_state_available:
+                self.connection.send_observation(
+                    RemoteTopic.VEHICLE_STATE.value,
+                    self.vehicle.observation().to_payload(),
+                    content_type="application/json",
+                )
             self.next_vehicle_status_ns = (
                 now_ns + VEHICLE_STATUS_PERIOD_MS * 1_000_000
             )
@@ -849,11 +890,12 @@ class ManualCaptureRuntime:
             self.session_status.to_payload(),
             content_type="application/json",
         )
-        self.connection.send_observation(
-            RemoteTopic.VEHICLE_STATE.value,
-            self.vehicle.observation().to_payload(),
-            content_type="application/json",
-        )
+        if self.session_status.vehicle_state_available:
+            self.connection.send_observation(
+                RemoteTopic.VEHICLE_STATE.value,
+                self.vehicle.observation().to_payload(),
+                content_type="application/json",
+            )
         self._send_capture_status()
 
     def _handle_other_control(self, message: ReceivedRemoteMessage) -> None:
@@ -902,6 +944,8 @@ class ManualCaptureRuntime:
             else:
                 self.minimum_rendered_sequence = None
             return
+        if message.topic == RemoteTopic.DEBUG_MOTION.value:
+            raise ValueError("Remote motion control is disabled in camera-only mode.")
         if message.topic == RemoteTopic.DEBUG_GRIPPER.value:
             if self.gripper_executor is None:
                 raise ValueError(
@@ -1004,14 +1048,20 @@ def build_session_status(
     server_instance_id: str,
     video_fps: float,
     video_modes: tuple[VideoFrameMode, ...] = (VideoFrameMode.RAW,),
+    camera_only: bool = False,
 ) -> RemoteSessionStatus:
+    if not isinstance(camera_only, bool):
+        raise TypeError("camera_only must be a boolean.")
+    motion_available = not camera_only
     return RemoteSessionStatus(
         session_id=f"session-{uuid.uuid4()}",
         server_instance_id=server_instance_id,
         timestamp_ns=time.monotonic_ns(),
         access_mode=config.remote.access_mode,
-        motion_control_available=True,
-        gripper_control_available=config.motion.gripper.enabled,
+        motion_control_available=motion_available,
+        gripper_control_available=(
+            motion_available and config.motion.gripper.enabled
+        ),
         capture_control_available=True,
         video_stream_available=True,
         video_modes=video_modes,
@@ -1024,8 +1074,12 @@ def build_session_status(
         map_snapshot_period_ms=None,
         capture_status_period_ms=CAPTURE_STATUS_PERIOD_MS,
         video_nominal_fps=video_fps,
-        max_linear_velocity_m_s=config.motion.max_linear_velocity_m_s,
-        max_angular_velocity_rad_s=config.motion.max_angular_velocity_rad_s,
+        max_linear_velocity_m_s=(
+            config.motion.max_linear_velocity_m_s if motion_available else None
+        ),
+        max_angular_velocity_rad_s=(
+            config.motion.max_angular_velocity_rad_s if motion_available else None
+        ),
         max_control_command_valid_for_ms=(
             config.motion.max_remote_command_valid_for_ms
         ),
@@ -1034,7 +1088,7 @@ def build_session_status(
 
 def run_manual_capture_session(
     connection: RemoteMessageConnection,
-    executor: RemoteMotionExecutor,
+    executor: RemoteMotionExecutor | None,
     gripper_executor: RemoteGripperExecutor | None,
     capture: CaptureSession,
     pipeline: CameraPipeline,
@@ -1157,7 +1211,7 @@ def _artifact_id(prefix: str) -> str:
 
 def _accept_with_shutdown(
     server: RemoteTcpServer,
-    controller: MotionController,
+    controller: MotionController | None,
     *,
     timeout_s: float,
     stop_requested: Callable[[], bool],
@@ -1167,7 +1221,8 @@ def _accept_with_shutdown(
         # STM32 continuously publishes 10 Hz telemetry, including while no
         # remote client is connected.  Keep the UART's bounded queue healthy
         # instead of leaving it unconsumed for the whole accept timeout.
-        controller.drain_messages()
+        if controller is not None:
+            controller.drain_messages()
         remaining_s = deadline - time.monotonic()
         if remaining_s <= 0:
             return None
@@ -1183,14 +1238,17 @@ def _validate_mode(
     *,
     video_fps: float,
     supervised_physical_stop_ready: bool,
+    camera_only: bool = False,
 ) -> None:
+    if not isinstance(camera_only, bool):
+        raise TypeError("camera_only must be a boolean.")
     if not config.remote.enabled or config.remote.role is not RemoteRole.SERVER:
         raise RuntimeError("Manual capture requires remote server mode.")
     if config.remote.access_mode is not RemoteAccessMode.DEBUG_CONTROL:
         raise RuntimeError("Manual capture requires remote debug_control mode.")
-    if not config.uart.enabled or not config.motion.enabled:
+    if not camera_only and (not config.uart.enabled or not config.motion.enabled):
         raise RuntimeError("Manual capture requires enabled UART and motion.")
-    if not supervised_physical_stop_ready:
+    if not camera_only and not supervised_physical_stop_ready:
         raise RuntimeError(
             "Current firmware watchdog state is unavailable; pass "
             "--supervised-physical-stop-ready only after a physical emergency "
@@ -1209,6 +1267,14 @@ def main() -> None:
     parser.add_argument("--accept-timeout-seconds", type=float, default=30.0)
     parser.add_argument("--video-fps", type=float, default=10.0)
     parser.add_argument("--jpeg-quality", type=int, default=80)
+    parser.add_argument(
+        "--camera-only",
+        action="store_true",
+        help=(
+            "Run video, BEV and capture without opening UART or advertising "
+            "motion/gripper control capabilities."
+        ),
+    )
     parser.add_argument(
         "--supervised-physical-stop-ready",
         action="store_true",
@@ -1232,18 +1298,29 @@ def main() -> None:
         config,
         video_fps=args.video_fps,
         supervised_physical_stop_ready=args.supervised_physical_stop_ready,
+        camera_only=args.camera_only,
     )
     output_root.mkdir(parents=True, exist_ok=True)
     config_snapshot = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
     server = config.remote.build_server()
-    channel = config.uart.build_channel()
-    controller: MotionController | None = config.motion.build_controller(channel)
-    executor = config.motion.build_remote_executor(controller)
-    gripper_executor = config.motion.build_remote_gripper_executor(controller)
+    channel = None if args.camera_only else config.uart.build_channel()
+    controller: MotionController | None = (
+        None if args.camera_only else config.motion.build_controller(channel)
+    )
+    executor = (
+        None if args.camera_only else config.motion.build_remote_executor(controller)
+    )
+    gripper_executor = (
+        None
+        if args.camera_only
+        else config.motion.build_remote_gripper_executor(controller)
+    )
     assert server is not None
-    assert channel is not None
-    assert executor is not None
+    if not args.camera_only:
+        assert channel is not None
+        assert controller is not None
+        assert executor is not None
     pipeline = build_camera_pipeline(config)
     perception_renderer = (
         PerceptionFrameRenderer(config.build_target_pose_detector)
@@ -1268,7 +1345,10 @@ def main() -> None:
     )
 
     try:
-        with server, channel:
+        with ExitStack() as resources:
+            resources.enter_context(server)
+            if channel is not None:
+                resources.enter_context(channel)
             try:
                 if perception_renderer is not None:
                     perception_renderer.start()
@@ -1289,12 +1369,14 @@ def main() -> None:
                         config=config,
                         config_snapshot=config_snapshot,
                         pipeline=pipeline,
+                        motion_logging_enabled=not args.camera_only,
                     )
                     status = build_session_status(
                         config,
                         server_instance_id=server_instance_id,
                         video_fps=args.video_fps,
                         video_modes=video_modes,
+                        camera_only=args.camera_only,
                     )
                     try:
                         with connection:
@@ -1312,6 +1394,8 @@ def main() -> None:
                                 stop_requested=shutdown_requested.is_set,
                                 safety_mode=(
                                     VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP
+                                    if not args.camera_only
+                                    else VehicleSafetyMode.UNAVAILABLE
                                 ),
                             )
                     except RemoteDisconnectedError:
@@ -1326,7 +1410,8 @@ def main() -> None:
             finally:
                 # run_remote_motion 已先停车；这里重复停车覆盖连接前/装配期异常。
                 try:
-                    executor.stop()
+                    if executor is not None:
+                        executor.stop()
                 finally:
                     try:
                         pipeline.source.stop()

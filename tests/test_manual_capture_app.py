@@ -301,6 +301,25 @@ def test_session_status_only_advertises_configured_gripper() -> None:
     assert not status.gripper_control_available
 
 
+def test_camera_only_status_disables_actuators_but_keeps_vehicle_heartbeat() -> None:
+    status = build_session_status(
+        _config(),
+        server_instance_id="test-server",
+        video_fps=10.0,
+        video_modes=(VideoFrameMode.RAW, VideoFrameMode.BEV),
+        camera_only=True,
+    )
+
+    assert not status.motion_control_available
+    assert not status.gripper_control_available
+    assert status.vehicle_state_available
+    assert status.vehicle_state_period_ms == 100
+    assert status.max_linear_velocity_m_s is None
+    assert status.max_angular_velocity_rad_s is None
+    assert status.capture_control_available
+    assert status.video_modes == (VideoFrameMode.RAW, VideoFrameMode.BEV)
+
+
 def test_accept_timeout_is_a_clean_stop(monkeypatch) -> None:
     moments = iter((10.0, 11.0))
     monkeypatch.setattr(
@@ -416,6 +435,8 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
     assert limited_right == pytest.approx(limited_left)
     assert any(payload.startswith(b"g") for payload in car.sent)
     assert car.sent[-1] == b"b0,0"
+
+
     recordings = list((tmp_path / "recordings").iterdir())
     assert len(recordings) == 1
     assert capture.recorder is None
@@ -493,6 +514,111 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
     assert second_vehicle.last_received_motion_command_id is None
     assert second_vehicle.last_applied_motion_command_id is None
     assert car.sent[-1] == b"b0,0"
+
+
+def test_camera_only_session_keeps_video_and_offline_vehicle_heartbeat(tmp_path) -> None:
+    config = _config()
+    pipeline = CameraPipeline(
+        FakeSource(
+            CameraFrame(
+                sequence=0,
+                timestamp_ns=0,
+                image_bgr=np.zeros((3, 4, 3), dtype=np.uint8),
+            )
+        ),
+        None,
+        ImageCoordinateSystem.RAW_PIXEL,
+        None,
+    )
+    capture = CaptureSession(
+        output_root=tmp_path,
+        config=config,
+        config_snapshot={},
+        pipeline=pipeline,
+        motion_logging_enabled=False,
+    )
+    connection = FakeConnection([], empty_polls_before_disconnect=5)
+    status = build_session_status(
+        config,
+        server_instance_id="camera-only-server",
+        video_fps=1_000.0,
+        camera_only=True,
+    )
+
+    with pytest.raises(RemoteDisconnectedError):
+        run_manual_capture_session(
+            connection,
+            None,
+            None,
+            capture,
+            pipeline,
+            status,
+            video_fps=1_000.0,
+            jpeg_quality=80,
+            safety_mode=VehicleSafetyMode.UNAVAILABLE,
+        )
+
+    topics = [topic for topic, _payload in connection.observations]
+    assert RemoteTopic.SESSION_STATUS.value in topics
+    assert RemoteTopic.VIDEO_FRAME.value in topics
+    assert RemoteTopic.CAPTURE_STATUS.value in topics
+    assert RemoteTopic.VEHICLE_STATE.value in topics
+    vehicle_payload = next(
+        payload
+        for topic, payload in connection.observations
+        if topic == RemoteTopic.VEHICLE_STATE.value
+    )
+    vehicle = VehicleStateObservation.from_payload(vehicle_payload)
+    assert not vehicle.control_ready
+    assert not vehicle.uart_connected
+    assert vehicle.safety_mode is VehicleSafetyMode.UNAVAILABLE
+    assert vehicle.stop_reason.value == "uart_fault"
+
+
+def test_camera_only_recording_uses_camera_schema_without_motion_log(tmp_path) -> None:
+    config = _config()
+    frame = CameraFrame(
+        sequence=0,
+        timestamp_ns=time.monotonic_ns(),
+        image_bgr=np.zeros((3, 4, 3), dtype=np.uint8),
+    )
+    pipeline = CameraPipeline(
+        FakeSource(frame),
+        None,
+        ImageCoordinateSystem.RAW_PIXEL,
+        None,
+    )
+    capture = CaptureSession(
+        output_root=tmp_path,
+        config=config,
+        config_snapshot={},
+        pipeline=pipeline,
+        motion_logging_enabled=False,
+    )
+    started = capture.execute(
+        DebugCaptureCommand(
+            request_id="camera-start",
+            issued_timestamp_ns=1,
+            action=CaptureAction.START,
+        ),
+        frame,
+    )
+    assert started.artifact_id is not None
+    capture.record(frame)
+    capture.execute(
+        DebugCaptureCommand(
+            request_id="camera-stop",
+            issued_timestamp_ns=2,
+            action=CaptureAction.STOP,
+        ),
+        frame,
+    )
+
+    recording = tmp_path / "recordings" / started.artifact_id
+    report = inspect_recording(recording)
+    assert report["recording_kind"] == "camera"
+    assert report["auxiliary_stream_reports"] == {}
+    assert not (recording / "motion.jsonl").exists()
 
 
 def test_manual_session_switches_between_raw_and_perception_video(tmp_path) -> None:
@@ -828,6 +954,24 @@ def test_manual_capture_requires_explicit_physical_stop_acknowledgement() -> Non
             video_fps=10.0,
             supervised_physical_stop_ready=False,
         )
+
+
+def test_camera_only_mode_does_not_require_uart_or_physical_stop() -> None:
+    config = _config()
+    config.remote = SimpleNamespace(
+        enabled=True,
+        role=RemoteRole.SERVER,
+        access_mode=RemoteAccessMode.DEBUG_CONTROL,
+    )
+    config.uart = SimpleNamespace(enabled=False)
+    config.motion.enabled = False
+
+    _validate_mode(
+        config,
+        video_fps=10.0,
+        supervised_physical_stop_ready=False,
+        camera_only=True,
+    )
 
 
 def test_camera_failure_faults_capture_and_stops_motion(tmp_path) -> None:
