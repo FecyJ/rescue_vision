@@ -1,4 +1,4 @@
-"""离线检查中心十字绝对位姿观测，不访问相机、串口或 Hailo。"""
+"""用文件或配置选择的相机检查中心十字定位，不访问串口或 Hailo。"""
 
 from __future__ import annotations
 
@@ -25,25 +25,25 @@ IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 
 
 @contextmanager
-def _frames(path: Path) -> Iterator[Iterator[tuple[int, np.ndarray]]]:
+def _frames(path: Path) -> Iterator[Iterator[CameraFrame]]:
     if path.suffix.lower() in IMAGE_SUFFIXES:
         image = cv2.imread(str(path))
         if image is None:
             raise ValueError(f"Cannot decode image: {path}")
-        yield iter(((0, image),))
+        yield iter((CameraFrame(0, monotonic_ns(), image),))
         return
 
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
         raise ValueError(f"Cannot open video: {path}")
 
-    def video_frames() -> Iterator[tuple[int, np.ndarray]]:
+    def video_frames() -> Iterator[CameraFrame]:
         sequence = 0
         while True:
             ok, image = capture.read()
             if not ok:
                 break
-            yield sequence, image
+            yield CameraFrame(sequence, monotonic_ns(), image)
             sequence += 1
         if sequence == 0:
             raise ValueError(f"Video contains no decodable frames: {path}")
@@ -52,6 +52,42 @@ def _frames(path: Path) -> Iterator[Iterator[tuple[int, np.ndarray]]]:
         yield video_frames()
     finally:
         capture.release()
+
+
+def _build_camera_source(config):
+    """Create the configured source without opening camera hardware."""
+
+    from rescue_vision.camera.picamera2_source import Picamera2Source
+    from rescue_vision.camera.rpicam_source import RpicamSource
+
+    source_class = (
+        Picamera2Source
+        if config.camera.backend == "picamera2"
+        else RpicamSource
+    )
+    return source_class(
+        image_size=config.camera.image_size,
+        fps=config.camera.fps,
+        lens_position=config.camera.lens_position,
+    )
+
+
+@contextmanager
+def _camera_frames(
+    config,
+    *,
+    source_factory=_build_camera_source,
+) -> Iterator[Iterator[CameraFrame]]:
+    """Open the configured latest-frame source and close it on every exit."""
+
+    source = source_factory(config)
+
+    def latest_frames() -> Iterator[CameraFrame]:
+        while True:
+            yield source.read(timeout=1.0)
+
+    with source:
+        yield latest_frames()
 
 
 def _point(point) -> list[float]:
@@ -186,6 +222,19 @@ def _status_lines(observation: CenterCrossPoseObservation) -> list[str]:
     ]
 
 
+def _put_lines(image: np.ndarray, lines: list[str]) -> None:
+    for index, line in enumerate(lines):
+        origin = (12, 28 + index * 25)
+        cv2.putText(
+            image, line, origin, cv2.FONT_HERSHEY_SIMPLEX,
+            0.58, (0, 0, 0), 4, cv2.LINE_AA,
+        )
+        cv2.putText(
+            image, line, origin, cv2.FONT_HERSHEY_SIMPLEX,
+            0.58, (255, 255, 255), 1, cv2.LINE_AA,
+        )
+
+
 def _put_status(
     image: np.ndarray,
     observation: CenterCrossPoseObservation,
@@ -202,16 +251,7 @@ def _put_status(
     )
     if terminal_text:
         lines.append(f"terminals={terminal_text}")
-    for index, line in enumerate(lines):
-        origin = (12, 28 + index * 25)
-        cv2.putText(
-            image, line, origin, cv2.FONT_HERSHEY_SIMPLEX,
-            0.58, (0, 0, 0), 4, cv2.LINE_AA,
-        )
-        cv2.putText(
-            image, line, origin, cv2.FONT_HERSHEY_SIMPLEX,
-            0.58, (255, 255, 255), 1, cv2.LINE_AA,
-        )
+    _put_lines(image, lines)
 
 
 def _undistorted_overlay(
@@ -324,9 +364,17 @@ def _prior_pose(values: list[float] | None) -> FieldPose2D | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run center-cross localization on an image or video."
+        description=(
+            "Run center-cross localization on an image, video or configured "
+            "live camera."
+        )
     )
-    parser.add_argument("input", type=Path, help="图片或视频路径")
+    parser.add_argument("input", type=Path, nargs="?", help="图片或视频路径")
+    parser.add_argument(
+        "--camera",
+        action="store_true",
+        help="按 runtime.yaml 打开最新帧相机源并自动显示实时界面。",
+    )
     parser.add_argument("--config", type=Path, default=Path("configs/runtime.yaml"))
     parser.add_argument("--output-jsonl", type=Path, required=True)
     parser.add_argument("--overlay-dir", type=Path)
@@ -344,6 +392,10 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    if args.camera == (args.input is not None):
+        parser.error("provide exactly one of input or --camera.")
+    if args.camera and args.already_undistorted:
+        parser.error("--already-undistorted is only valid for file input.")
     if args.max_frames is not None and args.max_frames <= 0:
         parser.error("--max-frames must be positive.")
 
@@ -371,13 +423,24 @@ def main() -> None:
 
     processed = 0
     selected = 0
+    show_display = args.display or args.camera
+    frame_context = (
+        _camera_frames(config)
+        if args.camera
+        else _frames(args.input)
+    )
     try:
-        with _frames(args.input) as frames, args.output_jsonl.open(
+        if show_display:
+            cv2.namedWindow("center cross - undistorted", cv2.WINDOW_NORMAL)
+            cv2.namedWindow("center cross - BEV", cv2.WINDOW_NORMAL)
+        with frame_context as frames, args.output_jsonl.open(
             "w", encoding="utf-8"
         ) as output:
-            for sequence, input_image in frames:
+            for raw_frame in frames:
                 if args.max_frames is not None and processed >= args.max_frames:
                     break
+                sequence = raw_frame.sequence
+                input_image = raw_frame.image_bgr
                 actual_size = (input_image.shape[1], input_image.shape[0])
                 if actual_size != config.camera.image_size:
                     raise ValueError(
@@ -389,25 +452,74 @@ def main() -> None:
                     if args.already_undistorted
                     else geometry.camera_model.undistort_image(input_image)
                 )
-                capture_timestamp_ns = monotonic_ns()
-                features = detector.detect(
-                    CameraFrame(sequence, capture_timestamp_ns, image),
-                    image,
-                    valid_mask=geometry.camera_model.valid_mask,
-                )
-                observation = localizer.localize(features, prior_pose=prior_pose)
+                stale_age_ms: float | None = None
+                if args.camera:
+                    realtime = detector.detect_realtime(
+                        raw_frame,
+                        image,
+                        valid_mask=geometry.camera_model.valid_mask,
+                    )
+                    if realtime.stale_dropped:
+                        stale_age_ms = realtime.dropped_stale_age_ms
+                        features = None
+                    else:
+                        features = realtime.result
+                else:
+                    features = detector.detect(
+                        raw_frame,
+                        image,
+                        valid_mask=geometry.camera_model.valid_mask,
+                    )
+                if features is None:
+                    assert stale_age_ms is not None
+                    observation = None
+                    payload = {
+                        "field_features": None,
+                        "localization": None,
+                        "stale_dropped_age_ms": stale_age_ms,
+                    }
+                    undistorted = image.copy()
+                    bev = projector.make_bev_image(image)
+                    _put_lines(
+                        undistorted,
+                        [f"STALE dropped age={stale_age_ms:.1f} ms"],
+                    )
+                    _put_lines(
+                        bev,
+                        [f"STALE dropped age={stale_age_ms:.1f} ms"],
+                    )
+                    selected_current = False
+                else:
+                    observation = localizer.localize(
+                        features,
+                        prior_pose=prior_pose,
+                    )
+                    payload = {
+                        "field_features": _feature_record(features),
+                        "localization": _localization_record(observation),
+                        "stale_dropped_age_ms": None,
+                    }
+                    undistorted = _undistorted_overlay(
+                        image,
+                        features,
+                        observation,
+                    )
+                    bev = _bev_overlay(
+                        image,
+                        projector,
+                        features,
+                        observation,
+                    )
+                    selected_current = observation.selected_pose is not None
                 output.write(
                     json.dumps(
-                        {
-                            "field_features": _feature_record(features),
-                            "localization": _localization_record(observation),
-                        },
+                        payload,
                         ensure_ascii=False,
                         allow_nan=False,
                     ) + "\n"
                 )
-                undistorted = _undistorted_overlay(image, features, observation)
-                bev = _bev_overlay(image, projector, features, observation)
+                if args.camera:
+                    output.flush()
                 if args.overlay_dir is not None:
                     paths = (
                         args.overlay_dir / f"{sequence:06d}_undistorted.jpg",
@@ -416,17 +528,17 @@ def main() -> None:
                     for path, overlay in zip(paths, (undistorted, bev)):
                         if not cv2.imwrite(str(path), overlay):
                             raise RuntimeError(f"Failed to write overlay: {path}")
-                if args.display:
+                if show_display:
                     cv2.imshow("center cross - undistorted", undistorted)
                     cv2.imshow("center cross - BEV", bev)
                     if cv2.waitKey(1) & 0xFF in {27, ord("q"), ord("Q")}:
                         processed += 1
-                        selected += int(observation.selected_pose is not None)
+                        selected += int(selected_current)
                         break
                 processed += 1
-                selected += int(observation.selected_pose is not None)
+                selected += int(selected_current)
     finally:
-        if args.display:
+        if show_display:
             cv2.destroyAllWindows()
     print(
         f"Processed {processed} frames; unique pose selected for {selected}; "

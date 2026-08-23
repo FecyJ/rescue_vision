@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import math
+from types import SimpleNamespace
 
 from manual_tests.cross_localization import (
+    _camera_frames,
     _frames,
     _localization_record,
     _prior_pose,
@@ -72,6 +74,35 @@ def test_manual_cross_localization_prior_and_image_input(tmp_path) -> None:
         np.zeros((8, 12, 3), dtype=np.uint8),
     )
     with _frames(image_path) as frames:
-        sequence, image = next(frames)
-    assert sequence == 0
-    assert image.shape == (8, 12, 3)
+        frame = next(frames)
+    assert frame.sequence == 0
+    assert frame.image_bgr.shape == (8, 12, 3)
+
+
+def test_manual_cross_localization_camera_context_closes_source() -> None:
+    class FakeSource:
+        def __init__(self) -> None:
+            self.entered = False
+            self.exited = False
+
+        def __enter__(self):
+            self.entered = True
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            self.exited = True
+
+        def read(self, timeout: float = 1.0):
+            assert timeout == 1.0
+            return SimpleNamespace(sequence=7)
+
+    source = FakeSource()
+    config = SimpleNamespace(camera=SimpleNamespace(backend="picamera2"))
+    with _camera_frames(
+        config,
+        source_factory=lambda _: source,
+    ) as frames:
+        assert next(frames).sequence == 7
+        assert source.entered is True
+        assert source.exited is False
+    assert source.exited is True
