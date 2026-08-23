@@ -18,6 +18,7 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `AppConfig.build_camera_model()` | 按内参开关创建 `CameraModel` | 内参关闭时返回 `None` |
 | `AppConfig.build_geometry()` | 创建相机模型和可选地面映射 | 内参关闭时返回 `None`；只有内参时 projector 为 `None` |
 | `AppConfig.build_target_pose_detector()` | 按当前 Hailo、类别和 HSV 配置创建任务目标检测器 | Hailo 关闭时返回 `None`；返回对象接管 backend 生命周期 |
+| `AppConfig.build_center_cross_localizer()` | 创建中心十字绝对位姿观测器 | 定位、场地特征或地面映射任一不可用时返回 `None` |
 | `UartConfig.build_channel()` | 创建协议无关 UART 行通道 | UART 关闭时返回 `None`；创建时尚不打开设备 |
 | `RemoteConfig.build_server()` | 创建树莓派直接 TCP 服务端 | 远程关闭时返回 `None`；创建时尚不监听 |
 | `RemoteConfig.connect_client()` | 仓库内参考客户端建立直接 TCP 连接 | 只用于互操作/人工检查；独立电脑端不得依赖 |
@@ -51,6 +52,7 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `HsvColorClassifierConfig` | 四类 HSV 闭区间、颜色证据门槛和掩码去噪参数 |
 | `TargetGroundGeometryConfig` | 四类三维形状尺寸、搜索步长、评分权重和接受门限 |
 | `FieldFeatureConfig` | 场地颜色、区域尺寸、点划线和边界候选阈值 |
+| `CenterCrossLocalizerConfig` | 终端射线关联、锚点置信度、先验创新和不确定度下限 |
 | `HailoConfig` | 模型资产、身份、类别映射和后端粗筛阈值 |
 | `RuntimeGeometry` | `camera_model`、可选 `ground_projector` |
 
@@ -183,10 +185,15 @@ field_detector = config.perception.build_field_feature_detector(
     max_observation_age_ms=config.processing.max_observation_age_ms,
     ground_projector=ground_projector,
 )
+center_cross_localizer = config.build_center_cross_localizer(
+    ground_projector=ground_projector,
+)
 ```
 
-配置关闭时返回 `None`。没有地面映射时仍可输出部分图像观测，但不能分配
+场地检测配置关闭时 `field_detector` 返回 `None`。没有地面映射时仍可输出部分图像观测，但不能分配
 安全区入口视角左右，也不能把像素伪装成毫米坐标。
+定位器还要求 `localization.enabled=true` 和地面映射；任一条件缺失时返回
+`None`。它不创建另一套标定或 BEV。
 
 ## 6. 几何开关组合
 

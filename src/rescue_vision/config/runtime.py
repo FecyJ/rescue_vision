@@ -13,6 +13,7 @@ from rescue_vision.communication.remote_messages import RemoteTopic
 from rescue_vision.geometry.camera_model import CameraCalibration, CameraModel
 from rescue_vision.geometry.ground_projector import GroundProjector
 from rescue_vision.geometry.types import FieldPoint
+from rescue_vision.localization import CenterCrossLocalizerConfig
 from rescue_vision.mission import MissionConfig
 from rescue_vision.perception.types import (
     COLOR_TARGET_CLASSES,
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
         RemoteGripperExecutor,
         RemoteMotionExecutor,
     )
+    from rescue_vision.localization import CenterCrossLocalizer
     from rescue_vision.perception import TargetPoseDetector
 
 
@@ -361,6 +363,20 @@ def _perception_defaults() -> dict[str, Any]:
                 "max_features": 8,
             },
         },
+    }
+
+
+def _localization_defaults() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "ray_min_forward_distance_mm": 500.0,
+        "ray_max_forward_distance_mm": 1800.0,
+        "ray_max_lateral_distance_mm": 120.0,
+        "ray_angle_tolerance_deg": 10.0,
+        "min_anchor_confidence": 0.25,
+        "max_prior_heading_innovation_deg": 20.0,
+        "position_uncertainty_floor_mm": 20.0,
+        "heading_uncertainty_floor_deg": 3.0,
     }
 
 
@@ -699,6 +715,7 @@ class AppConfig:
     world: WorldRuntimeConfig
     mission: MissionConfig
     perception: PerceptionConfig
+    localization: CenterCrossLocalizerConfig
     hailo: HailoConfig
 
     def build_camera_model(self) -> CameraModel | None:
@@ -760,6 +777,27 @@ class AppConfig:
             ground_projector=ground_projector,
         )
 
+    def build_center_cross_localizer(
+        self,
+        *,
+        ground_projector: GroundProjector | None,
+    ) -> CenterCrossLocalizer | None:
+        """Build center-cross localization when all geometric inputs exist."""
+
+        if (
+            not self.localization.enabled
+            or not self.perception.field_features.enabled
+            or not self.geometry.ground_mapping_enabled
+            or ground_projector is None
+        ):
+            return None
+        from rescue_vision.localization import CenterCrossLocalizer
+
+        return CenterCrossLocalizer(
+            self.localization,
+            max_observation_age_ms=self.processing.max_observation_age_ms,
+        )
+
 
 def load_runtime_config(path: str | Path) -> AppConfig:
     """从 YAML 加载运行配置；未知字段和无效值均视为错误。"""
@@ -781,6 +819,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "world",
             "mission",
             "perception",
+            "localization",
             "hailo",
         },
         "root",
@@ -2063,6 +2102,106 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         field_features=field_features,
     )
 
+    localization_raw = _merge_defaults(
+        _localization_defaults(),
+        _mapping(root.get("localization", {}), "localization"),
+    )
+    _reject_unknown(
+        localization_raw,
+        {
+            "enabled",
+            "ray_min_forward_distance_mm",
+            "ray_max_forward_distance_mm",
+            "ray_max_lateral_distance_mm",
+            "ray_angle_tolerance_deg",
+            "min_anchor_confidence",
+            "max_prior_heading_innovation_deg",
+            "position_uncertainty_floor_mm",
+            "heading_uncertainty_floor_deg",
+        },
+        "localization",
+    )
+    localization_enabled = _required(localization_raw, "enabled", "localization")
+    if not isinstance(localization_enabled, bool):
+        raise ValueError("localization.enabled must be a boolean.")
+    min_anchor_confidence = _threshold(
+        _required(
+            localization_raw,
+            "min_anchor_confidence",
+            "localization",
+        ),
+        "localization.min_anchor_confidence",
+    )
+    if min_anchor_confidence > 1.0:
+        raise ValueError("localization.min_anchor_confidence must be <= 1.0.")
+    localization = CenterCrossLocalizerConfig(
+        enabled=localization_enabled,
+        ray_min_forward_distance_mm=_finite_float(
+            _required(
+                localization_raw,
+                "ray_min_forward_distance_mm",
+                "localization",
+            ),
+            "localization.ray_min_forward_distance_mm",
+            minimum=0.0,
+        ),
+        ray_max_forward_distance_mm=_finite_float(
+            _required(
+                localization_raw,
+                "ray_max_forward_distance_mm",
+                "localization",
+            ),
+            "localization.ray_max_forward_distance_mm",
+            minimum=0.001,
+        ),
+        ray_max_lateral_distance_mm=_finite_float(
+            _required(
+                localization_raw,
+                "ray_max_lateral_distance_mm",
+                "localization",
+            ),
+            "localization.ray_max_lateral_distance_mm",
+            minimum=0.0,
+        ),
+        ray_angle_tolerance_deg=_finite_float(
+            _required(
+                localization_raw,
+                "ray_angle_tolerance_deg",
+                "localization",
+            ),
+            "localization.ray_angle_tolerance_deg",
+            minimum=0.001,
+        ),
+        min_anchor_confidence=min_anchor_confidence,
+        max_prior_heading_innovation_deg=_finite_float(
+            _required(
+                localization_raw,
+                "max_prior_heading_innovation_deg",
+                "localization",
+            ),
+            "localization.max_prior_heading_innovation_deg",
+            minimum=0.001,
+        ),
+        position_uncertainty_floor_mm=_finite_float(
+            _required(
+                localization_raw,
+                "position_uncertainty_floor_mm",
+                "localization",
+            ),
+            "localization.position_uncertainty_floor_mm",
+            minimum=0.001,
+        ),
+        heading_uncertainty_floor_deg=_finite_float(
+            _required(
+                localization_raw,
+                "heading_uncertainty_floor_deg",
+                "localization",
+            ),
+            "localization.heading_uncertainty_floor_deg",
+            minimum=0.001,
+        ),
+    )
+
     hailo_raw = _mapping(root.get("hailo", {}), "hailo")
     _reject_unknown(
         hailo_raw,
@@ -2173,5 +2312,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         world,
         mission,
         perception,
+        localization,
         hailo,
     )

@@ -2,7 +2,7 @@
 
 2027 工创赛“智能救援”赛项的上位机视觉工程，目标平台为 Raspberry Pi 5、Hailo-8L 和 Camera Module 3 NoIR Wide。
 
-当前已完成相机、标定与地面几何、严格配置、录制回放、数据集工具、离线评测、协议无关 UART、直接 TCP 远程消息通道、Rescue Car v2.0 差速与双舵机夹爪控制、受监督手动驾驶采集入口、统一目标观测、Hailo YOLO Pose 后端、四类目标传统视觉地面几何估计基线、传统视觉场地特征观测基线，以及可用合成事件运行的目标跟踪、最小世界模型和规则状态机；尚未完成正式四类目标模型、定位、完整区域/对手感知、规划、脚本运动采集、固件失联看门狗闭环、真实接触/交付证据适配和比赛应用入口。这不是可直接参赛的完整程序。
+当前已完成相机、标定与地面几何、严格配置、录制回放、数据集工具、离线评测、协议无关 UART、直接 TCP 远程消息通道、Rescue Car v2.0 差速与双舵机夹爪控制、受监督手动驾驶采集入口、统一目标观测、Hailo YOLO Pose 后端、四类目标传统视觉地面几何估计基线、传统视觉场地特征观测基线、中心十字绝对位姿候选与同帧红蓝安全区方向锚定，以及可用合成事件运行的目标跟踪、最小世界模型和规则状态机；尚未完成正式四类目标模型、IMU/编码器融合与完整定位、完整区域/对手感知、规划、脚本运动采集、固件失联看门狗闭环、真实接触/交付证据适配和比赛应用入口。这不是可直接参赛的完整程序。
 
 ## 快速上手
 
@@ -61,10 +61,11 @@ python -m pytest
 | [`data`](src/rescue_vision/data/README.md) | 已实现 | 记录检查、清单生成和按会话防泄漏划分 |
 | [`evaluation`](src/rescue_vision/evaluation/README.md) | 已实现 | 分类、地面误差、时延和失败样例报告 |
 | [`perception`](src/rescue_vision/perception/README.md) | 已实现基础设施 | Pose 框/K0、ROI HSV 分类分割、四类可配置三维模板地面中心估计，以及安全区、无编号出发区、中心十字和低精度边界候选；正式模型、实物精度与树莓派性能待验证 |
+| [`localization`](src/rescue_vision/localization/README.md) | 已实现视觉观测基础 | 中心十字四向位姿候选、同帧红蓝安全区方向锚定和先验门控；跨帧关联、连续融合与远场精度待实现/验证 |
 | [`tracking`](src/rescue_vision/tracking/README.md) | 已实现纯逻辑 | 时间关联、轨迹确认、短时遮挡、衰减和删除 |
 | [`world`](src/rescue_vision/world/README.md) | 已实现纯逻辑 | 静态区域、动态目标、危险状态、对手占据和不确定性 |
 | [`mission`](src/rescue_vision/mission/README.md) | 已实现纯逻辑 | 首次/容量/伤员/危险规则、安全降级和抽象动作 |
-| 定位至比赛应用主链路 | 未实现 | 定位、真实区域/接触证据、规划、正式动作到运动控制的适配和比赛入口待完成 |
+| 定位至比赛应用主链路 | 部分实现 | 中心十字视觉位姿观测已实现；连续融合、真实区域/接触证据、规划、正式动作到运动控制的适配和比赛入口待完成 |
 
 各包常用 API、命令和实际对接示例见 [`src/rescue_vision/README.md`](src/rescue_vision/README.md)。
 
@@ -83,7 +84,11 @@ FrameSource → CameraFrame → CameraModel → 去畸变帧
                                       └─> FieldFeatureDetector
                                                  └─> FieldFeatureDetectionResult
                                                               ↓
-                                                     定位（P4，未实现）
+                                                    CenterCrossLocalizer
+                                                              ↓
+                                               CenterCrossPoseObservation
+                                                              ↓
+                                                IMU/编码器融合（未实现）
 
 RemoteMessageConnection → DebugMotionCommand → RemoteMotionExecutor
                                                 ↓
@@ -139,7 +144,7 @@ UndistortedPixel ── GroundProjector（z=0）──↔ GroundPoint ──↔ 
     │
     └─ Hailo letterbox（内部临时）↔ 模型输入像素
 
-GroundPoint ── 定位（当前未实现）──> FieldPoint ──↔ MapPixel
+GroundPoint ── 唯一 FieldPose2D（中心十字观测已实现）──> FieldPoint ──↔ MapPixel
 ```
 
 - `CameraModel` 是 `RawPixel → UndistortedPixel` 的唯一实现；`GroundProjector`
@@ -153,8 +158,9 @@ GroundPoint ── 定位（当前未实现）──> FieldPoint ──↔ MapPi
 - `FieldPoint` 的零点和方向固定对应官方《规则讲解》场地图（第 37 页）：中心
   十字点划线交点为原点，`+x` 沿水平点划线向右，`+y` 沿竖直点划线指向红色
   安全区；红蓝方抽签不改变这个物理坐标方向。
-- `FieldPoint` 与 `GroundPoint` 不能直接互换。定位尚未实现时，世界模型可以
-  保留缺失的 `FieldPoint`，但不能把当前机器人局部地面点伪装成场地全局点。
+- `FieldPoint` 与 `GroundPoint` 不能直接互换。中心十字没有唯一位姿或连续
+  定位尚不可用时，世界模型保留缺失的 `FieldPoint`，不能把机器人局部地面点
+  伪装成场地全局点。
 
 ### 内部和显示侧的局部像素
 

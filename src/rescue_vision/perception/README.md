@@ -5,7 +5,8 @@
 类别并提供局部颜色分割掩码。`TargetGroundGeometryEstimator` 再利用该掩码、
 K0、完整相机外参和可配置三维形状估计目标地面中心、朝向与足迹。独立的
 `FieldFeatureDetector` 从同一去畸变帧检测安全区、出发区、中心十字和低精度
-边界候选。这些链路都不创建相机、不复制标定矩阵，也不修改跟踪、定位、
+边界候选；`localization.CenterCrossLocalizer` 再消费这些同帧观测，不回读
+图像或掩码。这些链路都不创建相机、不复制标定矩阵，也不修改跟踪、定位、
 世界模型或任务状态。
 
 ## 常用类和函数
@@ -363,6 +364,10 @@ for safe_zone in field_result.safe_zones if field_result is not None else ():
 两条点划线轴在地图匹配前保持无序；只有单条满足间断结构的轴时标记
 `partial`，普通实线不会作为中心轴。围栏基线和角点始终带
 `low_confidence_boundary`，单帧结果不能直接当作闭合场界。
+
+中心十字的四向对称、红蓝安全区终端关联、先验门控和 `FieldPose2D` 约定由
+[`localization` README](../localization/README.md) 统一定义；感知层不把
+`GroundPoint` 伪装成 `FieldPoint`。
 
 完整阈值位于 `configs/runtime.example.yaml` 的
 `perception.field_features`。红、蓝、洋红和紫色初值来自命题示意图，不是

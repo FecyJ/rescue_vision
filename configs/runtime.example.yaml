@@ -222,6 +222,20 @@ perception:
       corner_tolerance_deg: 20.0
       max_features: 8
 
+localization:
+  # 只生成中心十字低频绝对位姿观测；不包含 IMU/编码器融合。
+  enabled: false
+  # 从十字交点沿四条基准线射线搜索同帧安全区或场界终端。
+  ray_min_forward_distance_mm: 500.0
+  ray_max_forward_distance_mm: 1800.0
+  ray_max_lateral_distance_mm: 120.0
+  ray_angle_tolerance_deg: 10.0
+  min_anchor_confidence: 0.25
+  max_prior_heading_innovation_deg: 20.0
+  # 无实场误差标定前只提供保守下限，不能当作已验证精度。
+  position_uncertainty_floor_mm: 20.0
+  heading_uncertainty_floor_deg: 3.0
+
 hailo:
   # 模板默认禁用；实际部署值写入不提交的 configs/runtime.yaml。
   enabled: false

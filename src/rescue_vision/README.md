@@ -69,6 +69,9 @@ field_detector = config.perception.build_field_feature_detector(
     max_observation_age_ms=config.processing.max_observation_age_ms,
     ground_projector=geometry.ground_projector,
 )
+center_cross_localizer = config.build_center_cross_localizer(
+    ground_projector=geometry.ground_projector,
+)
 tracker = config.tracking.build_tracker()
 world_model = config.world.build_model()
 mission = config.mission.build_state_machine()
@@ -120,6 +123,17 @@ with source, detector:
             if field_realtime_result is not None
             else None
         )
+        center_pose_observation = (
+            center_cross_localizer.localize(field_result)
+            if center_cross_localizer is not None and field_result is not None
+            else None
+        )
+        robot_field_point = (
+            center_pose_observation.selected_pose.position
+            if center_pose_observation is not None
+            and center_pose_observation.selected_pose is not None
+            else None
+        )
         tracks = tracker.update(
             raw_frame.timestamp_ns,
             detection_result.observations,
@@ -128,9 +142,9 @@ with source, detector:
             timestamp_ns=monotonic_ns(),
             visual_timestamp_ns=raw_frame.timestamp_ns,
             tracks=tracks,
-            # field_result 留给后续定位消费。P4 定位接入前不传
-            # robot/target FieldPoint，
-            # 世界模型会保留明确的不确定性。
+            robot_field_point=robot_field_point,
+            # 中心十字没有唯一解时传 None，世界模型保留明确不确定性。
+            # 本示例尚未注入时间对齐的 IMU/编码器先验；完整融合未实现。
             # ground_geometry_result 当前提供机器人系中心/足迹；后续规划
             # 接口接入前不在这里伪造全局目标坐标。
         )
@@ -153,6 +167,7 @@ with source, detector:
 | [`motion`](motion/README.md) | `MotionController`、`MotionLimits`、`GripperCalibration`、`RemoteMotionExecutor`、`RemoteGripperExecutor`、`run_remote_motion` | 差速运动、持续夹爪双舵机、Rescue Car 协议和远程调试执行 |
 | [`geometry`](geometry/README.md) | `CameraModel`、`GroundProjector`、显式坐标类型（含 `MapPixel`） | 去畸变及像素/地面/BEV 转换 |
 | [`perception`](perception/README.md) | `TargetPoseDetector`、`PerceptionFrameRenderer`、`TargetGroundGeometryEstimator`、`FieldFeatureDetector` | 任务目标、最新帧可视化旁路、地面几何和静态场地特征观测 |
+| [`localization`](localization/README.md) | `CenterCrossLocalizer`、`FieldPose2D`、`CenterCrossPoseObservation` | 中心十字绝对位姿候选、同帧方向锚定和先验门控 |
 | [`tracking`](tracking/README.md) | `MultiTargetTracker`、`TrackedTarget`、`TrackStatus` | 时间关联、遮挡和轨迹生命周期 |
 | [`world`](world/README.md) | `WorldModel`、`WorldSnapshot`、`HazardState` | 区域、动态目标、对手占据和不确定性 |
 | [`mission`](mission/README.md) | `MissionStateMachine`、`replay_mission()`、`MissionDecision` | 规则、安全降级和抽象动作 |
@@ -167,4 +182,4 @@ with source, detector:
 - 原始像素使用 `RawPixel`，去畸变像素使用 `UndistortedPixel`，只有后者能交给 `GroundProjector`。
 - 感知算法只产生 `TargetObservation`、`TargetGroundGeometry` 或 `FieldFeatureDetectionResult`，不持有跟踪、定位、世界模型或规则状态。
 - 实时循环只处理最新帧；录制、显示、日志和通信使用有界旁路。
-- 当前正式任务目标模型、定位、完整区域/对手感知、真实接触与交付证据、规划、正式任务动作到运动控制的适配和比赛应用入口尚未完成。传统视觉场地特征目前只有合成测试基线；`app` 的远程驾驶/图传只用于赛外受监督采集，不能替代固件失联看门狗。
+- 当前正式任务目标模型、连续定位融合、完整区域/对手感知、真实接触与交付证据、规划、正式任务动作到运动控制的适配和比赛应用入口尚未完成。传统视觉场地特征和中心十字定位目前只有合成测试基线；`app` 的远程驾驶/图传只用于赛外受监督采集，不能替代固件失联看门狗。

@@ -266,6 +266,73 @@ def test_strict_config_and_geometry_build(tmp_path) -> None:
     assert geometry.ground_projector is not None
 
 
+def test_center_cross_localizer_requires_enabled_feature_and_ground_mapping(
+    tmp_path,
+) -> None:
+    calibration = write_intrinsics(tmp_path / "intrinsics.json")
+    (tmp_path / "ground.json").write_text(
+        json.dumps(
+            {
+                "quality": {"usable": True, "physically_valid": True},
+                "image_size": [32, 24],
+                "model_type": "pinhole",
+                "calibration_id": calibration.calibration_id,
+                "coordinate_frame": robot_frame_metadata(),
+                "image_to_ground": np.eye(3).tolist(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    localization = """
+localization:
+  enabled: true
+  ray_min_forward_distance_mm: 500.0
+  ray_max_forward_distance_mm: 1800.0
+  ray_max_lateral_distance_mm: 120.0
+  ray_angle_tolerance_deg: 10.0
+  min_anchor_confidence: 0.25
+  max_prior_heading_innovation_deg: 20.0
+  position_uncertainty_floor_mm: 20.0
+  heading_uncertainty_floor_deg: 3.0
+"""
+    enabled_text = config_text(extra=localization).replace(
+        "  field_features:\n    enabled: false",
+        "  field_features:\n    enabled: true",
+    )
+    path = tmp_path / "runtime.yaml"
+    path.write_text(enabled_text, encoding="utf-8")
+    loaded = load_runtime_config(path)
+    geometry = loaded.build_geometry()
+    assert geometry is not None
+    assert loaded.build_center_cross_localizer(
+        ground_projector=geometry.ground_projector
+    ) is not None
+    assert loaded.build_center_cross_localizer(ground_projector=None) is None
+
+    disabled_feature_path = tmp_path / "disabled_feature.yaml"
+    disabled_feature_path.write_text(
+        config_text(extra=localization),
+        encoding="utf-8",
+    )
+    disabled_feature = load_runtime_config(disabled_feature_path)
+    assert disabled_feature.build_center_cross_localizer(
+        ground_projector=geometry.ground_projector
+    ) is None
+
+    disabled_ground_path = tmp_path / "disabled_ground.yaml"
+    disabled_ground_path.write_text(
+        enabled_text.replace(
+            "  ground_mapping_enabled: true",
+            "  ground_mapping_enabled: false",
+        ),
+        encoding="utf-8",
+    )
+    disabled_ground = load_runtime_config(disabled_ground_path)
+    assert disabled_ground.build_center_cross_localizer(
+        ground_projector=geometry.ground_projector
+    ) is None
+
+
 def test_disabled_hailo_does_not_create_target_pose_detector(tmp_path) -> None:
     path = tmp_path / "runtime.yaml"
     path.write_text(
