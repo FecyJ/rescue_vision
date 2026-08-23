@@ -66,6 +66,7 @@ ground_geometry_estimator = (
     )
 )
 field_detector = config.perception.build_field_feature_detector(
+    static_map=config.world.static_map,
     max_observation_age_ms=config.processing.max_observation_age_ms,
     ground_projector=geometry.ground_projector,
 )
@@ -169,7 +170,7 @@ with source, detector:
 | [`perception`](perception/README.md) | `TargetPoseDetector`、`PerceptionFrameRenderer`、`TargetGroundGeometryEstimator`、`FieldFeatureDetector` | 任务目标、最新帧可视化旁路、地面几何和静态场地特征观测 |
 | [`localization`](localization/README.md) | `CenterCrossLocalizer`、`FieldPose2D`、`CenterCrossPoseObservation` | 中心十字绝对位姿候选、同帧方向锚定和先验门控 |
 | [`tracking`](tracking/README.md) | `MultiTargetTracker`、`TrackedTarget`、`TrackStatus` | 时间关联、遮挡和轨迹生命周期 |
-| [`world`](world/README.md) | `WorldModel`、`WorldSnapshot`、`HazardState` | 区域、动态目标、对手占据和不确定性 |
+| [`world`](world/README.md) | `StaticFieldMap`、`WorldModel`、`WorldSnapshot`、`HazardState` | 固定物理地图、任务区域派生、动态目标、对手占据和不确定性 |
 | [`mission`](mission/README.md) | `MissionStateMachine`、`replay_mission()`、`MissionDecision` | 规则、安全降级和抽象动作 |
 | [`calibration`](calibration/README.md) | 五个 `python -m` 标定命令 | 采集棋盘/ChArUco、生成内参与多图地面映射产物 |
 | [`data`](data/README.md) | `inspect_recording()`、`build_dataset_records()`、`split_records()` | 采集验收、清单和防泄漏划分 |

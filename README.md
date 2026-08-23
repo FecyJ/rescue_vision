@@ -54,7 +54,7 @@ python -m pytest
 | [`camera`](src/rescue_vision/camera/README.md) | 已实现 | 真机最新帧、离线回放和有界异步记录 |
 | [`calibration`](src/rescue_vision/calibration/README.md) | 已实现 | 棋盘/ChArUco 采集、三模型内参比较和固定机器人多位置地面映射 |
 | [`geometry`](src/rescue_vision/geometry/README.md) | 已实现 | 去畸变、显式坐标类型、地面/三维点投影与 BEV 转换 |
-| [`config`](src/rescue_vision/config/README.md) | 已实现 | 安全默认配置、UART/远程/motion/夹爪机械标定/几何/模型和感知算法装配 |
+| [`config`](src/rescue_vision/config/README.md) | 已实现 | 安全默认配置、静态场地、UART/远程/motion/夹爪机械标定/几何/模型和感知算法装配 |
 | [`communication`](src/rescue_vision/communication/README.md) | 已实现基础设施 | UART、直接 TCP 远程消息、raw/perception/BEV 图传模式选择、运动/夹爪/采集严格 schema 和有界队列；比赛发布器待接入 |
 | [`motion`](src/rescue_vision/motion/README.md) | 已实现基础设施 | 差速运动、持续扳机双舵机夹爪、单轮加速度限制、Rescue Car 协议解析和远程超时保护 |
 | [`app`](src/rescue_vision/app/README.md) | 已实现手动采集入口 | 赛外受监督驾驶、仅相机远程调试、持续夹爪控制、raw/perception/BEV 图传、采集控制与状态装配；比赛入口待实现 |
@@ -63,7 +63,7 @@ python -m pytest
 | [`perception`](src/rescue_vision/perception/README.md) | 已实现基础设施 | Pose 框/K0、ROI HSV 分类分割、四类可配置三维模板地面中心估计，以及安全区、无编号出发区、中心十字和低精度边界候选；正式模型、实物精度与树莓派性能待验证 |
 | [`localization`](src/rescue_vision/localization/README.md) | 已实现视觉观测基础 | 中心十字四向位姿候选、同帧红蓝安全区方向锚定和先验门控；跨帧关联、连续融合与远场精度待实现/验证 |
 | [`tracking`](src/rescue_vision/tracking/README.md) | 已实现纯逻辑 | 时间关联、轨迹确认、短时遮挡、衰减和删除 |
-| [`world`](src/rescue_vision/world/README.md) | 已实现纯逻辑 | 静态区域、动态目标、危险状态、对手占据和不确定性 |
+| [`world`](src/rescue_vision/world/README.md) | 已实现纯逻辑 | 固定物理地图、红蓝任务区域派生、动态目标、危险状态、对手占据和不确定性 |
 | [`mission`](src/rescue_vision/mission/README.md) | 已实现纯逻辑 | 首次/容量/伤员/危险规则、安全降级和抽象动作 |
 | 定位至比赛应用主链路 | 部分实现 | 中心十字视觉位姿观测已实现；连续融合、真实区域/接触证据、规划、正式动作到运动控制的适配和比赛入口待完成 |
 

@@ -1,12 +1,18 @@
 # `world`：最小世界模型
 
-本包把 `TrackedTarget`、静态场地区域、可选场地坐标和对手占据整理成不可变 `WorldSnapshot`。它是跟踪与规则状态机之间的唯一世界语义层，不运行检测、不维护比赛得分。
+本包维护固定物理场地地图，并把 `TrackedTarget`、抽签后的任务区域、可选场地
+坐标和对手占据整理成不可变 `WorldSnapshot`。它是静态地图与规则状态机之间的
+唯一世界语义层，不运行检测、不维护比赛得分。
 
 ## 常用类和函数
 
 | 入口 | 作用 |
 | --- | --- |
-| `WorldRuntimeConfig.build_model()` | 从 `runtime.yaml` 的世界参数和静态区域创建 `WorldModel` |
+| `WorldRuntimeConfig.build_model()` | 从物理静态地图和 `team_color` 派生任务区域并创建 `WorldModel` |
+| `StaticFieldMap` | 固定物理区域和中心十字终端语义的唯一权威 |
+| `PhysicalStaticRegion` / `PhysicalRegionKind` | 场界、红蓝安全分区和出发区的 `FieldPoint` 多边形 |
+| `StaticCenterCross` / `CenterCrossTerminal` | 中心交点及 `±x/±y` 四条射线的终端语义 |
+| `TeamColor` | `red`、`blue` 或保守的 `unknown` |
 | `WorldModel.update()` | 在单调时间轴上产生一个完整快照 |
 | `WorldSnapshot` | 状态机消费的动态目标、区域、对手和不确定性 |
 | `WorldSnapshot.target_region_kinds()` | 查询目标所在静态区域；缺少场地坐标时返回 `None` |
@@ -65,27 +71,50 @@ for target in snapshot.targets:
 
 `timestamp_ns` 是本次世界更新时刻，`visual_timestamp_ns` 是最近有效视觉帧时刻。两者必须来自同一单调时钟。没有检测目标的有效新帧仍应更新 `visual_timestamp_ns`，否则会被误判为视觉中断。
 
-## 4. 静态区域
+## 4. 固定物理地图与任务区域
 
-区域从 `runtime.yaml` 加载，顶点使用 `FieldPoint` 的 `[x_mm, y_mm]`。其原点是
-场地中心十字点划线交点，`+x` 沿水平点划线向右，`+y` 沿竖直点划线指向红色
-安全区；不要把机器人地面系的 `GroundPoint` 直接写入这里：
+所有不会随机器人运动改变的场地事实统一配置在 `world.static_map`。顶点使用
+`FieldPoint` 的 `[x_mm, y_mm]`：原点是中心十字交点，`+x` 沿水平基准线向右，
+`+y` 沿竖直基准线指向当前静态地图定义的红色安全区。不能写入机器人局部
+`GroundPoint`。
 
 ```yaml
 world:
-  # 其余阈值省略
-  regions:
-    - region_id: own-material
-      kind: own_material
-      polygon_field_mm:
-        - [-1400.0, -1400.0]
-        - [-900.0, -1400.0]
-        - [-900.0, -1000.0]
-        - [-1400.0, -1000.0]
+  team_color: unknown  # 抽签后改为 red 或 blue
+  static_map:
+    center_cross:
+      intersection_field_mm: [0.0, 0.0]
+      terminals:
+        positive_x: plain_boundary
+        negative_x: plain_boundary
+        positive_y: red_safe_zone
+        negative_y: blue_safe_zone
+    regions:
+      - region_id: field
+        kind: field
+        polygon_field_mm:
+          - [-1500.0, -1500.0]
+          - [1500.0, -1500.0]
+          - [1500.0, 1500.0]
+          - [-1500.0, 1500.0]
 ```
 
-允许的 `kind` 为 `field`、`own_material`、`own_injured` 和
-`opponent_safe`。多边形至少三个点、面积非零，边界点视为进入区域。示例坐标仅说明格式，必须在 P3 根据现场红蓝方变换和实测场地替换，不能直接作为比赛地图。
+完整的红/蓝物资区、伤员区和 1–4 号出发区启动地图及逐字段注释只在
+[`configs/runtime.example.yaml`](../../../configs/runtime.example.yaml) 维护，
+不在此复制第二份数值。
+
+物理 `kind` 允许 `field`、`red_material`、`red_injured`、`blue_material`、
+`blue_injured` 和 `start_zone`。多边形至少三个点、面积非零，`region_id`
+全局唯一；四个出发区使用相同 kind，以 `start-1` 至 `start-4` 区分。
+
+`team_color` 不改变物理地图。`red` 会把红色两个分区派生为
+`OWN_MATERIAL/OWN_INJURED`，把蓝色两个分区派生为 `OPPONENT_SAFE`；`blue`
+反向映射。`unknown` 只派生 `FIELD`，不会猜测己方/对方。状态机仍只消费派生后的
+`StaticRegion/RegionKind`，不解释物理颜色。
+
+中心十字终端是定位消歧的地图真值：同一种终端若配置在多条射线上，本身就不能
+唯一确定航向。例如默认 `plain_boundary` 同时位于 `±x`，所以普通边界仍保留
+180° 歧义。交点按场地坐标定义必须是 `[0, 0]`，不能用非零值补偿标定误差。
 
 ## 5. 危险与不确定性
 
@@ -118,4 +147,5 @@ world:
 - 视觉年龄超过 `max_visual_age_ms` 时保留快照但增加 `STALE_VISION`，由状态机输出保守停止；
 - 缺 K0 的目标仍保留图像与类别历史，同时标记
   `TARGET_WITHOUT_GROUND_POINT`，不能交给地面规划；
-- 当前没有区域感知、定位或对手检测实现；这些输入可用合成事件开发，但不能描述成已完成现场能力。
+- 固定物理地图和中心十字视觉位姿观测已实现；现场区域测量、连续定位融合和
+  对手检测仍未完成，合成事件不能作为现场能力证据。

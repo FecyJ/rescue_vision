@@ -88,9 +88,90 @@ world:
   danger_confirm_threshold: 0.60
   danger_suspect_threshold: 0.15
   unknown_suspect_threshold: 0.50
-  # P3 场地区域冻结前保持为空；坐标为 FieldPoint 的 [x_mm, y_mm]：原点是
-  # 中心十字点划线交点，+x 向右，+y 指向红色安全区。
-  regions: []
+  # 抽签后设为 red 或 blue；unknown 时只生成 field 语义，不把固定红蓝区
+  # 猜成己方/对方区域。
+  team_color: unknown
+  # 固定物理地图的唯一配置权威。坐标均为 FieldPoint 毫米：中心十字为原点，
+  # +x 沿水平基准线向右，+y 沿竖直基准线指向红色安全区。
+  static_map:
+    center_cross:
+      # 该值按坐标定义必须保持 [0, 0]；不能用它补偿标定或场地误差。
+      intersection_field_mm: [0.0, 0.0]
+      # 四条射线的固定终端语义供定位消歧。plain_boundary 在 ±x 重复，因此
+      # 单独看到普通边界仍保留 180° 歧义；红/蓝安全区任一可靠观测可定向。
+      terminals:
+        positive_x: plain_boundary
+        negative_x: plain_boundary
+        positive_y: red_safe_zone
+        negative_y: blue_safe_zone
+    # 以下 3000 mm 场界、600×300 mm 安全区和 300 mm 出发区来自命题示意图，
+    # 是启动地图而非现场测量真值；现场尺寸或布置变化时只改这里。
+    # 安全区多边形描述彩色有效区域，不包含外侧 660 mm 围栏厚度。
+    regions:
+      - region_id: field
+        kind: field
+        polygon_field_mm:
+          - [-1500.0, -1500.0]
+          - [1500.0, -1500.0]
+          - [1500.0, 1500.0]
+          - [-1500.0, 1500.0]
+      - region_id: red-material
+        kind: red_material
+        polygon_field_mm:
+          - [-300.0, 1200.0]
+          - [0.0, 1200.0]
+          - [0.0, 1500.0]
+          - [-300.0, 1500.0]
+      - region_id: red-injured
+        kind: red_injured
+        polygon_field_mm:
+          - [0.0, 1200.0]
+          - [300.0, 1200.0]
+          - [300.0, 1500.0]
+          - [0.0, 1500.0]
+      - region_id: blue-injured
+        kind: blue_injured
+        polygon_field_mm:
+          - [-300.0, -1500.0]
+          - [0.0, -1500.0]
+          - [0.0, -1200.0]
+          - [-300.0, -1200.0]
+      - region_id: blue-material
+        kind: blue_material
+        polygon_field_mm:
+          - [0.0, -1500.0]
+          - [300.0, -1500.0]
+          - [300.0, -1200.0]
+          - [0.0, -1200.0]
+      # 四个出发区共用 start_zone kind，以稳定 region_id 区分编号。
+      - region_id: start-1
+        kind: start_zone
+        polygon_field_mm:
+          - [-1500.0, 1200.0]
+          - [-1200.0, 1200.0]
+          - [-1200.0, 1500.0]
+          - [-1500.0, 1500.0]
+      - region_id: start-2
+        kind: start_zone
+        polygon_field_mm:
+          - [1200.0, 1200.0]
+          - [1500.0, 1200.0]
+          - [1500.0, 1500.0]
+          - [1200.0, 1500.0]
+      - region_id: start-3
+        kind: start_zone
+        polygon_field_mm:
+          - [-1500.0, -1500.0]
+          - [-1200.0, -1500.0]
+          - [-1200.0, -1200.0]
+          - [-1500.0, -1200.0]
+      - region_id: start-4
+        kind: start_zone
+        polygon_field_mm:
+          - [1200.0, -1500.0]
+          - [1500.0, -1500.0]
+          - [1500.0, -1200.0]
+          - [1200.0, -1200.0]
 
 mission:
   match_duration_s: 180.0
@@ -204,12 +285,8 @@ perception:
       # 同时容纳命题图内外尺寸和制造、标定误差；现场数据到位后收紧。
       dimension_tolerance_fraction: 0.40
     safe_zone:
-      width_mm: 600.0
-      depth_mm: 300.0
       entrance_color_fraction: 0.10
       divider_dark_fraction: 0.10
-    start_zone:
-      side_mm: 300.0
     center_cross:
       min_axis_span_fraction: 0.20
       max_gap_fraction: 0.06

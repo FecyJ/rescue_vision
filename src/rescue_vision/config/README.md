@@ -30,7 +30,7 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `PerceptionConfig.build_field_feature_detector()` | 创建传统视觉场地特征检测器 | `field_features.enabled=false` 时返回 `None` |
 | `PerceptionConfig.build_target_ground_geometry_estimator()` | 创建目标地面中心估计器 | 禁用时返回 `None`；启用时要求完整地面外参 |
 | `TrackingConfig.build_tracker()` | 创建一轮使用的多目标跟踪器 | 初始无轨迹 |
-| `WorldRuntimeConfig.build_model()` | 使用静态区域和危险阈值创建世界模型 | 区域可以暂时为空 |
+| `WorldRuntimeConfig.build_model()` | 按 `team_color` 把物理静态地图派生为任务区域 | 队伍颜色未知时只派生场界 |
 | `MissionConfig.build_state_machine()` | 创建一轮使用的规则状态机 | 初始为 `WAIT_START` |
 
 主要配置 dataclass：
@@ -46,12 +46,12 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `MotionRuntimeConfig` | 实测轮距、车体/车轮速度上限、单轮加速度上限、远程命令有效期和 `gripper` |
 | `GripperRuntimeConfig` | 能力开关、左右开/闭安全角度和固定速度全行程时间 |
 | `TrackingConfig` | 关联、确认、滑行、衰减和删除阈值 |
-| `WorldRuntimeConfig` | `WorldModelConfig` 与 `StaticRegion` 集合 |
+| `WorldRuntimeConfig` | 世界阈值、`TeamColor`、`StaticFieldMap` 及任务区域派生 |
 | `MissionConfig` | 比赛计时、安全超时、避让距离和目标优先级 |
 | `PerceptionConfig` | 目标检测/K0、ROI HSV、目标地面几何和静态场地特征参数 |
 | `HsvColorClassifierConfig` | 四类 HSV 闭区间、颜色证据门槛和掩码去噪参数 |
 | `TargetGroundGeometryConfig` | 四类三维形状尺寸、搜索步长、评分权重和接受门限 |
-| `FieldFeatureConfig` | 场地颜色、区域尺寸、点划线和边界候选阈值 |
+| `FieldFeatureConfig` | 场地颜色、形态学、公差、点划线和边界候选阈值 |
 | `CenterCrossLocalizerConfig` | 终端射线关联、锚点置信度、先验创新和不确定度下限 |
 | `HailoConfig` | 模型资产、身份、类别映射和后端粗筛阈值 |
 | `RuntimeGeometry` | `camera_model`、可选 `ground_projector` |
@@ -182,6 +182,7 @@ YAML、重新生成去畸变映射或重复创建 Hailo 设备。
 
 ```python
 field_detector = config.perception.build_field_feature_detector(
+    static_map=config.world.static_map,
     max_observation_age_ms=config.processing.max_observation_age_ms,
     ground_projector=ground_projector,
 )
@@ -192,8 +193,13 @@ center_cross_localizer = config.build_center_cross_localizer(
 
 场地检测配置关闭时 `field_detector` 返回 `None`。没有地面映射时仍可输出部分图像观测，但不能分配
 安全区入口视角左右，也不能把像素伪装成毫米坐标。
-定位器还要求 `localization.enabled=true` 和地面映射；任一条件缺失时返回
-`None`。它不创建另一套标定或 BEV。
+启用场地检测时，`world.static_map` 还必须同时包含红/蓝物资与伤员分区以及
+至少一个正方形出发区；检测器从这些多边形推导安全区和出发区物理尺寸，不在
+perception 保存副本。定位器还要求 `localization.enabled=true` 和地面映射；任一条件缺失时返回
+`None`。它从 `config.world.static_map` 读取中心十字交点和终端方向，不创建
+另一套地图、标定或 BEV。固定区域和地标的完整注释示例见
+`configs/runtime.example.yaml` 的 `world.static_map`；HSV、形态学和线段阈值
+仍属于 `perception.field_features`，不应移入 world。
 
 ## 6. 几何开关组合
 

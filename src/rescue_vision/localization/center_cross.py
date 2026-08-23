@@ -22,6 +22,7 @@ from rescue_vision.perception.field_feature_types import (
     FieldFeatureDetectionResult,
     SafeZoneColor,
 )
+from rescue_vision.world.static_map import StaticFieldMap
 
 
 def _unit(dx: float, dy: float) -> tuple[float, float]:
@@ -95,16 +96,20 @@ class CenterCrossLocalizer:
         self,
         config: CenterCrossLocalizerConfig,
         *,
+        static_map: StaticFieldMap,
         max_observation_age_ms: float,
     ) -> None:
         if not isinstance(config, CenterCrossLocalizerConfig):
             raise ValueError("config must be a CenterCrossLocalizerConfig.")
         if not config.enabled:
             raise ValueError("CenterCrossLocalizer requires config.enabled=true.")
+        if not isinstance(static_map, StaticFieldMap):
+            raise ValueError("static_map must be a StaticFieldMap.")
         age = float(max_observation_age_ms)
         if not math.isfinite(age) or age <= 0.0:
             raise ValueError("max_observation_age_ms must be positive and finite.")
         self._config = config
+        self._static_map = static_map
         self._max_observation_age_ms = age
 
     def _associated(
@@ -234,8 +239,10 @@ class CenterCrossLocalizer:
             cosine = math.cos(heading)
             sine = math.sin(heading)
             position = FieldPoint(
-                -(cosine * center.x - sine * center.y),
-                -(sine * center.x + cosine * center.y),
+                self._static_map.center_cross.intersection_field.x
+                - (cosine * center.x - sine * center.y),
+                self._static_map.center_cross.intersection_field.y
+                - (sine * center.x + cosine * center.y),
             )
             candidates.append(
                 CenterCrossPoseCandidate(
@@ -323,27 +330,26 @@ class CenterCrossLocalizer:
             )
             for direction in directions
         )
-        red = [
-            item for item in terminals
-            if item.kind is CenterLineTerminalKind.RED_SAFE_ZONE
-        ]
-        blue = [
-            item for item in terminals
-            if item.kind is CenterLineTerminalKind.BLUE_SAFE_ZONE
-        ]
-        anchored_headings = [
-            normalize_angle(
-                math.pi / 2.0
-                - math.atan2(item.direction_left, item.direction_forward)
+        anchored_headings: list[float] = []
+        anchor_kinds: list[CenterLineTerminalKind] = []
+        for terminal in terminals:
+            if terminal.kind is CenterLineTerminalKind.UNKNOWN:
+                continue
+            map_rays = self._static_map.center_cross.rays_for_terminal(
+                terminal.kind
             )
-            for item in red
-        ] + [
-            normalize_angle(
-                -math.pi / 2.0
-                - math.atan2(item.direction_left, item.direction_forward)
+            if len(map_rays) != 1:
+                continue
+            anchored_headings.append(
+                normalize_angle(
+                    map_rays[0].angle_rad
+                    - math.atan2(
+                        terminal.direction_left,
+                        terminal.direction_forward,
+                    )
+                )
             )
-            for item in blue
-        ]
+            anchor_kinds.append(terminal.kind)
         selected: CenterCrossPoseCandidate | None = None
         source: CenterCrossSelectionSource | None = None
         max_innovation = math.radians(
@@ -367,12 +373,18 @@ class CenterCrossLocalizer:
                 ) > max_innovation:
                     quality.add(CenterCrossLocalizationQuality.ANCHOR_PRIOR_CONFLICT)
                     selected = None
-                elif red and blue:
-                    source = CenterCrossSelectionSource.RED_BLUE_SAFE_ZONES
-                elif red:
-                    source = CenterCrossSelectionSource.RED_SAFE_ZONE
                 else:
-                    source = CenterCrossSelectionSource.BLUE_SAFE_ZONE
+                    if (
+                        CenterLineTerminalKind.RED_SAFE_ZONE in anchor_kinds
+                        and CenterLineTerminalKind.BLUE_SAFE_ZONE in anchor_kinds
+                    ):
+                        source = CenterCrossSelectionSource.RED_BLUE_SAFE_ZONES
+                    elif CenterLineTerminalKind.RED_SAFE_ZONE in anchor_kinds:
+                        source = CenterCrossSelectionSource.RED_SAFE_ZONE
+                    elif CenterLineTerminalKind.BLUE_SAFE_ZONE in anchor_kinds:
+                        source = CenterCrossSelectionSource.BLUE_SAFE_ZONE
+                    else:
+                        source = CenterCrossSelectionSource.STATIC_MAP_TERMINAL
         elif prior_pose is not None:
             nearest = self._nearest_candidate(candidates, prior_pose.heading_rad)
             if (

@@ -27,7 +27,7 @@ K0、完整相机外参和可配置三维形状估计目标地面中心、朝向
 | `StartZoneObservation` | 无编号洋红出发区轮廓及可选地面角点 |
 | `CenterCrossObservation` | 无序的两条中心轴或单轴部分观测 |
 | `BoundaryFeatureObservation` | 显式低置信度的围栏基线或场地角点候选 |
-| `FieldFeatureConfig` | 场地颜色、形态学、尺寸、线段和角点阈值 |
+| `FieldFeatureConfig` | 场地颜色、形态学、公差、线段和角点阈值 |
 | `RealtimeDetectionResult` | 实时检测结果，并明确记录是否丢弃了过期帧 |
 | `render_target_observations()` | 在同坐标系图像副本上叠加框、颜色掩码、K0、置信度和质量 |
 | `PerceptionFrameRenderer` | 单槽最新帧后台推理与可视化旁路；不阻塞相机/运动循环；`clear_latest()` 用于切换模式时丢弃旧结果 |
@@ -318,6 +318,7 @@ K0 不可用时可从检测框底部建立搜索种子，但会显式附加
 
 ```python
 field_detector = config.perception.build_field_feature_detector(
+    static_map=config.world.static_map,
     max_observation_age_ms=config.processing.max_observation_age_ms,
     ground_projector=geometry.ground_projector,
 )
@@ -369,9 +370,10 @@ for safe_zone in field_result.safe_zones if field_result is not None else ():
 [`localization` README](../localization/README.md) 统一定义；感知层不把
 `GroundPoint` 伪装成 `FieldPoint`。
 
-完整阈值位于 `configs/runtime.example.yaml` 的
-`perception.field_features`。红、蓝、洋红和紫色初值来自命题示意图，不是
-官方色卡；尺寸初值也包含较宽公差。获得现场材料、固定曝光和实际地面映射后
+完整算法阈值位于 `configs/runtime.example.yaml` 的
+`perception.field_features`；安全区和出发区物理尺寸只从
+`world.static_map.regions` 推导。红、蓝、洋红和紫色初值来自命题示意图，
+不是官方色卡；尺寸公差也只是启动值。获得现场材料、固定曝光和实际地面映射后
 必须重新标定。
 
 离线图片或视频检查：

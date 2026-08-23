@@ -24,6 +24,13 @@ from rescue_vision.perception import (
     SafeZoneColor,
     SafeZoneObservation,
 )
+from rescue_vision.world import (
+    CenterCrossRay,
+    CenterCrossTerminal,
+    StaticCenterCross,
+    StaticFieldMap,
+    default_static_field_map,
+)
 
 
 def config(**overrides: object) -> CenterCrossLocalizerConfig:
@@ -167,9 +174,16 @@ def result(
     )
 
 
-def localizer(**overrides: object) -> CenterCrossLocalizer:
+def localizer(
+    *,
+    static_map: StaticFieldMap | None = None,
+    **overrides: object,
+) -> CenterCrossLocalizer:
     return CenterCrossLocalizer(
         config(**overrides),
+        static_map=(
+            default_static_field_map() if static_map is None else static_map
+        ),
         max_observation_age_ms=100.0,
     )
 
@@ -236,6 +250,43 @@ def test_red_and_blue_safe_zones_anchor_global_heading() -> None:
         CenterLineTerminalKind.RED_SAFE_ZONE,
         CenterLineTerminalKind.BLUE_SAFE_ZONE,
     }
+
+
+def test_static_map_is_the_authority_for_safe_zone_direction() -> None:
+    reversed_map = StaticFieldMap(
+        StaticCenterCross(
+            FieldPoint(0.0, 0.0),
+            (
+                CenterCrossTerminal(
+                    CenterCrossRay.POSITIVE_X,
+                    CenterLineTerminalKind.PLAIN_BOUNDARY,
+                ),
+                CenterCrossTerminal(
+                    CenterCrossRay.NEGATIVE_X,
+                    CenterLineTerminalKind.PLAIN_BOUNDARY,
+                ),
+                CenterCrossTerminal(
+                    CenterCrossRay.POSITIVE_Y,
+                    CenterLineTerminalKind.BLUE_SAFE_ZONE,
+                ),
+                CenterCrossTerminal(
+                    CenterCrossRay.NEGATIVE_Y,
+                    CenterLineTerminalKind.RED_SAFE_ZONE,
+                ),
+            ),
+        ),
+        (),
+    )
+    observation = localizer(static_map=reversed_map).localize(
+        result(
+            safe_zones=(
+                safe_zone(SafeZoneColor.RED, GroundPoint(100.0, 1150.0)),
+            )
+        )
+    )
+
+    assert observation.selected_pose is not None
+    assert angular_distance(observation.selected_pose.heading_rad, math.pi) < 1e-9
 
 
 @pytest.mark.parametrize(

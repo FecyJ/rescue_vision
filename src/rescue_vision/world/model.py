@@ -8,8 +8,8 @@ from enum import Enum
 import math
 
 from rescue_vision.geometry.types import FieldPoint, GroundPoint
-from rescue_vision.perception import ClassProbabilities, TargetClass
-from rescue_vision.tracking import TrackStatus, TrackedTarget
+from rescue_vision.perception.types import ClassProbabilities, TargetClass
+from rescue_vision.tracking.tracker import TrackStatus, TrackedTarget
 
 
 class RegionKind(str, Enum):

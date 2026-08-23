@@ -16,6 +16,13 @@ from rescue_vision.perception import (
     SafeZoneSide,
     StaleObservationError,
 )
+from rescue_vision.world import (
+    PhysicalRegionKind,
+    PhysicalStaticRegion,
+    StaticFieldMap,
+    default_static_field_map,
+)
+from rescue_vision.geometry.types import FieldPoint
 
 
 def ranges(lower, upper) -> tuple[HsvRange, ...]:
@@ -38,9 +45,6 @@ def config(**overrides) -> FieldFeatureConfig:
         "close_iterations": 1,
         "min_region_area_fraction": 0.001,
         "min_rectangularity": 0.50,
-        "safe_width_mm": 200.0,
-        "safe_depth_mm": 100.0,
-        "start_side_mm": 60.0,
         "dimension_tolerance_fraction": 0.25,
         "entrance_color_fraction": 0.08,
         "divider_dark_fraction": 0.08,
@@ -56,6 +60,40 @@ def config(**overrides) -> FieldFeatureConfig:
     }
     values.update(overrides)
     return FieldFeatureConfig(**values)
+
+
+def static_map() -> StaticFieldMap:
+    center_cross = default_static_field_map().center_cross
+
+    def region(
+        region_id: str,
+        kind: PhysicalRegionKind,
+        min_x: float,
+        max_x: float,
+        min_y: float,
+        max_y: float,
+    ) -> PhysicalStaticRegion:
+        return PhysicalStaticRegion(
+            region_id,
+            kind,
+            (
+                FieldPoint(min_x, min_y),
+                FieldPoint(max_x, min_y),
+                FieldPoint(max_x, max_y),
+                FieldPoint(min_x, max_y),
+            ),
+        )
+
+    return StaticFieldMap(
+        center_cross,
+        (
+            region("red-material", PhysicalRegionKind.RED_MATERIAL, -100, 0, 500, 600),
+            region("red-injured", PhysicalRegionKind.RED_INJURED, 0, 100, 500, 600),
+            region("blue-injured", PhysicalRegionKind.BLUE_INJURED, -100, 0, -600, -500),
+            region("blue-material", PhysicalRegionKind.BLUE_MATERIAL, 0, 100, -600, -500),
+            region("start-1", PhysicalRegionKind.START_ZONE, -600, -540, 540, 600),
+        ),
+    )
 
 
 def projector() -> GroundProjector:
@@ -97,6 +135,7 @@ def test_safe_zone_uses_approach_frame_and_keeps_physical_color() -> None:
     image = safe_zone_scene()
     detector = FieldFeatureDetector(
         config(),
+        static_map=static_map(),
         max_observation_age_ms=100.0,
         ground_projector=projector(),
     )
@@ -133,6 +172,7 @@ def test_safe_zone_does_not_invent_sides_without_entrance_evidence() -> None:
     image = safe_zone_scene(include_purple=False)
     detector = FieldFeatureDetector(
         config(),
+        static_map=static_map(),
         max_observation_age_ms=100.0,
         ground_projector=projector(),
     )
@@ -155,6 +195,7 @@ def test_safe_zone_without_projector_keeps_pixel_observation_only() -> None:
     image = safe_zone_scene()
     detector = FieldFeatureDetector(
         config(),
+        static_map=static_map(),
         max_observation_age_ms=100.0,
     )
 
@@ -177,6 +218,7 @@ def test_start_zone_is_unlabelled_region_with_ground_corners() -> None:
     cv2.rectangle(image, (20, 250), (80, 310), bgr(150), thickness=-1)
     detector = FieldFeatureDetector(
         config(),
+        static_map=static_map(),
         max_observation_age_ms=100.0,
         ground_projector=projector(),
     )
@@ -203,6 +245,7 @@ def test_center_cross_recovers_two_dashed_perpendicular_axes() -> None:
         cv2.line(image, (200, start), (200, min(start + 28, 340)), (0, 0, 0), 3)
     detector = FieldFeatureDetector(
         config(),
+        static_map=static_map(),
         max_observation_age_ms=100.0,
         ground_projector=projector(),
     )
@@ -226,6 +269,7 @@ def test_single_long_marking_is_only_partial_center_evidence() -> None:
         cv2.line(image, (start, 200), (min(start + 28, 360), 200), (0, 0, 0), 3)
     detector = FieldFeatureDetector(
         config(),
+        static_map=static_map(),
         max_observation_age_ms=100.0,
         ground_projector=projector(),
     )
@@ -249,6 +293,7 @@ def test_solid_perpendicular_lines_are_not_center_cross() -> None:
     cv2.line(image, (40, 80), (40, 360), (0, 0, 0), 5)
     detector = FieldFeatureDetector(
         config(),
+        static_map=static_map(),
         max_observation_age_ms=100.0,
         ground_projector=projector(),
     )
@@ -269,6 +314,7 @@ def test_boundary_candidates_are_explicitly_low_confidence_and_bounded() -> None
     cv2.line(image, (40, 80), (40, 360), (0, 0, 0), 5)
     detector = FieldFeatureDetector(
         config(boundary_max_features=3),
+        static_map=static_map(),
         max_observation_age_ms=100.0,
         ground_projector=projector(),
     )
@@ -298,6 +344,7 @@ def test_undistortion_fill_boundary_is_not_reported_as_a_field_feature() -> None
     mask[40:360, 40:360] = 255
     detector = FieldFeatureDetector(
         config(),
+        static_map=static_map(),
         max_observation_age_ms=100.0,
     )
 
@@ -315,6 +362,7 @@ def test_field_detector_validates_frame_age_and_image_contract() -> None:
     image = np.full((40, 40, 3), 255, dtype=np.uint8)
     detector = FieldFeatureDetector(
         config(),
+        static_map=static_map(),
         max_observation_age_ms=1.0,
     )
 
@@ -368,5 +416,15 @@ def test_disabled_config_is_not_silently_instantiated() -> None:
     with pytest.raises(ValueError, match="enabled=true"):
         FieldFeatureDetector(
             config(enabled=False),
+            static_map=static_map(),
+            max_observation_age_ms=100.0,
+        )
+
+
+def test_enabled_detector_requires_physical_region_dimensions_from_world() -> None:
+    with pytest.raises(ValueError, match="red and blue"):
+        FieldFeatureDetector(
+            config(),
+            static_map=default_static_field_map(),
             max_observation_age_ms=100.0,
         )

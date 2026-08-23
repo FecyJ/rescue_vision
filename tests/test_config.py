@@ -10,6 +10,7 @@ from rescue_vision.config.runtime import load_runtime_config
 from rescue_vision.geometry.camera_model import CameraCalibration, CameraModelType
 from rescue_vision.geometry.ground_projector import GroundProjector
 from rescue_vision.geometry.types import robot_frame_metadata
+from rescue_vision.world import RegionKind, TeamColor
 
 
 def write_intrinsics(path, *, usable: bool = True) -> CameraCalibration:
@@ -108,7 +109,31 @@ world:
   danger_confirm_threshold: 0.6
   danger_suspect_threshold: 0.15
   unknown_suspect_threshold: 0.5
-  regions: []
+  team_color: unknown
+  static_map:
+    center_cross:
+      intersection_field_mm: [0.0, 0.0]
+      terminals:
+        positive_x: plain_boundary
+        negative_x: plain_boundary
+        positive_y: red_safe_zone
+        negative_y: blue_safe_zone
+    regions:
+      - region_id: red-material
+        kind: red_material
+        polygon_field_mm: [[-100.0, 500.0], [0.0, 500.0], [0.0, 600.0], [-100.0, 600.0]]
+      - region_id: red-injured
+        kind: red_injured
+        polygon_field_mm: [[0.0, 500.0], [100.0, 500.0], [100.0, 600.0], [0.0, 600.0]]
+      - region_id: blue-material
+        kind: blue_material
+        polygon_field_mm: [[0.0, -600.0], [100.0, -600.0], [100.0, -500.0], [0.0, -500.0]]
+      - region_id: blue-injured
+        kind: blue_injured
+        polygon_field_mm: [[-100.0, -600.0], [0.0, -600.0], [0.0, -500.0], [-100.0, -500.0]]
+      - region_id: start-1
+        kind: start_zone
+        polygon_field_mm: [[-600.0, 540.0], [-540.0, 540.0], [-540.0, 600.0], [-600.0, 600.0]]
 mission:
   match_duration_s: 180.0
   no_motion_timeout_s: 15.0
@@ -210,12 +235,8 @@ perception:
       min_rectangularity: 0.55
       dimension_tolerance_fraction: 0.40
     safe_zone:
-      width_mm: 600.0
-      depth_mm: 300.0
       entrance_color_fraction: 0.10
       divider_dark_fraction: 0.10
-    start_zone:
-      side_mm: 300.0
     center_cross:
       min_axis_span_fraction: 0.20
       max_gap_fraction: 0.06
@@ -483,8 +504,12 @@ def test_color_classifier_config_is_loaded_from_perception(tmp_path) -> None:
     assert target_geometry.orange_injured.length_mm == pytest.approx(80.0)
     field_features = config.perception.field_features
     assert field_features.enabled is False
-    assert field_features.safe_width_mm == pytest.approx(600.0)
-    assert field_features.start_side_mm == pytest.approx(300.0)
+    assert config.world.static_map.safe_zone_dimensions_mm(
+        TeamColor.RED
+    ) == pytest.approx((200.0, 100.0))
+    assert config.world.static_map.start_zone_dimensions_mm() == (
+        (60.0, 60.0),
+    )
     assert field_features.safe_red[0].lower == (0, 80, 80)
 
 
@@ -494,6 +519,7 @@ def test_field_feature_detector_is_built_only_when_enabled(tmp_path) -> None:
     disabled = load_runtime_config(path)
     assert (
         disabled.perception.build_field_feature_detector(
+            static_map=disabled.world.static_map,
             max_observation_age_ms=150.0,
         )
         is None
@@ -508,6 +534,7 @@ def test_field_feature_detector_is_built_only_when_enabled(tmp_path) -> None:
     )
     enabled = load_runtime_config(path)
     detector = enabled.perception.build_field_feature_detector(
+        static_map=enabled.world.static_map,
         max_observation_age_ms=150.0,
     )
     assert detector is not None
@@ -928,17 +955,7 @@ def test_remote_access_mode_is_strict(tmp_path) -> None:
 
 
 def test_p1_config_builds_algorithms_and_regions(tmp_path) -> None:
-    text = config_text().replace(
-        "  regions: []",
-        """  regions:
-    - region_id: own-material
-      kind: own_material
-      polygon_field_mm:
-        - [0.0, 0.0]
-        - [100.0, 0.0]
-        - [100.0, 100.0]
-        - [0.0, 100.0]""",
-    )
+    text = config_text().replace("  team_color: unknown", "  team_color: red")
     path = tmp_path / "runtime.yaml"
     path.write_text(text, encoding="utf-8")
 
@@ -949,8 +966,53 @@ def test_p1_config_builds_algorithms_and_regions(tmp_path) -> None:
         timestamp_ns=0,
         visual_timestamp_ns=0,
         tracks=[],
-    ).regions[0].region_id == "own-material"
+    ).regions[0].region_id == "red-material"
     assert config.mission.build_state_machine().phase.value == "wait_start"
+
+
+def test_static_physical_regions_derive_team_relative_mission_regions(
+    tmp_path,
+) -> None:
+    text = config_text().replace("  team_color: unknown", "  team_color: blue")
+    path = tmp_path / "runtime.yaml"
+    path.write_text(text, encoding="utf-8")
+
+    config = load_runtime_config(path)
+    mapped = {region.region_id: region.kind for region in config.world.mission_regions()}
+
+    assert config.world.team_color is TeamColor.BLUE
+    assert mapped == {
+        "red-material": RegionKind.OPPONENT_SAFE,
+        "red-injured": RegionKind.OPPONENT_SAFE,
+        "blue-material": RegionKind.OWN_MATERIAL,
+        "blue-injured": RegionKind.OWN_INJURED,
+    }
+
+
+def test_legacy_world_regions_and_nonzero_center_origin_are_rejected(
+    tmp_path,
+) -> None:
+    legacy = tmp_path / "legacy.yaml"
+    legacy.write_text(
+        config_text().replace(
+            "  team_color: unknown",
+            "  regions: []\n  team_color: unknown",
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Unknown keys in world"):
+        load_runtime_config(legacy)
+
+    shifted = tmp_path / "shifted.yaml"
+    shifted.write_text(
+        config_text().replace(
+            "intersection_field_mm: [0.0, 0.0]",
+            "intersection_field_mm: [1.0, 0.0]",
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="field frame origin"):
+        load_runtime_config(shifted)
 
 
 @pytest.mark.parametrize(

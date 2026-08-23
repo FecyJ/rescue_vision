@@ -123,9 +123,6 @@ class FieldFeatureConfig:
     close_iterations: int
     min_region_area_fraction: float
     min_rectangularity: float
-    safe_width_mm: float
-    safe_depth_mm: float
-    start_side_mm: float
     dimension_tolerance_fraction: float
     entrance_color_fraction: float
     divider_dark_fraction: float
@@ -208,8 +205,6 @@ class FieldFeatureConfig:
             _probability(getattr(self, name), name)
         if self.dimension_tolerance_fraction >= 1.0:
             raise ValueError("dimension_tolerance_fraction must be less than 1.")
-        for name in ("safe_width_mm", "safe_depth_mm", "start_side_mm"):
-            _positive(getattr(self, name), name)
         for name in (
             "center_perpendicular_tolerance_deg",
             "boundary_corner_tolerance_deg",

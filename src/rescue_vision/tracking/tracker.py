@@ -7,7 +7,7 @@ from enum import Enum
 import math
 
 from rescue_vision.geometry.types import GroundPoint, UndistortedPixel
-from rescue_vision.perception import (
+from rescue_vision.perception.types import (
     ClassProbabilities,
     ObservationQuality,
     TargetClass,

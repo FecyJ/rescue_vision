@@ -4,9 +4,10 @@
 位姿候选。它只负责低频几何视觉观测，不读取相机、串口、编码器或 IMU，不
 维护跨帧状态，也不直接修改世界模型。
 
-场地原点是中心十字交点，`+x` 沿水平基准线向右，`+y` 沿竖直基准线指向红色
-安全区。`FieldPose2D.heading_rad` 是从场地 `+x` 到机器人前向的逆时针角，范围
-为 `[-π, π]`。
+场地原点是中心十字交点。轴方向和四条射线的终端语义来自
+`config.world.static_map.center_cross`；默认地图的 `+x` 沿水平基准线向右，
+`+y` 指向红色安全区。`FieldPose2D.heading_rad` 是从场地 `+x` 到机器人前向的
+逆时针角，范围为 `[-π, π]`。
 
 ## 常用类和返回语义
 
@@ -19,9 +20,10 @@
 | `CenterLineTerminalKind` | `red_safe_zone`、`blue_safe_zone`、`plain_boundary` 或 `unknown` |
 | `CenterCrossLocalizationQuality` | 缺失/部分十字、无地面坐标、过期、歧义或先验冲突 |
 
-完整双轴十字产生四个相差 90° 的候选。红色安全区方向对应全局 `+y`，蓝色
-对应 `-y`，任一可靠颜色锚点即可选出唯一候选。普通场界只能辅助区分轴线，
-不能独自消除 180° 歧义。没有可靠锚点时可以由调用方注入时间对齐的先验位姿；
+完整双轴十字产生四个相差 90° 的候选。定位器把观察到的终端类别与静态地图
+中同类终端所在射线匹配；默认红色对应 `+y`、蓝色对应 `-y`。同一类别只出现
+在一条地图射线时才可唯一锚定，默认普通场界位于 `±x`，因此仍保留 180°
+歧义。没有可靠锚点时可以由调用方注入时间对齐的先验位姿；
 先验或锚点创新超限时 `selected_pose` 保持 `None`。
 
 ## 1. 加载配置和装配几何
@@ -35,8 +37,8 @@ if geometry is None or geometry.ground_projector is None:
     raise RuntimeError("中心十字定位需要启用可用的地面映射")
 ```
 
-这里的 `geometry` 绑定当前相机、分辨率、安装位姿和标定。不能为定位另建
-单应矩阵或 BEV 参数。
+这里的 `geometry` 绑定当前相机、分辨率、安装位姿和标定；静态地图已经由同一
+`config` 加载。不能为定位另建单应矩阵、BEV 参数或中心十字方向表。
 
 ## 2. 创建场地检测器和定位器
 
@@ -44,6 +46,7 @@ if geometry is None or geometry.ground_projector is None:
 
 ```python
 field_detector = config.perception.build_field_feature_detector(
+    static_map=config.world.static_map,
     max_observation_age_ms=config.processing.max_observation_age_ms,
     ground_projector=geometry.ground_projector,
 )

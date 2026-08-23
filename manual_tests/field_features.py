@@ -264,6 +264,7 @@ def main() -> None:
             "--already-undistorted explicitly."
         )
     detector = config.perception.build_field_feature_detector(
+        static_map=config.world.static_map,
         max_observation_age_ms=config.processing.max_observation_age_ms,
         ground_projector=projector,
     )

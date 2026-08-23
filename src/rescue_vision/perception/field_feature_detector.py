@@ -30,6 +30,7 @@ from rescue_vision.perception.field_feature_types import (
     StartZoneObservation,
 )
 from rescue_vision.perception.types import HsvRange
+from rescue_vision.world.static_map import StaticFieldMap, TeamColor
 
 
 FloatPoint = npt.NDArray[np.float64]
@@ -247,6 +248,7 @@ class FieldFeatureDetector:
         self,
         config: FieldFeatureConfig,
         *,
+        static_map: StaticFieldMap,
         max_observation_age_ms: float,
         ground_projector: GroundProjector | None = None,
     ) -> None:
@@ -257,10 +259,42 @@ class FieldFeatureDetector:
                 "FieldFeatureDetector requires config.enabled=true; runtime "
                 "callers should use PerceptionConfig.build_field_feature_detector()."
             )
+        if not isinstance(static_map, StaticFieldMap):
+            raise ValueError("static_map must be a StaticFieldMap.")
+        red_dimensions = static_map.safe_zone_dimensions_mm(TeamColor.RED)
+        blue_dimensions = static_map.safe_zone_dimensions_mm(TeamColor.BLUE)
+        if red_dimensions is None or blue_dimensions is None:
+            raise ValueError(
+                "FieldFeatureDetector requires red and blue material/injured "
+                "regions in static_map."
+            )
+        start_dimensions = static_map.start_zone_dimensions_mm()
+        if not start_dimensions:
+            raise ValueError(
+                "FieldFeatureDetector requires at least one start_zone region "
+                "in static_map."
+            )
+        start_sides: list[float] = []
+        for width_mm, depth_mm in start_dimensions:
+            if not math.isclose(width_mm, depth_mm, rel_tol=1e-6, abs_tol=1e-6):
+                raise ValueError("static_map start_zone regions must be square.")
+            start_sides.append(width_mm)
+        if not all(
+            math.isclose(side, start_sides[0], rel_tol=1e-6, abs_tol=1e-6)
+            for side in start_sides[1:]
+        ):
+            raise ValueError(
+                "static_map start_zone regions must use one consistent size."
+            )
         converted_age = float(max_observation_age_ms)
         if not math.isfinite(converted_age) or converted_age <= 0.0:
             raise ValueError("max_observation_age_ms must be positive and finite.")
         self._config = config
+        self._safe_zone_dimensions = {
+            SafeZoneColor.RED: red_dimensions,
+            SafeZoneColor.BLUE: blue_dimensions,
+        }
+        self._start_side_mm = start_sides[0]
         self._max_observation_age_ms = converted_age
         self._ground_projector = ground_projector
 
@@ -361,15 +395,16 @@ class FieldFeatureDetector:
             assert self._ground_projector is not None
             assert self._ground_projector.bev_config is not None
             mm_per_pixel = self._ground_projector.bev_config.mm_per_pixel
+            expected_width_mm, expected_depth_mm = self._safe_zone_dimensions[color]
             if not (
                 _within_expected(
                     width_px * mm_per_pixel,
-                    self._config.safe_width_mm,
+                    expected_width_mm,
                     self._config.dimension_tolerance_fraction,
                 )
                 and _within_expected(
                     depth_px * mm_per_pixel,
-                    self._config.safe_depth_mm,
+                    expected_depth_mm,
                     self._config.dimension_tolerance_fraction,
                 )
             ):
@@ -569,12 +604,12 @@ class FieldFeatureDetector:
                 if not (
                     _within_expected(
                         first * scale,
-                        self._config.start_side_mm,
+                        self._start_side_mm,
                         self._config.dimension_tolerance_fraction,
                     )
                     and _within_expected(
                         second * scale,
-                        self._config.start_side_mm,
+                        self._start_side_mm,
                         self._config.dimension_tolerance_fraction,
                     )
                 ):

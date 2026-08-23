@@ -11,12 +11,32 @@ from rescue_vision.world.model import (
     WorldTarget,
     WorldUncertainty,
 )
+from rescue_vision.world.static_map import (
+    CenterCrossRay,
+    CenterCrossTerminal,
+    CenterLineTerminalKind,
+    PhysicalRegionKind,
+    PhysicalStaticRegion,
+    StaticCenterCross,
+    StaticFieldMap,
+    TeamColor,
+    default_static_field_map,
+)
 
 __all__ = [
     "HazardState",
     "OpponentOccupancy",
     "RegionKind",
     "StaticRegion",
+    "CenterCrossRay",
+    "CenterCrossTerminal",
+    "CenterLineTerminalKind",
+    "PhysicalRegionKind",
+    "PhysicalStaticRegion",
+    "StaticCenterCross",
+    "StaticFieldMap",
+    "TeamColor",
+    "default_static_field_map",
     "WorldModel",
     "WorldModelConfig",
     "WorldSnapshot",

@@ -31,10 +31,19 @@ from rescue_vision.perception.target_ground_geometry import (
 )
 from rescue_vision.tracking import TrackingConfig
 from rescue_vision.world import (
+    CenterCrossRay,
+    CenterCrossTerminal,
+    CenterLineTerminalKind,
+    PhysicalRegionKind,
+    PhysicalStaticRegion,
     RegionKind,
+    StaticCenterCross,
+    StaticFieldMap,
     StaticRegion,
+    TeamColor,
     WorldModel,
     WorldModelConfig,
+    default_static_field_map,
 )
 
 if TYPE_CHECKING:
@@ -343,12 +352,9 @@ def _perception_defaults() -> dict[str, Any]:
                 "dimension_tolerance_fraction": 0.40,
             },
             "safe_zone": {
-                "width_mm": 600.0,
-                "depth_mm": 300.0,
                 "entrance_color_fraction": 0.10,
                 "divider_dark_fraction": 0.10,
             },
-            "start_zone": {"side_mm": 300.0},
             "center_cross": {
                 "min_axis_span_fraction": 0.20,
                 "max_gap_fraction": 0.06,
@@ -603,10 +609,53 @@ class MotionRuntimeConfig:
 @dataclass(frozen=True, slots=True)
 class WorldRuntimeConfig:
     model: WorldModelConfig
-    regions: tuple[StaticRegion, ...]
+    team_color: TeamColor
+    static_map: StaticFieldMap
+
+    def mission_regions(self) -> tuple[StaticRegion, ...]:
+        """Map fixed physical regions to current team-relative semantics."""
+
+        mapped: list[StaticRegion] = []
+        own_material = (
+            PhysicalRegionKind.RED_MATERIAL
+            if self.team_color is TeamColor.RED
+            else PhysicalRegionKind.BLUE_MATERIAL
+        )
+        own_injured = (
+            PhysicalRegionKind.RED_INJURED
+            if self.team_color is TeamColor.RED
+            else PhysicalRegionKind.BLUE_INJURED
+        )
+        opponent_kinds = (
+            {
+                PhysicalRegionKind.BLUE_MATERIAL,
+                PhysicalRegionKind.BLUE_INJURED,
+            }
+            if self.team_color is TeamColor.RED
+            else {
+                PhysicalRegionKind.RED_MATERIAL,
+                PhysicalRegionKind.RED_INJURED,
+            }
+        )
+        for region in self.static_map.regions:
+            kind: RegionKind | None = None
+            if region.kind is PhysicalRegionKind.FIELD:
+                kind = RegionKind.FIELD
+            elif self.team_color is not TeamColor.UNKNOWN:
+                if region.kind is own_material:
+                    kind = RegionKind.OWN_MATERIAL
+                elif region.kind is own_injured:
+                    kind = RegionKind.OWN_INJURED
+                elif region.kind in opponent_kinds:
+                    kind = RegionKind.OPPONENT_SAFE
+            if kind is not None:
+                mapped.append(
+                    StaticRegion(region.region_id, kind, region.polygon_field)
+                )
+        return tuple(mapped)
 
     def build_model(self) -> WorldModel:
-        return WorldModel(self.model, self.regions)
+        return WorldModel(self.model, self.mission_regions())
 
 
 @dataclass(frozen=True, slots=True)
@@ -644,6 +693,7 @@ class PerceptionConfig:
     def build_field_feature_detector(
         self,
         *,
+        static_map: StaticFieldMap,
         max_observation_age_ms: float,
         ground_projector: GroundProjector | None = None,
     ):
@@ -657,6 +707,7 @@ class PerceptionConfig:
 
         return FieldFeatureDetector(
             self.field_features,
+            static_map=static_map,
             max_observation_age_ms=max_observation_age_ms,
             ground_projector=ground_projector,
         )
@@ -795,6 +846,7 @@ class AppConfig:
 
         return CenterCrossLocalizer(
             self.localization,
+            static_map=self.world.static_map,
             max_observation_age_ms=self.processing.max_observation_age_ms,
         )
 
@@ -1242,7 +1294,8 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "danger_confirm_threshold",
             "danger_suspect_threshold",
             "unknown_suspect_threshold",
-            "regions",
+            "team_color",
+            "static_map",
         },
         "world",
     )
@@ -1270,12 +1323,87 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "world.unknown_suspect_threshold",
         ),
     )
-    regions_value = world_raw.get("regions", [])
+    try:
+        team_color = TeamColor(
+            _string(world_raw.get("team_color", "unknown"), "world.team_color")
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "world.team_color must be red, blue or unknown."
+        ) from exc
+
+    static_map_raw = _mapping(world_raw.get("static_map", {}), "world.static_map")
+    _reject_unknown(
+        static_map_raw,
+        {"center_cross", "regions"},
+        "world.static_map",
+    )
+    default_map = default_static_field_map()
+    center_raw = _mapping(
+        static_map_raw.get("center_cross", {}),
+        "world.static_map.center_cross",
+    )
+    _reject_unknown(
+        center_raw,
+        {"intersection_field_mm", "terminals"},
+        "world.static_map.center_cross",
+    )
+    intersection_value = center_raw.get("intersection_field_mm", [0.0, 0.0])
+    if not isinstance(intersection_value, list) or len(intersection_value) != 2:
+        raise ValueError(
+            "world.static_map.center_cross.intersection_field_mm must be "
+            "[x_mm, y_mm]."
+        )
+    intersection_field = FieldPoint(
+        _finite_float(
+            intersection_value[0],
+            "world.static_map.center_cross.intersection_field_mm[0]",
+            minimum=-float("inf"),
+        ),
+        _finite_float(
+            intersection_value[1],
+            "world.static_map.center_cross.intersection_field_mm[1]",
+            minimum=-float("inf"),
+        ),
+    )
+    default_terminals = {
+        item.ray.value: item.kind.value
+        for item in default_map.center_cross.terminals
+    }
+    terminals_raw = _mapping(
+        center_raw.get("terminals", default_terminals),
+        "world.static_map.center_cross.terminals",
+    )
+    expected_rays = {ray.value for ray in CenterCrossRay}
+    if set(terminals_raw) != expected_rays:
+        raise ValueError(
+            "world.static_map.center_cross.terminals keys must exactly be "
+            f"{sorted(expected_rays)!r}."
+        )
+    terminals: list[CenterCrossTerminal] = []
+    for ray in CenterCrossRay:
+        location = f"world.static_map.center_cross.terminals.{ray.value}"
+        try:
+            terminal_kind = CenterLineTerminalKind(
+                _string(terminals_raw[ray.value], location)
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"{location} must be red_safe_zone, blue_safe_zone, "
+                "plain_boundary or unknown."
+            ) from exc
+        terminals.append(CenterCrossTerminal(ray, terminal_kind))
+    center_cross_map = StaticCenterCross(
+        intersection_field=intersection_field,
+        terminals=tuple(terminals),
+    )
+
+    regions_value = static_map_raw.get("regions", [])
     if not isinstance(regions_value, list):
-        raise ValueError("world.regions must be a list.")
-    regions: list[StaticRegion] = []
+        raise ValueError("world.static_map.regions must be a list.")
+    physical_regions: list[PhysicalStaticRegion] = []
     for index, value in enumerate(regions_value):
-        location = f"world.regions[{index}]"
+        location = f"world.static_map.regions[{index}]"
         region_raw = _mapping(value, location)
         _reject_unknown(
             region_raw,
@@ -1283,7 +1411,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             location,
         )
         try:
-            kind = RegionKind(
+            kind = PhysicalRegionKind(
                 _string(
                     _required(region_raw, "kind", location),
                     f"{location}.kind",
@@ -1291,8 +1419,8 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             )
         except ValueError as exc:
             raise ValueError(
-                f"{location}.kind must be field, own_material, own_injured "
-                "or opponent_safe."
+                f"{location}.kind must be field, red_material, red_injured, "
+                "blue_material, blue_injured or start_zone."
             ) from exc
         polygon_value = _required(
             region_raw,
@@ -1322,8 +1450,8 @@ def load_runtime_config(path: str | Path) -> AppConfig:
                     ),
                 )
             )
-        regions.append(
-            StaticRegion(
+        physical_regions.append(
+            PhysicalStaticRegion(
                 region_id=_string(
                     _required(region_raw, "region_id", location),
                     f"{location}.region_id",
@@ -1332,7 +1460,11 @@ def load_runtime_config(path: str | Path) -> AppConfig:
                 polygon_field=tuple(polygon),
             )
         )
-    world = WorldRuntimeConfig(world_model, tuple(regions))
+    world = WorldRuntimeConfig(
+        world_model,
+        team_color,
+        StaticFieldMap(center_cross_map, tuple(physical_regions)),
+    )
 
     mission_raw = _mapping(
         root.get("mission", {}),
@@ -1809,7 +1941,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "morphology",
             "region_filter",
             "safe_zone",
-            "start_zone",
             "center_cross",
             "boundary",
         },
@@ -1876,21 +2007,10 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     _reject_unknown(
         safe_zone_raw,
         {
-            "width_mm",
-            "depth_mm",
             "entrance_color_fraction",
             "divider_dark_fraction",
         },
         "perception.field_features.safe_zone",
-    )
-    start_zone_raw = _mapping(
-        _required(field_raw, "start_zone", "perception.field_features"),
-        "perception.field_features.start_zone",
-    )
-    _reject_unknown(
-        start_zone_raw,
-        {"side_mm"},
-        "perception.field_features.start_zone",
     )
     center_raw = _mapping(
         _required(field_raw, "center_cross", "perception.field_features"),
@@ -1967,33 +2087,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
                 "perception.field_features.region_filter",
             ),
             "perception.field_features.region_filter.min_rectangularity",
-        ),
-        safe_width_mm=_finite_float(
-            _required(
-                safe_zone_raw,
-                "width_mm",
-                "perception.field_features.safe_zone",
-            ),
-            "perception.field_features.safe_zone.width_mm",
-            minimum=0.001,
-        ),
-        safe_depth_mm=_finite_float(
-            _required(
-                safe_zone_raw,
-                "depth_mm",
-                "perception.field_features.safe_zone",
-            ),
-            "perception.field_features.safe_zone.depth_mm",
-            minimum=0.001,
-        ),
-        start_side_mm=_finite_float(
-            _required(
-                start_zone_raw,
-                "side_mm",
-                "perception.field_features.start_zone",
-            ),
-            "perception.field_features.start_zone.side_mm",
-            minimum=0.001,
         ),
         dimension_tolerance_fraction=_threshold(
             _required(

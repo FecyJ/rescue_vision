@@ -7,6 +7,7 @@ from enum import Enum
 import math
 
 from rescue_vision.geometry.types import FieldPoint
+from rescue_vision.world.static_map import CenterLineTerminalKind
 
 
 def normalize_angle(angle_rad: float) -> float:
@@ -48,17 +49,11 @@ def _probability(value: float, location: str) -> float:
     return converted
 
 
-class CenterLineTerminalKind(str, Enum):
-    RED_SAFE_ZONE = "red_safe_zone"
-    BLUE_SAFE_ZONE = "blue_safe_zone"
-    PLAIN_BOUNDARY = "plain_boundary"
-    UNKNOWN = "unknown"
-
-
 class CenterCrossSelectionSource(str, Enum):
     RED_SAFE_ZONE = "red_safe_zone"
     BLUE_SAFE_ZONE = "blue_safe_zone"
     RED_BLUE_SAFE_ZONES = "red_blue_safe_zones"
+    STATIC_MAP_TERMINAL = "static_map_terminal"
     PRIOR = "prior"
 
 
