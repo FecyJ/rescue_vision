@@ -161,10 +161,10 @@ with source, detector:
 
 | 子包 | 常用入口 | 对接责任 |
 | --- | --- | --- |
-| [`app`](app/README.md) | `run_manual_capture_session()`、`rescue-vision-manual-capture` | 赛外受监督手动驾驶和车载采集装配 |
+| [`app`](app/README.md) | `run_manual_capture_session()`、`FieldMapSnapshotRenderer`、`LatestCenterCrossLocalization`、`rescue-vision-manual-capture` | 赛外受监督手动驾驶、车载采集和静态场地图/中心十字位姿远程发布装配 |
 | [`config`](config/README.md) | `load_runtime_config()`、`GripperRuntimeConfig`、`AppConfig.build_geometry()`、`HailoConfig.build_backend()` | 启动时严格加载、机械标定和装配 |
 | [`camera`](camera/README.md) | `FrameSource`、`CameraFrame`、`Picamera2Source`、`RecordingSource` | 产生带时间和序号的最新帧 |
-| [`communication`](communication/README.md) | `UartLineChannel`、`RemoteMessageConnection`、`VideoModeCommand`、`VideoFrameAttributes`、`MapSnapshotAttributes`、`RemoteSessionStatus` | UART、直接 TCP 远程消息、可选择 raw/perception/BEV 图传、FieldPoint/MapPixel 地图映射与严格观察 schema |
+| [`communication`](communication/README.md) | `UartLineChannel`、`RemoteMessageConnection`、`VideoModeCommand`、`VideoFrameAttributes`、`MapSnapshotAttributes`、`RemoteSessionStatus` | UART、直接 TCP 远程消息、可选择 raw/perception/BEV 图传、FieldPoint/MapPixel 地图映射及可空机器人全局位姿 schema |
 | [`motion`](motion/README.md) | `MotionController`、`MotionLimits`、`GripperCalibration`、`RemoteMotionExecutor`、`RemoteGripperExecutor`、`run_remote_motion` | 差速运动、持续夹爪双舵机、Rescue Car 协议和远程调试执行 |
 | [`geometry`](geometry/README.md) | `CameraModel`、`GroundProjector`、显式坐标类型（含 `MapPixel`） | 去畸变及像素/地面/BEV 转换 |
 | [`perception`](perception/README.md) | `TargetPoseDetector`、`PerceptionFrameRenderer`、`TargetGroundGeometryEstimator`、`FieldFeatureDetector` | 任务目标、最新帧可视化旁路、地面几何和静态场地特征观测 |
@@ -183,4 +183,4 @@ with source, detector:
 - 原始像素使用 `RawPixel`，去畸变像素使用 `UndistortedPixel`，只有后者能交给 `GroundProjector`。
 - 感知算法只产生 `TargetObservation`、`TargetGroundGeometry` 或 `FieldFeatureDetectionResult`，不持有跟踪、定位、世界模型或规则状态。
 - 实时循环只处理最新帧；录制、显示、日志和通信使用有界旁路。
-- 当前正式任务目标模型、连续定位融合、完整区域/对手感知、真实接触与交付证据、规划、正式任务动作到运动控制的适配和比赛应用入口尚未完成。传统视觉场地特征和中心十字定位目前只有合成测试基线；`app` 的远程驾驶/图传只用于赛外受监督采集，不能替代固件失联看门狗。
+- 当前正式任务目标模型、连续定位融合、完整区域/对手感知、真实接触与交付证据、规划、正式任务动作到运动控制的适配和比赛应用入口尚未完成。传统视觉场地特征和中心十字定位目前只有合成测试基线；远程场地图只发布新鲜唯一的低频绝对位姿，不能把过期位置当作连续定位。`app` 的远程驾驶/图传只用于赛外受监督采集，不能替代固件失联看门狗。

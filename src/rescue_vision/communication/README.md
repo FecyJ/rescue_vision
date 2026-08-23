@@ -36,7 +36,7 @@
 | `VideoFrameMode` | 图像内容枚举 | 原图、推理叠加图或机器人局部地面 BEV |
 | `RemoteSessionStatus` | 会话权限、能力、限值和周期 | TCP 建立后的首条业务消息 |
 | `VideoFrameAttributes` | JPEG 帧 header attributes | 严格尺寸、坐标系、时间和标定身份 |
-| `MapSnapshotAttributes` | PNG 场地图元数据 | `FieldPoint` 原点为中心十字交点；`field_to_map_pixel()` / `map_pixel_to_field()` 使用固定轴向 |
+| `MapSnapshotAttributes` | PNG 场地图元数据 | 固定 `FieldPoint`/`MapPixel` 映射，并原子携带可空的新鲜机器人全局位姿、置信度和不确定度 |
 | `VehicleStateObservation` | 车辆观察 JSON | UART、轮速、夹爪角度、显式安全模式和命令 ID |
 | `CaptureStatusObservation` | 采集观察 JSON schema | 当前记录状态及最近请求结果 |
 
@@ -569,6 +569,11 @@ def map_pixel_to_field(
 在这套映射中，PNG 中心十字对应场地 `FieldPoint(0, 0)`；向右增大 `u` 对应
 场地 `+x`，向红色安全区方向增大场地 `+y` 对应减小 PNG `v`。映射的边界和
 反向转换由 `MapSnapshotAttributes` 统一执行。
+
+`robot_localized=true` 时，`robot_x_mm`、`robot_y_mm`、
+`robot_heading_rad`、定位采集时间、置信度、不确定度和来源必须全部存在；为
+false 时必须全部为 `None`。调用方不得把上一帧位置带入 unlocalized 快照。
+PNG 绘制由 `app.FieldMapSnapshotRenderer` 完成，通信包只维护严格线级契约。
 
 `DebugMotionCommand.linear_velocity_m_s` 正负表示前后，
 `angular_velocity_rad_s` 逆时针为正。`TARGET_HEADING` 必须声明 `field` 或

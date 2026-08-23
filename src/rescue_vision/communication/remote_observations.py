@@ -604,6 +604,15 @@ class MapSnapshotAttributes:
     field_min_y_mm: float
     field_max_y_mm: float
     team_color: TeamColor
+    robot_localized: bool = False
+    robot_x_mm: float | None = None
+    robot_y_mm: float | None = None
+    robot_heading_rad: float | None = None
+    localization_capture_timestamp_ns: int | None = None
+    localization_confidence: float | None = None
+    localization_position_uncertainty_mm: float | None = None
+    localization_heading_uncertainty_rad: float | None = None
+    localization_source: str | None = None
 
     def __post_init__(self) -> None:
         _non_negative_int(self.snapshot_sequence, "snapshot_sequence")
@@ -629,6 +638,69 @@ class MapSnapshotAttributes:
             raise ValueError("field_min_y_mm must be less than field_max_y_mm.")
         if not isinstance(self.team_color, TeamColor):
             raise ValueError("team_color must be TeamColor.")
+        _boolean(self.robot_localized, "robot_localized")
+        optional_values = (
+            self.robot_x_mm,
+            self.robot_y_mm,
+            self.robot_heading_rad,
+            self.localization_capture_timestamp_ns,
+            self.localization_confidence,
+            self.localization_position_uncertainty_mm,
+            self.localization_heading_uncertainty_rad,
+            self.localization_source,
+        )
+        if self.robot_localized != all(
+            value is not None for value in optional_values
+        ):
+            raise ValueError(
+                "robot_localized must be true exactly when all robot localization "
+                "fields are present."
+            )
+        if not self.robot_localized and any(
+            value is not None for value in optional_values
+        ):
+            raise ValueError(
+                "Unlocalized map snapshots require null localization fields."
+            )
+        if self.robot_localized:
+            for name in ("robot_x_mm", "robot_y_mm", "robot_heading_rad"):
+                object.__setattr__(
+                    self,
+                    name,
+                    _finite_float(getattr(self, name), name),
+                )
+            assert self.robot_heading_rad is not None
+            if not -math.pi <= self.robot_heading_rad <= math.pi:
+                raise ValueError("robot_heading_rad must be in [-pi, pi].")
+            assert self.localization_capture_timestamp_ns is not None
+            _non_negative_int(
+                self.localization_capture_timestamp_ns,
+                "localization_capture_timestamp_ns",
+            )
+            if self.localization_capture_timestamp_ns > self.timestamp_ns:
+                raise ValueError(
+                    "localization_capture_timestamp_ns must not exceed timestamp_ns."
+                )
+            assert self.localization_confidence is not None
+            confidence = _finite_float(
+                self.localization_confidence,
+                "localization_confidence",
+            )
+            if not 0.0 <= confidence <= 1.0:
+                raise ValueError("localization_confidence must be in [0, 1].")
+            for name in (
+                "localization_position_uncertainty_mm",
+                "localization_heading_uncertainty_rad",
+            ):
+                assert getattr(self, name) is not None
+                if _finite_float(getattr(self, name), name) <= 0.0:
+                    raise ValueError(f"{name} must be positive.")
+            assert self.localization_source is not None
+            object.__setattr__(
+                self,
+                "localization_source",
+                _identifier(self.localization_source, "localization_source"),
+            )
 
     def field_to_map_pixel(self, point: FieldPoint) -> MapPixel:
         """把场地全局点映射到 PNG 像素；正 y 指向红色安全区。"""
@@ -678,6 +750,21 @@ class MapSnapshotAttributes:
             "field_min_y_mm": self.field_min_y_mm,
             "field_max_y_mm": self.field_max_y_mm,
             "team_color": self.team_color.value,
+            "robot_localized": self.robot_localized,
+            "robot_x_mm": self.robot_x_mm,
+            "robot_y_mm": self.robot_y_mm,
+            "robot_heading_rad": self.robot_heading_rad,
+            "localization_capture_timestamp_ns": (
+                self.localization_capture_timestamp_ns
+            ),
+            "localization_confidence": self.localization_confidence,
+            "localization_position_uncertainty_mm": (
+                self.localization_position_uncertainty_mm
+            ),
+            "localization_heading_uncertainty_rad": (
+                self.localization_heading_uncertainty_rad
+            ),
+            "localization_source": self.localization_source,
         }
 
     @classmethod
@@ -698,6 +785,15 @@ class MapSnapshotAttributes:
                 "field_min_y_mm",
                 "field_max_y_mm",
                 "team_color",
+                "robot_localized",
+                "robot_x_mm",
+                "robot_y_mm",
+                "robot_heading_rad",
+                "localization_capture_timestamp_ns",
+                "localization_confidence",
+                "localization_position_uncertainty_mm",
+                "localization_heading_uncertainty_rad",
+                "localization_source",
             },
             "MapSnapshotAttributes",
         )
@@ -717,6 +813,21 @@ class MapSnapshotAttributes:
                 attributes["team_color"],
                 "team_color",
             ),
+            robot_localized=attributes["robot_localized"],
+            robot_x_mm=attributes["robot_x_mm"],
+            robot_y_mm=attributes["robot_y_mm"],
+            robot_heading_rad=attributes["robot_heading_rad"],
+            localization_capture_timestamp_ns=attributes[
+                "localization_capture_timestamp_ns"
+            ],
+            localization_confidence=attributes["localization_confidence"],
+            localization_position_uncertainty_mm=attributes[
+                "localization_position_uncertainty_mm"
+            ],
+            localization_heading_uncertainty_rad=attributes[
+                "localization_heading_uncertainty_rad"
+            ],
+            localization_source=attributes["localization_source"],
         )
 
 

@@ -4,6 +4,7 @@ import json
 import time
 from types import SimpleNamespace
 
+import cv2
 import numpy as np
 import pytest
 
@@ -18,6 +19,7 @@ from rescue_vision.app.manual_capture import (
     build_session_status,
     run_manual_capture_session,
 )
+from rescue_vision.app.field_map import FieldMapSnapshotRenderer
 from rescue_vision.camera.frame import CameraFrame
 from rescue_vision.communication import (
     CaptureAction,
@@ -52,6 +54,14 @@ from rescue_vision.motion import (
     RemoteMotionResult,
 )
 from rescue_vision.geometry.ground_projector import BevConfig, GroundProjector
+from rescue_vision.geometry.types import FieldPoint
+from rescue_vision.world import (
+    PhysicalRegionKind,
+    PhysicalStaticRegion,
+    TeamColor,
+    default_static_field_map,
+)
+from rescue_vision.world.static_map import StaticFieldMap
 
 
 class FakeSource:
@@ -318,6 +328,80 @@ def test_camera_only_status_disables_actuators_but_keeps_vehicle_heartbeat() -> 
     assert status.max_angular_velocity_rad_s is None
     assert status.capture_control_available
     assert status.video_modes == (VideoFrameMode.RAW, VideoFrameMode.BEV)
+
+
+def test_camera_only_session_publishes_static_map_with_unlocalized_robot(
+    tmp_path,
+) -> None:
+    config = _config()
+    pipeline = CameraPipeline(
+        FakeSource(CameraFrame(0, 0, np.zeros((3, 4, 3), np.uint8))),
+        None,
+        ImageCoordinateSystem.RAW_PIXEL,
+        None,
+    )
+    capture = CaptureSession(
+        output_root=tmp_path,
+        config=config,
+        config_snapshot={},
+        pipeline=pipeline,
+    )
+    landmarks = default_static_field_map()
+    static_map = StaticFieldMap(
+        landmarks.center_cross,
+        (
+            PhysicalStaticRegion(
+                "field",
+                PhysicalRegionKind.FIELD,
+                (
+                    FieldPoint(-100.0, -100.0),
+                    FieldPoint(100.0, -100.0),
+                    FieldPoint(100.0, 100.0),
+                    FieldPoint(-100.0, 100.0),
+                ),
+            ),
+        ),
+    )
+    renderer = FieldMapSnapshotRenderer(static_map, TeamColor.UNKNOWN)
+    connection = FakeConnection([])
+    status = build_session_status(
+        config,
+        server_instance_id="test-server",
+        video_fps=10.0,
+        camera_only=True,
+        map_snapshot_available=True,
+    )
+
+    with pytest.raises(RemoteDisconnectedError):
+        run_manual_capture_session(
+            connection,
+            None,
+            None,
+            capture,
+            pipeline,
+            status,
+            video_fps=10.0,
+            jpeg_quality=80,
+            map_renderer=renderer,
+        )
+
+    map_payload = next(
+        payload
+        for topic, payload in connection.observations
+        if topic == RemoteTopic.MAP_SNAPSHOT.value
+    )
+    map_attributes = next(
+        attributes
+        for topic, attributes in connection.observation_attributes
+        if topic == RemoteTopic.MAP_SNAPSHOT.value
+    )
+    assert (
+        cv2.imdecode(np.frombuffer(map_payload, np.uint8), cv2.IMREAD_COLOR)
+        is not None
+    )
+    assert map_attributes["coordinate_system"] == "field_mm"
+    assert map_attributes["robot_localized"] is False
+    assert map_attributes["robot_x_mm"] is None
 
 
 def test_accept_timeout_is_a_clean_stop(monkeypatch) -> None:

@@ -73,9 +73,14 @@ from rescue_vision.motion import (
     run_remote_motion,
 )
 from rescue_vision.perception import PerceptionFrameRenderer
+from rescue_vision.app.field_map import (
+    FieldMapSnapshotRenderer,
+    LatestCenterCrossLocalization,
+)
 SESSION_STATUS_PERIOD_MS = 1_000
 VEHICLE_STATUS_PERIOD_MS = 100
 CAPTURE_STATUS_PERIOD_MS = 500
+MAP_SNAPSHOT_PERIOD_MS = 500
 
 
 @dataclass(frozen=True, slots=True)
@@ -731,6 +736,8 @@ class ManualCaptureRuntime:
         jpeg_quality: int,
         perception_renderer: PerceptionFrameRenderer | None,
         bev_renderer: BevFrameRenderer | None,
+        map_renderer: FieldMapSnapshotRenderer | None,
+        map_localization: LatestCenterCrossLocalization | None,
         stop_requested: Callable[[], bool],
         safety_mode: VehicleSafetyMode,
     ) -> None:
@@ -744,6 +751,8 @@ class ManualCaptureRuntime:
         self.jpeg_quality = jpeg_quality
         self.perception_renderer = perception_renderer
         self.bev_renderer = bev_renderer
+        self.map_renderer = map_renderer
+        self.map_localization = map_localization
         self.stop_requested = stop_requested
         if (executor is None) != (not session_status.motion_control_available):
             raise ValueError(
@@ -751,6 +760,10 @@ class ManualCaptureRuntime:
             )
         if gripper_executor is not None and executor is None:
             raise ValueError("gripper_executor requires a motion executor.")
+        if (map_renderer is None) != (not session_status.map_snapshot_available):
+            raise ValueError(
+                "map_renderer presence must match map_snapshot_available."
+            )
         self.vehicle = VehicleState(safety_mode=safety_mode)
         self.video_mode = VideoFrameMode.RAW
         self.last_sent_video_sequence: int | None = None
@@ -762,6 +775,7 @@ class ManualCaptureRuntime:
         self.next_session_status_ns = now_ns + SESSION_STATUS_PERIOD_MS * 1_000_000
         self.next_vehicle_status_ns = now_ns + VEHICLE_STATUS_PERIOD_MS * 1_000_000
         self.next_capture_status_ns = now_ns + CAPTURE_STATUS_PERIOD_MS * 1_000_000
+        self.next_map_snapshot_ns = now_ns
 
     def run(self) -> None:
         self._send_initial_status()
@@ -841,6 +855,8 @@ class ManualCaptureRuntime:
                 raise
             self.last_camera_frame_ns = time.monotonic_ns()
             self.capture.record(self.latest_frame)
+            if self.map_localization is not None:
+                self.map_localization.submit(self.latest_frame)
             if self.video_mode is VideoFrameMode.PERCEPTION:
                 if self.perception_renderer is None:
                     raise RuntimeError(
@@ -883,6 +899,9 @@ class ManualCaptureRuntime:
             self.next_capture_status_ns = (
                 now_ns + CAPTURE_STATUS_PERIOD_MS * 1_000_000
             )
+        if now_ns >= self.next_map_snapshot_ns:
+            self._send_map_snapshot(now_ns)
+            self.next_map_snapshot_ns = now_ns + MAP_SNAPSHOT_PERIOD_MS * 1_000_000
 
     def _send_initial_status(self) -> None:
         self.connection.send_reliable_observation(
@@ -897,6 +916,9 @@ class ManualCaptureRuntime:
                 content_type="application/json",
             )
         self._send_capture_status()
+        now_ns = time.monotonic_ns()
+        self._send_map_snapshot(now_ns)
+        self.next_map_snapshot_ns = now_ns + MAP_SNAPSHOT_PERIOD_MS * 1_000_000
 
     def _handle_other_control(self, message: ReceivedRemoteMessage) -> None:
         if (
@@ -1010,6 +1032,26 @@ class ManualCaptureRuntime:
             content_type="application/json",
         )
 
+    def _send_map_snapshot(self, timestamp_ns: int) -> None:
+        if self.map_renderer is None:
+            return
+        robot = (
+            None
+            if self.map_localization is None
+            else self.map_localization.latest_robot_pose(timestamp_ns)
+        )
+        snapshot = self.map_renderer.render(
+            timestamp_ns=timestamp_ns,
+            robot=robot,
+        )
+        self.connection.send_observation(
+            RemoteTopic.MAP_SNAPSHOT.value,
+            snapshot.png_bytes,
+            content_type="image/png",
+            attributes=snapshot.attributes.to_attributes(),
+            sender_timestamp_ns=timestamp_ns,
+        )
+
 
 def build_camera_pipeline(config: AppConfig) -> CameraPipeline:
     geometry = config.build_geometry()
@@ -1049,6 +1091,7 @@ def build_session_status(
     video_fps: float,
     video_modes: tuple[VideoFrameMode, ...] = (VideoFrameMode.RAW,),
     camera_only: bool = False,
+    map_snapshot_available: bool = False,
 ) -> RemoteSessionStatus:
     if not isinstance(camera_only, bool):
         raise TypeError("camera_only must be a boolean.")
@@ -1065,13 +1108,15 @@ def build_session_status(
         capture_control_available=True,
         video_stream_available=True,
         video_modes=video_modes,
-        map_snapshot_available=False,
+        map_snapshot_available=map_snapshot_available,
         vehicle_state_available=True,
         capture_status_available=True,
         target_heading_control_available=False,
         session_status_period_ms=SESSION_STATUS_PERIOD_MS,
         vehicle_state_period_ms=VEHICLE_STATUS_PERIOD_MS,
-        map_snapshot_period_ms=None,
+        map_snapshot_period_ms=(
+            MAP_SNAPSHOT_PERIOD_MS if map_snapshot_available else None
+        ),
         capture_status_period_ms=CAPTURE_STATUS_PERIOD_MS,
         video_nominal_fps=video_fps,
         max_linear_velocity_m_s=(
@@ -1098,6 +1143,8 @@ def run_manual_capture_session(
     jpeg_quality: int,
     perception_renderer: PerceptionFrameRenderer | None = None,
     bev_renderer: BevFrameRenderer | None = None,
+    map_renderer: FieldMapSnapshotRenderer | None = None,
+    map_localization: LatestCenterCrossLocalization | None = None,
     stop_requested: Callable[[], bool] = lambda: False,
     safety_mode: VehicleSafetyMode = VehicleSafetyMode.UNAVAILABLE,
 ) -> None:
@@ -1112,6 +1159,8 @@ def run_manual_capture_session(
         jpeg_quality=jpeg_quality,
         perception_renderer=perception_renderer,
         bev_renderer=bev_renderer,
+        map_renderer=map_renderer,
+        map_localization=map_localization,
         stop_requested=stop_requested,
         safety_mode=safety_mode,
     )
@@ -1333,6 +1382,35 @@ def main() -> None:
         and pipeline.ground_projector.bev_config is not None
         else None
     )
+    map_renderer = (
+        FieldMapSnapshotRenderer(config.world.static_map, config.world.team_color)
+        if config.world.static_map.regions
+        else None
+    )
+    field_detector = (
+        config.perception.build_field_feature_detector(
+            static_map=config.world.static_map,
+            max_observation_age_ms=config.processing.max_observation_age_ms,
+            ground_projector=pipeline.ground_projector,
+        )
+        if pipeline.ground_projector is not None
+        else None
+    )
+    center_cross_localizer = config.build_center_cross_localizer(
+        ground_projector=pipeline.ground_projector,
+    )
+    map_localization = (
+        LatestCenterCrossLocalization(
+            field_detector,
+            center_cross_localizer,
+            valid_mask=pipeline.camera_model.valid_mask,
+            max_pose_age_ms=config.processing.max_observation_age_ms,
+        )
+        if field_detector is not None
+        and center_cross_localizer is not None
+        and pipeline.camera_model is not None
+        else None
+    )
     video_modes = (VideoFrameMode.RAW,) + (
         (VideoFrameMode.PERCEPTION,) if perception_renderer is not None else ()
     ) + ((VideoFrameMode.BEV,) if bev_renderer is not None else ())
@@ -1354,6 +1432,8 @@ def main() -> None:
                     perception_renderer.start()
                 if bev_renderer is not None:
                     bev_renderer.start()
+                if map_localization is not None:
+                    map_localization.start()
                 pipeline.source.start()
                 while not shutdown_requested.is_set():
                     connection = _accept_with_shutdown(
@@ -1377,6 +1457,7 @@ def main() -> None:
                         video_fps=args.video_fps,
                         video_modes=video_modes,
                         camera_only=args.camera_only,
+                        map_snapshot_available=map_renderer is not None,
                     )
                     try:
                         with connection:
@@ -1391,6 +1472,8 @@ def main() -> None:
                                 jpeg_quality=args.jpeg_quality,
                                 perception_renderer=perception_renderer,
                                 bev_renderer=bev_renderer,
+                                map_renderer=map_renderer,
+                                map_localization=map_localization,
                                 stop_requested=shutdown_requested.is_set,
                                 safety_mode=(
                                     VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP
@@ -1420,8 +1503,12 @@ def main() -> None:
                             if perception_renderer is not None:
                                 perception_renderer.stop()
                         finally:
-                            if bev_renderer is not None:
-                                bev_renderer.stop()
+                            try:
+                                if bev_renderer is not None:
+                                    bev_renderer.stop()
+                            finally:
+                                if map_localization is not None:
+                                    map_localization.stop()
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
 

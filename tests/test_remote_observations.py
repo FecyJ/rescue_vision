@@ -206,6 +206,38 @@ def test_map_attributes_round_trip_and_bounds() -> None:
         )
 
 
+def test_map_attributes_carry_strict_localized_robot_pose() -> None:
+    attributes = MapSnapshotAttributes(
+        snapshot_sequence=3,
+        timestamp_ns=1_000,
+        width=400,
+        height=400,
+        field_min_x_mm=-1500.0,
+        field_max_x_mm=1500.0,
+        field_min_y_mm=-1500.0,
+        field_max_y_mm=1500.0,
+        team_color=TeamColor.BLUE,
+        robot_localized=True,
+        robot_x_mm=100.0,
+        robot_y_mm=-200.0,
+        robot_heading_rad=0.5,
+        localization_capture_timestamp_ns=900,
+        localization_confidence=0.75,
+        localization_position_uncertainty_mm=30.0,
+        localization_heading_uncertainty_rad=0.1,
+        localization_source="blue_safe_zone",
+    )
+
+    assert (
+        MapSnapshotAttributes.from_attributes(attributes.to_attributes())
+        == attributes
+    )
+    invalid = attributes.to_attributes()
+    invalid["robot_x_mm"] = None
+    with pytest.raises(ValueError, match="all robot localization"):
+        MapSnapshotAttributes.from_attributes(invalid)
+
+
 def test_field_map_mapping_uses_center_cross_and_red_positive_y() -> None:
     attributes = MapSnapshotAttributes(
         snapshot_sequence=0,

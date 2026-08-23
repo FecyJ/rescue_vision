@@ -14,6 +14,8 @@
 | `build_session_status()` | 同一 `AppConfig`、服务实例 ID、视频 FPS 和可用模式 | 创建声明运动、夹爪、视频模式、车辆和采集能力的会话状态 |
 | `run_manual_capture_session()` | 已启动连接、可选运动/夹爪执行器、采集会话、相机管线和可选 perception/BEV 旁路 | 运行单个完整车辆或仅相机 TCP 会话；断线/故障时清理当前记录 |
 | `BevFrameRenderer` | 已加载且包含 BEV 配置的 `GroundProjector`；显式 `start/stop` | 有界丢旧保新的后台 BEV 生成旁路；输出保留源帧号和采集时间 |
+| `FieldMapSnapshotRenderer` | `world.static_map` 和 `team_color` | 把唯一静态地图、可选新鲜机器人位姿及未来确认目标覆盖编码为场地图 PNG |
+| `LatestCenterCrossLocalization` | 已装配的场地特征检测器、中心十字定位器和有效像素掩码；显式 `start/stop` | 有界最新帧定位旁路；只返回未超过配置时效的唯一 `FieldPose2D` |
 
 `run_manual_capture_session()` 不创建或打开硬件资源。调用方传入
 `RemoteMotionExecutor`，并在 `motion.gripper.enabled=true` 时传入共享同一个
@@ -36,7 +38,7 @@ rescue-vision-manual-capture \
   --video-fps 10
 ```
 
-入口创建但不复制相机参数、运动限值或协议规则。连接后发送会话、视频、车辆
+入口创建但不复制相机参数、运动限值或协议规则。连接后发送会话、视频、场地图、车辆
 和采集状态，并同时接收 `control/debug/motion`、
 `control/debug/gripper`、`control/debug/capture` 与不执行动作的
 `control/video/mode`。运动命令继续由
@@ -46,7 +48,13 @@ rescue-vision-manual-capture \
 开始/停止统一 recording 会话。电脑端通过 `video_modes` 选择 `raw`、
 `perception` 或 `bev`；perception 由 `PerceptionFrameRenderer` 在最新帧后台
 旁路运行 `TargetPoseDetector`，BEV 只在当前地面映射包含 BEV 配置时由独立
-最新帧旁路生成。两者只发布带实际模式和坐标元数据的 JPEG，不阻塞运动安全循环。手动会话的 `motion.jsonl` 逐条
+最新帧旁路生成。两者只发布带实际模式和坐标元数据的 JPEG，不阻塞运动安全循环。
+只要 `world.static_map.regions` 非空，会话就声明并以 500 ms 周期发布
+`observation/map/snapshot`；若同时启用可用地面映射、`field_features` 和
+`localization`，独立最新帧旁路把中心十字唯一位姿绘制为地图箭头并写入严格
+attributes。观测超时或没有唯一解时地图仍发布，但明确清除机器人位置。当前不
+包含 IMU/编码器连续推算，离开中心十字可观测区域后不会沿用旧位姿。
+手动会话的 `motion.jsonl` 逐条
 保存运动/夹爪执行结果、轮速与舵机遥测、未知 UART 扩展报文和停车原因；
 这些事件与图像帧统一使用树莓派应用单调时间。
 等待首个客户端及断线重连期间，入口仍以有界周期排空 STM32 主动遥测，避免

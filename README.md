@@ -2,7 +2,7 @@
 
 2027 工创赛“智能救援”赛项的上位机视觉工程，目标平台为 Raspberry Pi 5、Hailo-8L 和 Camera Module 3 NoIR Wide。
 
-当前已完成相机、标定与地面几何、严格配置、录制回放、数据集工具、离线评测、协议无关 UART、直接 TCP 远程消息通道、Rescue Car v2.0 差速与双舵机夹爪控制、受监督手动驾驶采集入口、统一目标观测、Hailo YOLO Pose 后端、四类目标传统视觉地面几何估计基线、传统视觉场地特征观测基线、中心十字绝对位姿候选与同帧红蓝安全区方向锚定，以及可用合成事件运行的目标跟踪、最小世界模型和规则状态机；尚未完成正式四类目标模型、IMU/编码器融合与完整定位、完整区域/对手感知、规划、脚本运动采集、固件失联看门狗闭环、真实接触/交付证据适配和比赛应用入口。这不是可直接参赛的完整程序。
+当前已完成相机、标定与地面几何、严格配置、录制回放、数据集工具、离线评测、协议无关 UART、直接 TCP 远程消息通道、Rescue Car v2.0 差速与双舵机夹爪控制、受监督手动驾驶采集入口、统一目标观测、Hailo YOLO Pose 后端、四类目标传统视觉地面几何估计基线、传统视觉场地特征观测基线、中心十字绝对位姿候选与同帧红蓝安全区方向锚定、静态场地图及新鲜唯一机器人位姿远程发布，以及可用合成事件运行的目标跟踪、最小世界模型和规则状态机；尚未完成正式四类目标模型、IMU/编码器融合与完整定位、完整区域/对手感知、规划、脚本运动采集、固件失联看门狗闭环、真实接触/交付证据适配和比赛应用入口。这不是可直接参赛的完整程序。
 
 ## 快速上手
 
@@ -55,9 +55,9 @@ python -m pytest
 | [`calibration`](src/rescue_vision/calibration/README.md) | 已实现 | 棋盘/ChArUco 采集、三模型内参比较和固定机器人多位置地面映射 |
 | [`geometry`](src/rescue_vision/geometry/README.md) | 已实现 | 去畸变、显式坐标类型、地面/三维点投影与 BEV 转换 |
 | [`config`](src/rescue_vision/config/README.md) | 已实现 | 安全默认配置、静态场地、UART/远程/motion/夹爪机械标定/几何/模型和感知算法装配 |
-| [`communication`](src/rescue_vision/communication/README.md) | 已实现基础设施 | UART、直接 TCP 远程消息、raw/perception/BEV 图传模式选择、运动/夹爪/采集严格 schema 和有界队列；比赛发布器待接入 |
+| [`communication`](src/rescue_vision/communication/README.md) | 已实现基础设施 | UART、直接 TCP 远程消息、raw/perception/BEV 图传、带可空全局位姿的场地图、运动/夹爪/采集严格 schema 和有界队列；比赛发布器待接入 |
 | [`motion`](src/rescue_vision/motion/README.md) | 已实现基础设施 | 差速运动、持续扳机双舵机夹爪、单轮加速度限制、Rescue Car 协议解析和远程超时保护 |
-| [`app`](src/rescue_vision/app/README.md) | 已实现手动采集入口 | 赛外受监督驾驶、仅相机远程调试、持续夹爪控制、raw/perception/BEV 图传、采集控制与状态装配；比赛入口待实现 |
+| [`app`](src/rescue_vision/app/README.md) | 已实现手动采集入口 | 赛外受监督驾驶、仅相机远程调试、持续夹爪控制、raw/perception/BEV 图传、静态场地图与中心十字位姿发布、采集控制与状态装配；比赛入口待实现 |
 | [`data`](src/rescue_vision/data/README.md) | 已实现 | 记录检查、清单生成和按会话防泄漏划分 |
 | [`evaluation`](src/rescue_vision/evaluation/README.md) | 已实现 | 分类、地面误差、时延和失败样例报告 |
 | [`perception`](src/rescue_vision/perception/README.md) | 已实现基础设施 | Pose 框/K0、ROI HSV 分类分割、四类可配置三维模板地面中心估计，以及安全区、无编号出发区、中心十字和低精度边界候选；正式模型、实物精度与树莓派性能待验证 |
