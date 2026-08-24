@@ -211,6 +211,57 @@ def test_safe_zone_ignores_distant_same_color_target() -> None:
     assert max(ys) - min(ys) == pytest.approx(200.0, abs=6.0)
 
 
+def test_partial_safe_zone_uses_two_colored_halves_inside_purple_enclosure() -> None:
+    image = np.full((400, 400, 3), 255, dtype=np.uint8)
+    cv2.rectangle(image, (70, 25), (330, 175), bgr(138), thickness=12)
+    cv2.rectangle(image, (105, 70), (185, 95), bgr(105), thickness=-1)
+    cv2.rectangle(image, (215, 70), (295, 95), bgr(105), thickness=-1)
+    detector = FieldFeatureDetector(
+        safe_zone_config(),
+        static_map=static_map(),
+        max_observation_age_ms=100.0,
+        ground_projector=projector(),
+    )
+
+    result = detector.detect(
+        frame(image),
+        image,
+        valid_mask=valid_mask(image),
+        result_timestamp_ns=1_100_000,
+    )
+
+    assert len(result.safe_zones) == 1
+    observation = result.safe_zones[0]
+    assert observation.physical_color is SafeZoneColor.BLUE
+    assert observation.polygon_ground is not None
+    assert observation.confidence >= 0.25
+    assert FieldFeatureQuality.PARTIAL in observation.quality
+    assert FieldFeatureQuality.SIDE_UNRESOLVED in observation.quality
+    assert observation.entrance is None
+    assert observation.halves == ()
+
+
+def test_partial_safe_zone_rejects_colored_targets_without_purple_enclosure() -> None:
+    image = np.full((400, 400, 3), 255, dtype=np.uint8)
+    cv2.rectangle(image, (105, 70), (185, 95), bgr(105), thickness=-1)
+    cv2.rectangle(image, (215, 70), (295, 95), bgr(105), thickness=-1)
+    detector = FieldFeatureDetector(
+        safe_zone_config(),
+        static_map=static_map(),
+        max_observation_age_ms=100.0,
+        ground_projector=projector(),
+    )
+
+    result = detector.detect(
+        frame(image),
+        image,
+        valid_mask=valid_mask(image),
+        result_timestamp_ns=1_100_000,
+    )
+
+    assert result.safe_zones == ()
+
+
 def test_safe_zone_does_not_invent_sides_without_entrance_evidence() -> None:
     image = safe_zone_scene(include_purple=False)
     detector = FieldFeatureDetector(

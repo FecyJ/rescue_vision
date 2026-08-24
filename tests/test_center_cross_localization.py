@@ -109,6 +109,7 @@ def safe_zone(
     center: GroundPoint,
     *,
     confidence: float = 0.9,
+    partial: bool = False,
 ) -> SafeZoneObservation:
     polygon_ground = (
         GroundPoint(center.x - 100.0, center.y - 50.0),
@@ -134,6 +135,7 @@ def safe_zone(
                 FieldFeatureQuality.DIVIDER_UNRESOLVED,
                 FieldFeatureQuality.SIDE_UNRESOLVED,
             }
+            | ({FieldFeatureQuality.PARTIAL} if partial else set())
         ),
     )
 
@@ -317,6 +319,24 @@ def test_one_colored_safe_zone_is_enough_for_unique_heading(
     assert observation.selected_pose is not None
     assert observation.selected_pose.heading_rad == pytest.approx(0.0)
     assert observation.selection_source is source
+
+
+def test_partial_blue_zone_still_requires_and_can_pass_ray_anchor_gate() -> None:
+    observation = localizer().localize(
+        result(
+            safe_zones=(
+                safe_zone(
+                    SafeZoneColor.BLUE,
+                    GroundPoint(100.0, -1250.0),
+                    confidence=0.388,
+                    partial=True,
+                ),
+            )
+        )
+    )
+
+    assert observation.selected_pose is not None
+    assert observation.selection_source is CenterCrossSelectionSource.BLUE_SAFE_ZONE
 
 
 def test_plain_boundary_does_not_resolve_180_degree_ambiguity() -> None:

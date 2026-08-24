@@ -370,6 +370,15 @@ for safe_zone in field_result.safe_zones if field_result is not None else ():
 地面方向均成立时才生成两个 `halves`。证据不足时保留整区并标记
 `entrance_unresolved`、`divider_unresolved` 或 `side_unresolved`。
 
+完整彩色区域优先按静态地图尺寸和矩形度确认。紫色围栏有高度、遮挡导致完整
+尺寸不再可见时，检测器不会单纯放宽长宽比：只有至少两个同色分区的质心同时
+落入同一个紫色围栏外接矩形、总颜色面积和可见矩形度仍达标时，才输出带
+`partial`、`entrance_unresolved`、`divider_unresolved` 和
+`side_unresolved` 的保守安全区。散落的同色任务物块没有共同紫色围栏，不会
+触发该降级路径。部分安全区只提供可见颜色范围的多边形，不补画被遮挡区域；
+定位层仍需另外通过中心十字射线、距离、横向偏差、置信度和时效门限后才能把它
+作为方向锚点。
+
 出发区只输出洋红轮廓和角点，不做数字 OCR，也不包含 1–4 编号。中心十字先
 合并两类证据：HSV 深色点划线，以及比局部地面更暗、低饱和的连续细线；后者
 用于真实 BEV 中因材料、曝光和缩放而呈灰色实线的中心标记。Hough 重复线会按

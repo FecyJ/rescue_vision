@@ -528,6 +528,148 @@ class FieldFeatureDetector:
             )
             if candidate is not None:
                 candidates.append(candidate)
+        if candidates:
+            return max(candidates, key=lambda item: item.confidence)
+        return self._partial_safe_zone(
+            color,
+            color_mask,
+            purple_mask,
+            valid_area=valid_area,
+            is_bev=is_bev,
+        )
+
+    def _partial_safe_zone(
+        self,
+        color: SafeZoneColor,
+        color_mask: Uint8Array,
+        purple_mask: Uint8Array,
+        *,
+        valid_area: int,
+        is_bev: bool,
+    ) -> SafeZoneObservation | None:
+        """Accept occluded colored halves only inside one purple enclosure."""
+
+        minimum_total_area = max(
+            1,
+            math.ceil(self._config.min_region_area_fraction * valid_area),
+        )
+        component_count, labels, stats, centroids = (
+            cv2.connectedComponentsWithStats(color_mask, connectivity=8)
+        )
+        usable_components = tuple(
+            label
+            for label in range(1, component_count)
+            if stats[label, cv2.CC_STAT_AREA] > 0
+        )
+        if len(usable_components) < 2:
+            return None
+
+        purple_contours, _ = cv2.findContours(
+            purple_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        candidates: list[SafeZoneObservation] = []
+        for contour in purple_contours:
+            purple_area = float(cv2.contourArea(contour))
+            if purple_area < minimum_total_area:
+                continue
+            enclosure_rectangle = cv2.minAreaRect(contour)
+            enclosure_width, enclosure_height = enclosure_rectangle[1]
+            enclosure_area = float(enclosure_width * enclosure_height)
+            if enclosure_area <= 0.0:
+                continue
+            purple_fill = purple_area / enclosure_area
+            if purple_fill < self._config.entrance_color_fraction:
+                continue
+            enclosure_box = cv2.boxPoints(enclosure_rectangle).astype(np.float32)
+            enclosed_components = sorted(
+                label
+                for label in usable_components
+                if cv2.pointPolygonTest(
+                    enclosure_box,
+                    (
+                        float(centroids[label][0]),
+                        float(centroids[label][1]),
+                    ),
+                    False,
+                )
+                >= 0.0
+            )
+            enclosed_components.sort(
+                key=lambda label: int(stats[label, cv2.CC_STAT_AREA]),
+                reverse=True,
+            )
+            if len(enclosed_components) < 2:
+                continue
+            largest_component_area = int(
+                stats[enclosed_components[0], cv2.CC_STAT_AREA]
+            )
+            significant_components = tuple(
+                label
+                for label in enclosed_components
+                if stats[label, cv2.CC_STAT_AREA]
+                >= largest_component_area
+                * self._config.entrance_color_fraction
+            )
+            if len(significant_components) < 2:
+                continue
+            selected_mask = np.where(
+                np.isin(labels, significant_components),
+                255,
+                0,
+            ).astype(np.uint8)
+            selected_area = int(np.count_nonzero(selected_mask))
+            if selected_area < minimum_total_area:
+                continue
+            nonzero = cv2.findNonZero(selected_mask)
+            assert nonzero is not None
+            visible_rectangle = cv2.minAreaRect(nonzero)
+            visible_width, visible_height = visible_rectangle[1]
+            visible_rectangle_area = float(visible_width * visible_height)
+            if visible_rectangle_area <= 0.0:
+                continue
+            visible_rectangularity = selected_area / visible_rectangle_area
+            if visible_rectangularity < self._config.min_rectangularity:
+                continue
+            visible_box = cv2.boxPoints(visible_rectangle).astype(np.float64)
+            mapped_box = self._map_points(visible_box, is_bev=is_bev)
+            component_areas = [
+                int(stats[label, cv2.CC_STAT_AREA])
+                for label in significant_components
+            ]
+            component_balance = min(component_areas) / max(component_areas)
+            area_evidence = min(
+                1.0,
+                selected_area / max(2.0 * minimum_total_area, 1.0),
+            )
+            confidence = min(
+                0.55,
+                0.20
+                + 0.15 * area_evidence
+                + 0.10 * component_balance
+                + 0.10 * min(1.0, purple_fill),
+            )
+            quality = {
+                FieldFeatureQuality.PARTIAL,
+                FieldFeatureQuality.ENTRANCE_UNRESOLVED,
+                FieldFeatureQuality.DIVIDER_UNRESOLVED,
+                FieldFeatureQuality.SIDE_UNRESOLVED,
+            }
+            if mapped_box.ground is None:
+                quality.add(FieldFeatureQuality.NO_GROUND_PROJECTION)
+            candidates.append(
+                SafeZoneObservation(
+                    physical_color=color,
+                    polygon_undistorted=mapped_box.pixels,
+                    polygon_ground=mapped_box.ground,
+                    entrance=None,
+                    divider=None,
+                    halves=(),
+                    confidence=confidence,
+                    quality=frozenset(quality),
+                )
+            )
         if not candidates:
             return None
         return max(candidates, key=lambda item: item.confidence)
