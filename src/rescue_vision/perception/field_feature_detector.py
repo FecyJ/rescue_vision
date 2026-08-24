@@ -507,6 +507,41 @@ class FieldFeatureDetector:
         valid_area: int,
         is_bev: bool,
     ) -> SafeZoneObservation | None:
+        # The configured close operation has already joined the two halves
+        # across a narrow divider.  Extract its remaining components so
+        # distant same-colored targets cannot enlarge the safe-zone rectangle.
+        component_count, labels, stats, _centroids = (
+            cv2.connectedComponentsWithStats(color_mask, connectivity=8)
+        )
+        candidates: list[SafeZoneObservation] = []
+        for label in range(1, component_count):
+            if stats[label, cv2.CC_STAT_AREA] <= 0:
+                continue
+            component_mask = np.where(labels == label, 255, 0).astype(np.uint8)
+            candidate = self._safe_zone_component(
+                color,
+                component_mask,
+                purple_mask,
+                dark_mask,
+                valid_area=valid_area,
+                is_bev=is_bev,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item.confidence)
+
+    def _safe_zone_component(
+        self,
+        color: SafeZoneColor,
+        color_mask: Uint8Array,
+        purple_mask: Uint8Array,
+        dark_mask: Uint8Array,
+        *,
+        valid_area: int,
+        is_bev: bool,
+    ) -> SafeZoneObservation | None:
         nonzero = cv2.findNonZero(color_mask)
         if nonzero is None:
             return None

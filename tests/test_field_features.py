@@ -139,10 +139,18 @@ def safe_zone_scene(*, include_purple: bool = True) -> np.ndarray:
     return image
 
 
+def safe_zone_config(**overrides) -> FieldFeatureConfig:
+    return config(
+        morphology_kernel_size=5,
+        close_iterations=2,
+        **overrides,
+    )
+
+
 def test_safe_zone_uses_approach_frame_and_keeps_physical_color() -> None:
     image = safe_zone_scene()
     detector = FieldFeatureDetector(
-        config(),
+        safe_zone_config(),
         static_map=static_map(),
         max_observation_age_ms=100.0,
         ground_projector=projector(),
@@ -176,10 +184,37 @@ def test_safe_zone_uses_approach_frame_and_keeps_physical_color() -> None:
     assert FieldFeatureQuality.SIDE_UNRESOLVED not in observation.quality
 
 
+def test_safe_zone_ignores_distant_same_color_target() -> None:
+    image = safe_zone_scene()
+    cv2.rectangle(image, (20, 300), (60, 340), bgr(3), thickness=-1)
+    detector = FieldFeatureDetector(
+        safe_zone_config(),
+        static_map=static_map(),
+        max_observation_age_ms=100.0,
+        ground_projector=projector(),
+    )
+
+    result = detector.detect(
+        frame(image),
+        image,
+        valid_mask=valid_mask(image),
+        result_timestamp_ns=1_100_000,
+    )
+
+    assert len(result.safe_zones) == 1
+    observation = result.safe_zones[0]
+    assert observation.physical_color is SafeZoneColor.RED
+    assert observation.polygon_ground is not None
+    xs = [point.x for point in observation.polygon_ground]
+    ys = [point.y for point in observation.polygon_ground]
+    assert max(xs) - min(xs) == pytest.approx(100.0, abs=6.0)
+    assert max(ys) - min(ys) == pytest.approx(200.0, abs=6.0)
+
+
 def test_safe_zone_does_not_invent_sides_without_entrance_evidence() -> None:
     image = safe_zone_scene(include_purple=False)
     detector = FieldFeatureDetector(
-        config(),
+        safe_zone_config(),
         static_map=static_map(),
         max_observation_age_ms=100.0,
         ground_projector=projector(),
@@ -202,7 +237,7 @@ def test_safe_zone_does_not_invent_sides_without_entrance_evidence() -> None:
 def test_safe_zone_without_projector_keeps_pixel_observation_only() -> None:
     image = safe_zone_scene()
     detector = FieldFeatureDetector(
-        config(),
+        safe_zone_config(),
         static_map=static_map(),
         max_observation_age_ms=100.0,
     )
