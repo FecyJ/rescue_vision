@@ -125,7 +125,8 @@ python manual_tests/cross_localization.py \
   --camera \
   --config configs/runtime.yaml \
   --output-jsonl output/cross_camera_live.jsonl \
-  --overlay-dir output/cross_camera_overlays
+  --overlay-dir output/cross_camera_overlays \
+  --print-interval 0.5
 ```
 
 `--camera` 会自动打开去畸变和 BEV 两个可缩放窗口，无需再传 `--display`；按
@@ -134,6 +135,17 @@ python manual_tests/cross_localization.py \
 Picamera2/rpicam 源和窗口。偶发过期帧会在双窗口和 JSONL 中标记
 `STALE dropped` 后继续读取最新帧，不会把旧观测用于定位。需要在有限帧后
 自动结束时可加 `--max-frames 100`。
+
+实时相机模式显式跳过普通场界候选，只运行安全区、中心十字和方向锚定所需
+步骤，以满足定位时效预算；因此该模式 JSONL 的 `boundary_feature_count` 为 0。
+需要检查围栏基线/场角时改用 `field_features.py`，不要用本命令的空边界集合
+证明现场没有场界。
+
+BEV 窗口会半透明填充并标出 `CROSS`、`SAFE red`、`SAFE blue`；当同帧十字、
+地面投影和安全区/场界方向证据足够消除四向歧义时，终端按
+`--print-interval` 打印十字机器人地面坐标、终端证据和最终
+`FieldPoint(x, y, heading)` 计算结果。设为 `--print-interval 0` 可打印每个
+成功定位帧；没有唯一位姿时不会打印伪造结果，窗口仍显示候选和降级原因。
 
 实时相机输入一定是原始像素，脚本会使用当前 `CameraModel` 去畸变，因此
 `--camera` 不能与 `--already-undistorted` 同时使用。实时模式仍只是视觉定位

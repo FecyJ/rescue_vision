@@ -1,4 +1,4 @@
-"""用文件或配置选择的相机检查中心十字定位，不访问串口或 Hailo。"""
+"""检测中心十字和安全区，显示 BEV 叠加并检查绝对定位，不访问串口或 Hailo。"""
 
 from __future__ import annotations
 
@@ -180,21 +180,136 @@ def _feature_record(result: FieldFeatureDetectionResult) -> dict[str, object]:
     }
 
 
-def _draw_polygon(
+def _put_label(
+    image: np.ndarray,
+    label: str,
+    center: tuple[int, int],
+    color: tuple[int, int, int],
+) -> None:
+    origin = (center[0] + 5, center[1] - 5)
+    cv2.putText(
+        image,
+        label,
+        origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (0, 0, 0),
+        3,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        image,
+        label,
+        origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        color,
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def _draw_region(
     image: np.ndarray,
     points: list[tuple[int, int]],
     color: tuple[int, int, int],
-    thickness: int = 2,
+    label: str,
+    thickness: int = 3,
 ) -> None:
-    if len(points) >= 3:
-        cv2.polylines(
-            image,
-            [np.asarray(points, dtype=np.int32)],
-            True,
-            color,
-            thickness,
-            cv2.LINE_AA,
+    """Fill and outline one detected region, then put its label at the centroid."""
+
+    if len(points) < 3:
+        return
+    polygon = np.asarray(points, dtype=np.int32)
+    tinted = image.copy()
+    cv2.fillPoly(tinted, [polygon], color)
+    cv2.addWeighted(tinted, 0.18, image, 0.82, 0.0, dst=image)
+    cv2.polylines(
+        image,
+        [polygon],
+        True,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
+    center = tuple(np.rint(np.mean(polygon, axis=0)).astype(int))
+    _put_label(image, label, (int(center[0]), int(center[1])), color)
+
+
+def _ground_centroid(points: tuple[GroundPoint, ...]) -> GroundPoint:
+    return GroundPoint(
+        sum(point.x for point in points) / len(points),
+        sum(point.y for point in points) / len(points),
+    )
+
+
+def _format_safe_zone_evidence(result: FieldFeatureDetectionResult) -> str:
+    evidence: list[str] = []
+    for zone in result.safe_zones:
+        if zone.polygon_ground is None:
+            evidence.append(
+                f"{zone.physical_color.value}:no_ground"
+                f"(conf={zone.confidence:.2f})"
+            )
+            continue
+        center = _ground_centroid(zone.polygon_ground)
+        evidence.append(
+            f"{zone.physical_color.value}"
+            f"@({center.x:.0f},{center.y:.0f})mm"
+            f"(conf={zone.confidence:.2f})"
         )
+    return ", ".join(evidence) if evidence else "none"
+
+
+def _print_localization_calculation(
+    result: FieldFeatureDetectionResult,
+    observation: CenterCrossPoseObservation,
+) -> None:
+    """Print the actual same-frame evidence and the selected pose calculation."""
+
+    pose = observation.selected_pose
+    if pose is None:
+        return
+    cross = result.center_cross
+    cross_text = "none"
+    if cross is not None and cross.intersection_ground is not None:
+        cross_text = (
+            f"({cross.intersection_ground.x:.1f},"
+            f" {cross.intersection_ground.y:.1f})mm"
+        )
+    terminals = [
+        (
+            f"{terminal.kind.value}@{terminal.distance_mm:.0f}mm"
+            if terminal.distance_mm is not None
+            else terminal.kind.value
+        )
+        + (
+            f" dir=({terminal.direction_forward:.2f},"
+            f"{terminal.direction_left:.2f})"
+            f"(conf={terminal.confidence:.2f})"
+        )
+        for terminal in observation.terminals
+        if terminal.kind.value != "unknown"
+    ]
+    terminal_text = ", ".join(terminals) if terminals else "none"
+    source = (
+        observation.selection_source.value
+        if observation.selection_source is not None
+        else "none"
+    )
+    quality = ",".join(sorted(item.value for item in observation.quality))
+    quality_text = quality if quality else "none"
+    print(
+        f"[定位成功] frame={observation.frame_sequence} "
+        f"cross_ground={cross_text}; "
+        f"safe_zone_evidence=[{_format_safe_zone_evidence(result)}]; "
+        f"terminals=[{terminal_text}]\n"
+        f"  field_pose=(x={pose.position.x:.1f}, y={pose.position.y:.1f})mm "
+        f"heading={math.degrees(pose.heading_rad):.1f}deg "
+        f"source={source} confidence={observation.confidence:.2f} "
+        f"quality={quality_text}",
+        flush=True,
+    )
 
 
 def _status_lines(observation: CenterCrossPoseObservation) -> list[str]:
@@ -262,11 +377,11 @@ def _undistorted_overlay(
     output = image.copy()
     for zone in result.safe_zones:
         color = (0, 0, 255) if zone.physical_color.value == "red" else (255, 0, 0)
-        _draw_polygon(
+        _draw_region(
             output,
             [_pixel(point) for point in zone.polygon_undistorted],
             color,
-            3,
+            f"SAFE {zone.physical_color.value}",
         )
     cross = result.center_cross
     if cross is not None:
@@ -280,14 +395,16 @@ def _undistorted_overlay(
                 cv2.LINE_AA,
             )
         if cross.intersection_undistorted is not None:
+            center_pixel = _pixel(cross.intersection_undistorted)
             cv2.circle(
                 output,
-                _pixel(cross.intersection_undistorted),
+                center_pixel,
                 7,
                 (0, 255, 255),
                 2,
                 cv2.LINE_AA,
             )
+            _put_label(output, "CROSS", center_pixel, (0, 255, 255))
     for feature in result.boundary_features:
         points = [_pixel(point) for point in feature.points_undistorted]
         if len(points) == 1:
@@ -319,11 +436,11 @@ def _bev_overlay(
         if zone.polygon_ground is None:
             continue
         color = (0, 0, 255) if zone.physical_color.value == "red" else (255, 0, 0)
-        _draw_polygon(
+        _draw_region(
             output,
             _ground_pixels(projector, zone.polygon_ground),
             color,
-            3,
+            f"SAFE {zone.physical_color.value}",
         )
     cross = result.center_cross
     if cross is not None:
@@ -339,6 +456,7 @@ def _bev_overlay(
             center = cross.intersection_ground
             center_pixel = _ground_pixels(projector, (center,))[0]
             cv2.circle(output, center_pixel, 7, (0, 255, 255), 2, cv2.LINE_AA)
+            _put_label(output, "CROSS", center_pixel, (0, 255, 255))
             for terminal in observation.terminals:
                 if terminal.distance_mm is None:
                     continue
@@ -380,6 +498,16 @@ def main() -> None:
     parser.add_argument("--overlay-dir", type=Path)
     parser.add_argument("--display", action="store_true")
     parser.add_argument("--max-frames", type=int)
+    parser.add_argument(
+        "--print-interval",
+        type=float,
+        default=0.5,
+        metavar="SECONDS",
+        help=(
+            "唯一定位成功时打印一次计算结果的最小间隔；"
+            "设为 0 打印每个成功帧（默认 0.5）。"
+        ),
+    )
     parser.add_argument("--already-undistorted", action="store_true")
     parser.add_argument(
         "--prior-field-pose",
@@ -398,6 +526,11 @@ def main() -> None:
         parser.error("--already-undistorted is only valid for file input.")
     if args.max_frames is not None and args.max_frames <= 0:
         parser.error("--max-frames must be positive.")
+    if not math.isfinite(args.print_interval) or args.print_interval < 0.0:
+        parser.error("--print-interval must be finite and non-negative.")
+    print_interval_ns_float = args.print_interval * 1_000_000_000
+    if not math.isfinite(print_interval_ns_float):
+        parser.error("--print-interval is too large.")
 
     config = load_runtime_config(args.config)
     geometry = config.build_geometry()
@@ -423,6 +556,8 @@ def main() -> None:
 
     processed = 0
     selected = 0
+    last_print_timestamp_ns: int | None = None
+    print_interval_ns = round(print_interval_ns_float)
     show_display = args.display or args.camera
     frame_context = (
         _camera_frames(config)
@@ -512,6 +647,19 @@ def main() -> None:
                         observation,
                     )
                     selected_current = observation.selected_pose is not None
+                    if selected_current:
+                        result_timestamp_ns = observation.result_timestamp_ns
+                        if (
+                            last_print_timestamp_ns is None
+                            or print_interval_ns == 0
+                            or result_timestamp_ns - last_print_timestamp_ns
+                            >= print_interval_ns
+                        ):
+                            _print_localization_calculation(
+                                features,
+                                observation,
+                            )
+                            last_print_timestamp_ns = result_timestamp_ns
                 output.write(
                     json.dumps(
                         payload,
