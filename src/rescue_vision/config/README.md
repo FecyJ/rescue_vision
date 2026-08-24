@@ -28,6 +28,7 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `HailoConfig.build_backend()` | 校验模型资产并创建 Hailo 后端 | Hailo 关闭时返回 `None` |
 | `HailoConfig.model_class_mapping()` | 把模型 class ID 映射为 `TargetClass` | 直接传给 `TargetPoseDetector` |
 | `PerceptionConfig.build_field_feature_detector()` | 创建传统视觉场地特征检测器 | `field_features.enabled=false` 时返回 `None` |
+| `PerceptionConfig.build_field_boundary_estimator()` | 创建机器人系时序局部场界估计器 | 禁用时返回 `None`；启用时要求场地特征和 BEV 地面映射 |
 | `PerceptionConfig.build_target_ground_geometry_estimator()` | 创建目标地面中心估计器 | 禁用时返回 `None`；启用时要求完整地面外参 |
 | `TrackingConfig.build_tracker()` | 创建一轮使用的多目标跟踪器 | 初始无轨迹 |
 | `WorldRuntimeConfig.build_model()` | 按 `team_color` 把物理静态地图派生为任务区域 | 队伍颜色未知时只派生场界 |
@@ -48,10 +49,11 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `TrackingConfig` | 关联、确认、滑行、衰减和删除阈值 |
 | `WorldRuntimeConfig` | 世界阈值、`TeamColor`、`StaticFieldMap` 及任务区域派生 |
 | `MissionConfig` | 比赛计时、安全超时、避让距离和目标优先级 |
-| `PerceptionConfig` | 目标检测/K0、ROI HSV、目标地面几何和静态场地特征参数 |
+| `PerceptionConfig` | 目标检测/K0、ROI HSV、目标地面几何、静态场地特征和局部场界参数 |
 | `HsvColorClassifierConfig` | 四类 HSV 闭区间、颜色证据门槛和掩码去噪参数 |
 | `TargetGroundGeometryConfig` | 四类三维形状尺寸、搜索步长、评分权重和接受门限 |
 | `FieldFeatureConfig` | 场地颜色、形态学、公差、点划线和边界候选阈值 |
+| `FieldBoundaryConfig` | 共线拟合、矩形公差、时序确认、边界带、时效和遮挡开关 |
 | `CenterCrossLocalizerConfig` | 终端射线关联、锚点置信度、先验创新和不确定度下限 |
 | `HailoConfig` | 模型资产、身份、类别映射和后端粗筛阈值 |
 | `RuntimeGeometry` | `camera_model`、可选 `ground_projector` |
@@ -186,12 +188,18 @@ field_detector = config.perception.build_field_feature_detector(
     max_observation_age_ms=config.processing.max_observation_age_ms,
     ground_projector=ground_projector,
 )
+field_boundary_estimator = config.perception.build_field_boundary_estimator(
+    static_map=config.world.static_map,
+    ground_projector=ground_projector,
+)
 center_cross_localizer = config.build_center_cross_localizer(
     ground_projector=ground_projector,
 )
 ```
 
-场地检测配置关闭时 `field_detector` 返回 `None`。没有地面映射时仍可输出部分图像观测，但不能分配
+场地检测配置关闭时 `field_detector` 返回 `None`。局部场界估计配置关闭时
+`field_boundary_estimator` 返回 `None`；启用它必须同时启用场地检测，并使用
+带 BEV 的地面映射。没有地面映射时场地检测器仍可输出部分图像观测，但不能分配
 安全区入口视角左右，也不能把像素伪装成毫米坐标。
 启用场地检测时，`world.static_map` 还必须同时包含红/蓝物资与伤员分区以及
 至少一个正方形出发区；检测器从这些多边形推导安全区和出发区物理尺寸，不在

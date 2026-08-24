@@ -306,6 +306,27 @@ perception:
       min_line_length_fraction: 0.20
       corner_tolerance_deg: 20.0
       max_features: 8
+      min_vertical_support_count: 3
+      side_contrast_threshold: 15
+
+  # 局部场界只依赖机器人地面系 BEV，不依赖全局定位。默认只输出三态掩膜；
+  # 取得真实场边录像并验收危险类召回前，不启用推理前硬遮挡。
+  field_boundary:
+    enabled: false
+    hard_mask_enabled: false
+    min_candidate_confidence: 0.25
+    min_confirmations: 2
+    max_missed_frames: 1
+    line_angle_tolerance_deg: 12.0
+    line_distance_tolerance_mm: 120.0
+    ransac_inlier_distance_mm: 60.0
+    rectangle_tolerance_fraction: 0.20
+    boundary_band_mm: 120.0
+    segment_extension_mm: 150.0
+    min_filter_confidence: 0.55
+    max_mask_age_ms: 150.0
+    mask_blur_radius_px: 5
+    neutral_fill_bgr: [114, 114, 114]
 
 localization:
   # 只生成中心十字低频绝对位姿观测；不包含 IMU/编码器融合。

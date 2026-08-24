@@ -141,6 +141,8 @@ class FieldFeatureConfig:
     boundary_min_line_length_fraction: float
     boundary_corner_tolerance_deg: float
     boundary_max_features: int
+    boundary_min_vertical_support_count: int
+    boundary_side_contrast_threshold: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -187,6 +189,7 @@ class FieldFeatureConfig:
             "center_max_saturation",
             "boundary_canny_low_threshold",
             "boundary_canny_high_threshold",
+            "boundary_side_contrast_threshold",
         ):
             value = getattr(self, name)
             if (
@@ -244,6 +247,14 @@ class FieldFeatureConfig:
             or self.boundary_max_features <= 0
         ):
             raise ValueError("boundary_max_features must be a positive integer.")
+        if (
+            isinstance(self.boundary_min_vertical_support_count, bool)
+            or not isinstance(self.boundary_min_vertical_support_count, int)
+            or self.boundary_min_vertical_support_count <= 0
+        ):
+            raise ValueError(
+                "boundary_min_vertical_support_count must be a positive integer."
+            )
 
     def ranges_for_safe_color(
         self,
@@ -417,8 +428,11 @@ class BoundaryFeatureObservation:
     kind: BoundaryFeatureKind
     points_undistorted: tuple[UndistortedPixel, ...]
     points_ground: tuple[GroundPoint, ...] | None
+    capture_timestamp_ns: int
     confidence: float
     quality: frozenset[FieldFeatureQuality]
+    interior_normal_ground: tuple[float, float] | None = None
+    line_offset_mm: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, BoundaryFeatureKind):
@@ -446,6 +460,30 @@ class BoundaryFeatureObservation:
             raise ValueError("quality must contain FieldFeatureQuality values.")
         if FieldFeatureQuality.LOW_CONFIDENCE_BOUNDARY not in self.quality:
             raise ValueError("boundary features must be marked low confidence.")
+        if self.capture_timestamp_ns < 0:
+            raise ValueError("capture_timestamp_ns must be non-negative.")
+        if (self.interior_normal_ground is None) != (self.line_offset_mm is None):
+            raise ValueError(
+                "interior_normal_ground and line_offset_mm must be set together."
+            )
+        if self.interior_normal_ground is not None:
+            if self.kind is not BoundaryFeatureKind.FENCE_BASE_SEGMENT:
+                raise ValueError("only fence base segments can carry line parameters.")
+            if self.points_ground is None:
+                raise ValueError("line parameters require ground points.")
+            nx, ny = self.interior_normal_ground
+            offset = float(self.line_offset_mm)
+            if not all(math.isfinite(value) for value in (nx, ny, offset)):
+                raise ValueError("boundary line parameters must be finite.")
+            if not math.isclose(math.hypot(nx, ny), 1.0, abs_tol=1e-6):
+                raise ValueError("interior_normal_ground must be a unit vector.")
+            for point in self.points_ground:
+                if not math.isclose(
+                    nx * point.x + ny * point.y + offset,
+                    0.0,
+                    abs_tol=1e-5,
+                ):
+                    raise ValueError("ground endpoints must lie on the boundary line.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -504,6 +542,13 @@ class FieldFeatureDetectionResult:
         ):
             raise ValueError(
                 "boundary_features must contain BoundaryFeatureObservation values."
+            )
+        if any(
+            item.capture_timestamp_ns != self.capture_timestamp_ns
+            for item in self.boundary_features
+        ):
+            raise ValueError(
+                "boundary feature timestamps must match the containing frame."
             )
 
 

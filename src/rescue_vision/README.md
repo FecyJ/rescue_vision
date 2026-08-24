@@ -70,6 +70,10 @@ field_detector = config.perception.build_field_feature_detector(
     max_observation_age_ms=config.processing.max_observation_age_ms,
     ground_projector=geometry.ground_projector,
 )
+field_boundary_estimator = config.perception.build_field_boundary_estimator(
+    static_map=config.world.static_map,
+    ground_projector=geometry.ground_projector,
+)
 center_cross_localizer = config.build_center_cross_localizer(
     ground_projector=geometry.ground_projector,
 )
@@ -99,17 +103,6 @@ with source, detector:
         undistorted_bgr = geometry.camera_model.undistort_image(
             raw_frame.image_bgr
         )
-        detection_result = detector.detect_realtime(
-            raw_frame,
-            undistorted_bgr,
-        )
-        ground_geometry_result = (
-            ground_geometry_estimator.estimate_realtime(
-                detection_result.observations
-            )
-            if ground_geometry_estimator is not None
-            else None
-        )
         field_realtime_result = (
             field_detector.detect_realtime(
                 raw_frame,
@@ -122,6 +115,26 @@ with source, detector:
         field_result = (
             field_realtime_result.result
             if field_realtime_result is not None
+            else None
+        )
+        field_mask = (
+            field_boundary_estimator.update(
+                field_result,
+                valid_mask=geometry.camera_model.valid_mask,
+            )
+            if field_boundary_estimator is not None and field_result is not None
+            else None
+        )
+        detection_result = detector.detect_realtime(
+            raw_frame,
+            undistorted_bgr,
+            field_mask=field_mask,
+        )
+        ground_geometry_result = (
+            ground_geometry_estimator.estimate_realtime(
+                detection_result.observations
+            )
+            if ground_geometry_estimator is not None
             else None
         )
         center_pose_observation = (
@@ -167,7 +180,7 @@ with source, detector:
 | [`communication`](communication/README.md) | `UartLineChannel`、`RemoteMessageConnection`、`VideoModeCommand`、`VideoFrameAttributes`、`MapSnapshotAttributes`、`RemoteSessionStatus` | UART、直接 TCP 远程消息、可选择 raw/perception/BEV 图传、FieldPoint/MapPixel 地图映射及可空机器人全局位姿 schema |
 | [`motion`](motion/README.md) | `MotionController`、`MotionLimits`、`GripperCalibration`、`RemoteMotionExecutor`、`RemoteGripperExecutor`、`run_remote_motion` | 差速运动、持续夹爪双舵机、Rescue Car 协议和远程调试执行 |
 | [`geometry`](geometry/README.md) | `CameraModel`、`GroundProjector`、显式坐标类型（含 `MapPixel`） | 去畸变及像素/地面/BEV 转换 |
-| [`perception`](perception/README.md) | `TargetPoseDetector`、`PerceptionFrameRenderer`、`TargetGroundGeometryEstimator`、`FieldFeatureDetector` | 任务目标、最新帧可视化旁路、地面几何和静态场地特征观测 |
+| [`perception`](perception/README.md) | `TargetPoseDetector`、`PerceptionFrameRenderer`、`TargetGroundGeometryEstimator`、`FieldFeatureDetector`、`FieldBoundaryEstimator` | 任务目标、最新帧可视化旁路、地面几何、静态场地特征和局部场界三态掩膜 |
 | [`localization`](localization/README.md) | `CenterCrossLocalizer`、`FieldPose2D`、`CenterCrossPoseObservation` | 中心十字绝对位姿候选、同帧方向锚定和先验门控 |
 | [`tracking`](tracking/README.md) | `MultiTargetTracker`、`TrackedTarget`、`TrackStatus` | 时间关联、遮挡和轨迹生命周期 |
 | [`world`](world/README.md) | `StaticFieldMap`、`WorldModel`、`WorldSnapshot`、`HazardState` | 固定物理地图、任务区域派生、动态目标、对手占据和不确定性 |

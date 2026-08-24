@@ -15,6 +15,7 @@ from rescue_vision.geometry.ground_projector import GroundProjector
 from rescue_vision.geometry.types import GroundPoint, UndistortedPixel
 from rescue_vision.perception.backend import InferenceBackend
 from rescue_vision.perception.color_segmentation import segment_roi_colors
+from rescue_vision.perception.field_boundary import FieldBoundaryMask, FieldMaskState
 from rescue_vision.perception.types import (
     ClassProbabilities,
     ColorSegmentationStatus,
@@ -136,6 +137,7 @@ class TargetPoseDetector:
         frame: CameraFrame,
         undistorted_image_bgr: np.ndarray,
         *,
+        field_mask: FieldBoundaryMask | None = None,
         result_timestamp_ns: int | None = None,
     ) -> list[TargetObservation]:
         if (
@@ -157,8 +159,25 @@ class TargetPoseDetector:
             raise ValueError(
                 f"Undistorted image_size {image_size} does not match frame {frame_size}."
             )
+        if (
+            field_mask is not None
+            and field_mask.image_state.shape
+            != (image_size[1], image_size[0])
+        ):
+            raise ValueError(
+                "field_mask image shape must match the undistorted image, got "
+                f"{field_mask.image_state.shape} and {image_size}."
+            )
 
-        detections = self._backend.infer(undistorted_image_bgr)
+        inference_image_bgr = (
+            field_mask.mask_for_inference(
+                undistorted_image_bgr,
+                timestamp_ns=frame.timestamp_ns,
+            )
+            if field_mask is not None
+            else undistorted_image_bgr
+        )
+        detections = self._backend.infer(inference_image_bgr)
         candidate_detections: list[ModelDetection] = []
         for detection in detections:
             if detection.confidence < self._detection_threshold:
@@ -216,6 +235,29 @@ class TargetPoseDetector:
                     else None
                 )
 
+            if (
+                field_mask is not None
+                and field_mask.filter_ready
+                and field_mask.usable_at(frame.timestamp_ns)
+            ):
+                field_state = (
+                    field_mask.state_at_pixel(k0.u, k0.v)
+                    if k0 is not None
+                    else FieldMaskState.UNCERTAIN
+                )
+                if field_state is FieldMaskState.UNCERTAIN:
+                    quality.add(ObservationQuality.FIELD_BOUNDARY_UNCERTAIN)
+                elif field_state is FieldMaskState.OUTSIDE:
+                    conservative_classes = {
+                        target_class,
+                        model_target_class,
+                    }
+                    if conservative_classes.isdisjoint(
+                        {TargetClass.BLUE_DANGER, TargetClass.UNKNOWN}
+                    ):
+                        continue
+                    quality.add(ObservationQuality.OUTSIDE_FIELD_SUSPECTED)
+
             processed.append(
                 _ProcessedDetection(
                     detection=detection,
@@ -268,6 +310,7 @@ class TargetPoseDetector:
         frame: CameraFrame,
         undistorted_image_bgr: np.ndarray,
         *,
+        field_mask: FieldBoundaryMask | None = None,
         result_timestamp_ns: int | None = None,
     ) -> RealtimeDetectionResult:
         """检测最新帧，并安全丢弃偶发的过期观测。
@@ -280,6 +323,7 @@ class TargetPoseDetector:
             observations = self.detect(
                 frame,
                 undistorted_image_bgr,
+                field_mask=field_mask,
                 result_timestamp_ns=result_timestamp_ns,
             )
         except StaleObservationError as exc:

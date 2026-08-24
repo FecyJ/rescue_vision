@@ -5,7 +5,9 @@
 类别并提供局部颜色分割掩码。`TargetGroundGeometryEstimator` 再利用该掩码、
 K0、完整相机外参和可配置三维形状估计目标地面中心、朝向与足迹。独立的
 `FieldFeatureDetector` 从同一去畸变帧检测安全区、出发区、中心十字和低精度
-边界候选；`localization.CenterCrossLocalizer` 再消费这些同帧观测，不回读
+边界候选；独立的 `FieldBoundaryEstimator` 在机器人地面系中做共线拟合、矩形
+软约束和连续帧确认，输出三态 BEV/图像掩膜；
+`localization.CenterCrossLocalizer` 再消费这些同帧观测，不回读
 图像或掩码。这些链路都不创建相机、不复制标定矩阵，也不修改跟踪、定位、
 世界模型或任务状态。
 
@@ -28,6 +30,9 @@ K0、完整相机外参和可配置三维形状估计目标地面中心、朝向
 | `CenterCrossObservation` | 无序的两条中心轴或单轴部分观测 |
 | `BoundaryFeatureObservation` | 显式低置信度的围栏基线或场地角点候选 |
 | `FieldFeatureConfig` | 场地颜色、形态学、公差、线段和角点阈值 |
+| `FieldBoundaryEstimator` | 把逐帧围栏候选合并为时序确认的机器人系开放场界 |
+| `FieldBoundaryMask` / `FieldMaskState` | 只读 `inside` / `uncertain` / `outside` 图像与 BEV 掩膜 |
+| `FieldBoundaryConfig` | 共线/RANSAC、矩形公差、时序、边界带和遮挡参数 |
 | `RealtimeDetectionResult` | 实时检测结果，并明确记录是否丢弃了过期帧 |
 | `render_target_observations()` | 在同坐标系图像副本上叠加框、颜色掩码、K0、置信度和质量 |
 | `PerceptionFrameRenderer` | 单槽最新帧后台推理与可视化旁路；不阻塞相机/运动循环；`clear_latest()` 用于切换模式时丢弃旧结果 |
@@ -121,6 +126,10 @@ with source, detector:
 ```
 
 `detect()` 的两个输入必须属于同一采集帧：第一个参数提供原始 `sequence/timestamp_ns`，第二个参数是该帧经当前 `CameraModel` 产生的去畸变图。不能把缓存旧图、裁剪图或另一相机的图像配给当前帧。
+
+可选的 `field_mask` 必须由同一帧或仍在配置时效内的场界估计产生。掩膜过期
+时检测器自动使用原图；明确场外的普通目标按 K0 丢弃，危险类和 `unknown`
+只添加 `outside_field_suspected`，不会被单帧场界静默删除。
 
 实时调用统一使用 `detect_realtime()`：它只兜底
 `StaleObservationError`，返回空观测并通过 `stale_dropped` /
@@ -386,6 +395,49 @@ for safe_zone in field_result.safe_zones if field_result is not None else ():
 `world.static_map.regions` 推导。红、蓝、洋红和紫色初值来自命题示意图，
 不是官方色卡；尺寸公差也只是启动值。获得现场材料、固定曝光和实际地面映射后
 必须重新标定。
+
+### 7.3 时序局部场界和三态掩膜
+
+以下片段承接 7.2 的 `field_detector`、`geometry` 和同一帧变量。场界估计要求
+地面标定包含 BEV；它不需要 `FieldPose2D`，也不会产生或伪造全局坐标：
+
+```python
+field_boundary_estimator = config.perception.build_field_boundary_estimator(
+    static_map=config.world.static_map,
+    ground_projector=geometry.ground_projector,
+)
+```
+
+在每帧中先更新场界，再把结果交给目标检测器：
+
+```python
+field_mask = None
+if field_result is not None and field_boundary_estimator is not None:
+    field_mask = field_boundary_estimator.update(
+        field_result,
+        valid_mask=geometry.camera_model.valid_mask,
+    )
+
+detection_result = detector.detect_realtime(
+    raw_frame,
+    undistorted_bgr,
+    field_mask=field_mask,
+)
+```
+
+逐帧边界候选以长底边为主，并用与底边近似垂直的重复支撑线及线段两侧亮度
+变化提高置信度；这些证据不足时仍保留低置信度候选，不强判场界。
+`FieldBoundaryEstimator` 仅消费 `FENCE_BASE_SEGMENT` 地面线段，以确定性 RANSAC
+合并共线端点，使用场地图尺寸约束不合理平行边，并由机器人原点及同帧安全区、
+出发区、中心十字地面点确定场内法向。边界必须达到连续帧确认次数才参与分类；
+有限线段只在配置的端部扩展范围内生效，单边或双边不会被补成闭合矩形。
+
+掩膜编码固定为 `outside=0`、`uncertain=127`、`inside=255`。只有 `outside`
+会在推理副本中以配置的中性 BGR 渐变填充；原始录像、显示图和 HSV 复核仍使用
+未遮挡图像。`hard_mask_enabled` 默认关闭，必须用真实场边录像验收边界误差和
+危险类召回后才能开启。无候选、未确认、过期或低置信度时
+`filter_ready=false`、`hard_mask_ready=false`，检测前后都自动回退为不使用
+场界过滤。
 
 离线图片或视频检查：
 

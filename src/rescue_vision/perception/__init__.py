@@ -7,6 +7,13 @@ from rescue_vision.perception.detector import (
     TargetPoseDetector,
 )
 from rescue_vision.perception.field_feature_detector import FieldFeatureDetector
+from rescue_vision.perception.field_boundary import (
+    FieldBoundaryConfig,
+    FieldBoundaryEstimator,
+    FieldBoundaryMask,
+    FieldMaskState,
+    LocalFieldBoundary,
+)
 from rescue_vision.perception.field_feature_types import (
     BoundaryFeatureKind,
     BoundaryFeatureObservation,
@@ -63,6 +70,10 @@ __all__ = [
     "ColorSegmentationStatus",
     "FakeInferenceBackend",
     "FieldFeatureConfig",
+    "FieldBoundaryConfig",
+    "FieldBoundaryEstimator",
+    "FieldBoundaryMask",
+    "FieldMaskState",
     "FieldFeatureDetectionResult",
     "FieldFeatureDetector",
     "FieldFeatureQuality",
@@ -72,6 +83,7 @@ __all__ = [
     "GroundGeometryMethod",
     "GroundGeometryQuality",
     "LineSegmentObservation",
+    "LocalFieldBoundary",
     "RealtimeFieldFeatureResult",
     "RealtimeTargetGroundGeometryResult",
     "RegularTetrahedronTargetGeometry",

@@ -151,6 +151,7 @@ def boundary(
             UndistortedPixel(end.x + 2000.0, end.y + 2000.0),
         ),
         points_ground=(start, end),
+        capture_timestamp_ns=1_000_000,
         confidence=confidence,
         quality=frozenset({FieldFeatureQuality.LOW_CONFIDENCE_BOUNDARY}),
     )

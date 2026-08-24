@@ -63,6 +63,8 @@ def config(**overrides) -> FieldFeatureConfig:
         "boundary_min_line_length_fraction": 0.20,
         "boundary_corner_tolerance_deg": 20.0,
         "boundary_max_features": 6,
+        "boundary_min_vertical_support_count": 3,
+        "boundary_side_contrast_threshold": 15,
     }
     values.update(overrides)
     return FieldFeatureConfig(**values)
@@ -386,6 +388,20 @@ def test_boundary_candidates_are_explicitly_low_confidence_and_bounded() -> None
         FieldFeatureQuality.LOW_CONFIDENCE_BOUNDARY in item.quality
         for item in result.boundary_features
     )
+    ground_segments = tuple(
+        item
+        for item in result.boundary_features
+        if item.kind is BoundaryFeatureKind.FENCE_BASE_SEGMENT
+        and item.points_ground is not None
+    )
+    assert ground_segments
+    assert all(
+        item.capture_timestamp_ns == frame(image).timestamp_ns
+        for item in ground_segments
+    )
+    assert all(item.interior_normal_ground is not None for item in ground_segments)
+    assert all(item.line_offset_mm is not None for item in ground_segments)
+    assert max(item.confidence for item in ground_segments) > 0.55
 
 
 def test_undistortion_fill_boundary_is_not_reported_as_a_field_feature() -> None:

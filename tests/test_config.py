@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -8,9 +9,15 @@ import pytest
 
 from rescue_vision.config.runtime import load_runtime_config
 from rescue_vision.geometry.camera_model import CameraCalibration, CameraModelType
-from rescue_vision.geometry.ground_projector import GroundProjector
-from rescue_vision.geometry.types import robot_frame_metadata
-from rescue_vision.world import RegionKind, TeamColor
+from rescue_vision.geometry.ground_projector import BevConfig, GroundProjector
+from rescue_vision.geometry.types import FieldPoint, robot_frame_metadata
+from rescue_vision.world import (
+    PhysicalRegionKind,
+    PhysicalStaticRegion,
+    RegionKind,
+    StaticFieldMap,
+    TeamColor,
+)
 
 
 def write_intrinsics(path, *, usable: bool = True) -> CameraCalibration:
@@ -291,6 +298,62 @@ def test_strict_config_and_geometry_build(tmp_path) -> None:
     assert geometry is not None
     assert geometry.camera_model.image_size == (32, 24)
     assert geometry.ground_projector is not None
+
+
+def test_field_boundary_builder_requires_features_and_bev(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(config_text(), encoding="utf-8")
+    loaded = load_runtime_config(path)
+    enabled_boundary = replace(
+        loaded.perception.field_boundary,
+        enabled=True,
+    )
+    enabled_perception = replace(
+        loaded.perception,
+        field_boundary=enabled_boundary,
+        field_features=replace(loaded.perception.field_features, enabled=True),
+    )
+    projector = GroundProjector(
+        np.eye(3),
+        BevConfig(0.0, 100.0, -50.0, 50.0, 1.0),
+    )
+    field = PhysicalStaticRegion(
+        "field",
+        PhysicalRegionKind.FIELD,
+        (
+            FieldPoint(-1500.0, -1500.0),
+            FieldPoint(1500.0, -1500.0),
+            FieldPoint(1500.0, 1500.0),
+            FieldPoint(-1500.0, 1500.0),
+        ),
+    )
+    static_map = StaticFieldMap(
+        loaded.world.static_map.center_cross,
+        (field, *loaded.world.static_map.regions),
+    )
+
+    estimator = enabled_perception.build_field_boundary_estimator(
+        static_map=static_map,
+        ground_projector=projector,
+    )
+
+    assert estimator is not None
+    with pytest.raises(RuntimeError, match="BEV"):
+        enabled_perception.build_field_boundary_estimator(
+            static_map=static_map,
+            ground_projector=GroundProjector(np.eye(3)),
+        )
+    with pytest.raises(RuntimeError, match="field_features"):
+        replace(
+            enabled_perception,
+            field_features=replace(
+                enabled_perception.field_features,
+                enabled=False,
+            ),
+        ).build_field_boundary_estimator(
+            static_map=static_map,
+            ground_projector=projector,
+        )
 
 
 def test_center_cross_localizer_requires_enabled_feature_and_ground_mapping(

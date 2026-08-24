@@ -190,6 +190,43 @@ def _line_sample_fraction(mask: Uint8Array, segment: FloatPoint) -> float:
     return float(np.count_nonzero(mask[v, u])) / len(samples)
 
 
+def _line_side_contrast(
+    gray: Uint8Array,
+    valid_mask: Uint8Array,
+    segment: FloatPoint,
+) -> float:
+    """比较候选底边两侧的局部外观，作为场内外变化的弱证据。"""
+
+    direction = segment[1] - segment[0]
+    length = float(np.linalg.norm(direction))
+    if length <= 1e-6:
+        return 0.0
+    normal = np.asarray((-direction[1], direction[0]), dtype=np.float64) / length
+    offset = max(2.0, math.hypot(*gray.shape) * 0.01)
+    samples = np.linspace(segment[0], segment[1], max(8, round(length / 4.0)))
+    means: list[float] = []
+    height, width = gray.shape
+    for sign in (-1.0, 1.0):
+        shifted = samples + sign * offset * normal
+        u = np.rint(shifted[:, 0]).astype(np.intp)
+        v = np.rint(shifted[:, 1]).astype(np.intp)
+        selected = (
+            (u >= 0)
+            & (u < width)
+            & (v >= 0)
+            & (v < height)
+        )
+        u = u[selected]
+        v = v[selected]
+        if len(u) == 0:
+            return 0.0
+        valid = valid_mask[v, u] != 0
+        if int(np.count_nonzero(valid)) < max(3, len(u) // 2):
+            return 0.0
+        means.append(float(np.median(gray[v[valid], u[valid]])))
+    return abs(means[0] - means[1])
+
+
 def _segment_angle(segment: FloatPoint) -> float:
     direction = segment[1] - segment[0]
     return math.atan2(float(direction[1]), float(direction[0])) % math.pi
@@ -953,6 +990,7 @@ class FieldFeatureDetector:
         valid_mask: Uint8Array,
         center_cross: CenterCrossObservation | None,
         *,
+        capture_timestamp_ns: int,
         is_bev: bool,
     ) -> tuple[BoundaryFeatureObservation, ...]:
         gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
@@ -976,6 +1014,14 @@ class FieldFeatureDetector:
         )
         if not segments:
             return ()
+        support_segments = _hough_segments(
+            edges,
+            min_length_fraction=max(
+                0.03,
+                self._config.boundary_min_line_length_fraction * 0.30,
+            ),
+            max_gap_fraction=0.015,
+        )
 
         height, width = edges.shape
         diagonal = math.hypot(width, height)
@@ -1088,11 +1134,12 @@ class FieldFeatureDetector:
                     quality.add(FieldFeatureQuality.NO_GROUND_PROJECTION)
                 observations.append(
                     BoundaryFeatureObservation(
-                        BoundaryFeatureKind.FIELD_CORNER,
-                        mapped.pixels,
-                        mapped.ground,
-                        0.35,
-                        frozenset(quality),
+                        kind=BoundaryFeatureKind.FIELD_CORNER,
+                        points_undistorted=mapped.pixels,
+                        points_ground=mapped.ground,
+                        capture_timestamp_ns=capture_timestamp_ns,
+                        confidence=0.35,
+                        quality=frozenset(quality),
                     )
                 )
                 if len(observations) >= self._config.boundary_max_features:
@@ -1103,13 +1150,65 @@ class FieldFeatureDetector:
             quality = {FieldFeatureQuality.LOW_CONFIDENCE_BOUNDARY}
             if mapped.ground is None:
                 quality.add(FieldFeatureQuality.NO_GROUND_PROJECTION)
+            interior_normal: tuple[float, float] | None = None
+            line_offset: float | None = None
+            if mapped.ground is not None:
+                start = np.asarray(
+                    (mapped.ground[0].x, mapped.ground[0].y),
+                    dtype=np.float64,
+                )
+                end = np.asarray(
+                    (mapped.ground[1].x, mapped.ground[1].y),
+                    dtype=np.float64,
+                )
+                direction = end - start
+                direction /= np.linalg.norm(direction)
+                normal = np.asarray((-direction[1], direction[0]))
+                midpoint = (start + end) * 0.5
+                if float(np.dot(normal, -midpoint)) < 0.0:
+                    normal = -normal
+                interior_normal = (float(normal[0]), float(normal[1]))
+                line_offset = -float(np.dot(normal, midpoint))
+            vertical_support = sum(
+                1
+                for support in support_segments
+                if _perpendicular(
+                    segment,
+                    support,
+                    self._config.boundary_corner_tolerance_deg,
+                )
+                and min(
+                    _point_to_line_distance(support[0], segment),
+                    _point_to_line_distance(support[1], segment),
+                ) <= 0.03 * diagonal
+            )
+            vertical_score = min(
+                1.0,
+                vertical_support
+                / self._config.boundary_min_vertical_support_count,
+            )
+            contrast = _line_side_contrast(gray, interior_valid, segment)
+            contrast_score = min(
+                1.0,
+                contrast / self._config.boundary_side_contrast_threshold,
+            )
+            confidence = min(
+                0.75,
+                0.2
+                + 0.25 * _line_length(segment) / diagonal
+                + 0.15 * vertical_score
+                + 0.15 * contrast_score,
+            )
             observations.append(
                 BoundaryFeatureObservation(
-                    BoundaryFeatureKind.FENCE_BASE_SEGMENT,
-                    mapped.pixels,
-                    mapped.ground,
-                    min(0.45, 0.2 + 0.25 * _line_length(segment) / diagonal),
-                    frozenset(quality),
+                    kind=BoundaryFeatureKind.FENCE_BASE_SEGMENT,
+                    points_undistorted=mapped.pixels,
+                    points_ground=mapped.ground,
+                    capture_timestamp_ns=capture_timestamp_ns,
+                    confidence=confidence,
+                    quality=frozenset(quality),
+                    interior_normal_ground=interior_normal,
+                    line_offset_mm=line_offset,
                 )
             )
             if len(observations) >= self._config.boundary_max_features:
@@ -1242,6 +1341,7 @@ class FieldFeatureDetector:
             working.image_bgr,
             working.valid_mask,
             center_cross,
+            capture_timestamp_ns=frame.timestamp_ns,
             is_bev=working.is_bev,
         )
 

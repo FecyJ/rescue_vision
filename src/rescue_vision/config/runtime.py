@@ -22,6 +22,7 @@ from rescue_vision.perception.types import (
     TargetClass,
 )
 from rescue_vision.perception.field_feature_types import FieldFeatureConfig
+from rescue_vision.perception.field_boundary import FieldBoundaryConfig
 from rescue_vision.perception.target_ground_geometry import (
     BoxTargetGeometry,
     RegularTetrahedronTargetGeometry,
@@ -373,7 +374,26 @@ def _perception_defaults() -> dict[str, Any]:
                 "min_line_length_fraction": 0.20,
                 "corner_tolerance_deg": 20.0,
                 "max_features": 8,
+                "min_vertical_support_count": 3,
+                "side_contrast_threshold": 15,
             },
+        },
+        "field_boundary": {
+            "enabled": False,
+            "hard_mask_enabled": False,
+            "min_candidate_confidence": 0.25,
+            "min_confirmations": 2,
+            "max_missed_frames": 1,
+            "line_angle_tolerance_deg": 12.0,
+            "line_distance_tolerance_mm": 120.0,
+            "ransac_inlier_distance_mm": 60.0,
+            "rectangle_tolerance_fraction": 0.20,
+            "boundary_band_mm": 120.0,
+            "segment_extension_mm": 150.0,
+            "min_filter_confidence": 0.55,
+            "max_mask_age_ms": 150.0,
+            "mask_blur_radius_px": 5,
+            "neutral_fill_bgr": [114, 114, 114],
         },
     }
 
@@ -671,6 +691,7 @@ class PerceptionConfig:
     color_classifier: HsvColorClassifierConfig
     target_ground_geometry: TargetGroundGeometryConfig
     field_features: FieldFeatureConfig
+    field_boundary: FieldBoundaryConfig
 
     def build_target_ground_geometry_estimator(
         self,
@@ -715,6 +736,30 @@ class PerceptionConfig:
             self.field_features,
             static_map=static_map,
             max_observation_age_ms=max_observation_age_ms,
+            ground_projector=ground_projector,
+        )
+
+    def build_field_boundary_estimator(
+        self,
+        *,
+        static_map: StaticFieldMap,
+        ground_projector: GroundProjector | None,
+    ):
+        """按配置创建局部场界时序估计器；禁用时返回 ``None``。"""
+
+        if not self.field_boundary.enabled:
+            return None
+        if not self.field_features.enabled:
+            raise RuntimeError(
+                "Enabled field_boundary requires perception.field_features."
+            )
+        if ground_projector is None or ground_projector.bev_config is None:
+            raise RuntimeError("Enabled field_boundary requires BEV ground mapping.")
+        from rescue_vision.perception import FieldBoundaryEstimator
+
+        return FieldBoundaryEstimator(
+            self.field_boundary,
+            static_map=static_map,
             ground_projector=ground_projector,
         )
 
@@ -1548,6 +1593,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "color_classifier",
             "target_ground_geometry",
             "field_features",
+            "field_boundary",
         },
         "perception",
     )
@@ -2050,6 +2096,8 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "min_line_length_fraction",
             "corner_tolerance_deg",
             "max_features",
+            "min_vertical_support_count",
+            "side_contrast_threshold",
         },
         "perception.field_features.boundary",
     )
@@ -2247,6 +2295,115 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             ),
             "perception.field_features.boundary.max_features",
         ),
+        boundary_min_vertical_support_count=_positive_int(
+            _required(
+                boundary_raw,
+                "min_vertical_support_count",
+                "perception.field_features.boundary",
+            ),
+            "perception.field_features.boundary.min_vertical_support_count",
+        ),
+        boundary_side_contrast_threshold=_positive_int(
+            _required(
+                boundary_raw,
+                "side_contrast_threshold",
+                "perception.field_features.boundary",
+            ),
+            "perception.field_features.boundary.side_contrast_threshold",
+        ),
+    )
+    field_boundary_raw = _mapping(
+        _required(perception_raw, "field_boundary", "perception"),
+        "perception.field_boundary",
+    )
+    field_boundary_names = {
+        "enabled",
+        "hard_mask_enabled",
+        "min_candidate_confidence",
+        "min_confirmations",
+        "max_missed_frames",
+        "line_angle_tolerance_deg",
+        "line_distance_tolerance_mm",
+        "ransac_inlier_distance_mm",
+        "rectangle_tolerance_fraction",
+        "boundary_band_mm",
+        "segment_extension_mm",
+        "min_filter_confidence",
+        "max_mask_age_ms",
+        "mask_blur_radius_px",
+        "neutral_fill_bgr",
+    }
+    _reject_unknown(
+        field_boundary_raw,
+        field_boundary_names,
+        "perception.field_boundary",
+    )
+    for flag in ("enabled", "hard_mask_enabled"):
+        if not isinstance(field_boundary_raw[flag], bool):
+            raise ValueError(f"perception.field_boundary.{flag} must be a boolean.")
+    neutral_fill_raw = field_boundary_raw["neutral_fill_bgr"]
+    if not isinstance(neutral_fill_raw, list) or len(neutral_fill_raw) != 3:
+        raise ValueError(
+            "perception.field_boundary.neutral_fill_bgr must be [b, g, r]."
+        )
+    field_boundary = FieldBoundaryConfig(
+        enabled=field_boundary_raw["enabled"],
+        hard_mask_enabled=field_boundary_raw["hard_mask_enabled"],
+        min_candidate_confidence=_threshold(
+            field_boundary_raw["min_candidate_confidence"],
+            "perception.field_boundary.min_candidate_confidence",
+        ),
+        min_confirmations=_positive_int(
+            field_boundary_raw["min_confirmations"],
+            "perception.field_boundary.min_confirmations",
+        ),
+        max_missed_frames=_nonnegative_int(
+            field_boundary_raw["max_missed_frames"],
+            "perception.field_boundary.max_missed_frames",
+        ),
+        line_angle_tolerance_deg=_finite_float(
+            field_boundary_raw["line_angle_tolerance_deg"],
+            "perception.field_boundary.line_angle_tolerance_deg",
+            minimum=0.001,
+        ),
+        line_distance_tolerance_mm=_finite_float(
+            field_boundary_raw["line_distance_tolerance_mm"],
+            "perception.field_boundary.line_distance_tolerance_mm",
+            minimum=0.001,
+        ),
+        ransac_inlier_distance_mm=_finite_float(
+            field_boundary_raw["ransac_inlier_distance_mm"],
+            "perception.field_boundary.ransac_inlier_distance_mm",
+            minimum=0.001,
+        ),
+        rectangle_tolerance_fraction=_threshold(
+            field_boundary_raw["rectangle_tolerance_fraction"],
+            "perception.field_boundary.rectangle_tolerance_fraction",
+        ),
+        boundary_band_mm=_finite_float(
+            field_boundary_raw["boundary_band_mm"],
+            "perception.field_boundary.boundary_band_mm",
+            minimum=0.001,
+        ),
+        segment_extension_mm=_finite_float(
+            field_boundary_raw["segment_extension_mm"],
+            "perception.field_boundary.segment_extension_mm",
+            minimum=0.001,
+        ),
+        min_filter_confidence=_threshold(
+            field_boundary_raw["min_filter_confidence"],
+            "perception.field_boundary.min_filter_confidence",
+        ),
+        max_mask_age_ms=_finite_float(
+            field_boundary_raw["max_mask_age_ms"],
+            "perception.field_boundary.max_mask_age_ms",
+            minimum=0.001,
+        ),
+        mask_blur_radius_px=_nonnegative_int(
+            field_boundary_raw["mask_blur_radius_px"],
+            "perception.field_boundary.mask_blur_radius_px",
+        ),
+        neutral_fill_bgr=tuple(neutral_fill_raw),
     )
     perception = PerceptionConfig(
         detection_threshold=detection_threshold,
@@ -2254,6 +2411,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         color_classifier=color_classifier,
         target_ground_geometry=target_ground_geometry,
         field_features=field_features,
+        field_boundary=field_boundary,
     )
 
     localization_raw = _merge_defaults(
