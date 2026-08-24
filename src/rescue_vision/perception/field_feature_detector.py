@@ -242,7 +242,7 @@ def _deduplicate_center_axes(
     *,
     diagonal: float,
     angle_tolerance_deg: float,
-    limit: int = 20,
+    limit: int = 32,
 ) -> list[_CenterAxisCandidate]:
     """折叠同一物理轴产生的平行 Hough 重复线。"""
 
@@ -251,7 +251,10 @@ def _deduplicate_center_axes(
     distance_tolerance = max(2.0, diagonal * 0.01)
     for candidate in sorted(
         candidates,
-        key=lambda item: _line_length(item.segment),
+        key=lambda item: (
+            item.local_support + 0.10 * min(item.gap_count, 5),
+            _line_length(item.segment),
+        ),
         reverse=True,
     ):
         midpoint = np.mean(candidate.segment, axis=0)
@@ -534,6 +537,7 @@ class FieldFeatureDetector:
             color,
             color_mask,
             purple_mask,
+            dark_mask,
             valid_area=valid_area,
             is_bev=is_bev,
         )
@@ -543,6 +547,7 @@ class FieldFeatureDetector:
         color: SafeZoneColor,
         color_mask: Uint8Array,
         purple_mask: Uint8Array,
+        dark_mask: Uint8Array,
         *,
         valid_area: int,
         is_bev: bool,
@@ -561,7 +566,7 @@ class FieldFeatureDetector:
             for label in range(1, component_count)
             if stats[label, cv2.CC_STAT_AREA] > 0
         )
-        if len(usable_components) < 2:
+        if not usable_components:
             return None
 
         purple_contours, _ = cv2.findContours(
@@ -569,12 +574,31 @@ class FieldFeatureDetector:
             cv2.RETR_EXTERNAL,
             cv2.CHAIN_APPROX_SIMPLE,
         )
+        purple_contours = sorted(
+            (
+                contour
+                for contour in purple_contours
+                if cv2.contourArea(contour) >= minimum_total_area
+            ),
+            key=cv2.contourArea,
+            reverse=True,
+        )[:8]
+        enclosure_groups = [
+            (contour,)
+            for contour in purple_contours
+        ] + [
+            (first, second)
+            for first_index, first in enumerate(purple_contours)
+            for second in purple_contours[first_index + 1 :]
+        ]
         candidates: list[SafeZoneObservation] = []
-        for contour in purple_contours:
-            purple_area = float(cv2.contourArea(contour))
-            if purple_area < minimum_total_area:
-                continue
-            enclosure_rectangle = cv2.minAreaRect(contour)
+        for enclosure_group in enclosure_groups:
+            purple_area = sum(
+                float(cv2.contourArea(contour))
+                for contour in enclosure_group
+            )
+            enclosure_points = np.concatenate(enclosure_group, axis=0)
+            enclosure_rectangle = cv2.minAreaRect(enclosure_points)
             enclosure_width, enclosure_height = enclosure_rectangle[1]
             enclosure_area = float(enclosure_width * enclosure_height)
             if enclosure_area <= 0.0:
@@ -582,6 +606,35 @@ class FieldFeatureDetector:
             purple_fill = purple_area / enclosure_area
             if purple_fill < self._config.entrance_color_fraction:
                 continue
+            enclosure_geometry_confirmed = False
+            if is_bev:
+                assert self._ground_projector is not None
+                assert self._ground_projector.bev_config is not None
+                mm_per_pixel = self._ground_projector.bev_config.mm_per_pixel
+                expected_width_mm, expected_depth_mm = (
+                    self._safe_zone_dimensions[color]
+                )
+                enclosure_dimensions_mm = sorted(
+                    (
+                        enclosure_width * mm_per_pixel,
+                        enclosure_height * mm_per_pixel,
+                    ),
+                    reverse=True,
+                )
+                if not (
+                    _within_expected(
+                        enclosure_dimensions_mm[0],
+                        expected_width_mm,
+                        self._config.dimension_tolerance_fraction,
+                    )
+                    and _within_expected(
+                        enclosure_dimensions_mm[1],
+                        expected_depth_mm,
+                        self._config.dimension_tolerance_fraction,
+                    )
+                ):
+                    continue
+                enclosure_geometry_confirmed = True
             enclosure_box = cv2.boxPoints(enclosure_rectangle).astype(np.float32)
             enclosed_components = sorted(
                 label
@@ -600,7 +653,7 @@ class FieldFeatureDetector:
                 key=lambda label: int(stats[label, cv2.CC_STAT_AREA]),
                 reverse=True,
             )
-            if len(enclosed_components) < 2:
+            if not enclosed_components:
                 continue
             largest_component_area = int(
                 stats[enclosed_components[0], cv2.CC_STAT_AREA]
@@ -612,7 +665,7 @@ class FieldFeatureDetector:
                 >= largest_component_area
                 * self._config.entrance_color_fraction
             )
-            if len(significant_components) < 2:
+            if not significant_components:
                 continue
             selected_mask = np.where(
                 np.isin(labels, significant_components),
@@ -621,6 +674,11 @@ class FieldFeatureDetector:
             ).astype(np.uint8)
             selected_area = int(np.count_nonzero(selected_mask))
             if selected_area < minimum_total_area:
+                continue
+            purple_overlap = int(
+                np.count_nonzero(cv2.bitwise_and(selected_mask, purple_mask))
+            ) / selected_area
+            if purple_overlap > self._config.entrance_color_fraction:
                 continue
             nonzero = cv2.findNonZero(selected_mask)
             assert nonzero is not None
@@ -633,7 +691,60 @@ class FieldFeatureDetector:
             if visible_rectangularity < self._config.min_rectangularity:
                 continue
             visible_box = cv2.boxPoints(visible_rectangle).astype(np.float64)
-            mapped_box = self._map_points(visible_box, is_bev=is_bev)
+            observation_box = (
+                enclosure_box.astype(np.float64)
+                if enclosure_geometry_confirmed
+                else visible_box
+            )
+            mapped_box = self._map_points(observation_box, is_bev=is_bev)
+            edges = [
+                np.asarray(
+                    (visible_box[index], visible_box[(index + 1) % 4]),
+                    dtype=np.float64,
+                )
+                for index in range(4)
+            ]
+            edge_lengths = [_line_length(edge) for edge in edges]
+            longest = max(edge_lengths)
+            long_edge_indices = [
+                index
+                for index, length in enumerate(edge_lengths)
+                if length >= 0.85 * longest
+            ]
+            divider_score = 0.0
+            divider_segment: FloatPoint | None = None
+            if len(long_edge_indices) >= 2:
+                first_long_edge = edges[long_edge_indices[0]]
+                second_long_edge = edges[long_edge_indices[1]]
+                divider_segment = np.asarray(
+                    (
+                        np.mean(first_long_edge, axis=0),
+                        np.mean(second_long_edge, axis=0),
+                    ),
+                    dtype=np.float64,
+                )
+                divider_score = _line_fraction(
+                    dark_mask,
+                    divider_segment[0],
+                    divider_segment[1],
+                    max(3, round(min(visible_width, visible_height) * 0.12)),
+                )
+            has_two_color_halves = len(significant_components) >= 2
+            has_dark_divider = (
+                divider_segment is not None
+                and divider_score >= self._config.divider_dark_fraction
+            )
+            if (
+                not has_two_color_halves
+                and not has_dark_divider
+                and not enclosure_geometry_confirmed
+            ):
+                continue
+            divider_observation = (
+                self._line_observation(divider_segment, is_bev=is_bev)
+                if has_dark_divider and divider_segment is not None
+                else None
+            )
             component_areas = [
                 int(stats[label, cv2.CC_STAT_AREA])
                 for label in significant_components
@@ -643,19 +754,27 @@ class FieldFeatureDetector:
                 1.0,
                 selected_area / max(2.0 * minimum_total_area, 1.0),
             )
+            corroboration_score = (
+                component_balance
+                if has_two_color_halves
+                else min(1.0, divider_score)
+                if has_dark_divider
+                else self._config.entrance_color_fraction
+            )
             confidence = min(
                 0.55,
                 0.20
                 + 0.15 * area_evidence
-                + 0.10 * component_balance
+                + 0.10 * corroboration_score
                 + 0.10 * min(1.0, purple_fill),
             )
             quality = {
                 FieldFeatureQuality.PARTIAL,
                 FieldFeatureQuality.ENTRANCE_UNRESOLVED,
-                FieldFeatureQuality.DIVIDER_UNRESOLVED,
                 FieldFeatureQuality.SIDE_UNRESOLVED,
             }
+            if divider_observation is None:
+                quality.add(FieldFeatureQuality.DIVIDER_UNRESOLVED)
             if mapped_box.ground is None:
                 quality.add(FieldFeatureQuality.NO_GROUND_PROJECTION)
             candidates.append(
@@ -664,7 +783,7 @@ class FieldFeatureDetector:
                     polygon_undistorted=mapped_box.pixels,
                     polygon_ground=mapped_box.ground,
                     entrance=None,
-                    divider=None,
+                    divider=divider_observation,
                     halves=(),
                     confidence=confidence,
                     quality=frozenset(quality),
@@ -960,6 +1079,7 @@ class FieldFeatureDetector:
         valid_mask: Uint8Array,
         *,
         is_bev: bool,
+        anchor_points: tuple[FloatPoint, ...] = (),
     ) -> CenterCrossObservation | None:
         candidate_mask = cv2.bitwise_or(dark_mask, local_line_mask)
         raw_segments = _hough_segments(
@@ -991,8 +1111,13 @@ class FieldFeatureDetector:
         )
         candidates: list[_CenterAxisCandidate] = []
         for segment in raw_segments:
-            gap_count = _line_gap_count(gap_mask, segment)
             local_support = _line_sample_fraction(support_mask, segment)
+            gap_count = (
+                0
+                if local_support
+                >= self._config.center_min_line_support_fraction
+                else _line_gap_count(gap_mask, segment)
+            )
             if (
                 gap_count < self._config.center_min_gap_count
                 and local_support
@@ -1036,23 +1161,61 @@ class FieldFeatureDetector:
                 intersection = _segment_intersection(first, second)
                 if intersection is None:
                     continue
+                anchor_aligned = False
+                if anchor_points:
+                    cosine_threshold = math.cos(
+                        math.radians(
+                            self._config.center_perpendicular_tolerance_deg
+                            * 0.5
+                        )
+                    )
+                    axis_directions = (
+                        first[1] - first[0],
+                        second[1] - second[0],
+                    )
+                    for anchor_point in anchor_points:
+                        anchor_direction = anchor_point - intersection
+                        anchor_norm = float(np.linalg.norm(anchor_direction))
+                        if anchor_norm <= 1e-9:
+                            continue
+                        if any(
+                            abs(
+                                float(
+                                    np.dot(anchor_direction, axis_direction)
+                                    / (
+                                        anchor_norm
+                                        * np.linalg.norm(axis_direction)
+                                    )
+                                )
+                            )
+                            >= cosine_threshold
+                            for axis_direction in axis_directions
+                        ):
+                            anchor_aligned = True
+                            break
                 first_balance = _axis_balance(first, intersection)
                 second_balance = _axis_balance(second, intersection)
+                required_balance = (
+                    self._config.center_min_intersection_margin_fraction
+                    if anchor_aligned
+                    else self._config.center_min_axis_balance_fraction
+                )
                 if (
-                    min(first_balance, second_balance)
-                    < self._config.center_min_axis_balance_fraction
+                    min(first_balance, second_balance) < required_balance
                     or _mask_distance_at(distance_from_invalid, intersection)
                     < min_margin
                 ):
                     rejected_intersecting_pair = True
                     continue
-                support = 0.5 * (
-                    first_candidate.local_support
-                    + second_candidate.local_support
+                support = min(
+                    first_candidate.local_support,
+                    second_candidate.local_support,
                 )
                 score = (
                     _line_length(first) + _line_length(second)
                 ) * (0.5 + support) * min(first_balance, second_balance)
+                if anchor_aligned:
+                    score += 2.0 * diagonal
                 if score > best_score:
                     best_score = score
                     best_pair = (
@@ -1399,7 +1562,10 @@ class FieldFeatureDetector:
         *,
         valid_mask: Uint8Array,
         result_timestamp_ns: int | None = None,
+        include_boundary_features: bool = True,
     ) -> FieldFeatureDetectionResult:
+        if not isinstance(include_boundary_features, bool):
+            raise ValueError("include_boundary_features must be a boolean.")
         if (
             not isinstance(undistorted_image_bgr, np.ndarray)
             or undistorted_image_bgr.dtype != np.uint8
@@ -1491,6 +1657,25 @@ class FieldFeatureDetector:
         colored = cv2.bitwise_or(masks["safe_red"], masks["safe_blue"])
         colored = cv2.bitwise_or(colored, masks["start_magenta"])
         colored = cv2.bitwise_or(colored, masks["entrance_purple"])
+        for safe_zone in safe_zones:
+            if working.is_bev and safe_zone.polygon_ground is not None:
+                assert self._ground_projector is not None
+                zone_pixels = self._ground_projector.ground_to_bev_pixels(
+                    safe_zone.polygon_ground
+                )
+                polygon = np.asarray(
+                    [(pixel.u, pixel.v) for pixel in zone_pixels],
+                    dtype=np.int32,
+                )
+            else:
+                polygon = np.asarray(
+                    [
+                        (pixel.u, pixel.v)
+                        for pixel in safe_zone.polygon_undistorted
+                    ],
+                    dtype=np.int32,
+                )
+            cv2.fillConvexPoly(colored, polygon, 255)
         exclusion = cv2.dilate(
             colored,
             np.ones((5, 5), dtype=np.uint8),
@@ -1508,18 +1693,52 @@ class FieldFeatureDetector:
             ),
             cv2.bitwise_not(exclusion),
         )
+        center_anchor_points: list[FloatPoint] = []
+        for safe_zone in safe_zones:
+            if working.is_bev and safe_zone.polygon_ground is not None:
+                assert self._ground_projector is not None
+                zone_pixels = self._ground_projector.ground_to_bev_pixels(
+                    safe_zone.polygon_ground
+                )
+                center_anchor_points.append(
+                    np.mean(
+                        np.asarray(
+                            [(pixel.u, pixel.v) for pixel in zone_pixels],
+                            dtype=np.float64,
+                        ),
+                        axis=0,
+                    )
+                )
+            else:
+                center_anchor_points.append(
+                    np.mean(
+                        np.asarray(
+                            [
+                                (pixel.u, pixel.v)
+                                for pixel in safe_zone.polygon_undistorted
+                            ],
+                            dtype=np.float64,
+                        ),
+                        axis=0,
+                    )
+                )
         center_cross = self._center_cross(
             center_mask,
             local_line_mask,
             working.valid_mask,
             is_bev=working.is_bev,
+            anchor_points=tuple(center_anchor_points),
         )
-        boundary_features = self._boundary_features(
-            working.image_bgr,
-            working.valid_mask,
-            center_cross,
-            capture_timestamp_ns=frame.timestamp_ns,
-            is_bev=working.is_bev,
+        boundary_features = (
+            self._boundary_features(
+                working.image_bgr,
+                working.valid_mask,
+                center_cross,
+                capture_timestamp_ns=frame.timestamp_ns,
+                is_bev=working.is_bev,
+            )
+            if include_boundary_features
+            else ()
         )
 
         completed_timestamp_ns = (
@@ -1550,6 +1769,7 @@ class FieldFeatureDetector:
         *,
         valid_mask: Uint8Array,
         result_timestamp_ns: int | None = None,
+        include_boundary_features: bool = True,
     ) -> RealtimeFieldFeatureResult:
         """检测最新帧，并把过期结果转换为显式空结果。"""
 
@@ -1559,6 +1779,7 @@ class FieldFeatureDetector:
                 undistorted_image_bgr,
                 valid_mask=valid_mask,
                 result_timestamp_ns=result_timestamp_ns,
+                include_boundary_features=include_boundary_features,
             )
         except StaleObservationError as exc:
             return RealtimeFieldFeatureResult(

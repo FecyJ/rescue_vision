@@ -342,6 +342,9 @@ realtime_field_result = field_detector.detect_realtime(
     raw_frame,
     undistorted_bgr,
     valid_mask=geometry.camera_model.valid_mask,
+    # 绝对定位不使用普通场界消歧，省去两次昂贵 Hough；需要区域/场界输出的
+    # 通用感知调用方保持默认 True。
+    include_boundary_features=False,
 )
 if realtime_field_result.stale_dropped:
     # 不向定位层传递过期地标。
@@ -360,6 +363,10 @@ for safe_zone in field_result.safe_zones if field_result is not None else ():
 检测器会在颜色、线段和 BEV 路径中排除无效填充区，防止去畸变填充边界被
 误报为围栏或场角。
 
+`detect()` / `detect_realtime()` 的 `include_boundary_features` 默认为 `True`，
+因此普通调用方仍得到边界候选。只消费中心十字和红蓝方向锚点的实时定位旁路可
+显式传 `False`；此时 `boundary_features=()`，不能同时把该帧当作场界观测。
+
 启用带 BEV 配置的 `GroundProjector` 时，检测器每帧只生成一次 BEV 并在颜色、
 线段和角点步骤中复用。输出仍保留 `UndistortedPixel`；只有地面上的区域角点、
 线段端点才附带机器人系 `GroundPoint`。围栏顶部等非地面特征不会被地面
@@ -371,13 +378,19 @@ for safe_zone in field_result.safe_zones if field_result is not None else ():
 `entrance_unresolved`、`divider_unresolved` 或 `side_unresolved`。
 
 完整彩色区域优先按静态地图尺寸和矩形度确认。紫色围栏有高度、遮挡导致完整
-尺寸不再可见时，检测器不会单纯放宽长宽比：只有至少两个同色分区的质心同时
-落入同一个紫色围栏外接矩形、总颜色面积和可见矩形度仍达标时，才输出带
+尺寸不再可见时，检测器不会单纯放宽长宽比：同色可见区域必须落入同一个紫色
+围栏外接矩形、总颜色面积和可见矩形度仍达标，并满足双颜色分区、黑色中隔或
+BEV 围栏物理尺寸三项中的至少一项，才输出带
 `partial`、`entrance_unresolved`、`divider_unresolved` 和
 `side_unresolved` 的保守安全区。散落的同色任务物块没有共同紫色围栏，不会
 触发该降级路径。部分安全区只提供可见颜色范围的多边形，不补画被遮挡区域；
 定位层仍需另外通过中心十字射线、距离、横向偏差、置信度和时效门限后才能把它
 作为方向锚点。
+
+中心十字 Hough 候选去重优先保留局部线支撑和点划证据更强的轴，长度只作为
+次级排序，避免远场围栏或场边长线把较短但语义更明确的真实十字轴挤出候选集。
+安全区确认后会把其保守多边形加入十字排除掩膜，紫色围栏及内部隔板不会再次
+参与中心十字拟合。
 
 出发区只输出洋红轮廓和角点，不做数字 OCR，也不包含 1–4 编号。中心十字先
 合并两类证据：HSV 深色点划线，以及比局部地面更暗、低饱和的连续细线；后者

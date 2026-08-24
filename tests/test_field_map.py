@@ -90,8 +90,16 @@ def test_field_map_without_unique_pose_explicitly_reports_unlocalized() -> None:
 
 
 class FakeDetector:
-    def detect_realtime(self, frame, image, *, valid_mask):
+    def detect_realtime(
+        self,
+        frame,
+        image,
+        *,
+        valid_mask,
+        include_boundary_features=True,
+    ):
         del image, valid_mask
+        assert not include_boundary_features
         return RealtimeFieldFeatureResult(result=frame)
 
 
@@ -99,8 +107,16 @@ class OneStaleFrameDetector:
     def __init__(self) -> None:
         self.calls = 0
 
-    def detect_realtime(self, frame, image, *, valid_mask):
+    def detect_realtime(
+        self,
+        frame,
+        image,
+        *,
+        valid_mask,
+        include_boundary_features=True,
+    ):
         del image, valid_mask
+        assert not include_boundary_features
         self.calls += 1
         if self.calls == 1:
             return RealtimeFieldFeatureResult(

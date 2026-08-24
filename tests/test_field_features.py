@@ -213,9 +213,9 @@ def test_safe_zone_ignores_distant_same_color_target() -> None:
 
 def test_partial_safe_zone_uses_two_colored_halves_inside_purple_enclosure() -> None:
     image = np.full((400, 400, 3), 255, dtype=np.uint8)
-    cv2.rectangle(image, (70, 25), (330, 175), bgr(138), thickness=12)
-    cv2.rectangle(image, (105, 70), (185, 95), bgr(105), thickness=-1)
-    cv2.rectangle(image, (215, 70), (295, 95), bgr(105), thickness=-1)
+    cv2.rectangle(image, (90, 35), (310, 145), bgr(138), thickness=10)
+    cv2.rectangle(image, (110, 70), (185, 95), bgr(105), thickness=-1)
+    cv2.rectangle(image, (215, 70), (290, 95), bgr(105), thickness=-1)
     detector = FieldFeatureDetector(
         safe_zone_config(),
         static_map=static_map(),
@@ -260,6 +260,119 @@ def test_partial_safe_zone_rejects_colored_targets_without_purple_enclosure() ->
     )
 
     assert result.safe_zones == ()
+
+
+def test_partial_safe_zone_accepts_one_colored_band_with_dark_divider() -> None:
+    image = np.full((400, 400, 3), 255, dtype=np.uint8)
+    cv2.rectangle(image, (90, 35), (310, 145), bgr(138), thickness=10)
+    cv2.rectangle(image, (110, 70), (290, 105), bgr(105), thickness=-1)
+    cv2.line(image, (200, 70), (200, 105), (0, 0, 0), thickness=5)
+    detector = FieldFeatureDetector(
+        safe_zone_config(),
+        static_map=static_map(),
+        max_observation_age_ms=100.0,
+        ground_projector=projector(),
+    )
+
+    result = detector.detect(
+        frame(image),
+        image,
+        valid_mask=valid_mask(image),
+        result_timestamp_ns=1_100_000,
+    )
+
+    assert len(result.safe_zones) == 1
+    observation = result.safe_zones[0]
+    assert observation.physical_color is SafeZoneColor.BLUE
+    assert observation.divider is not None
+    assert FieldFeatureQuality.PARTIAL in observation.quality
+    assert FieldFeatureQuality.DIVIDER_UNRESOLVED not in observation.quality
+
+
+def test_partial_safe_zone_accepts_one_band_with_mapped_enclosure_size() -> None:
+    image = np.full((400, 400, 3), 255, dtype=np.uint8)
+    cv2.rectangle(image, (90, 35), (310, 145), bgr(138), thickness=10)
+    cv2.rectangle(image, (110, 70), (290, 90), bgr(105), thickness=-1)
+    detector = FieldFeatureDetector(
+        safe_zone_config(),
+        static_map=static_map(),
+        max_observation_age_ms=100.0,
+        ground_projector=projector(),
+    )
+
+    result = detector.detect(
+        frame(image),
+        image,
+        valid_mask=valid_mask(image),
+        result_timestamp_ns=1_100_000,
+    )
+
+    assert len(result.safe_zones) == 1
+    observation = result.safe_zones[0]
+    assert observation.physical_color is SafeZoneColor.BLUE
+    assert observation.confidence >= 0.25
+    assert FieldFeatureQuality.PARTIAL in observation.quality
+    assert FieldFeatureQuality.DIVIDER_UNRESOLVED in observation.quality
+    assert observation.polygon_ground is not None
+    xs = [point.x for point in observation.polygon_ground]
+    ys = [point.y for point in observation.polygon_ground]
+    assert max(xs) - min(xs) == pytest.approx(110.0, abs=15.0)
+    assert max(ys) - min(ys) == pytest.approx(220.0, abs=15.0)
+
+
+def test_partial_safe_zone_rejects_color_that_is_the_purple_enclosure() -> None:
+    image = np.full((400, 400, 3), 255, dtype=np.uint8)
+    cv2.rectangle(image, (90, 35), (310, 145), bgr(138), thickness=10)
+    cv2.rectangle(image, (110, 70), (185, 95), bgr(138), thickness=-1)
+    cv2.rectangle(image, (215, 70), (290, 95), bgr(138), thickness=-1)
+    overlapping_red = (
+        HsvRange((130, 60, 50), (160, 255, 255)),
+    )
+    detector = FieldFeatureDetector(
+        safe_zone_config(safe_red=overlapping_red),
+        static_map=static_map(),
+        max_observation_age_ms=100.0,
+        ground_projector=projector(),
+    )
+
+    result = detector.detect(
+        frame(image),
+        image,
+        valid_mask=valid_mask(image),
+        result_timestamp_ns=1_100_000,
+    )
+
+    assert all(
+        zone.physical_color is not SafeZoneColor.RED
+        for zone in result.safe_zones
+    )
+
+
+def test_center_cross_prefers_pair_aligned_with_safe_zone_anchor() -> None:
+    mask = np.zeros((400, 400), dtype=np.uint8)
+    cv2.line(mask, (20, 100), (300, 100), 255, thickness=3)
+    cv2.line(mask, (100, 20), (100, 260), 255, thickness=3)
+    cv2.line(mask, (210, 280), (350, 280), 255, thickness=3)
+    cv2.line(mask, (280, 278), (280, 350), 255, thickness=3)
+    detector = FieldFeatureDetector(
+        config(center_min_axis_span_fraction=0.10),
+        static_map=static_map(),
+        max_observation_age_ms=100.0,
+    )
+
+    cross = detector._center_cross(
+        np.zeros_like(mask),
+        mask,
+        np.full_like(mask, 255),
+        is_bev=False,
+        anchor_points=(np.asarray((370.0, 280.0)),),
+    )
+
+    assert cross is not None
+    assert len(cross.axes) == 2
+    assert cross.intersection_undistorted is not None
+    assert cross.intersection_undistorted.u == pytest.approx(280.0, abs=8.0)
+    assert cross.intersection_undistorted.v == pytest.approx(280.0, abs=8.0)
 
 
 def test_safe_zone_does_not_invent_sides_without_entrance_evidence() -> None:
@@ -488,6 +601,36 @@ def test_boundary_candidates_are_explicitly_low_confidence_and_bounded() -> None
     assert all(item.interior_normal_ground is not None for item in ground_segments)
     assert all(item.line_offset_mm is not None for item in ground_segments)
     assert max(item.confidence for item in ground_segments) > 0.55
+
+
+def test_localization_path_can_skip_expensive_boundary_candidates() -> None:
+    image = np.full((400, 400, 3), 255, dtype=np.uint8)
+    cv2.line(image, (40, 80), (360, 80), (0, 0, 0), 5)
+    detector = FieldFeatureDetector(
+        config(),
+        static_map=static_map(),
+        max_observation_age_ms=100.0,
+        ground_projector=projector(),
+    )
+
+    result = detector.detect(
+        frame(image),
+        image,
+        valid_mask=valid_mask(image),
+        result_timestamp_ns=1_100_000,
+        include_boundary_features=False,
+    )
+
+    assert result.boundary_features == ()
+
+    with pytest.raises(ValueError, match="include_boundary_features"):
+        detector.detect(
+            frame(image),
+            image,
+            valid_mask=valid_mask(image),
+            result_timestamp_ns=1_100_000,
+            include_boundary_features=1,  # type: ignore[arg-type]
+        )
 
 
 def test_undistortion_fill_boundary_is_not_reported_as_a_field_feature() -> None:

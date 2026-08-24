@@ -458,6 +458,7 @@ def main() -> None:
                         raw_frame,
                         image,
                         valid_mask=geometry.camera_model.valid_mask,
+                        include_boundary_features=False,
                     )
                     if realtime.stale_dropped:
                         stale_age_ms = realtime.dropped_stale_age_ms

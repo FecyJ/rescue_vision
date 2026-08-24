@@ -411,6 +411,7 @@ class LatestCenterCrossLocalization:
                     frame,
                     frame.image_bgr,
                     valid_mask=self._valid_mask,
+                    include_boundary_features=False,
                 )
                 result = realtime_result.result
                 if result is None:
