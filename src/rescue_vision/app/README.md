@@ -49,6 +49,9 @@ rescue-vision-manual-capture \
 `perception` 或 `bev`；perception 由 `PerceptionFrameRenderer` 在最新帧后台
 旁路运行 `TargetPoseDetector`，BEV 只在当前地面映射包含 BEV 配置时由独立
 最新帧旁路生成。两者只发布带实际模式和坐标元数据的 JPEG，不阻塞运动安全循环。
+相机去畸变、录像提交、JPEG 和地图发布之间都会再次检查远程命令期限并刷新
+轮速；多个旁路耗时不会再累计成一次超过 100 ms 的轮速跃迁。任一单项操作
+若独占控制线程超过 100 ms，仍先停车并退出，而不是增大阈值掩盖实时性故障。
 只要 `world.static_map.regions` 非空，会话就声明并以 500 ms 周期发布
 `observation/map/snapshot`；若同时启用可用地面映射、`field_features` 和
 `localization`，独立最新帧旁路把中心十字唯一位姿绘制为地图箭头并写入严格

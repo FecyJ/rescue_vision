@@ -107,6 +107,7 @@ class MotionController:
         self._monotonic_ns = monotonic_ns
         self._target_wheel_speeds_m_s = (0.0, 0.0)
         self._commanded_wheel_speeds_m_s = (0.0, 0.0)
+        self._last_sent_wheel_speeds_mm_s = (0, 0)
         self._last_acceleration_update_ns = self._now()
         self._last_wheel_command_ns = self._last_acceleration_update_ns
         self._command_sequence = 0
@@ -184,18 +185,23 @@ class MotionController:
         next_left = _move_toward(previous_left, target_left, maximum_delta)
         next_right = _move_toward(previous_right, target_right, maximum_delta)
         self._last_acceleration_update_ns = current_ns
-        changed = next_left != previous_left or next_right != previous_right
+        next_wire_speeds_mm_s = (
+            round(next_left * 1000.0),
+            round(next_right * 1000.0),
+        )
+        changed = next_wire_speeds_mm_s != self._last_sent_wheel_speeds_mm_s
         refresh_due = (
             current_ns - self._last_wheel_command_ns
             >= _WHEEL_COMMAND_REFRESH_NS
         )
+        self._commanded_wheel_speeds_m_s = (next_left, next_right)
         if not changed and not refresh_due:
             return False
         sequence = self._next_command_sequence()
         self._channel.send_frame(
             encode_wheel_speed_command(sequence, next_left, next_right)
         )
-        self._commanded_wheel_speeds_m_s = (next_left, next_right)
+        self._last_sent_wheel_speeds_mm_s = next_wire_speeds_mm_s
         self._last_wheel_command_ns = current_ns
         return True
 
@@ -374,6 +380,7 @@ class MotionController:
     def _reset_acceleration_state(self) -> None:
         self._target_wheel_speeds_m_s = (0.0, 0.0)
         self._commanded_wheel_speeds_m_s = (0.0, 0.0)
+        self._last_sent_wheel_speeds_mm_s = (0, 0)
         current_ns = self._now()
         self._last_acceleration_update_ns = current_ns
         self._last_wheel_command_ns = current_ns

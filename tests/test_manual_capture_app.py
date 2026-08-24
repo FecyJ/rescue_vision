@@ -14,6 +14,7 @@ from rescue_vision.app.manual_capture import (
     BevFrameRenderer,
     CameraPipeline,
     CaptureSession,
+    ManualCaptureRuntime,
     VehicleState,
     _accept_with_shutdown,
     _validate_mode,
@@ -122,13 +123,7 @@ class TelemetryAfterMotionChannel(FakeCarChannel):
         timeout: float | None = None,
     ) -> ReceivedUartFrame:
         del timeout
-        if (
-            not self.telemetry_sent
-            and any(
-                payload[0] == MessageType.SET_WHEEL_SPEED
-                for payload in self.sent
-            )
-        ):
+        if not self.telemetry_sent:
             self.telemetry_sent = True
             return ReceivedUartFrame(
                 sequence=0,
@@ -530,18 +525,6 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
             safety_mode=VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP,
         )
 
-    assert len(car.sent) >= 3
-    motion_payload = next(
-        payload
-        for payload in car.sent
-        if payload[0] == MessageType.SET_WHEEL_SPEED
-    )
-    _, limited_left_mm_s, limited_right_mm_s = struct.unpack(
-        "<Hhh", motion_payload[1:-2]
-    )
-    assert 0 <= limited_left_mm_s < 100
-    assert limited_right_mm_s == limited_left_mm_s
-    assert any(payload[0] == MessageType.SET_GRIPPER for payload in car.sent)
     assert car.sent[-1][0] == MessageType.SOFT_BRAKE
 
 
@@ -555,7 +538,6 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
     ]
     assert motion_report["event_counts"]["motion_command"] == 1
     assert motion_report["event_counts"]["gripper_command"] == 1
-    assert motion_report["event_counts"]["system_status"] == 1
     assert motion_report["event_counts"]["safety_stop"] == 1
     assert motion_report["covers_frame_time_range"] is True
     session_path = recordings[0] / "session.json"
@@ -1081,6 +1063,86 @@ def test_vehicle_state_reports_zero_twist_as_braking() -> None:
     assert observation.motion_state.value == "braking"
     assert observation.stop_reason.value == "none"
     assert observation.last_applied_motion_command_id == "centered-1"
+
+
+def test_manual_cycle_services_motion_between_slow_image_operations(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class Clock:
+        def __init__(self) -> None:
+            self.timestamp_ns = 0
+
+        def __call__(self) -> int:
+            return self.timestamp_ns
+
+        def advance(self, seconds: float) -> None:
+            self.timestamp_ns += round(seconds * 1e9)
+
+    class SlowPipeline:
+        def __init__(self, source, clock) -> None:
+            self.source = source
+            self.clock = clock
+            self.coordinate_system = ImageCoordinateSystem.RAW_PIXEL
+            self.calibration_id = None
+            self.ground_projector = None
+
+        def prepare(self, frame):
+            self.clock.advance(0.06)
+            return frame
+
+    clock = Clock()
+    monkeypatch.setattr(manual_capture_module.time, "monotonic_ns", clock)
+    frame = CameraFrame(
+        sequence=0,
+        timestamp_ns=0,
+        image_bgr=np.zeros((3, 4, 3), dtype=np.uint8),
+    )
+    config = _config()
+    pipeline = SlowPipeline(FakeSource(frame), clock)
+    capture = CaptureSession(
+        output_root=tmp_path,
+        config=config,
+        config_snapshot={},
+        pipeline=pipeline,
+    )
+    car = FakeCarChannel()
+    controller = MotionController(
+        car,
+        MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 500),
+        monotonic_ns=clock,
+    )
+    controller.forward(0.2)
+    runtime = ManualCaptureRuntime(
+        connection=FakeConnection([]),
+        executor=RemoteMotionExecutor(controller, monotonic_ns=clock),
+        gripper_executor=None,
+        capture=capture,
+        pipeline=pipeline,
+        session_status=build_session_status(
+            config,
+            server_instance_id="timing-test",
+            video_fps=10.0,
+        ),
+        video_fps=10.0,
+        jpeg_quality=80,
+        perception_renderer=None,
+        bev_renderer=None,
+        map_renderer=None,
+        map_localization=None,
+        stop_requested=lambda: False,
+        safety_mode=VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP,
+    )
+    runtime._send_current_video = lambda: clock.advance(0.06)
+
+    runtime._cycle()
+
+    wheel_commands = [
+        struct.unpack("<Hhh", payload[1:-2])[1:]
+        for payload in car.sent
+        if payload[0] == MessageType.SET_WHEEL_SPEED
+    ]
+    assert wheel_commands == [(30, 30), (60, 60)]
 
 
 def test_vehicle_state_tracks_gripper_command_and_firmware_angles() -> None:

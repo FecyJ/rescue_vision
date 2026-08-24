@@ -867,6 +867,7 @@ class ManualCaptureRuntime:
             except BaseException:
                 self.capture.fail(CaptureStopReason.CAMERA_ERROR)
                 raise
+            self._service_motion_safety()
             self.last_camera_frame_ns = time.monotonic_ns()
             self.capture.record(self.latest_frame)
             if self.map_localization is not None:
@@ -881,9 +882,12 @@ class ManualCaptureRuntime:
                 if self.bev_renderer is None:
                     raise RuntimeError("BEV video mode is not available in this session.")
                 self.bev_renderer.submit(self.latest_frame)
+            self._service_motion_safety()
         now_ns = time.monotonic_ns()
         if self.latest_frame is not None and now_ns >= self.next_video_ns:
+            self._service_motion_safety()
             self._send_current_video()
+            self._service_motion_safety()
             self.next_video_ns = now_ns + self.video_period_ns
         if now_ns >= self.next_session_status_ns:
             self.session_status = replace(
@@ -914,8 +918,20 @@ class ManualCaptureRuntime:
                 now_ns + CAPTURE_STATUS_PERIOD_MS * 1_000_000
             )
         if now_ns >= self.next_map_snapshot_ns:
+            self._service_motion_safety()
             self._send_map_snapshot(now_ns)
+            self._service_motion_safety()
             self.next_map_snapshot_ns = now_ns + MAP_SNAPSHOT_PERIOD_MS * 1_000_000
+
+    def _service_motion_safety(self) -> None:
+        """在同步旁路工作之间刷新轮速或执行到期停车。"""
+
+        if self.executor is None:
+            return
+        if self.executor.check_timeout():
+            self._on_motion_timeout()
+            return
+        self.executor.controller.update()
 
     def _send_initial_status(self) -> None:
         self.connection.send_reliable_observation(
