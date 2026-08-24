@@ -27,13 +27,13 @@ uart:
   # 本地实际设备名写入不提交的 runtime.yaml；禁用时不会导入或打开串口。
   enabled: false
   device: null
-  # 当前 STM32 电控协议为 115200 8N1、CRLF 结尾。
+  # 当前实现仍是 115200 8N1 文本行；两端后续按专项文档切换为同波特率二进制协议。
   baudrate: 115200
   read_timeout_ms: 100.0
   write_timeout_ms: 100.0
   # UART 后台读取只写入有界队列；溢出视为通信故障，不静默丢报文。
   receive_queue_capacity: 256
-  # 为后续同链路增加 IMU 遥测保留空间；具体报文仍由协议层定义。
+  # 当前文本行的上限；切换固定长度二进制帧时将由协议解码上限替代。
   max_line_bytes: 512
 
 remote:
