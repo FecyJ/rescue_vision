@@ -1,4 +1,4 @@
-"""协议无关的 UART 行分帧、收发与生命周期管理。"""
+"""协议无关的 COBS UART 帧收发与生命周期管理。"""
 
 from __future__ import annotations
 
@@ -20,8 +20,8 @@ class UartReceiveOverflowError(UartError):
     """接收方未及时消费，导致有界队列溢出。"""
 
 
-class UartLineTooLongError(UartError):
-    """收到超过配置上限且尚未完成的 UART 行。"""
+class CobsDecodeError(ValueError):
+    """一段非零字节不是合法 COBS 编码。"""
 
 
 @runtime_checkable
@@ -33,9 +33,62 @@ class _SerialPort(Protocol):
     def close(self) -> None: ...
 
 
+def cobs_encode(payload: bytes) -> bytes:
+    """对任意 bytes 执行标准 COBS 编码，不附加 ``0x00`` 定界符。"""
+
+    if not isinstance(payload, bytes):
+        raise TypeError(f"payload must be bytes, got {type(payload).__name__}.")
+    encoded = bytearray((0,))
+    code_index = 0
+    code = 1
+    for value in payload:
+        if value == 0:
+            encoded[code_index] = code
+            code_index = len(encoded)
+            encoded.append(0)
+            code = 1
+            continue
+        encoded.append(value)
+        code += 1
+        if code == 0xFF:
+            encoded[code_index] = code
+            code_index = len(encoded)
+            encoded.append(0)
+            code = 1
+    if payload and payload[-1] != 0 and code == 1:
+        del encoded[code_index]
+    else:
+        encoded[code_index] = code
+    return bytes(encoded)
+
+
+def cobs_decode(encoded: bytes) -> bytes:
+    """解码不含 ``0x00`` 定界符的标准 COBS 数据。"""
+
+    if not isinstance(encoded, bytes):
+        raise TypeError(f"encoded must be bytes, got {type(encoded).__name__}.")
+    if not encoded:
+        raise CobsDecodeError("COBS frame must be non-empty.")
+    decoded = bytearray()
+    index = 0
+    while index < len(encoded):
+        code = encoded[index]
+        if code == 0:
+            raise CobsDecodeError("COBS data must not contain zero bytes.")
+        index += 1
+        block_end = index + code - 1
+        if block_end > len(encoded):
+            raise CobsDecodeError("COBS code exceeds the encoded frame length.")
+        decoded.extend(encoded[index:block_end])
+        index = block_end
+        if code != 0xFF and index < len(encoded):
+            decoded.append(0)
+    return bytes(decoded)
+
+
 @dataclass(frozen=True, slots=True)
-class ReceivedUartLine:
-    """一条完整 UART 行；时间为树莓派接收完成时的单调时钟 ns。"""
+class ReceivedUartFrame:
+    """一帧已完成 COBS 解码的数据及树莓派接收完成时间。"""
 
     sequence: int
     received_timestamp_ns: int
@@ -46,76 +99,74 @@ class ReceivedUartLine:
             ("sequence", self.sequence),
             ("received_timestamp_ns", self.received_timestamp_ns),
         ):
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or value < 0
-            ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(
                     f"{name} must be a non-negative integer, got {value!r}."
                 )
-        if not isinstance(self.payload, bytes):
-            raise TypeError(
-                f"payload must be bytes, got {type(self.payload).__name__}."
-            )
-
-    def decode(self, encoding: str = "ascii") -> str:
-        """按调用方指定编码严格解码，协议层自行处理失败。"""
-
-        return self.payload.decode(encoding, errors="strict")
+        if not isinstance(self.payload, bytes) or not self.payload:
+            raise ValueError("payload must be non-empty bytes.")
 
 
-class UartLineFramer:
-    """把任意分块的字节流拆成 LF 或 CRLF 结尾的原始行。"""
+class UartFrameFramer:
+    """按 ``0x00`` 定界并 COBS 解码，可在损坏或超长帧后恢复。"""
 
-    def __init__(self, *, max_line_bytes: int) -> None:
+    def __init__(self, *, max_frame_bytes: int) -> None:
         if (
-            isinstance(max_line_bytes, bool)
-            or not isinstance(max_line_bytes, int)
-            or max_line_bytes <= 0
+            isinstance(max_frame_bytes, bool)
+            or not isinstance(max_frame_bytes, int)
+            or max_frame_bytes <= 0
         ):
             raise ValueError(
-                "max_line_bytes must be a positive integer, "
-                f"got {max_line_bytes!r}."
+                "max_frame_bytes must be a positive integer, "
+                f"got {max_frame_bytes!r}."
             )
-        self.max_line_bytes = max_line_bytes
+        self.max_frame_bytes = max_frame_bytes
+        self.max_encoded_frame_bytes = (
+            max_frame_bytes + max_frame_bytes // 254 + 1
+        )
         self._buffer = bytearray()
+        self._discarding = False
+        self.discarded_frames = 0
 
     @property
     def pending_bytes(self) -> bytes:
         return bytes(self._buffer)
 
     def feed(self, chunk: bytes) -> tuple[bytes, ...]:
-        """接收一个非空字节块，返回其中所有新完成的行。"""
+        """消费任意非空字节块，只返回合法且不超长的已解码帧。"""
 
         if not isinstance(chunk, bytes) or not chunk:
             raise ValueError("chunk must be non-empty bytes.")
-        self._buffer.extend(chunk)
-        lines: list[bytes] = []
-        while True:
-            newline_index = self._buffer.find(b"\n")
-            if newline_index < 0:
-                break
-            raw_line = bytes(self._buffer[:newline_index])
-            del self._buffer[: newline_index + 1]
-            if raw_line.endswith(b"\r"):
-                raw_line = raw_line[:-1]
-            if len(raw_line) > self.max_line_bytes:
-                raise UartLineTooLongError(
-                    f"UART line has {len(raw_line)} bytes; "
-                    f"maximum is {self.max_line_bytes}."
-                )
-            lines.append(raw_line)
-
-        pending_payload_length = len(self._buffer)
-        if self._buffer.endswith(b"\r"):
-            pending_payload_length -= 1
-        if pending_payload_length > self.max_line_bytes:
-            raise UartLineTooLongError(
-                "Incomplete UART line exceeds maximum "
-                f"{self.max_line_bytes} bytes."
-            )
-        return tuple(lines)
+        frames: list[bytes] = []
+        for value in chunk:
+            if value == 0:
+                if self._discarding:
+                    self._discarding = False
+                    self._buffer.clear()
+                    continue
+                if not self._buffer:
+                    self.discarded_frames += 1
+                    continue
+                encoded = bytes(self._buffer)
+                self._buffer.clear()
+                try:
+                    decoded = cobs_decode(encoded)
+                except CobsDecodeError:
+                    self.discarded_frames += 1
+                    continue
+                if not decoded or len(decoded) > self.max_frame_bytes:
+                    self.discarded_frames += 1
+                    continue
+                frames.append(decoded)
+                continue
+            if self._discarding:
+                continue
+            self._buffer.append(value)
+            if len(self._buffer) > self.max_encoded_frame_bytes:
+                self._buffer.clear()
+                self._discarding = True
+                self.discarded_frames += 1
+        return tuple(frames)
 
 
 def _open_pyserial(
@@ -144,8 +195,8 @@ def _open_pyserial(
     )
 
 
-class UartLineChannel:
-    """单后台读线程、有界接收队列的 8N1 UART 行通道。"""
+class UartFrameChannel:
+    """单后台读线程、有界接收队列的 8N1 COBS 帧通道。"""
 
     def __init__(
         self,
@@ -155,7 +206,7 @@ class UartLineChannel:
         read_timeout_s: float,
         write_timeout_s: float,
         receive_queue_capacity: int,
-        max_line_bytes: int,
+        max_frame_bytes: int,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
         serial_factory: Callable[..., _SerialPort] = _open_pyserial,
     ) -> None:
@@ -188,37 +239,34 @@ class UartLineChannel:
                 "receive_queue_capacity must be a positive integer, "
                 f"got {receive_queue_capacity!r}."
             )
+        UartFrameFramer(max_frame_bytes=max_frame_bytes)
 
         self.device = device.strip()
         self.baudrate = baudrate
         self.read_timeout_s = float(read_timeout_s)
         self.write_timeout_s = float(write_timeout_s)
         self.receive_queue_capacity = receive_queue_capacity
-        self.max_line_bytes = max_line_bytes
+        self.max_frame_bytes = max_frame_bytes
         self._monotonic_ns = monotonic_ns
         self._serial_factory = serial_factory
         self._serial: _SerialPort | None = None
         self._reader_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._write_lock = threading.Lock()
-        self._received = queue.Queue[ReceivedUartLine](
+        self._received = queue.Queue[ReceivedUartFrame](
             maxsize=receive_queue_capacity
         )
         self._reader_error: BaseException | None = None
         self._started = False
-        self.received_lines = 0
+        self.received_frames = 0
+        self.discarded_frames = 0
         self.sent_bytes = 0
-
-        # Validate the framing limit before opening hardware.
-        UartLineFramer(max_line_bytes=max_line_bytes)
 
     @property
     def started(self) -> bool:
         return self._started
 
     def check_health(self) -> None:
-        """确认通道已启动且后台读取没有失败。"""
-
         self._require_healthy()
 
     def start(self) -> None:
@@ -227,7 +275,8 @@ class UartLineChannel:
         self._stop_event.clear()
         self._reader_error = None
         self._received = queue.Queue(maxsize=self.receive_queue_capacity)
-        self.received_lines = 0
+        self.received_frames = 0
+        self.discarded_frames = 0
         self.sent_bytes = 0
         try:
             serial_port = self._serial_factory(
@@ -288,22 +337,20 @@ class UartLineChannel:
                     raise
                 raise UartError(f"UART write failed for {self.device!r}.") from exc
 
-    def send_line(self, payload: bytes) -> None:
-        """发送不含 CR/LF 的协议负载，并统一添加 CRLF。"""
+    def send_frame(self, payload: bytes) -> None:
+        """COBS 编码一个非空解码态帧并附加 ``0x00``。"""
 
         if not isinstance(payload, bytes) or not payload:
             raise ValueError("payload must be non-empty bytes.")
-        if b"\r" in payload or b"\n" in payload:
-            raise ValueError("UART line payload must not contain CR or LF.")
-        if len(payload) > self.max_line_bytes:
+        if len(payload) > self.max_frame_bytes:
             raise ValueError(
-                f"UART line has {len(payload)} bytes; "
-                f"maximum is {self.max_line_bytes}."
+                f"UART frame has {len(payload)} bytes; "
+                f"maximum is {self.max_frame_bytes}."
             )
-        self.send(payload + b"\r\n")
+        self.send(cobs_encode(payload) + b"\x00")
 
-    def receive_line(self, timeout: float | None = None) -> ReceivedUartLine:
-        """等待一条完整行；超时抛出 ``TimeoutError``。"""
+    def receive_frame(self, timeout: float | None = None) -> ReceivedUartFrame:
+        """等待一帧已完成 COBS 解码的数据；超时抛出 ``TimeoutError``。"""
 
         self._require_healthy()
         if timeout is not None and (
@@ -315,14 +362,14 @@ class UartLineChannel:
         timeout_s = None if timeout is None else float(timeout)
         if timeout_s == 0:
             try:
-                line = self._received.get_nowait()
+                frame = self._received.get_nowait()
             except queue.Empty as exc:
                 self._raise_reader_error()
                 raise TimeoutError(
-                    f"Timed out waiting for UART line from {self.device!r}."
+                    f"Timed out waiting for UART frame from {self.device!r}."
                 ) from exc
             self._raise_reader_error()
-            return line
+            return frame
 
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
         last_empty: queue.Empty | None = None
@@ -336,18 +383,16 @@ class UartLineChannel:
             else:
                 wait_s = 0.05
             try:
-                line = self._received.get(
-                    timeout=wait_s,
-                )
+                frame = self._received.get(timeout=wait_s)
             except queue.Empty as exc:
                 last_empty = exc
                 continue
             self._raise_reader_error()
-            return line
+            return frame
 
         self._raise_reader_error()
         error = TimeoutError(
-            f"Timed out waiting for UART line from {self.device!r}."
+            f"Timed out waiting for UART frame from {self.device!r}."
         )
         if last_empty is None:
             raise error
@@ -370,8 +415,6 @@ class UartLineChannel:
             try:
                 cancel_read()
             except BaseException:
-                # Optional wake-up only; the configured read timeout remains
-                # the portable shutdown path.
                 pass
         thread.join(timeout=self.read_timeout_s + 1.0)
         try:
@@ -398,7 +441,7 @@ class UartLineChannel:
             raise RuntimeError(f"UART cleanup failed in {location}.") from error
 
     def _reader_loop(self) -> None:
-        framer = UartLineFramer(max_line_bytes=self.max_line_bytes)
+        framer = UartFrameFramer(max_frame_bytes=self.max_frame_bytes)
         sequence = 0
         try:
             assert self._serial is not None
@@ -411,20 +454,21 @@ class UartLineChannel:
                         f"UART read must return bytes, got {type(chunk).__name__}."
                     )
                 for payload in framer.feed(chunk):
-                    line = ReceivedUartLine(
+                    frame = ReceivedUartFrame(
                         sequence=sequence,
                         received_timestamp_ns=self._monotonic_ns(),
                         payload=payload,
                     )
                     try:
-                        self._received.put_nowait(line)
+                        self._received.put_nowait(frame)
                     except queue.Full as exc:
                         raise UartReceiveOverflowError(
                             "UART receive queue is full at capacity "
                             f"{self.receive_queue_capacity}; consumer is too slow."
                         ) from exc
                     sequence += 1
-                    self.received_lines += 1
+                    self.received_frames += 1
+                self.discarded_frames = framer.discarded_frames
         except BaseException as exc:
             if not self._stop_event.is_set():
                 self._reader_error = exc
@@ -445,7 +489,7 @@ class UartLineChannel:
         self._raise_reader_error()
         return self._serial
 
-    def __enter__(self) -> UartLineChannel:
+    def __enter__(self) -> UartFrameChannel:
         self.start()
         return self
 
@@ -456,7 +500,7 @@ class UartLineChannel:
             if isinstance(exc, BaseException):
                 add_exception_note(
                     exc,
-                    f"UartLineChannel cleanup also failed: {cleanup_error!r}",
+                    f"UartFrameChannel cleanup also failed: {cleanup_error!r}",
                 )
                 return
             raise

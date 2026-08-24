@@ -8,17 +8,20 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from rescue_vision.motion.protocol import (
-    CarTelemetry,
-    CarLineChannel,
+    CarFrameChannel,
+    CarSystemStatus,
+    ControllerProtocolError,
     ParsedCarMessage,
-    UnknownCarMessage,
     encode_emergency_stop_command,
     encode_gripper_command,
     encode_soft_brake_command,
     encode_state_query_command,
     encode_wheel_speed_command,
-    parse_car_line,
+    parse_controller_frame,
 )
+
+
+_WHEEL_COMMAND_REFRESH_NS = 40_000_000
 
 
 def _positive_finite(value: object, location: str) -> float:
@@ -77,7 +80,7 @@ class MotionLimits:
 
 
 class MotionController:
-    """通过同一行通道驱动 Rescue Car 底盘和夹爪。
+    """通过同一 COBS 帧通道驱动 STM32 底盘和夹爪。
 
     `drive()` 的车体 twist 参考点是两驱动轮接地点连线的中点，与机器人
     地面坐标系原点一致。
@@ -85,7 +88,7 @@ class MotionController:
 
     def __init__(
         self,
-        channel: CarLineChannel,
+        channel: CarFrameChannel,
         limits: MotionLimits,
         *,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
@@ -100,8 +103,11 @@ class MotionController:
         self._target_wheel_speeds_m_s = (0.0, 0.0)
         self._commanded_wheel_speeds_m_s = (0.0, 0.0)
         self._last_acceleration_update_ns = self._now()
+        self._last_wheel_command_ns = self._last_acceleration_update_ns
+        self._command_sequence = 0
         self._gripper_target_angles_deg: tuple[float, float] | None = None
         self._has_gripper_command = False
+        self.invalid_received_frames = 0
 
     @property
     def target_wheel_speeds_m_s(self) -> tuple[float, float]:
@@ -159,10 +165,19 @@ class MotionController:
         next_left = _move_toward(previous_left, target_left, maximum_delta)
         next_right = _move_toward(previous_right, target_right, maximum_delta)
         self._last_acceleration_update_ns = current_ns
-        if next_left == previous_left and next_right == previous_right:
+        changed = next_left != previous_left or next_right != previous_right
+        refresh_due = (
+            current_ns - self._last_wheel_command_ns
+            >= _WHEEL_COMMAND_REFRESH_NS
+        )
+        if not changed and not refresh_due:
             return False
-        self._channel.send_line(encode_wheel_speed_command(next_left, next_right))
+        sequence = self._next_command_sequence()
+        self._channel.send_frame(
+            encode_wheel_speed_command(sequence, next_left, next_right)
+        )
         self._commanded_wheel_speeds_m_s = (next_left, next_right)
+        self._last_wheel_command_ns = current_ns
         return True
 
     def drive(
@@ -262,8 +277,12 @@ class MotionController:
     ) -> None:
         """同时设置左右夹爪舵机角度，单位 degree。"""
 
-        payload = encode_gripper_command(left_angle_deg, right_angle_deg)
-        self._channel.send_line(payload)
+        payload = encode_gripper_command(
+            self._next_command_sequence(),
+            left_angle_deg,
+            right_angle_deg,
+        )
+        self._channel.send_frame(payload)
         self._gripper_target_angles_deg = (
             float(left_angle_deg),
             float(right_angle_deg),
@@ -273,22 +292,28 @@ class MotionController:
     def soft_brake(self) -> None:
         """按固件减速度斜坡制动到静止。"""
 
-        self._channel.send_line(encode_soft_brake_command())
+        self._channel.send_frame(
+            encode_soft_brake_command(self._next_command_sequence())
+        )
         self._reset_acceleration_state()
 
     def emergency_stop(self) -> None:
         """触发固件急停。"""
 
-        self._channel.send_line(encode_emergency_stop_command())
+        self._channel.send_frame(
+            encode_emergency_stop_command(self._next_command_sequence())
+        )
         self._reset_acceleration_state()
 
     def query_state(self) -> None:
         """请求固件立即返回当前状态。"""
 
-        self._channel.send_line(encode_state_query_command())
+        self._channel.send_frame(
+            encode_state_query_command(self._next_command_sequence())
+        )
 
     def receive_message(self, timeout: float | None = None) -> ParsedCarMessage:
-        """接收回传；忽略空行，并把非空损坏行隔离为未知消息。"""
+        """接收一条合法 STM32 消息；损坏、未知和方向错误的帧直接丢弃。"""
 
         deadline_ns: int | None = None
         wait_s = timeout
@@ -296,24 +321,19 @@ class MotionController:
             wait_s = _non_negative(timeout, "timeout")
             deadline_ns = self._now() + round(wait_s * 1_000_000_000)
         while True:
-            line = self._channel.receive_line(timeout=wait_s)
-            if not line.payload:
+            frame = self._channel.receive_frame(timeout=wait_s)
+            try:
+                message = parse_controller_frame(frame)
+            except ControllerProtocolError:
+                self.invalid_received_frames += 1
                 if deadline_ns is not None:
                     wait_s = max(
                         0.0,
                         (deadline_ns - self._now()) / 1_000_000_000.0,
                     )
                 continue
-            try:
-                message = parse_car_line(line)
-            except ValueError:
-                return UnknownCarMessage(
-                    uart_sequence=line.sequence,
-                    received_timestamp_ns=line.received_timestamp_ns,
-                    payload=line.payload,
-                )
             if (
-                isinstance(message, CarTelemetry)
+                isinstance(message, CarSystemStatus)
                 and not self._has_gripper_command
             ):
                 self._gripper_target_angles_deg = (
@@ -323,7 +343,7 @@ class MotionController:
             return message
 
     def drain_messages(self) -> tuple[ParsedCarMessage, ...]:
-        """非阻塞排空当前回传，防止 10 Hz 遥测挤满 UART 队列。"""
+        """非阻塞排空当前回传，防止 100 Hz 定位遥测挤满 UART 队列。"""
 
         messages: list[ParsedCarMessage] = []
         while True:
@@ -335,7 +355,14 @@ class MotionController:
     def _reset_acceleration_state(self) -> None:
         self._target_wheel_speeds_m_s = (0.0, 0.0)
         self._commanded_wheel_speeds_m_s = (0.0, 0.0)
-        self._last_acceleration_update_ns = self._now()
+        current_ns = self._now()
+        self._last_acceleration_update_ns = current_ns
+        self._last_wheel_command_ns = current_ns
+
+    def _next_command_sequence(self) -> int:
+        sequence = self._command_sequence
+        self._command_sequence = (sequence + 1) & 0xFFFF
+        return sequence
 
     def _now(self, value: int | None = None) -> int:
         current = self._monotonic_ns() if value is None else value

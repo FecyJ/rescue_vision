@@ -6,15 +6,18 @@ import pytest
 
 from rescue_vision.motion import (
     CarCommandReply,
-    CarSafetyStatus,
     CarStopReason,
-    CarTelemetry,
+    CarSystemStatus,
+    CommandResult,
     ExecutedRemoteGripper,
     ExecutedRemoteMotion,
     ManualMotionLogWriter,
     RemoteGripperResult,
     RemoteMotionResult,
-    UnknownCarMessage,
+    MessageType,
+    OdometryImu,
+    SensorFlags,
+    SystemFlags,
     inspect_manual_motion_log,
 )
 
@@ -47,34 +50,50 @@ def test_manual_motion_log_round_trip_preserves_monotonic_time_sources(
         )
     )
     writer.record_car_message(
-        CarTelemetry(
+        OdometryImu(
             uart_sequence=3,
             received_timestamp_ns=120,
-            controller_timestamp_ms=50,
-            actual_left_m_s=0.11,
-            actual_right_m_s=0.09,
-            target_left_m_s=0.12,
-            target_right_m_s=0.08,
-            servo_left_deg=90,
-            servo_right_deg=90,
+            telemetry_sequence=7,
+            sample_timestamp_us=50_000,
+            left_encoder_count=100,
+            right_encoder_count=101,
+            gyro_x_urad_s=1,
+            gyro_y_urad_s=2,
+            gyro_z_urad_s=3,
+            accel_x_mm_s2=4,
+            accel_y_mm_s2=5,
+            accel_z_mm_s2=9807,
+            imu_temperature_cdeg=3600,
+            sensor_flags=(
+                SensorFlags.IMU_VALID
+                | SensorFlags.LEFT_ENCODER_VALID
+                | SensorFlags.RIGHT_ENCODER_VALID
+            ),
         )
     )
     writer.record_car_message(
-        CarCommandReply(4, 130, True, "m=0.12,0.08")
+        CarCommandReply(
+            4,
+            130,
+            9,
+            MessageType.SET_WHEEL_SPEED,
+            CommandResult.ACCEPTED,
+        )
     )
     writer.record_car_message(
-        CarSafetyStatus(
+        CarSystemStatus(
             uart_sequence=5,
             received_timestamp_ns=135,
-            controller_timestamp_ms=65,
+            status_sequence=8,
+            controller_timestamp_us=65_000,
             watchdog_timeout_ms=300,
-            watchdog_armed=True,
-            emergency_stop_latched=False,
             last_motion_command_age_ms=15,
+            system_flags=SystemFlags.WATCHDOG_ARMED,
             stop_reason=CarStopReason.RUNNING,
+            servo_left_target_cdeg=9000,
+            servo_right_target_cdeg=9000,
         )
     )
-    writer.record_car_message(UnknownCarMessage(6, 140, b"imu,1,2,3"))
     writer.record_timeout(command_id="drive-1", timestamp_ns=210)
     writer.record_gripper_timeout(
         command_id="grip-1",
@@ -88,7 +107,7 @@ def test_manual_motion_log_round_trip_preserves_monotonic_time_sources(
 
     report = inspect_manual_motion_log(path)
 
-    assert report["event_count"] == 11
+    assert report["event_count"] == 10
     assert report["first_timestamp_ns"] == 100
     assert report["last_timestamp_ns"] == 230
     assert report["event_counts"] == {
@@ -98,11 +117,10 @@ def test_manual_motion_log_round_trip_preserves_monotonic_time_sources(
         "motion_command": 1,
         "motion_timeout": 1,
         "safety_stop": 1,
-        "safety_status": 1,
+        "system_status": 1,
         "stream_finished": 1,
         "stream_started": 1,
-        "unknown_uart": 1,
-        "wheel_telemetry": 1,
+        "odometry_imu": 1,
     }
     events = [
         json.loads(line)
@@ -112,8 +130,8 @@ def test_manual_motion_log_round_trip_preserves_monotonic_time_sources(
     assert events[2]["timestamp_ns"] == 115
     assert events[3]["timestamp_ns"] == 120
     assert events[5]["stop_reason"] == "running"
-    assert events[6]["payload_hex"] == b"imu,1,2,3".hex()
-    assert events[8]["timestamp_ns"] == 216
+    assert events[3]["sample_timestamp_us"] == 50_000
+    assert events[7]["timestamp_ns"] == 216
 
 
 def test_manual_motion_log_rejects_sequence_and_truncation(tmp_path) -> None:

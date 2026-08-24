@@ -325,16 +325,15 @@ perception:
 uart:
   enabled: true
   device: /dev/serial0
-  baudrate: 115200
   read_timeout_ms: 100.0
   write_timeout_ms: 100.0
   receive_queue_capacity: 256
-  max_line_bytes: 512
 ```
 
-`build_channel()` 返回协议无关的 `UartLineChannel`；进入上下文时才导入
-PySerial 并打开设备。电机命令、轮速和未来 IMU 报文由后续协议层解释，
-不能把类别前缀或字段数塞进运行配置。完整生命周期和故障语义见
+`build_channel()` 返回协议无关的 `UartFrameChannel`；进入上下文时才导入
+PySerial 并打开设备。115200 8N1 和 64-byte COBS 解码边界由冻结协议直接
+确定，不在 YAML 重复配置；消息类型、CRC 和字段布局同样不能塞进运行配置。
+完整生命周期和故障语义见
 [`communication` README](../communication/README.md)。
 
 ## 11. 远程通信装配语义

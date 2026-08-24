@@ -52,7 +52,7 @@ if TYPE_CHECKING:
         RemoteConnectionOptions,
         RemoteMessageConnection,
         RemoteTcpServer,
-        UartLineChannel,
+        UartFrameChannel,
     )
     from rescue_vision.motion import (
         GripperCalibration,
@@ -443,27 +443,29 @@ class ProcessingConfig:
 class UartConfig:
     enabled: bool
     device: str | None
-    baudrate: int
     read_timeout_ms: float
     write_timeout_ms: float
     receive_queue_capacity: int
-    max_line_bytes: int
 
-    def build_channel(self) -> UartLineChannel | None:
-        """按配置创建协议无关 UART 行通道；禁用时返回 ``None``。"""
+    def build_channel(self) -> UartFrameChannel | None:
+        """按配置创建协议无关 UART COBS 帧通道；禁用时返回 ``None``。"""
 
         if not self.enabled:
             return None
         assert self.device is not None
-        from rescue_vision.communication import UartLineChannel
+        from rescue_vision.communication import UartFrameChannel
+        from rescue_vision.motion.protocol import (
+            MAX_DECODED_FRAME_BYTES,
+            STM32_UART_BAUDRATE,
+        )
 
-        return UartLineChannel(
+        return UartFrameChannel(
             device=self.device,
-            baudrate=self.baudrate,
+            baudrate=STM32_UART_BAUDRATE,
             read_timeout_s=self.read_timeout_ms / 1000.0,
             write_timeout_s=self.write_timeout_ms / 1000.0,
             receive_queue_capacity=self.receive_queue_capacity,
-            max_line_bytes=self.max_line_bytes,
+            max_frame_bytes=MAX_DECODED_FRAME_BYTES,
         )
 
 
@@ -574,7 +576,7 @@ class MotionRuntimeConfig:
 
     def build_controller(
         self,
-        channel: UartLineChannel | None,
+        channel: UartFrameChannel | None,
     ) -> MotionController | None:
         """按配置创建运动控制器；不会创建或打开 UART。"""
 
@@ -1040,11 +1042,9 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         {
             "enabled",
             "device",
-            "baudrate",
             "read_timeout_ms",
             "write_timeout_ms",
             "receive_queue_capacity",
-            "max_line_bytes",
         },
         "uart",
     )
@@ -1062,10 +1062,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     uart = UartConfig(
         enabled=uart_enabled,
         device=uart_device,
-        baudrate=_positive_int(
-            uart_raw.get("baudrate", 115200),
-            "uart.baudrate",
-        ),
         read_timeout_ms=_finite_float(
             uart_raw.get("read_timeout_ms", 100.0),
             "uart.read_timeout_ms",
@@ -1079,10 +1075,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         receive_queue_capacity=_positive_int(
             uart_raw.get("receive_queue_capacity", 256),
             "uart.receive_queue_capacity",
-        ),
-        max_line_bytes=_positive_int(
-            uart_raw.get("max_line_bytes", 512),
-            "uart.max_line_bytes",
         ),
     )
 

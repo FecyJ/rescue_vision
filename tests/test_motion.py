@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+import struct
 
 import pytest
 
@@ -10,15 +11,15 @@ from rescue_vision.communication import (
     HeadingReference,
     MotionControlMode,
     ReceivedRemoteMessage,
-    ReceivedUartLine,
+    ReceivedUartFrame,
     RemoteStream,
     RemoteTopic,
 )
 from rescue_vision.motion import (
     CarCommandReply,
-    CarSafetyStatus,
     CarStopReason,
-    CarTelemetry,
+    CarSystemStatus,
+    CommandResult,
     GripperCalibration,
     MotionController,
     MotionLimits,
@@ -28,21 +29,30 @@ from rescue_vision.motion import (
     RemoteMotionError,
     RemoteMotionExecutor,
     RemoteMotionResult,
-    UnknownCarMessage,
-    parse_car_line,
+    MessageType,
+    OdometryImu,
+    SensorFlags,
+    SystemFlags,
+    encode_emergency_stop_command,
+    encode_gripper_command,
+    encode_soft_brake_command,
+    encode_state_query_command,
+    encode_wheel_speed_command,
+    pack_protocol_frame,
+    parse_controller_frame,
     run_remote_motion,
 )
 
 
 class FakeCarChannel:
-    def __init__(self, received: list[ReceivedUartLine] | None = None) -> None:
+    def __init__(self, received: list[ReceivedUartFrame] | None = None) -> None:
         self.sent: list[bytes] = []
         self.received = list(received or [])
 
-    def send_line(self, payload: bytes) -> None:
+    def send_frame(self, payload: bytes) -> None:
         self.sent.append(payload)
 
-    def receive_line(self, timeout: float | None = None) -> ReceivedUartLine:
+    def receive_frame(self, timeout: float | None = None) -> ReceivedUartFrame:
         del timeout
         if not self.received:
             raise TimeoutError
@@ -165,6 +175,58 @@ def gripper_calibration() -> GripperCalibration:
     )
 
 
+def system_status_frame(
+    uart_sequence: int,
+    received_timestamp_ns: int,
+    *,
+    status_sequence: int = 1,
+    controller_timestamp_us: int = 10_000,
+    system_flags: SystemFlags = SystemFlags.WATCHDOG_ARMED,
+    stop_reason: CarStopReason = CarStopReason.RUNNING,
+    left_cdeg: int = 9000,
+    right_cdeg: int = 9000,
+) -> ReceivedUartFrame:
+    payload = struct.pack(
+        "<HQHIHBHH",
+        status_sequence,
+        controller_timestamp_us,
+        300,
+        25,
+        int(system_flags),
+        int(stop_reason),
+        left_cdeg,
+        right_cdeg,
+    )
+    return ReceivedUartFrame(
+        uart_sequence,
+        received_timestamp_ns,
+        pack_protocol_frame(MessageType.SYSTEM_STATUS, payload),
+    )
+
+
+def command_reply_frame(
+    uart_sequence: int,
+    received_timestamp_ns: int,
+    *,
+    command_sequence: int,
+    command_type: MessageType = MessageType.SET_WHEEL_SPEED,
+    result: CommandResult = CommandResult.ACCEPTED,
+) -> ReceivedUartFrame:
+    return ReceivedUartFrame(
+        uart_sequence,
+        received_timestamp_ns,
+        pack_protocol_frame(
+            MessageType.COMMAND_REPLY,
+            struct.pack(
+                "<HBB",
+                command_sequence,
+                int(command_type),
+                int(result),
+            ),
+        ),
+    )
+
+
 def test_gripper_calibration_rejects_unsafe_endpoints_and_travel_time() -> None:
     with pytest.raises(ValueError, match="Left gripper"):
         GripperCalibration(20.0, 174.0, 20.0, 174.0, 1.0)
@@ -201,14 +263,14 @@ def test_motion_functions_encode_differential_drive_and_stops() -> None:
     controller.query_state()
 
     assert channel.sent == [
-        b"m0.1,0.3",
-        b"m0.1,0.1",
-        b"m-0.1,-0.1",
-        b"m-0.1,0.1",
-        b"m0.1,-0.1",
-        b"b0,0",
-        b"e",
-        b"v",
+        encode_wheel_speed_command(0, 0.1, 0.3),
+        encode_wheel_speed_command(1, 0.1, 0.1),
+        encode_wheel_speed_command(2, -0.1, -0.1),
+        encode_wheel_speed_command(3, -0.1, 0.1),
+        encode_wheel_speed_command(4, 0.1, -0.1),
+        encode_soft_brake_command(5),
+        encode_emergency_stop_command(6),
+        encode_state_query_command(7),
     ]
 
 
@@ -223,23 +285,18 @@ def test_gripper_angles_encode_left_then_right_and_reject_invalid_values() -> No
     with pytest.raises(ValueError, match="finite"):
         controller.set_gripper_angles(float("nan"), 90.0)
 
-    assert channel.sent == [b"g27,167", b"g0,180"]
+    assert channel.sent == [
+        encode_gripper_command(0, 27.0, 167.0),
+        encode_gripper_command(1, 0.0, 180.0),
+    ]
 
 
 def test_gripper_target_uses_initial_telemetry_then_local_commands() -> None:
     clock = FakeClock(100)
     channel = FakeCarChannel(
         [
-            ReceivedUartLine(
-                sequence=0,
-                received_timestamp_ns=99,
-                payload=b"t1,0,0,0,0,90,90",
-            ),
-            ReceivedUartLine(
-                sequence=1,
-                received_timestamp_ns=101,
-                payload=b"t2,0,0,0,0,30,150",
-            ),
+            system_status_frame(0, 99),
+            system_status_frame(1, 101, left_cdeg=3000, right_cdeg=15000),
         ]
     )
     controller = MotionController(channel, limits(), monotonic_ns=clock)
@@ -274,7 +331,30 @@ def test_wheel_targets_are_slew_limited_across_acceleration_and_reversal() -> No
     clock.advance(0.1)
     assert controller.update()
     assert controller.commanded_wheel_speeds_m_s == pytest.approx((-0.05, 0.05))
-    assert channel.sent == [b"m0.05,-0.05", b"m0,0", b"m-0.05,0.05"]
+    assert channel.sent == [
+        encode_wheel_speed_command(0, 0.0, 0.0),
+        encode_wheel_speed_command(1, 0.05, -0.05),
+        encode_wheel_speed_command(2, 0.0, 0.0),
+        encode_wheel_speed_command(3, -0.05, 0.05),
+    ]
+
+
+def test_unchanged_wheel_target_is_refreshed_for_firmware_watchdog() -> None:
+    channel = FakeCarChannel()
+    clock = FakeClock()
+    controller = MotionController(channel, limits(), monotonic_ns=clock)
+
+    clock.advance(0.039)
+    assert not controller.update()
+    clock.advance(0.001)
+    assert controller.update()
+    clock.advance(0.040)
+    assert controller.update()
+
+    assert channel.sent == [
+        encode_wheel_speed_command(0, 0.0, 0.0),
+        encode_wheel_speed_command(1, 0.0, 0.0),
+    ]
 
 
 def test_soft_brake_clears_pending_acceleration_target() -> None:
@@ -288,10 +368,14 @@ def test_soft_brake_clears_pending_acceleration_target() -> None:
     controller.soft_brake()
     clock.advance(1.0)
 
-    assert not controller.update()
+    assert controller.update()
     assert controller.target_wheel_speeds_m_s == (0.0, 0.0)
     assert controller.commanded_wheel_speeds_m_s == (0.0, 0.0)
-    assert channel.sent == [b"m0.05,0.05", b"b0,0"]
+    assert channel.sent == [
+        encode_wheel_speed_command(0, 0.05, 0.05),
+        encode_soft_brake_command(1),
+        encode_wheel_speed_command(2, 0.0, 0.0),
+    ]
 
 
 def test_motion_limits_reject_instead_of_clamping() -> None:
@@ -370,94 +454,44 @@ def test_wheel_limited_drive_still_rejects_body_velocity_limit() -> None:
     assert channel.sent == []
 
 
-def test_parse_car_replies_telemetry_and_unknown_prefix() -> None:
-    telemetry = parse_car_line(
-        ReceivedUartLine(
-            3,
-            5_000,
-            b"t12345,0.19,0.20,0.20,0.20,90,45",
-        )
+def test_controller_discards_invalid_protocol_frames_before_valid_message() -> None:
+    invalid_crc = bytearray(
+        command_reply_frame(0, 1_000, command_sequence=3).payload
     )
-    ok = parse_car_line(ReceivedUartLine(4, 6_000, b"OK m=0.20,0.20"))
-    error = parse_car_line(ReceivedUartLine(5, 7_000, b"ERR: unknown cmd 'z'"))
-    unknown = parse_car_line(ReceivedUartLine(6, 8_000, b"imu,1,2,3"))
-    binary = parse_car_line(ReceivedUartLine(7, 9_000, b"\xff\x00\x80"))
-
-    assert isinstance(telemetry, CarTelemetry)
-    assert telemetry.controller_timestamp_ms == 12_345
-    assert telemetry.actual_left_m_s == pytest.approx(0.19)
-    assert telemetry.servo_right_deg == pytest.approx(45.0)
-    assert ok == CarCommandReply(4, 6_000, True, "m=0.20,0.20")
-    assert error == CarCommandReply(5, 7_000, False, "unknown cmd 'z'")
-    assert unknown == UnknownCarMessage(6, 8_000, b"imu,1,2,3")
-    assert binary == UnknownCarMessage(7, 9_000, b"\xff\x00\x80")
-
-
-def test_controller_ignores_empty_uart_lines_before_valid_message() -> None:
+    invalid_crc[-1] ^= 0xFF
     channel = FakeCarChannel(
         [
-            ReceivedUartLine(0, 1_000, b""),
-            ReceivedUartLine(1, 2_000, b""),
-            ReceivedUartLine(2, 3_000, b"OK"),
+            ReceivedUartFrame(0, 1_000, bytes(invalid_crc)),
+            command_reply_frame(1, 3_000, command_sequence=4),
         ]
     )
     controller = MotionController(channel, limits())
 
     assert controller.receive_message(timeout=0) == CarCommandReply(
-        uart_sequence=2,
+        uart_sequence=1,
         received_timestamp_ns=3_000,
-        succeeded=True,
-        detail="",
+        command_sequence=4,
+        command_type=MessageType.SET_WHEEL_SPEED,
+        result=CommandResult.ACCEPTED,
     )
+    assert controller.invalid_received_frames == 1
 
 
-def test_parse_versioned_car_safety_status() -> None:
-    status = parse_car_line(
-        ReceivedUartLine(
-            7,
-            9_000,
-            b"s1,12350,300,1,0,25,running",
-        )
-    )
-    startup = parse_car_line(
-        ReceivedUartLine(
-            8,
-            10_000,
-            b"s1,10,300,1,0,-1,startup",
-        )
-    )
+def test_parse_system_status_and_initial_gripper_target() -> None:
+    status = parse_controller_frame(system_status_frame(7, 9_000))
 
-    assert status == CarSafetyStatus(
+    assert status == CarSystemStatus(
         uart_sequence=7,
         received_timestamp_ns=9_000,
-        controller_timestamp_ms=12_350,
+        status_sequence=1,
+        controller_timestamp_us=10_000,
         watchdog_timeout_ms=300,
-        watchdog_armed=True,
-        emergency_stop_latched=False,
         last_motion_command_age_ms=25,
+        system_flags=SystemFlags.WATCHDOG_ARMED,
         stop_reason=CarStopReason.RUNNING,
+        servo_left_target_cdeg=9000,
+        servo_right_target_cdeg=9000,
     )
-    assert isinstance(startup, CarSafetyStatus)
-    assert startup.last_motion_command_age_ms is None
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        b"t1,0,0",
-        b"t-1,0,0,0,0,90,90",
-        b"t1,nan,0,0,0,90,90",
-        b"t1,0,0,0,0,181,90",
-        b"s1,1,300,2,0,10,running",
-        b"s1,1,300,1,0,-2,running",
-        b"s1,1,0,1,0,10,running",
-        b"s1,1,300,1,0,10,future_reason",
-        b"s1,1,300,1,0,10",
-    ],
-)
-def test_parse_car_line_rejects_malformed_known_messages(payload: bytes) -> None:
-    with pytest.raises(ValueError):
-        parse_car_line(ReceivedUartLine(0, 0, payload))
 
 
 def test_remote_twist_executes_and_expiry_uses_receive_clock() -> None:
@@ -477,14 +511,17 @@ def test_remote_twist_executes_and_expiry_uses_receive_clock() -> None:
     assert channel.sent == []
     clock.advance(0.2)
     assert controller.update()
-    assert channel.sent == [b"m0.1,0.1"]
+    assert channel.sent == [encode_wheel_speed_command(0, 0.1, 0.1)]
     assert not executor.check_timeout(now_ns=1_199_999_999)
     assert executor.next_wait_s(
         0.05,
         now_ns=1_190_000_000,
     ) == pytest.approx(0.01)
     assert executor.check_timeout(now_ns=1_200_000_000)
-    assert channel.sent == [b"m0.1,0.1", b"b0,0"]
+    assert channel.sent == [
+        encode_wheel_speed_command(0, 0.1, 0.1),
+        encode_soft_brake_command(1),
+    ]
 
 
 def test_remote_twist_scales_coupled_wheel_limit_instead_of_stopping() -> None:
@@ -562,7 +599,7 @@ def test_remote_zero_twist_slew_limits_to_zero_and_clears_deadline() -> None:
     assert executor.active_deadline_ns is None
     assert controller.target_wheel_speeds_m_s == (0.0, 0.0)
     assert controller.commanded_wheel_speeds_m_s == pytest.approx((0.2, 0.2))
-    assert channel.sent == [b"m0.2,0.2"]
+    assert channel.sent == [encode_wheel_speed_command(0, 0.2, 0.2)]
 
     for _ in range(4):
         clock.advance(0.1)
@@ -570,11 +607,11 @@ def test_remote_zero_twist_slew_limits_to_zero_and_clears_deadline() -> None:
 
     assert controller.commanded_wheel_speeds_m_s == (0.0, 0.0)
     assert channel.sent == [
-        b"m0.2,0.2",
-        b"m0.15,0.15",
-        b"m0.1,0.1",
-        b"m0.05,0.05",
-        b"m0,0",
+        encode_wheel_speed_command(0, 0.2, 0.2),
+        encode_wheel_speed_command(1, 0.15, 0.15),
+        encode_wheel_speed_command(2, 0.1, 0.1),
+        encode_wheel_speed_command(3, 0.05, 0.05),
+        encode_wheel_speed_command(4, 0.0, 0.0),
     ]
 
 
@@ -598,7 +635,10 @@ def test_remote_deadman_off_and_already_expired_commands_stop() -> None:
 
     assert stopped.result is RemoteMotionResult.STOPPED_DEADMAN
     assert expired.result is RemoteMotionResult.EXPIRED
-    assert channel.sent == [b"b0,0", b"b0,0"]
+    assert channel.sent == [
+        encode_soft_brake_command(0),
+        encode_soft_brake_command(1),
+    ]
 
 
 def test_invalid_remote_commands_stop_before_reporting_error() -> None:
@@ -632,7 +672,11 @@ def test_invalid_remote_commands_stop_before_reporting_error() -> None:
             now_ns=1_050_000_000,
         )
 
-    assert channel.sent == [b"b0,0", b"b0,0", b"b0,0"]
+    assert channel.sent == [
+        encode_soft_brake_command(0),
+        encode_soft_brake_command(1),
+        encode_soft_brake_command(2),
+    ]
 
 
 def test_remote_validity_limit_is_enforced_without_using_sender_clock() -> None:
@@ -645,17 +689,18 @@ def test_remote_validity_limit_is_enforced_without_using_sender_clock() -> None:
             now_ns=1_000_000_001,
         )
 
-    assert channel.sent == [b"b0,0"]
+    assert channel.sent == [encode_soft_brake_command(0)]
 
 
 def test_remote_gripper_advances_while_refreshed_and_stops_on_release() -> None:
     clock = FakeClock(1_050_000_000)
     channel = FakeCarChannel(
         [
-            ReceivedUartLine(
-                sequence=0,
-                received_timestamp_ns=1_000_000_000,
-                payload=b"t1,0,0,0,0,20,174",
+            system_status_frame(
+                0,
+                1_000_000_000,
+                left_cdeg=2000,
+                right_cdeg=17400,
             )
         ]
     )
@@ -686,7 +731,7 @@ def test_remote_gripper_advances_while_refreshed_and_stops_on_release() -> None:
     assert applied.deadline_timestamp_ns == 1_200_000_000
     assert stopped.result is RemoteGripperResult.STOPPED
     assert expired.result is RemoteGripperResult.EXPIRED
-    assert channel.sent == [b"g26,168"]
+    assert channel.sent == [encode_gripper_command(0, 26.0, 168.0)]
 
 
 def test_remote_gripper_uses_fixed_speed_and_stops_on_conflicting_triggers() -> None:
@@ -722,7 +767,7 @@ def test_remote_gripper_uses_fixed_speed_and_stops_on_conflicting_triggers() -> 
     )
 
     assert cancelled.result is RemoteGripperResult.STOPPED
-    assert channel.sent == [b"g38,156"]
+    assert channel.sent == [encode_gripper_command(1, 38.0, 156.0)]
 
 
 def test_remote_gripper_timeout_stops_at_last_target() -> None:
@@ -748,7 +793,7 @@ def test_remote_gripper_timeout_stops_at_last_target() -> None:
     clock.advance(0.1)
     assert not executor.update()
     assert controller.gripper_target_angles_deg == pytest.approx((23.0, 171.0))
-    assert channel.sent == [b"g23,171"]
+    assert channel.sent == [encode_gripper_command(1, 23.0, 171.0)]
 
 
 def test_remote_gripper_projects_state_to_194_degree_sum_before_motion() -> None:
@@ -774,7 +819,7 @@ def test_remote_gripper_projects_state_to_194_degree_sum_before_motion() -> None
     assert left == pytest.approx(91.0)
     assert right == pytest.approx(103.0)
     assert left + right == pytest.approx(194.0)
-    assert channel.sent == [b"g91,103"]
+    assert channel.sent == [encode_gripper_command(1, 91.0, 103.0)]
 
 
 def test_remote_gripper_clamps_projected_state_to_valid_servo_range() -> None:
@@ -797,7 +842,7 @@ def test_remote_gripper_clamps_projected_state_to_valid_servo_range() -> None:
     assert executor.update()
 
     assert controller.gripper_target_angles_deg == pytest.approx((20.0, 174.0))
-    assert channel.sent == [b"g20,174"]
+    assert channel.sent == [encode_gripper_command(1, 20.0, 174.0)]
 
 
 def test_invalid_remote_gripper_command_does_not_actuate() -> None:
@@ -830,20 +875,14 @@ def test_invalid_remote_gripper_command_does_not_actuate() -> None:
 
 
 def test_remote_loop_drains_uart_and_stops_on_exit() -> None:
+    invalid_crc = bytearray(
+        command_reply_frame(0, 8, command_sequence=5).payload
+    )
+    invalid_crc[-1] ^= 0x01
     channel = FakeCarChannel(
         [
-            ReceivedUartLine(0, 8, b""),
-            ReceivedUartLine(1, 9, b"\xff\x00\x80"),
-            ReceivedUartLine(
-                2,
-                10,
-                b"t2,0.1,OK m=-0.05,0.1,0.1,90,90",
-            ),
-            ReceivedUartLine(
-                3,
-                11,
-                b"t1,0.1,0.1,0.1,0.1,90,90",
-            )
+            ReceivedUartFrame(0, 8, bytes(invalid_crc)),
+            system_status_frame(1, 11),
         ]
     )
     clock = FakeClock()
@@ -869,26 +908,13 @@ def test_remote_loop_drains_uart_and_stops_on_exit() -> None:
         poll_interval_s=0.01,
     )
 
-    assert car_messages == [
-        UnknownCarMessage(1, 9, b"\xff\x00\x80"),
-        UnknownCarMessage(
-            2,
-            10,
-            b"t2,0.1,OK m=-0.05,0.1,0.1,90,90",
-        ),
-        CarTelemetry(
-            uart_sequence=3,
-            received_timestamp_ns=11,
-            controller_timestamp_ms=1,
-            actual_left_m_s=0.1,
-            actual_right_m_s=0.1,
-            target_left_m_s=0.1,
-            target_right_m_s=0.1,
-            servo_left_deg=90,
-            servo_right_deg=90,
-        ),
+    assert car_messages == [parse_controller_frame(system_status_frame(1, 11))]
+    assert executor.controller.invalid_received_frames == 1
+    assert channel.sent == [
+        encode_wheel_speed_command(0, 0.0, 0.0),
+        encode_wheel_speed_command(1, 0.05, 0.05),
+        encode_soft_brake_command(2),
     ]
-    assert channel.sent == [b"m0.05,0.05", b"b0,0"]
 
 
 def test_remote_loop_routes_other_controls_without_bypassing_stop() -> None:
@@ -914,12 +940,12 @@ def test_remote_loop_routes_other_controls_without_bypassing_stop() -> None:
     )
 
     assert routed == [capture_message]
-    assert channel.sent == [b"b0,0"]
+    assert channel.sent == [encode_soft_brake_command(0)]
 
 
 def test_remote_loop_uart_receive_fault_stops_before_propagating() -> None:
     class FaultingCarChannel(FakeCarChannel):
-        def receive_line(self, timeout: float | None = None) -> ReceivedUartLine:
+        def receive_frame(self, timeout: float | None = None) -> ReceivedUartFrame:
             del timeout
             raise RuntimeError("UART receive failed")
 
@@ -933,4 +959,4 @@ def test_remote_loop_uart_receive_fault_stops_before_propagating() -> None:
             stop_requested=lambda: False,
         )
 
-    assert channel.sent == [b"b0,0"]
+    assert channel.sent == [encode_soft_brake_command(0)]

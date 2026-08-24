@@ -1,40 +1,36 @@
 # `motion`：小车运动控制与远程调试执行
 
-本包当前把车体速度意图转换为 Rescue Car v2.0 双轮速度命令，控制双舵机夹爪，
+本包把车体速度意图转换为 STM32 固定长度二进制双轮速度命令，控制双舵机夹爪，
 并执行电脑端传来的 `control/debug/motion` 和
-`control/debug/gripper`。它依赖调用方注入 UART 行通道和远程连接，不创建
+`control/debug/gripper`。它依赖调用方注入 UART COBS 帧通道和远程连接，不创建
 串口、TCP 服务、定位器或规划器。
 
-电控协议依据本次提供的
-`docs/Rescue Car v2.0 — 电控代码使用说明书.pdf`：115200 8N1、CRLF
-行结束，`m<L>,<R>` 设置轮速、`g<L°>,<R°>` 设置夹爪双舵机、
-`b0,0` 柔和停车、`e` 急停，STM32 回传 `OK`、`ERR` 和 10 Hz `t...`
-遥测。
-
-树莓派与 STM32 后续共同切换的目标接口以
+树莓派与 STM32 接口以
 [`docs/树莓派与单片机通信协议.md`](../../../docs/树莓派与单片机通信协议.md)
-为唯一权威。目标协议使用 COBS、CRC16 和固定长度二进制消息，统一运动、夹爪、
-固件看门狗及编码器/IMU 遥测；当前代码尚未实现，实施时直接替换本文以下旧
-文本协议入口，不增加兼容层。
+为唯一权威。树莓派端已经使用 COBS、CRC16 和固定长度二进制消息统一运动、
+夹爪、固件看门狗及编码器/IMU 遥测，并删除旧文本协议兼容层；STM32 固件
+仍待实现和真机验收。
 
 ## 常用类和函数
 
 | 入口 | 输入 | 输出或语义 |
 | --- | --- | --- |
 | `MotionLimits` | 轮距、车体/车轮速度与单轮加速度上限、远程有效期上限 | 创建时严格校验 |
-| `MotionController` | UART 行通道、`MotionLimits` | Rescue Car 运动控制器 |
+| `MotionController` | UART 帧通道、`MotionLimits` | STM32 运动控制器 |
 | `MotionController.drive()` | 前进速度 m/s、逆时针角速度 rad/s | 差速换算后设置左右轮目标 |
 | `drive_wheel_limited()` | 分别合法的车体线速度和角速度 | 必要时同比缩放并返回实际 twist，使单轮不超限 |
 | `set_wheel_speeds()` | 左右轮速度 m/s | 绕过车体 twist 换算，仍执行轮速限幅校验 |
-| `update()` | 可选本机单调时间 ns | 按单轮最大加速度推进并下发目标；返回是否发送 |
+| `update()` | 可选本机单调时间 ns | 按单轮最大加速度推进，并至少 20 Hz 刷新轮速；返回是否发送 |
 | `forward()` / `backward()` | 非负速度 m/s | 直行前进/后退 |
 | `turn_left()` / `turn_right()` | 非负角速度 rad/s | 原地左转/右转 |
 | `set_gripper_angles()` | 左右舵机角度 degree | 同时下发严格 `[0, 180]` 角度 |
 | `gripper_target_angles_deg` | 无 | 启动遥测或本进程最近下发的左右舵机目标；尚无时为 `None` |
 | `soft_brake()` / `emergency_stop()` | 无 | 固件斜坡制动/紧急停止 |
 | `query_state()` | 无 | 请求固件立即返回状态 |
-| `receive_message()` | 可选等待秒数 | 忽略空行，返回轮速、安全状态、命令回复或未知回传 |
-| `CarSafetyStatus` | `s1` 状态行 | 固件单调时间、看门狗、锁存急停、命令年龄和停车原因 |
+| `receive_message()` | 可选等待秒数 | 丢弃损坏帧，返回编码器/IMU、系统状态或命令回复 |
+| `OdometryImu` | `ODOMETRY_IMU` | 同周期累计编码器、三轴 IMU、采样时间和质量位 |
+| `CarSystemStatus` | `SYSTEM_STATUS` | 固件单调时间、看门狗、锁存急停、命令年龄和舵机目标 |
+| `CarCommandReply` | `COMMAND_REPLY` | 原命令序号、类型和接受/拒绝原因 |
 | `drain_messages()` | 无 | 非阻塞排空当前 UART 回传 |
 | `RemoteMotionExecutor.execute()` | `ReceivedRemoteMessage` | 校验远程运动消息后执行 |
 | `RemoteMotionExecutor.check_timeout()` | 可选本机单调时间 ns | 到期时停车，返回是否触发 |
@@ -43,7 +39,7 @@
 | `RemoteGripperExecutor.update()` | 可选本机单调时间 ns | 按按压方向以配置速度渐进下发舵机目标 |
 | `RemoteGripperExecutor.check_timeout()` / `stop()` | 可选本机单调时间 ns | 超时或退出时停止推进，保留当前角度 |
 | `run_remote_motion()` | 远程接收器、执行器、退出回调 | 持续收命令、排空回传、分派其他 control，并在退出时停车 |
-| `ManualMotionLogWriter` | recording 内的 `motion.jsonl` | 顺序写入运动/夹爪命令、遥测、UART 扩展和停车事件 |
+| `ManualMotionLogWriter` | recording 内的 `motion.jsonl` | 顺序写入运动/夹爪命令、编码器/IMU、系统状态、回复和停车事件 |
 | `ManualMotionLogWriter.record_gripper()` | `ExecutedRemoteGripper` | 记录扳机状态及 applied/stopped/expired 结果 |
 | `record_gripper_timeout()` | 命令 ID、单调时间 ns | 记录持续夹爪命令到期停止 |
 | `inspect_manual_motion_log()` | `motion.jsonl` 路径 | 严格校验 schema、事件序号和时间范围摘要 |
@@ -124,11 +120,11 @@ controller.update()
 超过 `MotionLimits` 时，调用会抛出 `ValueError`，不会把请求悄悄截断。
 每次 `update()` 使用树莓派本机单调时间计算允许的最大轮速增量；时钟倒退会
 被拒绝。`run_remote_motion()` 已在每轮循环自动调用它，手动采集应用不需要
-另建定时器。其他直接调用方应以不超过 100 ms 的有界周期调用 `update()`，
-否则目标只会停留在最近一次实际下发值。
+另建定时器。其他直接调用方应以不超过 50 ms 的有界周期调用 `update()`；
+即使轮速没有变化，控制器也会至少 20 Hz 重发当前目标以刷新固件看门狗。
 远程手柄在死手仍开启时回中，执行器会调用 `drive(0, 0)` 设置零目标，再由
 同一 `update()` 循环按 `max_wheel_acceleration_m_s2` 逐级降低左右轮命令；
-不会直接发送 `m0,0` 或固件 `b0,0`。死手关闭、命令过期、非法输入及退出
+不会直接发送柔和停车命令。死手关闭、命令过期、非法输入及退出
 仍使用独立的柔和停车安全路径。
 
 ## 3. 直接设置左右轮速度
@@ -166,7 +162,7 @@ controller.turn_right(angular_velocity_rad_s=0.80)
 
 ## 5. 控制夹爪双舵机
 
-夹爪使用 Rescue Car 的 `g<左角度>,<右角度>` 指令，左右字段不能交换。
+夹爪使用二进制 `SET_GRIPPER`，线路单位为百分之一度，左右字段不能交换。
 以下片段应放在前文已打开的 `with channel` 内：
 
 ```python
@@ -189,8 +185,8 @@ controller.set_gripper_angles(
 夹爪位置由 STM32 锁存，和底盘运动目标具有不同安全语义。
 `soft_brake()`、运动命令超时或断线停车不会自动改变夹爪角度，以免运输时
 意外丢落；调用方退出前若确实需要释放，必须根据现场安全条件显式发送另一组
-已标定角度。10 Hz 遥测中的 `servo_left_deg` / `servo_right_deg` 是固件
-`CarState` 报告的目标角度，不是舵机物理位置反馈。
+已标定角度。10 Hz `CarSystemStatus` 中的舵机字段是固件目标角度，不是舵机
+物理位置反馈。
 低层 `set_gripper_angles()` 仍忠实编码调用方给出的两个角度；194° 和约束
 属于远程夹爪执行器及其 `GripperCalibration`，不会暗中改变其他直接调用方。
 
@@ -208,53 +204,54 @@ controller.soft_brake()
 controller.emergency_stop()
 ```
 
-`soft_brake()` 发送 `b0,0`，由固件按配置减速度降到零；`emergency_stop()`
-发送 `e`。当前固件的急停是否锁存、如何恢复仍需真机冻结，应用不得假设发送
-下一条速度命令就能安全解除急停。
+`soft_brake()` 发送 `SOFT_BRAKE`，由固件按配置减速度降到零；
+`emergency_stop()` 发送 `EMERGENCY_STOP`。协议不定义远程解除急停命令，
+应用不得假设发送下一条速度命令就能解除急停。
 
 ## 7. 查询并处理电控回传
 
-发送状态查询后，命令回复和主动 10 Hz 遥测可能交错，因此不能假定下一行
+发送状态查询后，命令回复、100 Hz 定位遥测和 10 Hz 系统状态可能交错，不能假定下一帧
 一定是查询回复：
 
 ```python
 from rescue_vision.motion import (
     CarCommandReply,
-    CarSafetyStatus,
-    CarTelemetry,
-    UnknownCarMessage,
+    CarSystemStatus,
+    OdometryImu,
 )
 
 controller.query_state()
 message = controller.receive_message(timeout=0.5)
 
-if isinstance(message, CarTelemetry):
+if isinstance(message, OdometryImu):
     print(
         message.received_timestamp_ns,
-        message.controller_timestamp_ms,
-        message.actual_left_m_s,
-        message.actual_right_m_s,
+        message.sample_timestamp_us,
+        message.left_encoder_count,
+        message.right_encoder_count,
+        message.gyro_z_rad_s,
     )
-elif isinstance(message, CarSafetyStatus):
-    # 只有新鲜且 watchdog_armed=True 的 s1 状态才能作为固件保护证据。
+elif isinstance(message, CarSystemStatus):
+    # 只有新鲜且 watchdog_armed=True 的状态及真机停车验收才能作为保护证据。
     print(
         message.watchdog_timeout_ms,
         message.watchdog_armed,
         message.emergency_stop_latched,
-        message.stop_reason.value,
+        message.stop_reason.name.lower(),
     )
 elif isinstance(message, CarCommandReply):
-    print("OK" if message.succeeded else "ERR", message.detail)
-elif isinstance(message, UnknownCarMessage):
-    # 未来 IMU 等新前缀在显式支持前会保留为原始 bytes。
-    print("unknown car message:", message.payload)
+    print(
+        message.command_sequence,
+        message.command_type.name,
+        message.result.name,
+    )
 ```
 
 实时循环应持续消费回传。只发送而不接收会使 UART 有界队列最终溢出：
 
 ```python
 for message in controller.drain_messages():
-    # 调用方可在这里分发轮速遥测、日志或未来 IMU 消息。
+    # 调用方可在这里分发定位遥测、系统状态和回复。
     print(message)
 ```
 
@@ -416,21 +413,13 @@ finally:
   全行程时间来自车端运行配置
   运行配置，不由客户端逐条指定，避免绕过统一安全上限。
 - 死手保持开启且 twist 回到零时，零目标和其他有效目标一样经过单轮加速度
-  限制；真机已发现固件 `b0,0` 会使实测轮速直接归零，因此普通回中不再
-  依赖该固件斜坡。
+  限制；普通回中不发送 `SOFT_BRAKE`，只由周期轮速命令逐步降到零。
 - 死手关闭、命令过期、非法 payload、未知控制模式和循环正常退出均进入柔和
   停车；协议或通信异常也会尝试停车并继续抛出原始异常。
-- `drain_messages()` / `run_remote_motion()` 会排空 10 Hz 回传。未知前缀保留
-  为 `UnknownCarMessage`，非 ASCII 原始行也按相同方式保留；只有 CR/LF 的
-  空 UART 行没有业务内容，会被忽略。以上情况不会导致手动采集循环退出或被
-  误判为命令成功；录制期间非空原始 bytes 以十六进制写入 `unknown_uart`。
-  冻结的 `s1` 行解析为 `CarSafetyStatus` 并写入运动日志
-  当前记录格式；当前固件尚不产生该状态。`parse_car_line()` 对损坏的已知
-  `t...` / `s1...` 报文仍严格抛出 `ValueError`；实时
-  `MotionController.receive_message()` 会把单条损坏报文隔离为
-  `UnknownCarMessage`，防止固件遥测和 `OK` 输出交错时终止采集。后续正常
-  报文仍会继续解析。
-- 当前固件资料没有失联看门狗。进程被强杀、树莓派掉电或 UART 物理断开时，
+- `drain_messages()` / `run_remote_motion()` 会持续排空 100 Hz 回传。COBS
+  损坏、空帧、超长帧、CRC 错误、未知类型、错误方向、固定长度或枚举非法的
+  帧均被丢弃，下一帧继续解析；它们不会被记录成伪业务消息或误判为命令成功。
+- STM32 固件尚未实现和验收本文失联看门狗。进程被强杀、树莓派掉电或 UART 物理断开时，
   Python 无法保证停车；只能在架空轮或有物理急停、人员全程监督的环境验证，
   不能把本模块的超时当作固件级失控保护。
 

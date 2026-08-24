@@ -9,10 +9,9 @@ from typing import Any, TextIO
 
 from rescue_vision.motion.protocol import (
     CarCommandReply,
-    CarSafetyStatus,
-    CarTelemetry,
+    CarSystemStatus,
+    OdometryImu,
     ParsedCarMessage,
-    UnknownCarMessage,
 )
 from rescue_vision.motion.remote_control import (
     ExecutedRemoteGripper,
@@ -43,27 +42,38 @@ _EVENT_KEYS = {
         "close_pressed",
     },
     "gripper_timeout": {"command_id"},
-    "wheel_telemetry": {
+    "odometry_imu": {
         "uart_sequence",
-        "controller_timestamp_ms",
-        "actual_left_m_s",
-        "actual_right_m_s",
-        "target_left_m_s",
-        "target_right_m_s",
-        "servo_left_deg",
-        "servo_right_deg",
+        "telemetry_sequence",
+        "sample_timestamp_us",
+        "left_encoder_count",
+        "right_encoder_count",
+        "gyro_x_urad_s",
+        "gyro_y_urad_s",
+        "gyro_z_urad_s",
+        "accel_x_mm_s2",
+        "accel_y_mm_s2",
+        "accel_z_mm_s2",
+        "imu_temperature_cdeg",
+        "sensor_flags",
     },
-    "safety_status": {
+    "system_status": {
         "uart_sequence",
-        "controller_timestamp_ms",
+        "status_sequence",
+        "controller_timestamp_us",
         "watchdog_timeout_ms",
-        "watchdog_armed",
-        "emergency_stop_latched",
         "last_motion_command_age_ms",
+        "system_flags",
         "stop_reason",
+        "servo_left_target_cdeg",
+        "servo_right_target_cdeg",
     },
-    "command_reply": {"uart_sequence", "succeeded", "detail"},
-    "unknown_uart": {"uart_sequence", "payload_hex"},
+    "command_reply": {
+        "uart_sequence",
+        "command_sequence",
+        "command_type",
+        "result",
+    },
     "safety_stop": {"reason"},
 }
 _COMMON_KEYS = {
@@ -86,7 +96,7 @@ _STOP_REASONS = {
 
 
 class ManualMotionLogWriter:
-    """同步写入低频运动事件；每行刷新以保留故障前证据。"""
+    """同步写入运动事件与 100 Hz 定位遥测；每行刷新以保留故障前证据。"""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).expanduser().resolve()
@@ -148,45 +158,46 @@ class ManualMotionLogWriter:
         )
 
     def record_car_message(self, message: ParsedCarMessage) -> None:
-        if isinstance(message, CarTelemetry):
+        if isinstance(message, OdometryImu):
             self._write(
-                "wheel_telemetry",
+                "odometry_imu",
                 message.received_timestamp_ns,
                 uart_sequence=message.uart_sequence,
-                controller_timestamp_ms=message.controller_timestamp_ms,
-                actual_left_m_s=message.actual_left_m_s,
-                actual_right_m_s=message.actual_right_m_s,
-                target_left_m_s=message.target_left_m_s,
-                target_right_m_s=message.target_right_m_s,
-                servo_left_deg=message.servo_left_deg,
-                servo_right_deg=message.servo_right_deg,
+                telemetry_sequence=message.telemetry_sequence,
+                sample_timestamp_us=message.sample_timestamp_us,
+                left_encoder_count=message.left_encoder_count,
+                right_encoder_count=message.right_encoder_count,
+                gyro_x_urad_s=message.gyro_x_urad_s,
+                gyro_y_urad_s=message.gyro_y_urad_s,
+                gyro_z_urad_s=message.gyro_z_urad_s,
+                accel_x_mm_s2=message.accel_x_mm_s2,
+                accel_y_mm_s2=message.accel_y_mm_s2,
+                accel_z_mm_s2=message.accel_z_mm_s2,
+                imu_temperature_cdeg=message.imu_temperature_cdeg,
+                sensor_flags=int(message.sensor_flags),
             )
-        elif isinstance(message, CarSafetyStatus):
+        elif isinstance(message, CarSystemStatus):
             self._write(
-                "safety_status",
+                "system_status",
                 message.received_timestamp_ns,
                 uart_sequence=message.uart_sequence,
-                controller_timestamp_ms=message.controller_timestamp_ms,
+                status_sequence=message.status_sequence,
+                controller_timestamp_us=message.controller_timestamp_us,
                 watchdog_timeout_ms=message.watchdog_timeout_ms,
-                watchdog_armed=message.watchdog_armed,
-                emergency_stop_latched=message.emergency_stop_latched,
                 last_motion_command_age_ms=message.last_motion_command_age_ms,
-                stop_reason=message.stop_reason.value,
+                system_flags=int(message.system_flags),
+                stop_reason=message.stop_reason.name.lower(),
+                servo_left_target_cdeg=message.servo_left_target_cdeg,
+                servo_right_target_cdeg=message.servo_right_target_cdeg,
             )
         elif isinstance(message, CarCommandReply):
             self._write(
                 "command_reply",
                 message.received_timestamp_ns,
                 uart_sequence=message.uart_sequence,
-                succeeded=message.succeeded,
-                detail=message.detail,
-            )
-        elif isinstance(message, UnknownCarMessage):
-            self._write(
-                "unknown_uart",
-                message.received_timestamp_ns,
-                uart_sequence=message.uart_sequence,
-                payload_hex=message.payload.hex(),
+                command_sequence=message.command_sequence,
+                command_type=message.command_type.name.lower(),
+                result=message.result.name.lower(),
             )
         else:
             raise TypeError(
@@ -309,27 +320,29 @@ def _validate_event_fields(
     for name in (
         "deadline_timestamp_ns",
         "uart_sequence",
-        "controller_timestamp_ms",
+        "telemetry_sequence",
+        "sample_timestamp_us",
+        "status_sequence",
+        "controller_timestamp_us",
         "watchdog_timeout_ms",
+        "sensor_flags",
+        "system_flags",
+        "servo_left_target_cdeg",
+        "servo_right_target_cdeg",
+        "command_sequence",
     ):
         if name in record:
             _non_negative_integer(record[name], f"{location}.{name}")
     for name in (
         "linear_velocity_m_s",
         "angular_velocity_rad_s",
-        "actual_left_m_s",
-        "actual_right_m_s",
-        "target_left_m_s",
-        "target_right_m_s",
-        "servo_left_deg",
-        "servo_right_deg",
     ):
         if name in record:
             _finite_number(record[name], f"{location}.{name}")
     for name in (
         "command_id",
+        "command_type",
         "result",
-        "payload_hex",
         "reason",
         "stop_reason",
     ):
@@ -337,17 +350,10 @@ def _validate_event_fields(
             not isinstance(record[name], str) or not record[name]
         ):
             raise ValueError(f"{location}.{name} must be a non-empty string.")
-    if "detail" in record and not isinstance(record["detail"], str):
-        raise ValueError(f"{location}.detail must be a string.")
     if "deadman_enabled" in record and not isinstance(
         record["deadman_enabled"], bool
     ):
         raise ValueError(f"{location}.deadman_enabled must be a boolean.")
-    if "succeeded" in record and not isinstance(record["succeeded"], bool):
-        raise ValueError(f"{location}.succeeded must be a boolean.")
-    for name in ("watchdog_armed", "emergency_stop_latched"):
-        if name in record and not isinstance(record[name], bool):
-            raise ValueError(f"{location}.{name} must be a boolean.")
     for name in ("open_pressed", "close_pressed"):
         if name in record and not isinstance(record[name], bool):
             raise ValueError(f"{location}.{name} must be a boolean.")
@@ -377,23 +383,21 @@ def _validate_event_fields(
         and record["reason"] not in _STOP_REASONS
     ):
         raise ValueError(f"{location}.reason is not supported.")
-    if event_type == "unknown_uart":
-        payload_hex = str(record["payload_hex"])
-        if (
-            not payload_hex
-            or len(payload_hex) % 2
-            or payload_hex != payload_hex.lower()
-            or any(
-                character not in "0123456789abcdef"
-                for character in payload_hex
-            )
+    if event_type == "odometry_imu":
+        for name in (
+            "left_encoder_count",
+            "right_encoder_count",
+            "gyro_x_urad_s",
+            "gyro_y_urad_s",
+            "gyro_z_urad_s",
+            "accel_x_mm_s2",
+            "accel_y_mm_s2",
+            "accel_z_mm_s2",
+            "imu_temperature_cdeg",
         ):
-            raise ValueError(f"{location}.payload_hex must be lowercase hex.")
-    if event_type == "wheel_telemetry":
-        for name in ("servo_left_deg", "servo_right_deg"):
-            if not 0.0 <= float(record[name]) <= 180.0:
-                raise ValueError(f"{location}.{name} must be in [0, 180].")
-    if event_type == "safety_status":
+            if isinstance(record[name], bool) or not isinstance(record[name], int):
+                raise ValueError(f"{location}.{name} must be an integer.")
+    if event_type == "system_status":
         if int(record["watchdog_timeout_ms"]) <= 0:
             raise ValueError(
                 f"{location}.watchdog_timeout_ms must be positive."
@@ -406,6 +410,9 @@ def _validate_event_fields(
             "emergency_stop",
         }:
             raise ValueError(f"{location}.stop_reason is not supported.")
+        for name in ("servo_left_target_cdeg", "servo_right_target_cdeg"):
+            if not 0 <= int(record[name]) <= 18000:
+                raise ValueError(f"{location}.{name} must be in [0, 18000].")
 
 
 def _non_negative_integer(value: object, location: str) -> int:

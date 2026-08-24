@@ -43,12 +43,14 @@ from rescue_vision.communication.remote_observations import (
     VideoFrameAttributes,
 )
 from rescue_vision.communication.uart import (
-    ReceivedUartLine,
+    CobsDecodeError,
+    ReceivedUartFrame,
     UartError,
-    UartLineChannel,
-    UartLineFramer,
-    UartLineTooLongError,
+    UartFrameChannel,
+    UartFrameFramer,
     UartReceiveOverflowError,
+    cobs_decode,
+    cobs_encode,
 )
 
 __all__ = [
@@ -65,7 +67,8 @@ __all__ = [
     "MapSnapshotAttributes",
     "MotionControlMode",
     "ReceivedRemoteMessage",
-    "ReceivedUartLine",
+    "CobsDecodeError",
+    "ReceivedUartFrame",
     "RemoteAccessMode",
     "RemoteConnectionOptions",
     "RemoteDisconnectedError",
@@ -82,9 +85,8 @@ __all__ = [
     "RemoteTopic",
     "TeamColor",
     "UartError",
-    "UartLineChannel",
-    "UartLineFramer",
-    "UartLineTooLongError",
+    "UartFrameChannel",
+    "UartFrameFramer",
     "UartReceiveOverflowError",
     "VehicleMotionState",
     "VehicleSafetyMode",
@@ -93,5 +95,7 @@ __all__ = [
     "VideoFrameAttributes",
     "VideoFrameMode",
     "VideoModeCommand",
+    "cobs_decode",
+    "cobs_encode",
     "connect_remote_client",
 ]

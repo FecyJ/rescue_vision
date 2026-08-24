@@ -2,11 +2,11 @@
 
 本包提供两种协议无关传输基础：
 
-- UART 字节收发、CRLF/LF 行分帧、接收时间戳和有界队列；
+- UART 字节收发、`0x00` 定界、COBS 解码、接收时间戳和有界队列；
 - 电脑与树莓派之间免密直连、带长度分帧和有界控制/观察队列的 TCP 消息
   通道。
 
-本包不解释电机、舵机、轮速、IMU 或任务规则。Rescue Car 协议适配器和
+本包不解释电机、舵机、编码器、IMU 或任务规则。STM32 协议适配器和
 远程调试意图到底盘动作的转换位于相邻
 [`motion`](../motion/README.md) 包。
 
@@ -14,13 +14,14 @@
 
 | 入口 | 用途 | 关键语义 |
 | --- | --- | --- |
-| `UartLineChannel` | 真实 8N1 UART 后台读取与同步发送 | 必须 `start/stop` 或使用上下文管理 |
-| `send()` | 写出任意非空 bytes | 不添加行结束符 |
-| `send_line()` | 写出一条协议 payload | 禁止内含 CR/LF，自动添加 CRLF |
-| `receive_line()` | 等待一条完整行 | 返回 `ReceivedUartLine`；超时抛出 `TimeoutError` |
+| `UartFrameChannel` | 真实 8N1 UART 后台读取与同步发送 | 必须 `start/stop` 或使用上下文管理 |
+| `send()` | 写出任意非空 bytes | 仅供底层使用，不添加分帧 |
+| `send_frame()` | 写出一帧解码态 payload | 自动 COBS 编码并添加 `0x00` |
+| `receive_frame()` | 等待一帧已解码数据 | 返回 `ReceivedUartFrame`；超时抛出 `TimeoutError` |
 | `check_health()` | 检查后台读取和设备状态 | 通道未启动或已经故障时抛出异常 |
-| `ReceivedUartLine` | 一条完整原始行 | 带 UART 序号和树莓派接收单调时间 ns |
-| `UartLineFramer` | 对任意字节分块执行 CRLF/LF 分帧 | 不解码、不解释报文前缀 |
+| `ReceivedUartFrame` | 一帧 COBS 解码结果 | 带 UART 序号和树莓派接收完成单调时间 ns |
+| `UartFrameFramer` | 对任意字节分块执行定界和 COBS 解码 | 损坏/超长帧丢弃并在下一定界符恢复 |
+| `cobs_encode()` / `cobs_decode()` | 无硬件 COBS 编解码 | 不添加或消费末尾 `0x00` |
 | `RemoteTcpServer` | 树莓派 TCP 服务端 | 单监听端点；`accept()` 返回一个消息连接 |
 | `connect_remote_client()` | 仓库内参考客户端 | 只用于互操作和人工检查 |
 | `RemoteMessageConnection` | 一个 TCP 会话的双向消息通道 | 启动两个后台线程，严格验证线路序号 |
@@ -82,33 +83,26 @@ finally:
 `stop()` 可以重复调用。关闭 UART 不等于小车已经停车；需要停车时必须先由
 `motion` 在通道仍可写时发送制动命令。
 
-## 3. 发送 UART 数据
+## 3. 发送 UART 帧
 
-行协议通常使用 `send_line()`。它统一添加 `\r\n`，调用方不得自己附加：
+业务代码应通过 `MotionController` 生成 CRC 和固定消息。确需单独使用传输层时，
+`send_frame()` 接受 COBS 编码前的完整 payload，并自动完成分帧：
 
 ```python
 with uart_channel:
-    # 实际写出的 bytes 是 b"v\r\n"。
-    uart_channel.send_line(b"v")
+    uart_channel.send_frame(decoded_protocol_frame)
 ```
 
-确实需要发送不带行结束符的二进制数据时才使用 `send()`：
+`decoded_protocol_frame` 由 `motion.protocol` 产生，已经包含消息类型和 CRC。
+调用方不得自行 COBS 编码、添加 `0x00`，也不得用底层 `send()` 绕过统一分帧。
+
+## 4. 接收 UART 帧
+
+`receive_frame()` 返回 COBS 解码后的 bytes、线路序号和树莓派接收完成时间：
 
 ```python
 with uart_channel:
-    uart_channel.send(b"\x01\x02\x03")
-```
-
-`communication` 不校验 `b"v"` 是否为合法电控命令。Rescue Car 命令应通过
-`MotionController` 发送，不要在业务模块中散落手写协议字符串。
-
-## 4. 接收 UART 行
-
-`receive_line()` 返回原始 bytes、线路序号和树莓派接收时间：
-
-```python
-with uart_channel:
-    received = uart_channel.receive_line(timeout=0.5)
+    received = uart_channel.receive_frame(timeout=0.5)
     print(
         received.sequence,
         received.received_timestamp_ns,
@@ -121,39 +115,37 @@ with uart_channel:
 ```python
 with uart_channel:
     try:
-        received = uart_channel.receive_line(timeout=0.1)
+        received = uart_channel.receive_frame(timeout=0.1)
     except TimeoutError:
         uart_channel.check_health()
     else:
-        process_raw_uart_line(received)
+        process_decoded_uart_frame(received)
 ```
 
-这里的 `process_raw_uart_line()` 代表调用方提供的分发函数。Rescue Car
-调用方应改用 `MotionController.receive_message()`，由唯一协议层解析
-`OK`、`ERR`、轮速遥测和未知前缀。
+这里的 `process_decoded_uart_frame()` 代表调用方提供的分发函数。底盘调用方
+应改用 `MotionController.receive_message()`，由唯一协议层校验 CRC、固定长度、
+消息方向、枚举和值域，再返回命令回复、编码器/IMU 或系统状态。
 
-STM32 自身的毫秒计时应作为协议字段另外保存，不能替代树莓派
+STM32 自身的微秒计时作为协议字段另外保存，不能替代树莓派
 `received_timestamp_ns` 与相机帧对齐。命令回复和主动遥测可能交错，不能
-假定“发送后的下一行就是这条命令的回复”。
+假定“发送后的下一帧就是这条命令的回复”。
 
-## 5. 单独使用 `UartLineFramer`
+## 5. 单独使用 `UartFrameFramer`
 
-`UartLineFramer` 用于没有 `UartLineChannel` 的字节流测试或其他传输适配，
+`UartFrameFramer` 用于没有 `UartFrameChannel` 的字节流测试或其他传输适配，
 不会访问硬件：
 
 ```python
-from rescue_vision.communication import UartLineFramer
+from rescue_vision.communication import UartFrameFramer, cobs_encode
 
-framer = UartLineFramer(max_line_bytes=64)
+framer = UartFrameFramer(max_frame_bytes=64)
+wire = cobs_encode(b"\x80\x01\x00") + b"\x00"
 
-assert framer.feed(b"OK m=0.2") == ()
-assert framer.feed(b",0.2\r\nt1,0,0\n") == (
-    b"OK m=0.2,0.2",
-    b"t1,0,0",
-)
+assert framer.feed(wire[:2]) == ()
+assert framer.feed(wire[2:]) == (b"\x80\x01\x00",)
 ```
 
-生产 UART 已在 `UartLineChannel` 内部使用同一个 framer，不应在调用方再次
+生产 UART 已在 `UartFrameChannel` 内部使用同一个 framer，不应在调用方再次
 分帧。
 
 ## 6. 从运行配置装配树莓派 TCP 服务端
@@ -586,8 +578,8 @@ PNG 绘制由 `app.FieldMapSnapshotRenderer` 完成，通信包只维护严格�
 
 ## 队列、故障和降级语义
 
-- UART 行超过 `max_line_bytes`、接收队列溢出、设备断开或后台读取异常都会
-  使通道进入故障，不会静默丢弃命令回复或遥测。
+- COBS 损坏、空帧和超长帧会被丢弃并在下一 `0x00` 恢复；接收队列溢出、
+  设备断开或后台读取异常会使通道进入故障，不会静默丢弃已验证消息。
 - `send_control()` 和 `send_reliable_observation()` 共用可靠优先队列，满时
   抛出 `RemoteQueueOverflowError`。
 - `send_observation()` 的发送队列以及参考客户端的观察接收队列均按 topic
@@ -601,7 +593,8 @@ PNG 绘制由 `app.FieldMapSnapshotRenderer` 完成，通信包只维护严格�
   应先停车并清理当前会话，再回到等待新连接；正常客户端退出不得终止整个
   服务进程。
 - 远程断开、UART 故障和应用退出后的车辆停车由应用、`motion` 与 STM32
-  看门狗共同保证。当前固件资料没有失联看门狗，不能把关闭连接当作停车证据。
+  看门狗共同保证。树莓派协议已经实现，STM32 看门狗仍需实现和真机验收；
+  不能把关闭连接当作停车证据。
 
 ## 人工检查入口
 

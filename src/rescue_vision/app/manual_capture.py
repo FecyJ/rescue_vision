@@ -60,7 +60,8 @@ from rescue_vision.geometry.camera_model import (
 )
 from rescue_vision.geometry.ground_projector import BevConfig, GroundProjector
 from rescue_vision.motion import (
-    CarTelemetry,
+    CarStopReason,
+    CarSystemStatus,
     ExecutedRemoteGripper,
     ExecutedRemoteMotion,
     MotionController,
@@ -617,7 +618,7 @@ class VehicleState:
         if safety_mode is VehicleSafetyMode.FIRMWARE_WATCHDOG:
             raise ValueError(
                 "Manual capture firmware_watchdog needs fresh "
-                "CarSafetyStatus gating before it can be selected."
+                "CarSystemStatus gating before it can be selected."
             )
         if safety_mode not in {
             VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP,
@@ -626,7 +627,7 @@ class VehicleState:
             raise ValueError(f"Unsupported safety_mode {safety_mode!r}.")
         self.safety_mode = safety_mode
         self.sequence = 0
-        self.telemetry: CarTelemetry | None = None
+        self.system_status: CarSystemStatus | None = None
         self.motion_state = VehicleMotionState.STOPPED
         self.stop_reason = (
             VehicleStopReason.UART_FAULT
@@ -639,8 +640,14 @@ class VehicleState:
         self.last_applied_gripper_command_id: str | None = None
 
     def on_car_message(self, message: ParsedCarMessage) -> None:
-        if isinstance(message, CarTelemetry):
-            self.telemetry = message
+        if isinstance(message, CarSystemStatus):
+            self.system_status = message
+            if message.emergency_stop_latched:
+                self.motion_state = VehicleMotionState.STOPPED
+                self.stop_reason = VehicleStopReason.EMERGENCY_STOP
+            elif message.stop_reason is CarStopReason.WATCHDOG_TIMEOUT:
+                self.motion_state = VehicleMotionState.STOPPED
+                self.stop_reason = VehicleStopReason.CONTROLLER_WATCHDOG
 
     def on_motion(self, outcome: ExecutedRemoteMotion) -> None:
         self.last_received_command_id = outcome.command_id
@@ -674,40 +681,37 @@ class VehicleState:
             self.last_applied_gripper_command_id = outcome.command_id
 
     def observation(self) -> VehicleStateObservation:
-        telemetry = self.telemetry
+        status = self.system_status
         uart_connected = self.safety_mode is not VehicleSafetyMode.UNAVAILABLE
+        emergency_stop_latched = (
+            False if status is None else status.emergency_stop_latched
+        )
         observation = VehicleStateObservation(
             state_sequence=self.sequence,
             timestamp_ns=time.monotonic_ns(),
-            control_ready=uart_connected,
+            control_ready=uart_connected and not emergency_stop_latched,
             safety_mode=self.safety_mode,
             uart_connected=uart_connected,
             watchdog_armed=(
                 self.safety_mode is VehicleSafetyMode.FIRMWARE_WATCHDOG
             ),
-            emergency_stop_latched=False,
+            emergency_stop_latched=emergency_stop_latched,
             motion_state=self.motion_state,
             stop_reason=self.stop_reason,
             controller_uptime_ms=(
-                None if telemetry is None else telemetry.controller_timestamp_ms
+                None
+                if status is None
+                else status.controller_timestamp_us // 1000
             ),
-            target_left_velocity_m_s=(
-                None if telemetry is None else telemetry.target_left_m_s
-            ),
-            target_right_velocity_m_s=(
-                None if telemetry is None else telemetry.target_right_m_s
-            ),
-            measured_left_velocity_m_s=(
-                None if telemetry is None else telemetry.actual_left_m_s
-            ),
-            measured_right_velocity_m_s=(
-                None if telemetry is None else telemetry.actual_right_m_s
-            ),
+            target_left_velocity_m_s=None,
+            target_right_velocity_m_s=None,
+            measured_left_velocity_m_s=None,
+            measured_right_velocity_m_s=None,
             gripper_left_angle_deg=(
-                None if telemetry is None else telemetry.servo_left_deg
+                None if status is None else status.servo_left_deg
             ),
             gripper_right_angle_deg=(
-                None if telemetry is None else telemetry.servo_right_deg
+                None if status is None else status.servo_right_deg
             ),
             heading_rad=None,
             heading_reference=None,
@@ -1291,8 +1295,8 @@ def _accept_with_shutdown(
 ) -> RemoteMessageConnection | None:
     deadline = time.monotonic() + timeout_s
     while not stop_requested():
-        # STM32 continuously publishes 10 Hz telemetry, including while no
-        # remote client is connected.  Keep the UART's bounded queue healthy
+        # STM32 continuously publishes 100 Hz localization telemetry, including
+        # while no remote client is connected. Keep the UART's bounded queue healthy
         # instead of leaving it unconsumed for the whole accept timeout.
         if controller is not None:
             controller.drain_messages()

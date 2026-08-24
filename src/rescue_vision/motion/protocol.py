@@ -1,24 +1,132 @@
-"""Rescue Car v2.0 UART 命令编码与回传解析。"""
+"""树莓派与 STM32 固定长度二进制命令及遥测协议。"""
 
 from __future__ import annotations
 
 import math
+import struct
 from dataclasses import dataclass
-from enum import Enum
+from enum import IntEnum, IntFlag
 from typing import Protocol
 
-from rescue_vision.communication import ReceivedUartLine
+from rescue_vision.communication import ReceivedUartFrame
 
 
-class CarLineChannel(Protocol):
-    """运动层所需的最小行通道接口。"""
+MAX_DECODED_FRAME_BYTES = 64
+STM32_UART_BAUDRATE = 115200
+_CRC_STRUCT = struct.Struct("<H")
+_WHEEL_COMMAND = struct.Struct("<Hhh")
+_SEQUENCE_COMMAND = struct.Struct("<H")
+_GRIPPER_COMMAND = struct.Struct("<HHH")
+_COMMAND_REPLY = struct.Struct("<HBB")
+_ODOMETRY_IMU = struct.Struct("<HQqqiiiiiihH")
+_SYSTEM_STATUS = struct.Struct("<HQHIHBHH")
+_NO_MOTION_COMMAND_AGE = 0xFFFFFFFF
 
-    def send_line(self, payload: bytes) -> None: ...
 
-    def receive_line(self, timeout: float | None = None) -> ReceivedUartLine: ...
+class ControllerProtocolError(ValueError):
+    """一帧数据不符合冻结的 STM32 协议。"""
 
 
-def _finite_float(value: object, location: str) -> float:
+class MessageType(IntEnum):
+    SET_WHEEL_SPEED = 0x10
+    SOFT_BRAKE = 0x11
+    EMERGENCY_STOP = 0x12
+    SET_GRIPPER = 0x13
+    QUERY_STATUS = 0x14
+    COMMAND_REPLY = 0x80
+    ODOMETRY_IMU = 0x81
+    SYSTEM_STATUS = 0x82
+
+
+class CommandResult(IntEnum):
+    ACCEPTED = 0
+    OUT_OF_RANGE = 1
+    EMERGENCY_STOP_LATCHED = 2
+    DEVICE_UNAVAILABLE = 3
+
+
+class SensorFlags(IntFlag):
+    IMU_VALID = 1 << 0
+    IMU_CALIBRATED = 1 << 1
+    LEFT_ENCODER_VALID = 1 << 2
+    RIGHT_ENCODER_VALID = 1 << 3
+    GYRO_SATURATED = 1 << 4
+    ACCEL_SATURATED = 1 << 5
+    SAMPLE_OVERRUN = 1 << 6
+
+
+class SystemFlags(IntFlag):
+    WATCHDOG_ARMED = 1 << 0
+    EMERGENCY_STOP_LATCHED = 1 << 1
+    MOTOR_OUTPUT_ENABLED = 1 << 2
+    GRIPPER_OUTPUT_AVAILABLE = 1 << 3
+
+
+class CarStopReason(IntEnum):
+    STARTUP = 0
+    RUNNING = 1
+    SOFT_BRAKE = 2
+    WATCHDOG_TIMEOUT = 3
+    EMERGENCY_STOP = 4
+
+
+class CarFrameChannel(Protocol):
+    """运动层所需的最小 COBS 帧通道接口。"""
+
+    def send_frame(self, payload: bytes) -> None: ...
+
+    def receive_frame(
+        self,
+        timeout: float | None = None,
+    ) -> ReceivedUartFrame: ...
+
+
+def crc16_ccitt_false(data: bytes) -> int:
+    """计算 CRC-16/CCITT-FALSE。"""
+
+    if not isinstance(data, bytes):
+        raise TypeError(f"data must be bytes, got {type(data).__name__}.")
+    crc = 0xFFFF
+    for value in data:
+        crc ^= value << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
+
+
+def pack_protocol_frame(message_type: MessageType, payload: bytes) -> bytes:
+    """构造 COBS 编码前的 ``type | payload | crc16_le``。"""
+
+    if not isinstance(message_type, MessageType):
+        raise TypeError("message_type must be a MessageType.")
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes.")
+    body = bytes((message_type.value,)) + payload
+    frame = body + _CRC_STRUCT.pack(crc16_ccitt_false(body))
+    if len(frame) > MAX_DECODED_FRAME_BYTES:
+        raise ValueError(
+            f"Decoded protocol frame has {len(frame)} bytes; "
+            f"maximum is {MAX_DECODED_FRAME_BYTES}."
+        )
+    return frame
+
+
+def _command_sequence(value: object) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= 0xFFFF
+    ):
+        raise ValueError(
+            f"command_sequence must be an integer in [0, 65535], got {value!r}."
+        )
+    return value
+
+
+def _finite(value: object, location: str) -> float:
     if (
         isinstance(value, bool)
         or not isinstance(value, (int, float))
@@ -26,6 +134,68 @@ def _finite_float(value: object, location: str) -> float:
     ):
         raise ValueError(f"{location} must be finite, got {value!r}.")
     return float(value)
+
+
+def encode_wheel_speed_command(
+    command_sequence: int,
+    left_m_s: float,
+    right_m_s: float,
+) -> bytes:
+    """编码左右轮目标速度，线路单位为 mm/s。"""
+
+    sequence = _command_sequence(command_sequence)
+    speeds: list[int] = []
+    for name, value in (("left_m_s", left_m_s), ("right_m_s", right_m_s)):
+        mm_s = round(_finite(value, name) * 1000.0)
+        if not -32768 <= mm_s <= 32767:
+            raise ValueError(f"{name} is outside the protocol int16 range.")
+        speeds.append(mm_s)
+    return pack_protocol_frame(
+        MessageType.SET_WHEEL_SPEED,
+        _WHEEL_COMMAND.pack(sequence, speeds[0], speeds[1]),
+    )
+
+
+def encode_soft_brake_command(command_sequence: int) -> bytes:
+    return pack_protocol_frame(
+        MessageType.SOFT_BRAKE,
+        _SEQUENCE_COMMAND.pack(_command_sequence(command_sequence)),
+    )
+
+
+def encode_emergency_stop_command(command_sequence: int) -> bytes:
+    return pack_protocol_frame(
+        MessageType.EMERGENCY_STOP,
+        _SEQUENCE_COMMAND.pack(_command_sequence(command_sequence)),
+    )
+
+
+def encode_gripper_command(
+    command_sequence: int,
+    left_angle_deg: float,
+    right_angle_deg: float,
+) -> bytes:
+    sequence = _command_sequence(command_sequence)
+    angles: list[int] = []
+    for name, value in (
+        ("left_angle_deg", left_angle_deg),
+        ("right_angle_deg", right_angle_deg),
+    ):
+        angle = _finite(value, name)
+        if not 0.0 <= angle <= 180.0:
+            raise ValueError(f"{name} must be in [0, 180], got {angle!r}.")
+        angles.append(round(angle * 100.0))
+    return pack_protocol_frame(
+        MessageType.SET_GRIPPER,
+        _GRIPPER_COMMAND.pack(sequence, angles[0], angles[1]),
+    )
+
+
+def encode_state_query_command(command_sequence: int) -> bytes:
+    return pack_protocol_frame(
+        MessageType.QUERY_STATUS,
+        _SEQUENCE_COMMAND.pack(_command_sequence(command_sequence)),
+    )
 
 
 def _non_negative_int(value: object, location: str) -> int:
@@ -36,325 +206,273 @@ def _non_negative_int(value: object, location: str) -> int:
     return value
 
 
-def _format_float(value: object, location: str) -> str:
-    converted = _finite_float(value, location)
-    if converted == 0.0:
-        converted = 0.0
-    return format(converted, ".9g")
-
-
-def encode_wheel_speed_command(left_m_s: float, right_m_s: float) -> bytes:
-    """编码立即设置左右轮目标速度的 ``m`` 指令。"""
-
-    left = _format_float(left_m_s, "left_m_s")
-    right = _format_float(right_m_s, "right_m_s")
-    return f"m{left},{right}".encode("ascii")
-
-
-def encode_soft_brake_command(
-    left_m_s: float = 0.0,
-    right_m_s: float = 0.0,
-) -> bytes:
-    """编码斜坡制动到指定左右轮速度的 ``b`` 指令。"""
-
-    left = _format_float(left_m_s, "left_m_s")
-    right = _format_float(right_m_s, "right_m_s")
-    return f"b{left},{right}".encode("ascii")
-
-
-def encode_gripper_command(
-    left_angle_deg: float,
-    right_angle_deg: float,
-) -> bytes:
-    """编码同时设置左右夹爪舵机角度的 ``g`` 指令。"""
-
-    angles: list[str] = []
-    for name, value in (
-        ("left_angle_deg", left_angle_deg),
-        ("right_angle_deg", right_angle_deg),
+def _bounded_int(value: object, minimum: int, maximum: int, location: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not minimum <= value <= maximum
     ):
-        angle = _finite_float(value, name)
-        if not 0.0 <= angle <= 180.0:
-            raise ValueError(f"{name} must be in [0, 180], got {angle!r}.")
-        angles.append(_format_float(angle, name))
-    return f"g{angles[0]},{angles[1]}".encode("ascii")
-
-
-def encode_emergency_stop_command() -> bytes:
-    """编码固件急停指令。"""
-
-    return b"e"
-
-
-def encode_state_query_command() -> bytes:
-    """编码当前状态查询指令。"""
-
-    return b"v"
-
-
-@dataclass(frozen=True, slots=True)
-class CarTelemetry:
-    """STM32 10 Hz 遥测；速度为 m/s，舵机字段为固件目标角度 degree。"""
-
-    uart_sequence: int
-    received_timestamp_ns: int
-    controller_timestamp_ms: int
-    actual_left_m_s: float
-    actual_right_m_s: float
-    target_left_m_s: float
-    target_right_m_s: float
-    servo_left_deg: float
-    servo_right_deg: float
-
-    def __post_init__(self) -> None:
-        for name in (
-            "uart_sequence",
-            "received_timestamp_ns",
-            "controller_timestamp_ms",
-        ):
-            _non_negative_int(getattr(self, name), name)
-        for name in (
-            "actual_left_m_s",
-            "actual_right_m_s",
-            "target_left_m_s",
-            "target_right_m_s",
-            "servo_left_deg",
-            "servo_right_deg",
-        ):
-            object.__setattr__(
-                self,
-                name,
-                _finite_float(getattr(self, name), name),
-            )
-        for name in ("servo_left_deg", "servo_right_deg"):
-            angle = getattr(self, name)
-            if not 0.0 <= angle <= 180.0:
-                raise ValueError(f"{name} must be in [0, 180], got {angle!r}.")
-
-
-class CarStopReason(str, Enum):
-    """STM32 安全状态报告的当前停车/运行原因。"""
-
-    STARTUP = "startup"
-    RUNNING = "running"
-    SOFT_BRAKE = "soft_brake"
-    WATCHDOG_TIMEOUT = "watchdog_timeout"
-    EMERGENCY_STOP = "emergency_stop"
-
-
-@dataclass(frozen=True, slots=True)
-class CarSafetyStatus:
-    """``s1`` 安全状态；所有时间均来自 STM32 单调时钟。"""
-
-    uart_sequence: int
-    received_timestamp_ns: int
-    controller_timestamp_ms: int
-    watchdog_timeout_ms: int
-    watchdog_armed: bool
-    emergency_stop_latched: bool
-    last_motion_command_age_ms: int | None
-    stop_reason: CarStopReason
-
-    def __post_init__(self) -> None:
-        for name in (
-            "uart_sequence",
-            "received_timestamp_ns",
-            "controller_timestamp_ms",
-        ):
-            _non_negative_int(getattr(self, name), name)
-        if (
-            isinstance(self.watchdog_timeout_ms, bool)
-            or not isinstance(self.watchdog_timeout_ms, int)
-            or self.watchdog_timeout_ms <= 0
-        ):
-            raise ValueError(
-                "watchdog_timeout_ms must be a positive integer, "
-                f"got {self.watchdog_timeout_ms!r}."
-            )
-        for name in ("watchdog_armed", "emergency_stop_latched"):
-            if not isinstance(getattr(self, name), bool):
-                raise ValueError(f"{name} must be a boolean.")
-        if self.last_motion_command_age_ms is not None:
-            _non_negative_int(
-                self.last_motion_command_age_ms,
-                "last_motion_command_age_ms",
-            )
-        if not isinstance(self.stop_reason, CarStopReason):
-            raise ValueError(
-                "stop_reason must be a CarStopReason, "
-                f"got {self.stop_reason!r}."
-            )
+        raise ValueError(
+            f"{location} must be an integer in [{minimum}, {maximum}], "
+            f"got {value!r}."
+        )
+    return value
 
 
 @dataclass(frozen=True, slots=True)
 class CarCommandReply:
-    """STM32 对一条命令的成功或错误回复。"""
-
     uart_sequence: int
     received_timestamp_ns: int
-    succeeded: bool
-    detail: str
+    command_sequence: int
+    command_type: MessageType
+    result: CommandResult
 
     def __post_init__(self) -> None:
         _non_negative_int(self.uart_sequence, "uart_sequence")
         _non_negative_int(self.received_timestamp_ns, "received_timestamp_ns")
-        if not isinstance(self.succeeded, bool):
-            raise ValueError("succeeded must be a boolean.")
-        if not isinstance(self.detail, str):
-            raise ValueError("detail must be a string.")
+        _command_sequence(self.command_sequence)
+        if not isinstance(
+            self.command_type,
+            MessageType,
+        ) or self.command_type not in {
+            MessageType.SET_WHEEL_SPEED,
+            MessageType.SOFT_BRAKE,
+            MessageType.EMERGENCY_STOP,
+            MessageType.SET_GRIPPER,
+            MessageType.QUERY_STATUS,
+        }:
+            raise ValueError("command_type must identify a controller command.")
+        if not isinstance(self.result, CommandResult):
+            raise ValueError("result must be a CommandResult.")
 
 
 @dataclass(frozen=True, slots=True)
-class UnknownCarMessage:
-    """保留未知前缀，供同一 UART 后续扩展 IMU 等消息。"""
-
+class OdometryImu:
     uart_sequence: int
     received_timestamp_ns: int
-    payload: bytes
+    telemetry_sequence: int
+    sample_timestamp_us: int
+    left_encoder_count: int
+    right_encoder_count: int
+    gyro_x_urad_s: int
+    gyro_y_urad_s: int
+    gyro_z_urad_s: int
+    accel_x_mm_s2: int
+    accel_y_mm_s2: int
+    accel_z_mm_s2: int
+    imu_temperature_cdeg: int
+    sensor_flags: SensorFlags
 
     def __post_init__(self) -> None:
         _non_negative_int(self.uart_sequence, "uart_sequence")
         _non_negative_int(self.received_timestamp_ns, "received_timestamp_ns")
-        if not isinstance(self.payload, bytes) or not self.payload:
-            raise ValueError("payload must be non-empty bytes.")
+        _bounded_int(self.telemetry_sequence, 0, 0xFFFF, "telemetry_sequence")
+        _bounded_int(
+            self.sample_timestamp_us,
+            0,
+            0xFFFFFFFFFFFFFFFF,
+            "sample_timestamp_us",
+        )
+        for name in ("left_encoder_count", "right_encoder_count"):
+            _bounded_int(getattr(self, name), -(1 << 63), (1 << 63) - 1, name)
+        for name in (
+            "gyro_x_urad_s",
+            "gyro_y_urad_s",
+            "gyro_z_urad_s",
+            "accel_x_mm_s2",
+            "accel_y_mm_s2",
+            "accel_z_mm_s2",
+        ):
+            _bounded_int(getattr(self, name), -(1 << 31), (1 << 31) - 1, name)
+        _bounded_int(
+            self.imu_temperature_cdeg,
+            -(1 << 15),
+            (1 << 15) - 1,
+            "imu_temperature_cdeg",
+        )
+        if not isinstance(self.sensor_flags, SensorFlags):
+            raise ValueError("sensor_flags must be SensorFlags.")
+        if int(self.sensor_flags) & ~_known_flag_mask(SensorFlags):
+            raise ValueError("sensor_flags contains undefined bits.")
+
+    @property
+    def gyro_z_rad_s(self) -> float:
+        return self.gyro_z_urad_s / 1_000_000.0
 
 
-ParsedCarMessage = (
-    CarTelemetry | CarSafetyStatus | CarCommandReply | UnknownCarMessage
-)
+@dataclass(frozen=True, slots=True)
+class CarSystemStatus:
+    uart_sequence: int
+    received_timestamp_ns: int
+    status_sequence: int
+    controller_timestamp_us: int
+    watchdog_timeout_ms: int
+    last_motion_command_age_ms: int | None
+    system_flags: SystemFlags
+    stop_reason: CarStopReason
+    servo_left_target_cdeg: int
+    servo_right_target_cdeg: int
+
+    def __post_init__(self) -> None:
+        _non_negative_int(self.uart_sequence, "uart_sequence")
+        _non_negative_int(self.received_timestamp_ns, "received_timestamp_ns")
+        _bounded_int(self.status_sequence, 0, 0xFFFF, "status_sequence")
+        _bounded_int(
+            self.controller_timestamp_us,
+            0,
+            0xFFFFFFFFFFFFFFFF,
+            "controller_timestamp_us",
+        )
+        _bounded_int(self.watchdog_timeout_ms, 1, 0xFFFF, "watchdog_timeout_ms")
+        if self.last_motion_command_age_ms is not None:
+            _bounded_int(
+                self.last_motion_command_age_ms,
+                0,
+                _NO_MOTION_COMMAND_AGE - 1,
+                "last_motion_command_age_ms",
+            )
+        if not isinstance(self.system_flags, SystemFlags):
+            raise ValueError("system_flags must be SystemFlags.")
+        if int(self.system_flags) & ~_known_flag_mask(SystemFlags):
+            raise ValueError("system_flags contains undefined bits.")
+        if not isinstance(self.stop_reason, CarStopReason):
+            raise ValueError("stop_reason must be a CarStopReason.")
+        for name in ("servo_left_target_cdeg", "servo_right_target_cdeg"):
+            value = getattr(self, name)
+            _bounded_int(value, 0, 18000, name)
+
+    @property
+    def watchdog_armed(self) -> bool:
+        return bool(self.system_flags & SystemFlags.WATCHDOG_ARMED)
+
+    @property
+    def emergency_stop_latched(self) -> bool:
+        return bool(self.system_flags & SystemFlags.EMERGENCY_STOP_LATCHED)
+
+    @property
+    def servo_left_deg(self) -> float:
+        return self.servo_left_target_cdeg / 100.0
+
+    @property
+    def servo_right_deg(self) -> float:
+        return self.servo_right_target_cdeg / 100.0
 
 
-def parse_car_line(line: ReceivedUartLine) -> ParsedCarMessage:
-    """解析一条 Rescue Car 回传，同时保留树莓派接收时间。"""
+ParsedCarMessage = CarCommandReply | OdometryImu | CarSystemStatus
 
-    if not isinstance(line, ReceivedUartLine):
+
+def _known_flag_mask(enum_type: type[IntFlag]) -> int:
+    mask = 0
+    for flag in enum_type:
+        mask |= int(flag)
+    return mask
+
+
+def _verify_frame(frame: ReceivedUartFrame) -> tuple[MessageType, bytes]:
+    if not isinstance(frame, ReceivedUartFrame):
         raise TypeError(
-            f"line must be ReceivedUartLine, got {type(line).__name__}."
+            f"frame must be ReceivedUartFrame, got {type(frame).__name__}."
+        )
+    if len(frame.payload) < 3:
+        raise ControllerProtocolError("Protocol frame is shorter than type and CRC.")
+    body = frame.payload[:-2]
+    expected_crc = _CRC_STRUCT.unpack(frame.payload[-2:])[0]
+    actual_crc = crc16_ccitt_false(body)
+    if actual_crc != expected_crc:
+        raise ControllerProtocolError(
+            f"CRC mismatch: received 0x{expected_crc:04X}, "
+            f"calculated 0x{actual_crc:04X}."
         )
     try:
-        text = line.payload.decode("ascii")
-    except UnicodeDecodeError:
-        # 串口噪声、调试输出或尚未支持的二进制扩展不能使受监督控制循环退出。
-        # 原始 bytes 会由运动日志以十六进制保存，供现场追查。
-        return UnknownCarMessage(
-            line.sequence,
-            line.received_timestamp_ns,
-            line.payload,
-        )
-
-    if text == "OK" or text.startswith("OK "):
-        return CarCommandReply(
-            line.sequence,
-            line.received_timestamp_ns,
-            True,
-            text[2:].strip(),
-        )
-    if text.startswith("ERR:"):
-        return CarCommandReply(
-            line.sequence,
-            line.received_timestamp_ns,
-            False,
-            text[3:].lstrip(": "),
-        )
-    if text.startswith("s1,"):
-        return _parse_safety_status(line, text)
-    if not text.startswith("t"):
-        return UnknownCarMessage(
-            line.sequence,
-            line.received_timestamp_ns,
-            line.payload,
-        )
-
-    fields = text[1:].split(",")
-    if len(fields) != 7:
-        raise ValueError(
-            "Car telemetry must contain controller timestamp and six values, "
-            f"got {len(fields)} fields in {text!r}."
-        )
-    try:
-        controller_timestamp_ms = int(fields[0])
+        message_type = MessageType(body[0])
     except ValueError as exc:
-        raise ValueError(
-            f"Invalid controller timestamp in telemetry {text!r}."
+        raise ControllerProtocolError(
+            f"Unknown message type 0x{body[0]:02X}."
         ) from exc
-    if controller_timestamp_ms < 0:
-        raise ValueError(
-            "controller_timestamp_ms must be non-negative, "
-            f"got {controller_timestamp_ms!r}."
-        )
-    values = tuple(
-        _finite_float(
-            float(value),
-            f"telemetry[{index + 1}]",
-        )
-        for index, value in enumerate(fields[1:])
-    )
-    return CarTelemetry(
-        uart_sequence=line.sequence,
-        received_timestamp_ns=line.received_timestamp_ns,
-        controller_timestamp_ms=controller_timestamp_ms,
-        actual_left_m_s=values[0],
-        actual_right_m_s=values[1],
-        target_left_m_s=values[2],
-        target_right_m_s=values[3],
-        servo_left_deg=values[4],
-        servo_right_deg=values[5],
-    )
+    return message_type, body[1:]
 
 
-def _parse_safety_status(
-    line: ReceivedUartLine,
-    text: str,
-) -> CarSafetyStatus:
-    fields = text.split(",")
-    if len(fields) != 7:
-        raise ValueError(
-            "Car safety status s1 must contain six values, "
-            f"got {len(fields) - 1} in {text!r}."
+def _unpack_exact(
+    layout: struct.Struct,
+    payload: bytes,
+    message_type: MessageType,
+) -> tuple[int, ...]:
+    if len(payload) != layout.size:
+        raise ControllerProtocolError(
+            f"{message_type.name} payload has {len(payload)} bytes; "
+            f"expected {layout.size}."
         )
-    integer_names = (
-        "controller_timestamp_ms",
-        "watchdog_timeout_ms",
-        "watchdog_armed",
-        "emergency_stop_latched",
-        "last_motion_command_age_ms",
-    )
-    parsed: list[int] = []
-    for name, value in zip(integer_names, fields[1:6], strict=True):
+    return layout.unpack(payload)
+
+
+def parse_controller_frame(frame: ReceivedUartFrame) -> ParsedCarMessage:
+    """校验 CRC、类型、固定长度、枚举和值域并解析一帧 STM32 回传。"""
+
+    message_type, payload = _verify_frame(frame)
+    if message_type is MessageType.COMMAND_REPLY:
+        command_sequence, command_type_raw, result_raw = _unpack_exact(
+            _COMMAND_REPLY, payload, message_type
+        )
         try:
-            parsed.append(int(value))
+            command_type = MessageType(command_type_raw)
+            result = CommandResult(result_raw)
         except ValueError as exc:
-            raise ValueError(
-                f"Invalid {name} in car safety status {text!r}."
+            raise ControllerProtocolError(
+                "COMMAND_REPLY contains an unknown enum."
             ) from exc
-    controller_timestamp_ms, watchdog_timeout_ms, armed, latched, age = parsed
-    if controller_timestamp_ms < 0:
-        raise ValueError("controller_timestamp_ms must be non-negative.")
-    if watchdog_timeout_ms <= 0:
-        raise ValueError("watchdog_timeout_ms must be positive.")
-    if armed not in (0, 1):
-        raise ValueError("watchdog_armed must be encoded as 0 or 1.")
-    if latched not in (0, 1):
-        raise ValueError(
-            "emergency_stop_latched must be encoded as 0 or 1."
-        )
-    if age < -1:
-        raise ValueError(
-            "last_motion_command_age_ms must be -1 or non-negative."
-        )
-    try:
-        stop_reason = CarStopReason(fields[6])
-    except ValueError as exc:
-        raise ValueError(
-            f"Unsupported stop_reason in car safety status {text!r}."
-        ) from exc
-    return CarSafetyStatus(
-        uart_sequence=line.sequence,
-        received_timestamp_ns=line.received_timestamp_ns,
-        controller_timestamp_ms=controller_timestamp_ms,
-        watchdog_timeout_ms=watchdog_timeout_ms,
-        watchdog_armed=bool(armed),
-        emergency_stop_latched=bool(latched),
-        last_motion_command_age_ms=None if age == -1 else age,
-        stop_reason=stop_reason,
+        try:
+            return CarCommandReply(
+                frame.sequence,
+                frame.received_timestamp_ns,
+                command_sequence,
+                command_type,
+                result,
+            )
+        except ValueError as exc:
+            raise ControllerProtocolError(str(exc)) from exc
+
+    if message_type is MessageType.ODOMETRY_IMU:
+        values = _unpack_exact(_ODOMETRY_IMU, payload, message_type)
+        try:
+            return OdometryImu(
+                uart_sequence=frame.sequence,
+                received_timestamp_ns=frame.received_timestamp_ns,
+                telemetry_sequence=values[0],
+                sample_timestamp_us=values[1],
+                left_encoder_count=values[2],
+                right_encoder_count=values[3],
+                gyro_x_urad_s=values[4],
+                gyro_y_urad_s=values[5],
+                gyro_z_urad_s=values[6],
+                accel_x_mm_s2=values[7],
+                accel_y_mm_s2=values[8],
+                accel_z_mm_s2=values[9],
+                imu_temperature_cdeg=values[10],
+                sensor_flags=SensorFlags(values[11]),
+            )
+        except ValueError as exc:
+            raise ControllerProtocolError(str(exc)) from exc
+
+    if message_type is MessageType.SYSTEM_STATUS:
+        values = _unpack_exact(_SYSTEM_STATUS, payload, message_type)
+        try:
+            return CarSystemStatus(
+                uart_sequence=frame.sequence,
+                received_timestamp_ns=frame.received_timestamp_ns,
+                status_sequence=values[0],
+                controller_timestamp_us=values[1],
+                watchdog_timeout_ms=values[2],
+                last_motion_command_age_ms=(
+                    None if values[3] == _NO_MOTION_COMMAND_AGE else values[3]
+                ),
+                system_flags=SystemFlags(values[4]),
+                stop_reason=CarStopReason(values[5]),
+                servo_left_target_cdeg=values[6],
+                servo_right_target_cdeg=values[7],
+            )
+        except ValueError as exc:
+            raise ControllerProtocolError(str(exc)) from exc
+
+    raise ControllerProtocolError(
+        f"Received command-only message type {message_type.name} from STM32."
     )

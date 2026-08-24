@@ -27,14 +27,11 @@ uart:
   # 本地实际设备名写入不提交的 runtime.yaml；禁用时不会导入或打开串口。
   enabled: false
   device: null
-  # 当前实现仍是 115200 8N1 文本行；两端后续按专项文档切换为同波特率二进制协议。
-  baudrate: 115200
+  # STM32 二进制协议在代码与专项文档中固定为 115200 8N1，不重复配置。
   read_timeout_ms: 100.0
   write_timeout_ms: 100.0
   # UART 后台读取只写入有界队列；溢出视为通信故障，不静默丢报文。
   receive_queue_capacity: 256
-  # 当前文本行的上限；切换固定长度二进制帧时将由协议解码上限替代。
-  max_line_bytes: 512
 
 remote:
   # 树莓派通常为 server；电脑调试端可使用单独 runtime.yaml 配成 client。

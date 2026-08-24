@@ -71,11 +71,9 @@ processing:
 uart:
   enabled: false
   device: null
-  baudrate: 115200
   read_timeout_ms: 100.0
   write_timeout_ms: 100.0
   receive_queue_capacity: 256
-  max_line_bytes: 512
 remote:
   enabled: false
   role: server
@@ -856,8 +854,8 @@ def test_uart_config_builds_channel_without_opening_device(tmp_path) -> None:
     path = tmp_path / "runtime.yaml"
     path.write_text(
         config_text().replace(
-            "  enabled: false\n  device: null\n  baudrate: 115200",
-            "  enabled: true\n  device: /dev/serial0\n  baudrate: 57600",
+            "  enabled: false\n  device: null",
+            "  enabled: true\n  device: /dev/serial0",
             1,
         ),
         encoding="utf-8",
@@ -868,8 +866,24 @@ def test_uart_config_builds_channel_without_opening_device(tmp_path) -> None:
 
     assert channel is not None
     assert channel.device == "/dev/serial0"
-    assert channel.baudrate == 57600
+    assert channel.baudrate == 115200
+    assert channel.max_frame_bytes == 64
     assert not channel.started
+
+
+def test_uart_fixed_protocol_parameters_are_not_runtime_schema(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text().replace(
+            "  read_timeout_ms: 100.0",
+            "  baudrate: 57600\n  read_timeout_ms: 100.0",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Unknown keys in uart.*baudrate"):
+        load_runtime_config(path)
 
 
 def test_enabled_uart_requires_device(tmp_path) -> None:

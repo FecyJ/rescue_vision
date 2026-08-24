@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import struct
 import time
 from types import SimpleNamespace
 
@@ -30,7 +31,7 @@ from rescue_vision.communication import (
     ImageCoordinateSystem,
     MotionControlMode,
     ReceivedRemoteMessage,
-    ReceivedUartLine,
+    ReceivedUartFrame,
     RemoteAccessMode,
     RemoteDisconnectedError,
     RemoteRole,
@@ -43,15 +44,21 @@ from rescue_vision.communication import (
 )
 from rescue_vision.data.check_recording import inspect_recording
 from rescue_vision.motion import (
+    CarStopReason,
+    CarSystemStatus,
     ExecutedRemoteGripper,
     ExecutedRemoteMotion,
     GripperCalibration,
     MotionController,
     MotionLimits,
+    MessageType,
     RemoteGripperExecutor,
     RemoteGripperResult,
     RemoteMotionExecutor,
     RemoteMotionResult,
+    SystemFlags,
+    encode_soft_brake_command,
+    pack_protocol_frame,
 )
 from rescue_vision.geometry.ground_projector import BevConfig, GroundProjector
 from rescue_vision.geometry.types import FieldPoint
@@ -97,10 +104,10 @@ class FakeCarChannel:
     def __init__(self) -> None:
         self.sent: list[bytes] = []
 
-    def send_line(self, payload: bytes) -> None:
+    def send_frame(self, payload: bytes) -> None:
         self.sent.append(payload)
 
-    def receive_line(self, timeout: float | None = None):
+    def receive_frame(self, timeout: float | None = None):
         del timeout
         raise TimeoutError
 
@@ -110,20 +117,36 @@ class TelemetryAfterMotionChannel(FakeCarChannel):
         super().__init__()
         self.telemetry_sent = False
 
-    def receive_line(
+    def receive_frame(
         self,
         timeout: float | None = None,
-    ) -> ReceivedUartLine:
+    ) -> ReceivedUartFrame:
         del timeout
         if (
             not self.telemetry_sent
-            and any(payload.startswith(b"m") for payload in self.sent)
+            and any(
+                payload[0] == MessageType.SET_WHEEL_SPEED
+                for payload in self.sent
+            )
         ):
             self.telemetry_sent = True
-            return ReceivedUartLine(
+            return ReceivedUartFrame(
                 sequence=0,
                 received_timestamp_ns=time.monotonic_ns(),
-                payload=b"t1,0.1,0.1,0.1,0.1,90,90",
+                payload=pack_protocol_frame(
+                    MessageType.SYSTEM_STATUS,
+                    struct.pack(
+                        "<HQHIHBHH",
+                        1,
+                        1_000,
+                        300,
+                        10,
+                        int(SystemFlags.WATCHDOG_ARMED),
+                        int(CarStopReason.RUNNING),
+                        9000,
+                        9000,
+                    ),
+                ),
             )
         raise TimeoutError
 
@@ -509,16 +532,17 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
 
     assert len(car.sent) >= 3
     motion_payload = next(
-        payload for payload in car.sent if payload.startswith(b"m")
+        payload
+        for payload in car.sent
+        if payload[0] == MessageType.SET_WHEEL_SPEED
     )
-    assert motion_payload.startswith(b"m")
-    limited_left, limited_right = (
-        float(value) for value in motion_payload[1:].split(b",")
+    _, limited_left_mm_s, limited_right_mm_s = struct.unpack(
+        "<Hhh", motion_payload[1:-2]
     )
-    assert 0.0 < limited_left < 0.1
-    assert limited_right == pytest.approx(limited_left)
-    assert any(payload.startswith(b"g") for payload in car.sent)
-    assert car.sent[-1] == b"b0,0"
+    assert 0 <= limited_left_mm_s < 100
+    assert limited_right_mm_s == limited_left_mm_s
+    assert any(payload[0] == MessageType.SET_GRIPPER for payload in car.sent)
+    assert car.sent[-1][0] == MessageType.SOFT_BRAKE
 
 
     recordings = list((tmp_path / "recordings").iterdir())
@@ -531,7 +555,7 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
     ]
     assert motion_report["event_counts"]["motion_command"] == 1
     assert motion_report["event_counts"]["gripper_command"] == 1
-    assert motion_report["event_counts"]["wheel_telemetry"] == 1
+    assert motion_report["event_counts"]["system_status"] == 1
     assert motion_report["event_counts"]["safety_stop"] == 1
     assert motion_report["covers_frame_time_range"] is True
     session_path = recordings[0] / "session.json"
@@ -597,7 +621,7 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
     )
     assert second_vehicle.last_received_motion_command_id is None
     assert second_vehicle.last_applied_motion_command_id is None
-    assert car.sent[-1] == b"b0,0"
+    assert car.sent[-1][0] == MessageType.SOFT_BRAKE
 
 
 def test_camera_only_session_keeps_video_and_offline_vehicle_heartbeat(tmp_path) -> None:
@@ -1011,7 +1035,7 @@ def test_recording_queue_overflow_faults_capture_and_requires_stop(
 
     assert capture.faulted
     assert capture.recorder is None
-    assert car.sent == [b"b0,0"]
+    assert car.sent == [encode_soft_brake_command(0)]
 
 
 def test_manual_capture_rejects_competition_observe_only_mode() -> None:
@@ -1033,7 +1057,7 @@ def test_manual_capture_rejects_competition_observe_only_mode() -> None:
 
 
 def test_vehicle_state_cannot_claim_unverified_firmware_watchdog() -> None:
-    with pytest.raises(ValueError, match="fresh CarSafetyStatus"):
+    with pytest.raises(ValueError, match="fresh CarSystemStatus"):
         VehicleState(safety_mode=VehicleSafetyMode.FIRMWARE_WATCHDOG)
 
 
@@ -1074,16 +1098,17 @@ def test_vehicle_state_tracks_gripper_command_and_firmware_angles() -> None:
         )
     )
     vehicle.on_car_message(
-        manual_capture_module.CarTelemetry(
+        CarSystemStatus(
             uart_sequence=1,
             received_timestamp_ns=20,
-            controller_timestamp_ms=5,
-            actual_left_m_s=0.0,
-            actual_right_m_s=0.0,
-            target_left_m_s=0.0,
-            target_right_m_s=0.0,
-            servo_left_deg=27.0,
-            servo_right_deg=167.0,
+            status_sequence=1,
+            controller_timestamp_us=5_000,
+            watchdog_timeout_ms=300,
+            last_motion_command_age_ms=10,
+            system_flags=SystemFlags.WATCHDOG_ARMED,
+            stop_reason=CarStopReason.RUNNING,
+            servo_left_target_cdeg=2700,
+            servo_right_target_cdeg=16700,
         )
     )
 
@@ -1211,4 +1236,4 @@ def test_camera_failure_faults_capture_and_stops_motion(tmp_path) -> None:
 
     assert capture.faulted
     assert capture.stop_reason is CaptureStopReason.CAMERA_ERROR
-    assert car.sent == [b"b0,0"]
+    assert car.sent == [encode_soft_brake_command(0)]
