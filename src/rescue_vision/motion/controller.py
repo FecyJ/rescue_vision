@@ -22,6 +22,11 @@ from rescue_vision.motion.protocol import (
 
 
 _WHEEL_COMMAND_REFRESH_NS = 40_000_000
+_MAX_ACTIVE_UPDATE_GAP_NS = 100_000_000
+
+
+class MotionControlTimingError(RuntimeError):
+    """活动运动控制循环停顿过久，已先发送柔和停车。"""
 
 
 def _positive_finite(value: object, location: str) -> float:
@@ -159,6 +164,20 @@ class MotionController:
         elapsed_s = (
             current_ns - self._last_acceleration_update_ns
         ) / 1_000_000_000.0
+        elapsed_ns = current_ns - self._last_acceleration_update_ns
+        if elapsed_ns > _MAX_ACTIVE_UPDATE_GAP_NS and any(
+            value != 0.0
+            for value in (
+                *self._target_wheel_speeds_m_s,
+                *self._commanded_wheel_speeds_m_s,
+            )
+        ):
+            gap_ms = elapsed_ns / 1_000_000.0
+            self.soft_brake()
+            raise MotionControlTimingError(
+                "Active motion update gap exceeded 100 ms; "
+                f"soft brake was sent after {gap_ms:.3f} ms."
+            )
         maximum_delta = self.limits.max_wheel_acceleration_m_s2 * elapsed_s
         previous_left, previous_right = self._commanded_wheel_speeds_m_s
         target_left, target_right = self._target_wheel_speeds_m_s

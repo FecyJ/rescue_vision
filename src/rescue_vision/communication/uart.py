@@ -192,6 +192,7 @@ def _open_pyserial(
         stopbits=serial.STOPBITS_ONE,
         timeout=read_timeout_s,
         write_timeout=write_timeout_s,
+        exclusive=True,
     )
 
 
@@ -320,7 +321,10 @@ class UartFrameChannel:
 
         if not isinstance(payload, bytes) or not payload:
             raise ValueError("payload must be non-empty bytes.")
-        serial_port = self._require_healthy()
+        # A receive-thread failure still permits the shutdown path to attempt
+        # one final SOFT_BRAKE before the port closes. Read-side callers and
+        # check_health() continue to surface the original failure immediately.
+        serial_port = self._require_open()
         with self._write_lock:
             offset = 0
             try:
@@ -484,9 +488,13 @@ class UartFrameChannel:
         ) from self._reader_error
 
     def _require_healthy(self) -> _SerialPort:
+        serial_port = self._require_open()
+        self._raise_reader_error()
+        return serial_port
+
+    def _require_open(self) -> _SerialPort:
         if not self._started or self._serial is None:
             raise RuntimeError("UART channel is not started.")
-        self._raise_reader_error()
         return self._serial
 
     def __enter__(self) -> UartFrameChannel:

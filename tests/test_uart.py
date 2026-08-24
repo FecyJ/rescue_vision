@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import queue
+import sys
 import time
 from collections.abc import Callable
+from types import SimpleNamespace
 
 import pytest
+
+import rescue_vision.communication.uart as uart_module
 
 from rescue_vision.communication import (
     CobsDecodeError,
@@ -176,6 +180,44 @@ def test_channel_serializes_partial_writes_and_adds_cobs_delimiter() -> None:
     assert channel.sent_bytes == len(fake.written)
 
 
+def test_real_serial_open_requests_exclusive_device(monkeypatch) -> None:
+    fake = FakeSerial()
+    captured: dict[str, object] = {}
+
+    def serial_constructor(**kwargs):
+        captured.update(kwargs)
+        return fake
+
+    monkeypatch.setitem(
+        sys.modules,
+        "serial",
+        SimpleNamespace(
+            EIGHTBITS=8,
+            PARITY_NONE="N",
+            STOPBITS_ONE=1,
+            Serial=serial_constructor,
+        ),
+    )
+    result = uart_module._open_pyserial(
+        device="/dev/test-uart",
+        baudrate=115200,
+        read_timeout_s=0.05,
+        write_timeout_s=0.05,
+    )
+
+    assert result is fake
+    assert captured == {
+        "port": "/dev/test-uart",
+        "baudrate": 115200,
+        "bytesize": 8,
+        "parity": "N",
+        "stopbits": 1,
+        "timeout": 0.05,
+        "write_timeout": 0.05,
+        "exclusive": True,
+    }
+
+
 @pytest.mark.parametrize("payload", [b"", b"x" * 65])
 def test_send_frame_rejects_invalid_payload(payload: bytes) -> None:
     channel = make_channel(FakeSerial())
@@ -218,6 +260,19 @@ def test_reader_error_is_reported_and_port_still_closes() -> None:
 
     assert isinstance(error.__cause__, OSError)
     assert fake.closed
+
+
+def test_reader_failure_still_allows_final_safety_write() -> None:
+    fake = FakeSerial()
+    channel = make_channel(fake)
+    safety_frame = b"\x11\x00\x00\xcf\xb8"
+
+    with channel:
+        fake.incoming.put(OSError("receive failed"))
+        wait_for_failure(channel, UartError)
+        channel.send_frame(safety_frame)
+
+    assert bytes(fake.written) == cobs_encode(safety_frame) + b"\x00"
 
 
 def test_indefinite_receive_is_woken_by_reader_failure() -> None:

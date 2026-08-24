@@ -14,7 +14,7 @@
 
 | 入口 | 用途 | 关键语义 |
 | --- | --- | --- |
-| `UartFrameChannel` | 真实 8N1 UART 后台读取与同步发送 | 必须 `start/stop` 或使用上下文管理 |
+| `UartFrameChannel` | 真实 8N1 UART 后台读取与同步发送 | 必须管理生命周期；真实设备独占打开 |
 | `send()` | 写出任意非空 bytes | 仅供底层使用，不添加分帧 |
 | `send_frame()` | 写出一帧解码态 payload | 自动 COBS 编码并添加 `0x00` |
 | `receive_frame()` | 等待一帧已解码数据 | 返回 `ReceivedUartFrame`；超时抛出 `TimeoutError` |
@@ -58,6 +58,10 @@ if uart_channel is None:
 
 `build_channel()` 只创建对象，不导入 PySerial，也不打开设备。下文 UART
 片段都建立在这个 `uart_channel` 上。
+
+真实 PySerial 设备使用 `exclusive=True`。驾驶进程已打开 UART 时，另一个
+监测器或测试进程会以 `Resource temporarily unavailable` 失败，而不是同时
+读取并把同一 COBS 字节流拆散。监测前必须先退出驾驶程序。
 
 ## 2. 打开和关闭 UART
 
@@ -580,6 +584,9 @@ PNG 绘制由 `app.FieldMapSnapshotRenderer` 完成，通信包只维护严格�
 
 - COBS 损坏、空帧和超长帧会被丢弃并在下一 `0x00` 恢复；接收队列溢出、
   设备断开或后台读取异常会使通道进入故障，不会静默丢弃已验证消息。
+- 同一设备的第二次打开会被独占锁拒绝；不得移除该锁来同时运行驾驶和监测。
+- 读线程故障仍允许退出路径在关闭串口前尽力写出最后一帧停车命令；健康检查
+  和接收仍立即报告原始故障，应用不会在失去遥测后继续驾驶。
 - `send_control()` 和 `send_reliable_observation()` 共用可靠优先队列，满时
   抛出 `RemoteQueueOverflowError`。
 - `send_observation()` 的发送队列以及参考客户端的观察接收队列均按 topic

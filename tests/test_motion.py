@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+import random
 import struct
 
 import pytest
@@ -22,6 +23,7 @@ from rescue_vision.motion import (
     CommandResult,
     GripperCalibration,
     MotionController,
+    MotionControlTimingError,
     MotionLimits,
     RemoteGripperError,
     RemoteGripperExecutor,
@@ -33,6 +35,7 @@ from rescue_vision.motion import (
     OdometryImu,
     SensorFlags,
     SystemFlags,
+    crc16_ccitt_false,
     encode_emergency_stop_command,
     encode_gripper_command,
     encode_soft_brake_command,
@@ -241,22 +244,30 @@ def test_gripper_calibration_rejects_unsafe_endpoints_and_travel_time() -> None:
 def test_motion_functions_encode_differential_drive_and_stops() -> None:
     channel = FakeCarChannel()
     clock = FakeClock()
-    controller = MotionController(channel, limits(), monotonic_ns=clock)
+    fast_limits = MotionLimits(
+        wheel_track_m=0.20,
+        max_linear_velocity_m_s=0.30,
+        max_angular_velocity_rad_s=2.0,
+        max_wheel_velocity_m_s=0.40,
+        max_wheel_acceleration_m_s2=10.0,
+        max_remote_command_valid_for_ms=500,
+    )
+    controller = MotionController(channel, fast_limits, monotonic_ns=clock)
 
     controller.drive(0.2, 1.0)
-    clock.advance(1.0)
+    clock.advance(0.05)
     assert controller.update()
     controller.forward(0.1)
-    clock.advance(1.0)
+    clock.advance(0.05)
     assert controller.update()
     controller.backward(0.1)
-    clock.advance(1.0)
+    clock.advance(0.05)
     assert controller.update()
     controller.turn_left(1.0)
-    clock.advance(1.0)
+    clock.advance(0.05)
     assert controller.update()
     controller.turn_right(1.0)
-    clock.advance(1.0)
+    clock.advance(0.05)
     assert controller.update()
     controller.soft_brake()
     controller.emergency_stop()
@@ -355,6 +366,66 @@ def test_unchanged_wheel_target_is_refreshed_for_firmware_watchdog() -> None:
         encode_wheel_speed_command(0, 0.0, 0.0),
         encode_wheel_speed_command(1, 0.0, 0.0),
     ]
+
+
+def test_active_control_loop_gap_soft_brakes_instead_of_resuming_target() -> None:
+    channel = FakeCarChannel()
+    clock = FakeClock()
+    controller = MotionController(channel, limits(), monotonic_ns=clock)
+    controller.forward(0.20)
+    clock.advance(0.05)
+    assert controller.update()
+
+    clock.advance(0.101)
+    with pytest.raises(MotionControlTimingError, match="soft brake"):
+        controller.update()
+
+    assert controller.target_wheel_speeds_m_s == (0.0, 0.0)
+    assert controller.commanded_wheel_speeds_m_s == (0.0, 0.0)
+    assert channel.sent == [
+        encode_wheel_speed_command(0, 0.025, 0.025),
+        encode_soft_brake_command(1),
+    ]
+
+
+def test_idle_control_loop_gap_only_refreshes_zero_watchdog_command() -> None:
+    channel = FakeCarChannel()
+    clock = FakeClock()
+    controller = MotionController(channel, limits(), monotonic_ns=clock)
+
+    clock.advance(1.0)
+    assert controller.update()
+
+    assert channel.sent == [encode_wheel_speed_command(0, 0.0, 0.0)]
+
+
+def test_random_joystick_stress_never_emits_unsigned_or_overlimit_wheels() -> None:
+    channel = FakeCarChannel()
+    clock = FakeClock()
+    controller = MotionController(channel, limits(), monotonic_ns=clock)
+    generator = random.Random(20260824)
+
+    for _ in range(2_000):
+        controller.drive_wheel_limited(
+            generator.uniform(-0.25, 0.25),
+            generator.uniform(-1.0, 1.0),
+        )
+        clock.advance(0.02)
+        controller.update()
+
+    signed_wheels: list[tuple[int, int]] = []
+    for frame in channel.sent:
+        assert frame[0] == MessageType.SET_WHEEL_SPEED
+        assert struct.unpack("<H", frame[-2:])[0] == crc16_ccitt_false(frame[:-2])
+        _, left_mm_s, right_mm_s = struct.unpack("<Hhh", frame[1:-2])
+        signed_wheels.append((left_mm_s, right_mm_s))
+
+    assert signed_wheels
+    assert any(left < 0 or right < 0 for left, right in signed_wheels)
+    assert all(
+        abs(left) <= 300 and abs(right) <= 300
+        for left, right in signed_wheels
+    )
 
 
 def test_soft_brake_clears_pending_acceleration_target() -> None:
@@ -509,9 +580,9 @@ def test_remote_twist_executes_and_expiry_uses_receive_clock() -> None:
     assert result.deadline_timestamp_ns == 1_200_000_000
     assert executor.active_deadline_ns == 1_200_000_000
     assert channel.sent == []
-    clock.advance(0.2)
+    clock.advance(0.1)
     assert controller.update()
-    assert channel.sent == [encode_wheel_speed_command(0, 0.1, 0.1)]
+    assert channel.sent == [encode_wheel_speed_command(0, 0.05, 0.05)]
     assert not executor.check_timeout(now_ns=1_199_999_999)
     assert executor.next_wait_s(
         0.05,
@@ -519,7 +590,7 @@ def test_remote_twist_executes_and_expiry_uses_receive_clock() -> None:
     ) == pytest.approx(0.01)
     assert executor.check_timeout(now_ns=1_200_000_000)
     assert channel.sent == [
-        encode_wheel_speed_command(0, 0.1, 0.1),
+        encode_wheel_speed_command(0, 0.05, 0.05),
         encode_soft_brake_command(1),
     ]
 
@@ -579,8 +650,9 @@ def test_remote_zero_twist_slew_limits_to_zero_and_clears_deadline() -> None:
             )
         )
     )
-    clock.advance(0.4)
-    assert controller.update()
+    for _ in range(4):
+        clock.advance(0.1)
+        assert controller.update()
 
     stopped = executor.execute(
         remote_message(
@@ -599,7 +671,12 @@ def test_remote_zero_twist_slew_limits_to_zero_and_clears_deadline() -> None:
     assert executor.active_deadline_ns is None
     assert controller.target_wheel_speeds_m_s == (0.0, 0.0)
     assert controller.commanded_wheel_speeds_m_s == pytest.approx((0.2, 0.2))
-    assert channel.sent == [encode_wheel_speed_command(0, 0.2, 0.2)]
+    assert channel.sent == [
+        encode_wheel_speed_command(0, 0.05, 0.05),
+        encode_wheel_speed_command(1, 0.1, 0.1),
+        encode_wheel_speed_command(2, 0.15, 0.15),
+        encode_wheel_speed_command(3, 0.2, 0.2),
+    ]
 
     for _ in range(4):
         clock.advance(0.1)
@@ -607,11 +684,14 @@ def test_remote_zero_twist_slew_limits_to_zero_and_clears_deadline() -> None:
 
     assert controller.commanded_wheel_speeds_m_s == (0.0, 0.0)
     assert channel.sent == [
-        encode_wheel_speed_command(0, 0.2, 0.2),
-        encode_wheel_speed_command(1, 0.15, 0.15),
-        encode_wheel_speed_command(2, 0.1, 0.1),
-        encode_wheel_speed_command(3, 0.05, 0.05),
-        encode_wheel_speed_command(4, 0.0, 0.0),
+        encode_wheel_speed_command(0, 0.05, 0.05),
+        encode_wheel_speed_command(1, 0.1, 0.1),
+        encode_wheel_speed_command(2, 0.15, 0.15),
+        encode_wheel_speed_command(3, 0.2, 0.2),
+        encode_wheel_speed_command(4, 0.15, 0.15),
+        encode_wheel_speed_command(5, 0.1, 0.1),
+        encode_wheel_speed_command(6, 0.05, 0.05),
+        encode_wheel_speed_command(7, 0.0, 0.0),
     ]
 
 
