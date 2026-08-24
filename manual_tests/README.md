@@ -18,8 +18,42 @@
 - `remote_link.py --config PATH`：在树莓派侧以 `remote.role: server` 监听电脑端客户端，连接后发送协议要求的最小会话状态，并持续打印收到的 control；该状态有意声明所有业务能力不可用，所以正式客户端应保持控制禁用。仅验证连接可使用 `observe_only`；用自制底层客户端检查 control 帧时使用 `debug_control`。
 - `remote_video.py --config PATH`：发送真实相机的最新 JPEG 帧和周期会话状态，接收电脑端的原图/perception 图像模式请求，但不接收或执行运动、夹爪和采集控制。
 - `remote_capture.py`：兼容旧人工命令的薄包装；正式入口为 `rescue-vision-manual-capture`。
+- `stm32_monitor.py`：默认只读监测配置中的 STM32 COBS/CRC16 UART，周期显示
+  编码器/IMU、系统状态、实际频率、序号丢帧和协议错误；可选只发送一次
+  `QUERY_STATUS`，不发送运动或夹爪命令。
 
 运行前先执行 `python -m pip install -e .`，并确保系统包和显示环境可用。
+
+## STM32 串口监测
+
+持续被动监测，按 `Ctrl+C` 退出：
+
+```bash
+python manual_tests/stm32_monitor.py \
+  --config configs/runtime.yaml
+```
+
+默认每秒打印汇总和最新一帧定位/状态。只运行 10 秒：
+
+```bash
+python manual_tests/stm32_monitor.py \
+  --config configs/runtime.yaml \
+  --duration-seconds 10
+```
+
+打开后发送一次不刷新运动看门狗、也不控制执行器的状态查询：
+
+```bash
+python manual_tests/stm32_monitor.py \
+  --config configs/runtime.yaml \
+  --query-status
+```
+
+需要逐帧查看时添加 `--verbose`；正常链路约产生 110 行/秒，不适合作为默认
+显示。`SUMMARY` 中的 `cobs_drop` 表示 COBS 定界/解码丢弃，
+`protocol_error` 表示 CRC、长度、类型、方向、枚举或状态位错误，
+`*_missing/duplicate/regression` 分别表示遥测序号缺失、重复或倒退。串口可能
+按批到达，因此定位时间必须看 `ODOM sample_us`，不能用终端打印间隔积分。
 
 数据采集不另建重复的硬件脚本：用
 `rescue-vision-record --frames 200 --display` 执行真机短录，再用
