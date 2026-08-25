@@ -495,6 +495,7 @@ def test_breakup_safety_hold_does_not_oscillate_back_into_breakup() -> None:
     )
     assert still_held.state is Simulation20PointState.SAFETY_HOLD
     assert still_held.linear_velocity_m_s == 0.0
+    assert still_held.reason == held.reason
 
 
 def test_hazard_only_view_searches_in_place_without_forward_motion() -> None:

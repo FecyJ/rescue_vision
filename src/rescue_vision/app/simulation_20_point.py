@@ -409,6 +409,7 @@ class Simulation20PointSequence:
         self._retreat_base_distance_m: float | None = None
         self._rebreakup_mode = False
         self._hold_resume_state: Simulation20PointState | None = None
+        self._safety_hold_reason: str | None = None
 
     @classmethod
     def from_app_config(cls, config: AppConfig) -> Simulation20PointSequence:
@@ -559,7 +560,13 @@ class Simulation20PointSequence:
         if self._hazard_only_view(perception):
             return self._handle_hazard_only_view(timestamp_ns, snapshot)
         if self.state is Simulation20PointState.SAFETY_HOLD:
-            return self._decision(timestamp_ns, 0.0, 0.0, "safety_hold")
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                self._safety_hold_reason or "safety_hold",
+                world_snapshot=snapshot,
+            )
         if self._breakup is not None:
             return self._step_breakup(
                 timestamp_ns,
@@ -653,6 +660,7 @@ class Simulation20PointSequence:
             return self._decision(timestamp_ns, 0.0, 0.0, "resume_evidence_missing")
         resume_state = self._hold_resume_state
         self._hold_resume_state = None
+        self._safety_hold_reason = None
         self.state = resume_state or Simulation20PointState.SCAN_GREEN
         if self.state is Simulation20PointState.SCAN_GREEN:
             self._scan_start_heading = None
@@ -739,6 +747,7 @@ class Simulation20PointSequence:
             self._selected_track_id = None
             self._selected_plan = None
             self._hold_resume_state = None
+            self._safety_hold_reason = None
             self.state = Simulation20PointState.SCAN_GREEN
             self._scan_start_heading = None
             self._scan_last_heading = None
@@ -749,6 +758,7 @@ class Simulation20PointSequence:
                 or Simulation20PointState.BREAKUP_SAFETY_CHECK
             )
             self._hold_resume_state = None
+            self._safety_hold_reason = None
         posture = GripperPosture.CLOSED
         breakup_state = getattr(self._breakup, "state", None)
         if breakup_state in {
@@ -1848,6 +1858,7 @@ class Simulation20PointSequence:
         if decision.activity in {ActivityState.SAFETY_HOLD, ActivityState.AVOIDING}:
             if self.state is not Simulation20PointState.SAFETY_HOLD:
                 self._hold_resume_state = self.state
+                self._safety_hold_reason = decision.reason
             self.state = Simulation20PointState.SAFETY_HOLD
         return decision
 
@@ -1914,8 +1925,14 @@ class Simulation20PointSequence:
     def _hold(self, timestamp_ns: int, reason: str) -> SimulationDecision:
         if self.state is not Simulation20PointState.SAFETY_HOLD:
             self._hold_resume_state = self.state
+            self._safety_hold_reason = reason
         self.state = Simulation20PointState.SAFETY_HOLD
-        return self._decision(timestamp_ns, 0.0, 0.0, reason)
+        return self._decision(
+            timestamp_ns,
+            0.0,
+            0.0,
+            self._safety_hold_reason or reason,
+        )
 
     def _terminal(
         self,
@@ -1927,6 +1944,7 @@ class Simulation20PointSequence:
     ) -> SimulationDecision:
         self.state = Simulation20PointState.TERMINAL_STOP
         self._hold_resume_state = None
+        self._safety_hold_reason = None
         self._transport = TransportStatus()
         return self._decision(
             timestamp_ns,
