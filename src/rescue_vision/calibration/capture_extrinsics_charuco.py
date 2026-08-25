@@ -88,7 +88,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         choices=(0, 90, 180, 270),
         default=0,
-        help="Counter-clockwise rotation from OpenCV board x to field x.",
+        help=(
+            "Counter-clockwise in-plane rotation applied after converting the "
+            "camera-facing printed board axes into the field frame."
+        ),
     )
     parser.add_argument(
         "--max-detection-scale",

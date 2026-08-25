@@ -2,56 +2,38 @@
 
 本页是相机内参与地面映射的唯一操作说明。标定脚本默认使用本目录下的路径，不受终端当前目录影响；现场生成的 `calibration_captures/` 和 `output/` 已被 Git 忽略。运行时结构和坐标边界见[项目结构](../../../docs/项目结构.md)。
 
-## 常用命令与产物
-
-| 命令 | 使用时机 | 主要产物 |
-| --- | --- | --- |
-| `python -m rescue_vision.calibration.capture_chessboard_images` | 相机条件固定后采集内参样本 | 棋盘原图、检测图、逐帧元数据 |
-| `python -m rescue_vision.calibration.calibrate_intrinsics` | 比较三种模型并选择内参 | `selected_calibration.json`、诊断图 |
-| `python -m rescue_vision.calibration.capture_extrinsics_ground` | 固定机器人、移动棋盘并交互采集外参图片 | `board_calibration.json`、图片和检测图 |
-| `python -m rescue_vision.calibration.capture_extrinsics_charuco` | 固定机器人、移动 ChArUco 板并采集局部角点 | `board_calibration.json`、图片和检测图 |
-| `python -m rescue_vision.calibration.calibrate_extrinsics_ground` | 相机和机器人安装姿态最终固定后 | `ground_mapping.json`、BEV 与多图误差诊断 |
-| `CameraModel.from_json()` | 独立检查标定产物 | 默认拒绝 `quality.usable=false` |
-| `load_runtime_config(...).build_geometry()` | 实际运行接入 | 联合验证内参、分辨率和地面映射 ID |
-
-多图外参流程的可测试入口包括 `load_board_calibration()`、
-`validate_capture_session()`、`fit_station_robust_homography()`、
-`board_points_field_mm()` 和 `field_points_to_robot_ground()`；它们负责严格加载
-JSON 与采集条件、站位均衡筛点和留一验证、按 11×8 内角点展开棋盘坐标，以及按
-声明的轴向转换到机器人地面系。最终
-求解仍通过 `calibrate_extrinsics_ground` 命令装配内参、图片和输出目录；当
-`board.board_type` 为 `charuco` 时，求解器按每张图片可见的 ChArUco ID 查找板坐标，
-不要求整板 88 个角点。ChArUco 相关可测试入口为
-`create_charuco_board()`、`detect_charuco_board()` 和
-`charuco_points_field_mm()`；采集稳定性使用 `charuco_detection_jitter_px()`。
-
-## 完整工作流速览
+## 使用顺序
 
 1. 固定相机、分辨率、裁剪和焦点后采集棋盘图；
 2. 用这批图片比较三种模型并选择内参；
 3. 固定机器人在场地全局原点，按定位模板把棋盘放到多个站位并拍照；
-4. 在 JSON 中记录每张照片的参考内角点全局坐标，运行脚本自动检测棋盘角点并求解地面映射；
+4. 在 JSON 中记录每张照片的实体参考点全局坐标，运行脚本自动检测标定板角点并求解地面映射；
 5. 验收产物后再写入 `configs/runtime.yaml`。
 
-每一步的实际命令在下文独立代码段给出，并承接上一步产物。前两步只依赖相机
-和棋盘；地面映射必须等相机和机器人安装姿态固定。不要把不同焦点、分辨率或
-安装条件的产物混用。
+前两步是内参标定，只依赖相机和棋盘；后三步是外参与地面映射标定，必须承接已经
+验收的 `selected_calibration.json`，并等相机和机器人安装姿态最终固定后再执行。
+不要把不同相机、焦点、分辨率、裁剪或安装条件的产物混用。
 
-## 固定条件
+## 第一部分：内参标定
 
-一套标定只对以下条件组合有效：
+内参描述相机自身的投影和镜头畸变，负责 `RawPixel → UndistortedPixel`。这一部分
+不使用机器人地面坐标，也不求相机安装姿态。
 
-- 相机与镜头个体；
-- `2304 × 1296` 取流分辨率和裁剪模式；
-- 固定 `LensPosition`；
-- 相机安装位置和姿态；
-- 相机模型及 `new_camera_matrix`；
-- 地面点坐标定义：原点为两驱动轮接地点连线的中点，`x` 向前、`y` 向左、
-  `z` 向上，单位 mm。
+### 内参命令与产物
 
-分辨率、焦点、镜头或 `new_K` 改变时至少重新做内参验证；安装位姿改变时必须重新做地面映射。不要只凭肉眼观察去畸变图判断标定质量。
+| 命令或入口 | 用途 | 主要产物或结果 |
+| --- | --- | --- |
+| `python -m rescue_vision.calibration.capture_chessboard_images` | 相机条件固定后采集内参样本 | 棋盘原图、检测图、逐帧元数据 |
+| `python -m rescue_vision.calibration.calibrate_intrinsics` | 比较三种模型并选择内参 | `selected_calibration.json`、模型比较和诊断图 |
+| `CameraModel.from_json()` | 独立加载并检查内参产物 | 默认拒绝 `quality.usable=false` |
 
-## 1. 采集棋盘图
+### 内参固定条件
+
+同一套内参只适用于相同的相机与镜头个体、`2304 × 1296` 取流分辨率、裁剪模式和
+固定 `LensPosition`。改变其中任一条件，或重新选择 `new_K`，都必须重新求解并验证
+内参；不能只凭肉眼观察去畸变图判断质量。
+
+### 1.1 采集内参棋盘图
 
 标定板为 12×9 个实体方格、11×8 个内角点。测量实际方格边长，并让棋盘覆盖画面中央、四角、边缘、近处、远处和多种倾角。避免同一姿态重复采样。
 
@@ -73,7 +55,7 @@ calibration_captures/chessboard_2304x1296_时间戳/
 └── images.jsonl
 ```
 
-## 2. 求解并选择内参模型
+### 1.2 求解并选择内参模型
 
 脚本比较标准针孔、Rational 针孔和 OpenCV Fisheye 模型。选择依据是 K 折验证集重投影 RMSE，而不是只看全量拟合误差。
 
@@ -142,7 +124,7 @@ JSON 重排不需要改变 ID；只要实际标定条件或参数改变，就必
 
 `CameraModel.from_json(...)` 默认拒绝 `quality.usable=false` 的结果。
 
-### 控制去畸变黑边
+### 1.3 控制去畸变黑边
 
 去畸变的视野保留越多，边缘越可能出现无法从原图采样的区域。运行时会把这些像素统一填为与 YOLO Letterbox 一致的灰度 `114`；应在生成 `new_K` 时处理有效视野取舍，不要在录制后直接裁图：
 
@@ -161,7 +143,36 @@ python -m rescue_vision.calibration.calibrate_intrinsics \
 `calibration_id`，并重新制作所有依赖旧标定的地面映射和任务数据。不能只
 修改 `selected_calibration.json` 中的数值。
 
-## 3. 固定机器人并采集多位置棋盘图
+## 第二部分：外参与地面映射标定
+
+外参描述相机相对机器人地面系的安装姿态，并生成
+`UndistortedPixel ↔ GroundPoint` 所需的地面映射。开始本部分前，必须先完成并验收
+第一部分的 `selected_calibration.json`；外参采集会严格核对相机型号、传感器尺寸、
+裁剪、分辨率、焦点和 `calibration_id`。
+
+### 外参命令与产物
+
+| 命令或入口 | 用途 | 主要产物或结果 |
+| --- | --- | --- |
+| `python -m rescue_vision.calibration.capture_extrinsics_ground` | 用完整普通棋盘采集多站位外参图片 | `board_calibration.json`、原图和检测图 |
+| `python -m rescue_vision.calibration.capture_extrinsics_charuco` | 用可局部检测的 ChArUco 板采集多站位图片 | `board_calibration.json`、原图和检测图 |
+| `python -m rescue_vision.calibration.calibrate_extrinsics_ground` | 站位均衡筛点并求物理外参与地面映射 | `ground_mapping.json`、BEV 和误差诊断 |
+| `load_runtime_config(...).build_geometry()` | 实际运行时联合装配内参与地面映射 | 校验分辨率、标定 ID、质量和物理一致性 |
+
+多图外参流程的可测试入口包括 `load_board_calibration()`、
+`validate_capture_session()`、`fit_station_robust_homography()`、
+`board_points_field_mm()` 和 `field_points_to_robot_ground()`；它们负责严格加载
+JSON 与采集条件、站位均衡筛点和留一验证、展开棋盘坐标，以及转换到机器人地面系。
+ChArUco 相关入口为 `create_charuco_board()`、`detect_charuco_board()`、
+`charuco_points_field_mm()` 和 `charuco_detection_jitter_px()`。
+
+### 外参固定条件与坐标
+
+外参只适用于相机相对机器人未改变的安装位置和姿态。机器人地面系原点为两驱动轮
+接地点连线中点，`x` 向前、`y` 向左、`z` 向上，单位 mm。安装位姿、内参或
+`new_K` 变化时必须重新制作地面映射。
+
+### 2.1 固定机器人并采集多位置标定板图
 
 此步骤只能在相机和机器人最终固定后进行。以两驱动轮接地点连线中点作为机器人
 地面原点，把该点停在场地全局系 `(0, 0)`；机器人
@@ -203,10 +214,11 @@ Enter/Space 拍摄；11×8 内角点检测失败时不会计入张数，可调�
 如果换用 ChArUco 板，使用独立命令：
 
 ```bash
+# A4 ChArUco
 python -m rescue_vision.calibration.capture_extrinsics_charuco \
-  --squares-x 12 --squares-y 9 \
-  --square-size-mm 15.0 --marker-size-mm 10.0 \
-  --dictionary DICT_4X4_100 \
+  --squares-x 7 --squares-y 5 \
+  --square-size-mm 35.0 --marker-size-mm 25.0 \
+  --dictionary DICT_5X5_100 \
   --minimum-charuco-corners 8 \
   --board-rotation-degrees 0 \
   --max-detection-scale 2.0 \
@@ -214,14 +226,15 @@ python -m rescue_vision.calibration.capture_extrinsics_charuco \
 ```
 
 ChArUco 板必须打印面朝向相机，并在 OpenCV 板坐标原点侧的外框角做永久物理标记；
-`--board-rotation-degrees` 表示 OpenCV 板坐标相对场地坐标逆时针旋转的
-`0/90/180/270` 度。每站输入的是这个已标记外框角的场地坐标。一张图必须检测到
+OpenCV 当前板坐标的 `y` 朝打印图案下方，因此程序会先按打印面做 `y` 轴翻转，再
+应用 `--board-rotation-degrees` 指定的 `0/90/180/270` 度平面旋转。每站输入的是
+已标记外框角的场地坐标。一张图必须检测到
 至少 8 个角点，覆盖至少 3 行和 3 列 ID，并通过连续帧稳定性和清晰度门槛才会保存。
 最后一张仍为 `holdout`。
 随后仍使用 `calibrate_extrinsics_ground`，无需换求解命令：
 它会读取 `board_type: "charuco"`、字典和角点 ID，并用可见角点拟合。
 
-## 4. 编写多图棋盘 JSON
+### 2.2 检查或编写多图标定板 JSON
 
 复制 [`board_calibration.example.json`](board_calibration.example.json)（普通棋盘）或
 [`board_calibration_charuco.example.json`](board_calibration_charuco.example.json)（ChArUco），将图片路径和
@@ -253,7 +266,7 @@ ChArUco 配置另需 `chessboard_size_squares`、`marker_size_mm`、`dictionary`
 ChArUco 采集要求当前 OpenCV 构建提供 `cv2.aruco.CharucoBoard` 和
 `cv2.aruco.CharucoDetector`；若构建不含 ArUco 模块，脚本会在打开相机前报错。
 
-## 5. 求解地面映射
+### 2.3 求解外参与地面映射
 
 脚本默认读取仓库根目录的 `configs/runtime.yaml`，从
 `geometry.intrinsics_path` 获取内参，并通过 `load_runtime_config()` 与
@@ -358,7 +371,9 @@ output/ground_mapping_YYYYMMDD_HHMMSS_ffffff/
 基础矩阵往返和 BEV 四角方向已有自动测试；实际安装仍必须使用独立保留点
 测量地面误差。
 
-## 6. 产物管理
+## 产物管理与运行接入
+
+### 3.1 产物管理
 
 原始采集和临时输出不提交 Git。最终部署应保留一份经过验收的配置，并同时记录：
 
@@ -369,7 +384,7 @@ output/ground_mapping_YYYYMMDD_HHMMSS_ffffff/
 
 如果这些元数据无法对应，宁可重新标定，也不要混用两次标定产物。
 
-## 7. 接入 `configs/runtime.yaml`
+### 3.2 接入 `configs/runtime.yaml`
 
 内参验收后先启用去畸变；地面映射完成并通过保留点验证后再单独启用：
 

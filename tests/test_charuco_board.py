@@ -77,9 +77,9 @@ def test_charuco_ids_expand_to_board_coordinates() -> None:
     assert np.allclose(
         points,
         [
-            [135.0, 233.0],
-            [150.0, 233.0],
-            [135.0, 248.0],
+            [135.0, 167.0],
+            [150.0, 167.0],
+            [135.0, 152.0],
         ],
     )
 
@@ -95,7 +95,7 @@ def test_charuco_board_coordinates_apply_explicit_rotation() -> None:
         90,
     )
 
-    assert np.allclose(points, [[67.0, 235.0]])
+    assert np.allclose(points, [[133.0, 235.0]])
 
 def test_partial_charuco_points_recover_planar_pose() -> None:
     board = create_charuco_board((12, 9), 15.0, 10.0, "DICT_4X4_100")

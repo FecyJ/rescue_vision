@@ -223,7 +223,13 @@ def charuco_points_field_mm(
     edge_margin_mm: tuple[float, float, float, float],
     board_rotation_degrees: int,
 ) -> np.ndarray:
-    """Map IDs through the explicitly oriented OpenCV board coordinate frame."""
+    """Map IDs from the camera-facing printed board into the field frame.
+
+    OpenCV's current ChArUco object coordinates increase ``y`` toward the
+    printed image's bottom.  With the printed face toward the camera and field
+    ``+y`` pointing away from the robot, that axis must be reflected before the
+    configured in-plane rotation is applied.
+    """
 
     ids = np.asarray(charuco_ids, dtype=np.int64).reshape(-1)
     board_points = np.asarray(board.getChessboardCorners(), dtype=np.float64)
@@ -241,13 +247,18 @@ def charuco_points_field_mm(
             "board_rotation_degrees must be one of 0, 90, 180 or 270, got "
             f"{board_rotation_degrees!r}."
         )
-    left, _right, bottom, _top = edge_margin_mm
-    local_points = board_points[ids, :2] + np.array(
-        [left, bottom], dtype=np.float64
+    origin_x_margin, _opposite_x_margin, origin_y_margin, _opposite_y_margin = (
+        edge_margin_mm
+    )
+    printed_face_points = np.column_stack(
+        (
+            board_points[ids, 0] + origin_x_margin,
+            -(board_points[ids, 1] + origin_y_margin),
+        )
     )
     angle = math.radians(board_rotation_degrees)
     rotation = np.array(
         [[math.cos(angle), -math.sin(angle)], [math.sin(angle), math.cos(angle)]],
         dtype=np.float64,
     )
-    return outer + local_points @ rotation.T
+    return outer + printed_face_points @ rotation.T
