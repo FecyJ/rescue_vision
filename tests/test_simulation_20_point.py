@@ -17,6 +17,7 @@ from rescue_vision.app.simulation_20_point import (
     Simulation20PointState,
     SimulationHealth,
     SimulationPreflight,
+    _publish_remote_simulation_state,
 )
 from rescue_vision.config import Simulation20PointRuntimeConfig, load_runtime_config
 from rescue_vision.geometry.types import FieldPoint, GroundPoint, UndistortedPixel
@@ -224,6 +225,42 @@ def pose(*, x: float = -1000.0, y: float = 0.0, heading: float = 0.0):
         anchor_source="configured_start",
         quality=frozenset(),
     )
+
+
+def test_simulation_remote_state_submits_latest_localization() -> None:
+    class _RecordingRemote:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, object]] = []
+
+        def check_health(self) -> None:
+            self.events.append(("health", None))
+
+        def submit_localization(
+            self,
+            estimate: FusedPoseEstimate | None,
+            timestamp_ns: int,
+        ) -> None:
+            self.events.append(("localization", (estimate, timestamp_ns)))
+
+        def submit(self, frame: object) -> None:
+            self.events.append(("perception", frame))
+
+    remote = _RecordingRemote()
+    estimate = pose(x=-1350.0, y=-1200.0, heading=1.5)
+    rendered = object()
+
+    _publish_remote_simulation_state(
+        remote,
+        pose=estimate,
+        timestamp_ns=200,
+        rendered=rendered,
+    )
+
+    assert remote.events == [
+        ("health", None),
+        ("localization", (estimate, 200)),
+        ("perception", rendered),
+    ]
 
 
 def start_sequence(sequence: Simulation20PointSequence) -> None:

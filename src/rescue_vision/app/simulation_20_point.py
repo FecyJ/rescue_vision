@@ -179,6 +179,35 @@ class SimulationHealth:
         return None
 
 
+class _SimulationRemoteTransport(Protocol):
+    def check_health(self) -> None: ...
+
+    def submit_localization(
+        self,
+        estimate: FusedPoseEstimate | None,
+        timestamp_ns: int,
+    ) -> None: ...
+
+    def submit(self, frame: object) -> None: ...
+
+
+def _publish_remote_simulation_state(
+    remote_transport: _SimulationRemoteTransport | None,
+    *,
+    pose: FusedPoseEstimate,
+    timestamp_ns: int,
+    rendered: object | None,
+) -> None:
+    """提交本周期最新定位和可选 perception 帧，不复制定位源。"""
+
+    if remote_transport is None:
+        return
+    remote_transport.check_health()
+    remote_transport.submit_localization(pose, timestamp_ns)
+    if rendered is not None:
+        remote_transport.submit(rendered)
+
+
 @dataclass(frozen=True, slots=True)
 class GreenTransportPlan:
     """一枚绿色普通物资的目标场地点、预推点和安全推送走廊。"""
@@ -2184,10 +2213,12 @@ def _run_hardware(
                     ),
                 )
                 if remote_transport is not None:
-                    remote_transport.check_health()
-                    rendered = renderer.latest()
-                    if rendered is not None:
-                        remote_transport.submit(rendered)
+                    _publish_remote_simulation_state(
+                        remote_transport,
+                        pose=pose,
+                        timestamp_ns=now_ns,
+                        rendered=renderer.latest(),
+                    )
                 if decision.gripper_posture is not last_posture:
                     gripper = config.motion.gripper.build_calibration()
                     assert gripper is not None

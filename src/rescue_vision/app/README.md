@@ -124,6 +124,9 @@ else:
 服务、停止融合旁路、关闭 UART。相机等待、Hailo 推理、JPEG、TCP 和写盘不在
 `step()` 内执行。
 
+20 分模拟赛入口会把同一控制周期取得的编码器/IMU `FusedPoseEstimate` 提交给远程
+`map/state` 发布器；发布器仍按 200 ms 节流，只发布最新定位，不复制或另建定位源。
+
 命令行入口：
 
 ```bash
