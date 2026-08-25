@@ -146,10 +146,24 @@ class _ImmediateGreenBreakup:
         )
 
 
+class _ApproachBreakup:
+    def step(self, *, timestamp_ns, cumulative_distance_m, perception):
+        del cumulative_distance_m, perception
+        return BreakupDecision(
+            timestamp_ns,
+            BreakupState.APPROACH_CLUSTER,
+            0.1,
+            0.0,
+            GripperPosture.CLOSED,
+            "approach_cluster",
+        )
+
+
 def make_sequence(
     *,
     config: Simulation20PointRuntimeConfig | None = None,
     breakup: object | None = None,
+    confirmation_hits: int = 1,
 ) -> Simulation20PointSequence:
     regions = (
         StaticRegion(
@@ -176,7 +190,7 @@ def make_sequence(
     return Simulation20PointSequence(
         config or runtime_config(),
         tracker=MultiTargetTracker(
-            TrackingConfig(1, 2000.0, 0.1, 1000.0, 0.1, 0.01)
+            TrackingConfig(confirmation_hits, 2000.0, 0.1, 1000.0, 0.1, 0.01)
         ),
         world_model=WorldModel(
             WorldModelConfig(500.0, 500.0, 0.6, 0.15, 0.5),
@@ -390,6 +404,87 @@ def test_side_path_failure_cannot_be_overridden_by_motion_request() -> None:
     )
     assert decision.state is Simulation20PointState.TERMINAL_STOP
     assert decision.linear_velocity_m_s == 0.0
+
+
+def test_breakup_safety_waits_for_track_confirmation_before_approach() -> None:
+    sequence = make_sequence(
+        breakup=_ApproachBreakup(),
+        confirmation_hits=2,
+    )
+    start_sequence(sequence)
+    first = snapshot(
+        1,
+        2,
+        observation(1, 2, GroundPoint(500.0, 0.0)),
+    )
+    safety_check = sequence.step(
+        2,
+        perception=first,
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+    assert safety_check.state is Simulation20PointState.BREAKUP_SAFETY_CHECK
+    assert safety_check.linear_velocity_m_s == 0.0
+
+    confirmed = snapshot(
+        2,
+        3,
+        observation(2, 3, GroundPoint(500.0, 0.0)),
+    )
+    approaching = sequence.step(
+        3,
+        perception=confirmed,
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+    assert approaching.state is Simulation20PointState.APPROACH_CLUSTER
+    assert approaching.linear_velocity_m_s == pytest.approx(0.1)
+
+
+def test_breakup_safety_hold_does_not_oscillate_back_into_breakup() -> None:
+    sequence = make_sequence(breakup=_ApproachBreakup())
+    start_sequence(sequence)
+    danger_1 = snapshot(
+        1,
+        2,
+        observation(
+            1,
+            2,
+            GroundPoint(500.0, 0.0),
+            target_class=TargetClass.BLUE_DANGER,
+        ),
+    )
+    sequence.step(
+        2,
+        perception=danger_1,
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+    danger_2 = snapshot(
+        2,
+        3,
+        observation(
+            2,
+            3,
+            GroundPoint(500.0, 0.0),
+            target_class=TargetClass.BLUE_DANGER,
+        ),
+    )
+    held = sequence.step(
+        3,
+        perception=danger_2,
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+    assert held.state is Simulation20PointState.SAFETY_HOLD
+    still_held = sequence.step(
+        4,
+        perception=danger_2,
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+    assert still_held.state is Simulation20PointState.SAFETY_HOLD
+    assert still_held.linear_velocity_m_s == 0.0
 
 
 def test_four_green_deliveries_latch_finish_stop_and_twenty_points() -> None:

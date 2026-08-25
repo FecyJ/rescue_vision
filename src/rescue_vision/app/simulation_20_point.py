@@ -554,6 +554,10 @@ class Simulation20PointSequence:
         except (RuntimeError, ValueError) as exc:
             return self._terminal(timestamp_ns, f"world_update_failed:{exc}")
 
+        if self.state is Simulation20PointState.SAFETY_HOLD:
+            return self._decision(timestamp_ns, 0.0, 0.0, "safety_hold")
+        if self.state is Simulation20PointState.RESET_TARGET_TRACKS:
+            return self._step_reset_tracks(timestamp_ns, perception, pose, snapshot)
         if self._breakup is not None:
             return self._step_breakup(
                 timestamp_ns,
@@ -562,10 +566,6 @@ class Simulation20PointSequence:
                 cumulative_distance_m,
                 snapshot,
             )
-        if self.state is Simulation20PointState.RESET_TARGET_TRACKS:
-            return self._step_reset_tracks(timestamp_ns, perception, pose, snapshot)
-        if self.state is Simulation20PointState.SAFETY_HOLD:
-            return self._decision(timestamp_ns, 0.0, 0.0, "safety_hold")
         if self.state is Simulation20PointState.UPDATE_PROGRESS:
             # Delivery evidence has already been accepted by mission. Reset
             # the post-delivery track set before a coasting copy of the old
@@ -769,8 +769,22 @@ class Simulation20PointSequence:
                     posture=breakup_decision.gripper_posture,
                     world_snapshot=snapshot,
                 )
-            if not self._breakup_safety_clear(snapshot):
-                return self._hold(timestamp_ns, "breakup_safety_evidence_missing")
+            safe, hard_block, reason = self._breakup_safety_status(snapshot)
+            if not safe:
+                if hard_block:
+                    return self._hold(
+                        timestamp_ns,
+                        f"breakup_safety_evidence_missing:{reason}",
+                    )
+                self.state = Simulation20PointState.BREAKUP_SAFETY_CHECK
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    0.0,
+                    f"breakup_safety_wait:{reason}",
+                    posture=breakup_decision.gripper_posture,
+                    world_snapshot=snapshot,
+                )
             self.state = Simulation20PointState.APPROACH_CLUSTER
         else:
             self.state = {
@@ -805,15 +819,39 @@ class Simulation20PointSequence:
         )
 
     def _breakup_safety_clear(self, snapshot: WorldSnapshot) -> bool:
+        return self._breakup_safety_status(snapshot)[0]
+
+    @staticmethod
+    def _breakup_safety_status(
+        snapshot: WorldSnapshot,
+    ) -> tuple[bool, bool, str]:
+        """Return ``(safe, hard_block, reason)`` for the pre-push gate.
+
+        A missing/stale or not-yet-confirmed target is a zero-motion wait. An
+        explicit unknown/danger observation is a safety hold and requires
+        external recovery evidence.
+        """
+
         if WorldUncertainty.STALE_VISION in snapshot.uncertainties:
-            return False
+            return False, False, "stale_vision_wait_new_frame"
         if not snapshot.targets:
-            return False
-        return all(
-            target.target_class is not TargetClass.UNKNOWN
-            and target.hazard_state is HazardState.CLEAR
-            for target in snapshot.targets
-        )
+            return False, False, "no_targets_wait_new_frame"
+        for target in snapshot.targets:
+            if target.target_class in {
+                TargetClass.UNKNOWN,
+                TargetClass.BLUE_DANGER,
+            }:
+                return False, True, f"explicit_{target.target_class.value}"
+            if target.hazard_state is HazardState.CONFIRMED:
+                return False, True, f"confirmed_hazard_track_{target.track_id}"
+            if (
+                target.hazard_state is HazardState.SUSPECTED
+                and target.track_status is TrackStatus.CONFIRMED
+            ):
+                return False, True, f"suspected_hazard_track_{target.track_id}"
+            if target.track_status is not TrackStatus.CONFIRMED:
+                return False, False, "targets_not_confirmed_wait_new_frame"
+        return True, False, "clear"
 
     def _begin_reset_tracks(self, perception: PerceptionSnapshot | None) -> None:
         self._ignore_frames_through = self._last_tracker_frame_sequence
@@ -1948,6 +1986,9 @@ def _run_hardware(
     stop_requested = False
     camera_started = False
     fusion_started = False
+    active_motion_since_ns: int | None = None
+    last_reported_state: Simulation20PointState | None = None
+    next_progress_ns = 0
     previous_sigterm = signal.getsignal(signal.SIGTERM)
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -2028,8 +2069,13 @@ def _run_hardware(
                     pose=pose,
                     cumulative_distance_m=encoder_tracker.distance_m,
                     health=SimulationHealth(
-                        control_ready=latest_status is not None
-                        and latest_status.protocol_ready,
+                        control_ready=(
+                            latest_status is not None
+                            and latest_status.protocol_ready
+                            and controller.motion_synchronized
+                            and not controller.link_degraded
+                            and not controller.emergency_stop_latched
+                        ),
                         command_accepted=True,
                         watchdog_armed=latest_status is not None
                         and latest_status.watchdog_armed,
@@ -2066,16 +2112,57 @@ def _run_hardware(
                             gripper.closed_right_angle_deg,
                         )
                     last_posture = decision.gripper_posture
+                motion_requested = (
+                    decision.linear_velocity_m_s != 0.0
+                    or decision.angular_velocity_rad_s != 0.0
+                )
+                if motion_requested:
+                    if active_motion_since_ns is None:
+                        active_motion_since_ns = now_ns
+                else:
+                    active_motion_since_ns = None
+                if (
+                    active_motion_since_ns is not None
+                    and now_ns - active_motion_since_ns >= 750_000_000
+                    and latest_status is not None
+                    and now_ns - latest_status.received_timestamp_ns
+                    <= 500_000_000
+                    and not latest_status.motor_output_enabled
+                ):
+                    raise RuntimeError(
+                        "STM32 motor output remained disabled after a motion "
+                        "request; "
+                        f"stop_reason={latest_status.stop_reason.name.lower()} "
+                        f"watchdog_armed={latest_status.watchdog_armed} "
+                        "last_motion_command_age_ms="
+                        f"{latest_status.last_motion_command_age_ms}."
+                    )
                 controller.drive_wheel_limited(
                     decision.linear_velocity_m_s,
                     decision.angular_velocity_rad_s,
                 )
-                print(
-                    f"state={decision.state.value} reason={decision.reason} "
-                    f"deliveries={decision.valid_green_deliveries} "
-                    f"score={decision.score_points}",
-                    flush=True,
-                )
+                if decision.state is not last_reported_state or now_ns >= next_progress_ns:
+                    status_text = "status=none"
+                    if latest_status is not None:
+                        status_text = (
+                            "status=("
+                            f"motor_output={latest_status.motor_output_enabled},"
+                            f"watchdog={latest_status.watchdog_armed},"
+                            f"stop_reason={latest_status.stop_reason.name.lower()},"
+                            f"motion_age_ms={latest_status.last_motion_command_age_ms})"
+                        )
+                    print(
+                        f"state={decision.state.value} reason={decision.reason} "
+                        f"deliveries={decision.valid_green_deliveries} "
+                        f"score={decision.score_points} "
+                        f"{encoder_tracker.diagnostic()} "
+                        f"target_wheel_m_s={controller.target_wheel_speeds_m_s} "
+                        f"commanded_wheel_m_s={controller.commanded_wheel_speeds_m_s} "
+                        f"{status_text}",
+                        flush=True,
+                    )
+                    last_reported_state = decision.state
+                    next_progress_ns = now_ns + 1_000_000_000
                 if decision.state in {
                     Simulation20PointState.TERMINAL_STOP,
                     Simulation20PointState.FINISH_STOP,
