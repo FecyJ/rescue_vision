@@ -67,6 +67,8 @@ class BreakupState(str, Enum):
     APPROACH_CLUSTER = "approach_cluster"
     BREAKUP_PUSH = "breakup_push"
     BREAKUP_RELEASE = "breakup_release"
+    BREAKUP_OPEN_RETREAT = "breakup_open_retreat"
+    BREAKUP_CLOSE = "breakup_close"
     RETREAT = "retreat"
     SCAN_GREEN = "scan_green"
     GREEN_FOUND = "green_found"
@@ -1161,23 +1163,23 @@ class ClusterBreakupSequence:
         self,
         config: ClusterBreakupRuntimeConfig,
         *,
-        gripper_open_hold_time_s: float,
+        gripper_full_travel_time_s: float,
     ) -> None:
         if not isinstance(config, ClusterBreakupRuntimeConfig):
             raise TypeError("config must be a ClusterBreakupRuntimeConfig.")
         if not config.enabled:
             raise ValueError("ClusterBreakupSequence requires enabled config.")
         if (
-            isinstance(gripper_open_hold_time_s, bool)
-            or not isinstance(gripper_open_hold_time_s, (int, float))
-            or not math.isfinite(float(gripper_open_hold_time_s))
-            or float(gripper_open_hold_time_s) <= 0.0
+            isinstance(gripper_full_travel_time_s, bool)
+            or not isinstance(gripper_full_travel_time_s, (int, float))
+            or not math.isfinite(float(gripper_full_travel_time_s))
+            or float(gripper_full_travel_time_s) <= 0.0
         ):
             raise ValueError(
-                "gripper_open_hold_time_s must be finite and positive."
+                "gripper_full_travel_time_s must be finite and positive."
             )
         self.config = config
-        self._gripper_open_hold_time_s = float(gripper_open_hold_time_s)
+        self._gripper_full_travel_time_s = float(gripper_full_travel_time_s)
         self.state = BreakupState.WAIT_ODOMETRY
         self._state_started_ns: int | None = None
         self._state_distance_m: float | None = None
@@ -1341,12 +1343,59 @@ class ClusterBreakupSequence:
         if self.state is BreakupState.BREAKUP_RELEASE:
             if self._motion_timed_out(timestamp_ns):
                 return self._fault(timestamp_ns, "gripper_release_timeout")
-            if self._elapsed_s(timestamp_ns) < self._gripper_open_hold_time_s:
+            if self._elapsed_s(timestamp_ns) < self._gripper_full_travel_time_s:
                 return self._decision(
                     timestamp_ns,
                     0.0,
                     0.0,
-                    "hold_open_gripper_before_retreat",
+                    "hold_open_gripper_before_open_retreat",
+                )
+            self._transition(
+                BreakupState.BREAKUP_OPEN_RETREAT,
+                timestamp_ns,
+                cumulative_distance_m,
+            )
+            return self._decision(
+                timestamp_ns,
+                -self.config.retreat_speed_m_s,
+                0.0,
+                "gripper_open_and_retreat",
+            )
+
+        if self.state is BreakupState.BREAKUP_OPEN_RETREAT:
+            if self._motion_timed_out(timestamp_ns):
+                return self._fault(timestamp_ns, "open_gripper_retreat_timeout")
+            if self._reached_distance(
+                cumulative_distance_m,
+                self.config.gripper_open_retreat_distance_m,
+            ):
+                self._transition(
+                    BreakupState.BREAKUP_CLOSE,
+                    timestamp_ns,
+                    cumulative_distance_m,
+                )
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    0.0,
+                    "open_retreat_complete_stop_and_close_gripper",
+                )
+            return self._decision(
+                timestamp_ns,
+                -self.config.retreat_speed_m_s,
+                0.0,
+                "open_gripper_retreat_fixed_distance",
+            )
+
+        if self.state is BreakupState.BREAKUP_CLOSE:
+            if self._motion_timed_out(timestamp_ns):
+                return self._fault(timestamp_ns, "gripper_close_timeout")
+            if self._elapsed_s(timestamp_ns) < self._gripper_full_travel_time_s:
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    0.0,
+                    "hold_closed_gripper_before_retreat",
                 )
             self._transition(
                 BreakupState.RETREAT,
@@ -1357,7 +1406,7 @@ class ClusterBreakupSequence:
                 timestamp_ns,
                 -self.config.retreat_speed_m_s,
                 0.0,
-                "gripper_close_and_retreat",
+                "closed_gripper_retreat",
             )
 
         if self.state is BreakupState.RETREAT:
@@ -1410,7 +1459,10 @@ class ClusterBreakupSequence:
     ) -> BreakupDecision:
         posture = (
             GripperPosture.OPEN
-            if self.state is BreakupState.BREAKUP_RELEASE
+            if self.state in {
+                BreakupState.BREAKUP_RELEASE,
+                BreakupState.BREAKUP_OPEN_RETREAT,
+            }
             else GripperPosture.CLOSED
         )
         return BreakupDecision(timestamp_ns, self.state, linear, angular, posture, reason)
@@ -1582,7 +1634,7 @@ def _run_hardware(
     )
     sequence = ClusterBreakupSequence(
         breakup,
-        gripper_open_hold_time_s=gripper.full_travel_time_s,
+        gripper_full_travel_time_s=gripper.full_travel_time_s,
     )
     pipeline = build_camera_pipeline(config)
     renderer = PerceptionFrameRenderer(

@@ -65,6 +65,7 @@ def breakup_config(**changes: object) -> ClusterBreakupRuntimeConfig:
         "gripper_open_distance_mm": 250.0,
         "breakup_speed_m_s": 0.25,
         "breakup_distance_m": 0.2,
+        "gripper_open_retreat_distance_m": 0.1,
         "retreat_speed_m_s": 0.1,
         "retreat_distance_m": 0.1,
         "scan_green_angular_velocity_rad_s": 0.3,
@@ -158,7 +159,7 @@ def cluster_snapshot(
 def test_breakup_sequence_reaches_scan_green_then_stops_on_green() -> None:
     sequence = ClusterBreakupSequence(
         breakup_config(),
-        gripper_open_hold_time_s=1.0,
+        gripper_full_travel_time_s=1.0,
     )
 
     waiting = sequence.step(
@@ -233,9 +234,36 @@ def test_breakup_sequence_reaches_scan_green_then_stops_on_green() -> None:
     assert holding_open.gripper_posture is GripperPosture.OPEN
     assert holding_open.linear_velocity_m_s == 0.0
 
-    retreating = sequence.step(
+    open_retreating = sequence.step(
         timestamp_ns=3_000_000_000,
         cumulative_distance_m=0.75,
+        perception=None,
+    )
+    assert open_retreating.state is BreakupState.BREAKUP_OPEN_RETREAT
+    assert open_retreating.gripper_posture is GripperPosture.OPEN
+    assert open_retreating.linear_velocity_m_s < 0.0
+
+    open_retreating_done = sequence.step(
+        timestamp_ns=3_500_000_000,
+        cumulative_distance_m=0.65,
+        perception=None,
+    )
+    assert open_retreating_done.state is BreakupState.BREAKUP_CLOSE
+    assert open_retreating_done.gripper_posture is GripperPosture.CLOSED
+    assert open_retreating_done.linear_velocity_m_s == 0.0
+
+    closing = sequence.step(
+        timestamp_ns=4_000_000_000,
+        cumulative_distance_m=0.65,
+        perception=None,
+    )
+    assert closing.state is BreakupState.BREAKUP_CLOSE
+    assert closing.gripper_posture is GripperPosture.CLOSED
+    assert closing.linear_velocity_m_s == 0.0
+
+    retreating = sequence.step(
+        timestamp_ns=4_500_000_000,
+        cumulative_distance_m=0.65,
         perception=None,
     )
     assert retreating.state is BreakupState.RETREAT
@@ -243,8 +271,8 @@ def test_breakup_sequence_reaches_scan_green_then_stops_on_green() -> None:
     assert retreating.linear_velocity_m_s < 0.0
 
     scanning = sequence.step(
-        timestamp_ns=3_500_000_000,
-        cumulative_distance_m=0.65,
+        timestamp_ns=5_000_000_000,
+        cumulative_distance_m=0.55,
         perception=None,
     )
     assert scanning.state is BreakupState.SCAN_GREEN
@@ -261,7 +289,7 @@ def test_breakup_sequence_reaches_scan_green_then_stops_on_green() -> None:
         ),
     )
     assert sequence.step(
-        timestamp_ns=3_600_000_000,
+        timestamp_ns=5_100_000_000,
         cumulative_distance_m=0.65,
         perception=green_1,
     ).state is BreakupState.SCAN_GREEN
@@ -275,7 +303,7 @@ def test_breakup_sequence_reaches_scan_green_then_stops_on_green() -> None:
         ),
     )
     found = sequence.step(
-        timestamp_ns=3_700_000_000,
+        timestamp_ns=5_200_000_000,
         cumulative_distance_m=0.65,
         perception=green_2,
     )
@@ -406,7 +434,7 @@ def test_odometry_fusion_pump_submit_does_not_wait_for_slow_fusion() -> None:
 def test_breakup_search_direction_can_be_right() -> None:
     sequence = ClusterBreakupSequence(
         breakup_config(search_direction="right"),
-        gripper_open_hold_time_s=1.0,
+        gripper_full_travel_time_s=1.0,
     )
     sequence.step(timestamp_ns=0, cumulative_distance_m=0.0, perception=None)
     decision = sequence.step(

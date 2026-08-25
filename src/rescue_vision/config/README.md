@@ -49,7 +49,7 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `MotionRuntimeConfig` | 实测轮距、车体/车轮速度上限、单轮加速度上限、远程命令有效期、`odometry`、`gripper` 和解团试验参数 |
 | `OdometryRuntimeConfig` | 每圈计数、左右有效轮径和静态 `gyro_z` 零偏 |
 | `GripperRuntimeConfig` | 能力开关、左右开/闭安全角度、角度和与固定速度全行程时间 |
-| `ClusterBreakupRuntimeConfig` | 定距出发、左右搜索方向、居中、接近、张爪冲散、退离合爪和绿色扫描参数 |
+| `ClusterBreakupRuntimeConfig` | 定距出发、左右搜索方向、居中、接近、张爪冲散、张爪退出、停车合爪、闭爪退离和绿色扫描参数 |
 | `Simulation20PointRuntimeConfig` | 预推/走廊、扫描、接触、交付确认、退离和重复解团上限；目标交付数固定为 4 |
 | `TrackingConfig` | 关联、确认、滑行、衰减和删除阈值 |
 | `WorldRuntimeConfig` | 世界阈值、`TeamColor`、`StaticFieldMap` 及任务区域派生 |

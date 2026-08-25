@@ -70,6 +70,9 @@ class Simulation20PointState(str, Enum):
     BREAKUP_SAFETY_CHECK = "breakup_safety_check"
     APPROACH_CLUSTER = "approach_cluster"
     BREAKUP_PUSH = "breakup_push"
+    BREAKUP_RELEASE = "breakup_release"
+    BREAKUP_OPEN_RETREAT = "breakup_open_retreat"
+    BREAKUP_CLOSE = "breakup_close"
     RETREAT_FROM_CLUSTER = "retreat_from_cluster"
     RESET_TARGET_TRACKS = "reset_target_tracks"
     SCAN_GREEN = "scan_green"
@@ -421,7 +424,7 @@ class Simulation20PointSequence:
         def make_breakup() -> ClusterBreakupSequence:
             return ClusterBreakupSequence(
                 config.motion.cluster_breakup,
-                gripper_open_hold_time_s=gripper.full_travel_time_s,
+                gripper_full_travel_time_s=gripper.full_travel_time_s,
             )
 
         return cls(
@@ -776,13 +779,20 @@ class Simulation20PointSequence:
                 BreakupState.SEARCH_CLUSTER: Simulation20PointState.SEARCH_CLUSTER,
                 BreakupState.CENTER_CLUSTER: Simulation20PointState.CENTER_CLUSTER,
                 BreakupState.BREAKUP_PUSH: Simulation20PointState.BREAKUP_PUSH,
-                BreakupState.BREAKUP_RELEASE: Simulation20PointState.BREAKUP_PUSH,
+                BreakupState.BREAKUP_RELEASE: Simulation20PointState.BREAKUP_RELEASE,
+                BreakupState.BREAKUP_OPEN_RETREAT: (
+                    Simulation20PointState.BREAKUP_OPEN_RETREAT
+                ),
+                BreakupState.BREAKUP_CLOSE: Simulation20PointState.BREAKUP_CLOSE,
                 BreakupState.RETREAT: Simulation20PointState.RETREAT_FROM_CLUSTER,
                 BreakupState.SCAN_GREEN: Simulation20PointState.SCAN_GREEN,
             }[breakup_decision.state]
             if self._rebreakup_mode and self.state not in {
                 Simulation20PointState.RETREAT_FROM_CLUSTER,
                 Simulation20PointState.BREAKUP_PUSH,
+                Simulation20PointState.BREAKUP_RELEASE,
+                Simulation20PointState.BREAKUP_OPEN_RETREAT,
+                Simulation20PointState.BREAKUP_CLOSE,
             }:
                 self.state = Simulation20PointState.CENTER_REBREAKUP_CLUSTER
         return self._decision(

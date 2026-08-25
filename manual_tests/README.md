@@ -350,12 +350,13 @@ rescue-vision-cluster-breakup \
 观察旁路都不参与运动决策。
 
 首次上车把 `departure_distance_m`、`breakup_speed_m_s`、
-`breakup_distance_m` 和 `retreat_distance_m` 调到保守小值，并依次验收：
+`breakup_distance_m`、`gripper_open_retreat_distance_m` 和
+`retreat_distance_m` 调到保守小值，并依次验收：
 
 1. 架空轮确认左右编码器有效、前进累计路程为正、配置的左右搜索方向正确；
 2. 不放目标，只验证定距越障后左转，超时和 Ctrl-C 均停车；
 3. 放置静止目标团但禁用电机，核对联合框中心和 K0 前向距离触发位置；
-4. 低速短行程张爪推送，确认倒退退出接触区后才合爪；
+4. 低速短行程张爪推送，确认张爪退出配置距离后停车合爪，再执行闭爪退离；
 5. 解团后连续两帧识别绿色，终端打印 `green_found` 并停车。
 
 记录实际路程误差、目标团居中误差、张爪触发距离、每类物块最大位移及是否出现

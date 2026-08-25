@@ -112,12 +112,13 @@ motion:
     center_max_angular_velocity_rad_s: 0.55
     approach_speed_m_s: 0.12
     # 最近有效 K0 地面点进入该前向距离后，保持闭爪并开始定距冲散；
-    # 到达冲散距离后原地开爪，按 motion.gripper.full_travel_time_s 保持，
-    # 再闭爪退离。
+    # 到达冲散距离后停车张爪，按 motion.gripper.full_travel_time_s 完全打开，
+    # 张爪退出一段距离，再停车合爪并进入闭爪 RETREAT。
     gripper_open_distance_mm: 260.0
     breakup_speed_m_s: 0.25
     breakup_distance_m: 0.25
-    # 冲散到达后先原地开爪释放，再合拢并退出接触区。
+    # 张爪退出距离与闭爪 RETREAT 距离分开配置。
+    gripper_open_retreat_distance_m: 0.10
     retreat_speed_m_s: 0.10
     retreat_distance_m: 0.10
     scan_green_angular_velocity_rad_s: 0.35

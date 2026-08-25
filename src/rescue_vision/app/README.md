@@ -13,9 +13,9 @@
 | 入口 | 输入与生命周期 | 输出或语义 |
 | --- | --- | --- |
 | `rescue-vision-manual-capture` | `runtime.yaml`、车端输出根目录和显式监督确认 | 完整装配 TCP/UART/相机/运动/夹爪/记录；推荐生产入口 |
-| `rescue-vision-cluster-breakup` | `runtime.yaml` 和显式监督确认 | 定距越障、目标团搜索/居中、闭爪定距冲散、原地开爪释放、闭爪退离并扫描绿色；找到绿色后停车 |
+| `rescue-vision-cluster-breakup` | `runtime.yaml` 和显式监督确认 | 定距越障、目标团搜索/居中、闭爪定距冲散、原地全开、张爪退出、停车合爪、闭爪退离并扫描绿色；找到绿色后停车 |
 | `rescue-vision-simulation-20-point` | `runtime.simulation-20min.yaml` 和显式监督确认 | 复用现有解团，跟踪/世界模型/规则门禁、受限预推导航、单绿色推送、交付验证、退离和四次完成停车 |
-| `ClusterBreakupSequence(...).step()` | `ClusterBreakupRuntimeConfig`、`motion.gripper.full_travel_time_s`、同一单调时间轴、编码器累计路程和最新 `PerceptionSnapshot` | 纯逻辑流程决策；不创建相机、Hailo、UART 或电机；冲散后按夹爪全行程时间保持开爪 |
+| `ClusterBreakupSequence(...).step()` | `ClusterBreakupRuntimeConfig`、`motion.gripper.full_travel_time_s`、同一单调时间轴、编码器累计路程和最新 `PerceptionSnapshot` | 纯逻辑流程决策；不创建相机、Hailo、UART 或电机；冲散后全开、张爪退出、停车合爪，再进入闭爪退离 |
 | `EncoderTravelTracker.submit()` | 带有效双编码器的 `OdometryImu` | 使用运行配置机械标定产生机器人中心累计有符号路程 |
 | `OdometryImuFusion.submit_odometry()` | 同一 UART 消费链路中的 `OdometryImu` | 解团临时配置只输出编码器+IMU 连续 `FieldPose2D`；不调用 `submit_visual()` |
 | `OdometryFusionPump` | `OdometryImu` 有界队列和 `OdometryImuFusion` | 顺序处理融合，不阻塞运动刷新线程；队列满或 worker 异常进入停车路径 |
@@ -235,8 +235,10 @@ rescue-vision-cluster-breakup \
 `cluster_min_detections` 个模型观测 → 用观测框联合中心做比例居中 → 低速接近。
 最近有效 K0 地面点进入 `gripper_open_distance_mm` 后，夹爪保持闭合，车辆以
 `breakup_speed_m_s` 推进 `breakup_distance_m`；到达后原地停车并切到已标定张开端点，
-保持 `motion.gripper.full_travel_time_s` 后切回闭合端点，再以
-`retreat_speed_m_s` 倒退 `retreat_distance_m`。最后进入 `SCAN_GREEN` 左转
+保持 `motion.gripper.full_travel_time_s` 完全打开，再以
+`retreat_speed_m_s` 张爪倒退 `gripper_open_retreat_distance_m`。到达后停车切回闭合
+端点，保持同一全行程时间，最后以 `retreat_speed_m_s` 闭爪倒退
+`retreat_distance_m`。最后进入 `SCAN_GREEN` 左转
 扫描，连续看到配置帧数的 `green_supply` 后停车退出。当前不会继续接近或交付
 绿色目标。
 
@@ -288,5 +290,7 @@ rescue-vision-cluster-breakup \
 `CarState`，不代表有物理位置传感器或已经完成抓取。
 
 解团试验仍不是比赛模式：当前固件看门狗未经真车验收，所以必须保留物理急停和
-全程监督。当前流程在冲散距离结束后原地开爪释放，再合拢并倒退；仍需现场确认
-机械结构不会形成抓取或承载。
+全程监督。当前流程在冲散距离结束后原地全开，以张爪退出
+`gripper_open_retreat_distance_m`，停车合爪并等待全行程，再执行闭爪
+`retreat_distance_m`；仍需现场确认机械结构不会形成抓取或承载。张爪退出和闭爪
+等待均由状态机控制，不能在退出段中提前合爪。

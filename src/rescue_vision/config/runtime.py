@@ -646,6 +646,7 @@ class ClusterBreakupRuntimeConfig:
     gripper_open_distance_mm: float
     breakup_speed_m_s: float
     breakup_distance_m: float
+    gripper_open_retreat_distance_m: float
     retreat_speed_m_s: float
     retreat_distance_m: float
     scan_green_angular_velocity_rad_s: float
@@ -670,6 +671,7 @@ class ClusterBreakupRuntimeConfig:
             "gripper_open_distance_mm",
             "breakup_speed_m_s",
             "breakup_distance_m",
+            "gripper_open_retreat_distance_m",
             "retreat_speed_m_s",
             "retreat_distance_m",
             "scan_green_angular_velocity_rad_s",
@@ -1645,6 +1647,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         "gripper_open_distance_mm",
         "breakup_speed_m_s",
         "breakup_distance_m",
+        "gripper_open_retreat_distance_m",
         "retreat_speed_m_s",
         "retreat_distance_m",
         "scan_green_angular_velocity_rad_s",
@@ -1700,6 +1703,9 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         ),
         breakup_speed_m_s=breakup_float("breakup_speed_m_s", 0.25),
         breakup_distance_m=breakup_float("breakup_distance_m", 0.25),
+        gripper_open_retreat_distance_m=breakup_float(
+            "gripper_open_retreat_distance_m", 0.10
+        ),
         retreat_speed_m_s=breakup_float("retreat_speed_m_s", 0.10),
         retreat_distance_m=breakup_float("retreat_distance_m", 0.10),
         scan_green_angular_velocity_rad_s=breakup_float(
