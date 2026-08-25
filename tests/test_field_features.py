@@ -55,7 +55,9 @@ def config(**overrides) -> FieldFeatureConfig:
         "center_local_window_fraction": 0.015,
         "center_local_contrast_threshold": 10,
         "center_max_saturation": 80,
+        "center_min_floor_value": 120,
         "center_min_line_support_fraction": 0.10,
+        "center_min_white_surround_fraction": 0.60,
         "center_min_axis_balance_fraction": 0.08,
         "center_min_intersection_margin_fraction": 0.02,
         "boundary_canny_low_threshold": 50,
@@ -364,8 +366,13 @@ def test_center_cross_prefers_pair_aligned_with_safe_zone_anchor() -> None:
         np.zeros_like(mask),
         mask,
         np.full_like(mask, 255),
+        np.full_like(mask, 255),
         is_bev=False,
-        anchor_points=(np.asarray((370.0, 280.0)),),
+        anchor_polygons=(
+            np.asarray(
+                ((360.0, 270.0), (390.0, 270.0), (390.0, 290.0), (360.0, 290.0))
+            ),
+        ),
     )
 
     assert cross is not None
@@ -468,6 +475,53 @@ def test_center_cross_recovers_two_dashed_perpendicular_axes() -> None:
     assert len(result.center_cross.axes) == 2
     assert result.center_cross.intersection_ground is not None
     assert FieldFeatureQuality.PARTIAL not in result.center_cross.quality
+
+
+def test_center_cross_tolerates_local_colored_target_occlusion() -> None:
+    image = np.full((400, 400, 3), 255, dtype=np.uint8)
+    for start in range(60, 341, 45):
+        cv2.line(image, (start, 200), (min(start + 28, 340), 200), (0, 0, 0), 3)
+        cv2.line(image, (200, start), (200, min(start + 28, 340)), (0, 0, 0), 3)
+    cv2.rectangle(image, (110, 195), (120, 205), bgr(75), thickness=-1)
+    cv2.rectangle(image, (195, 110), (205, 120), bgr(15), thickness=-1)
+    detector = FieldFeatureDetector(
+        config(),
+        static_map=static_map(),
+        max_observation_age_ms=100.0,
+        ground_projector=projector(),
+    )
+
+    result = detector.detect(
+        frame(image),
+        image,
+        valid_mask=valid_mask(image),
+        result_timestamp_ns=1_100_000,
+    )
+
+    assert result.center_cross is not None
+    assert len(result.center_cross.axes) == 2
+
+
+def test_center_cross_rejects_dark_non_floor_background() -> None:
+    image = np.full((400, 400, 3), 70, dtype=np.uint8)
+    for start in range(60, 341, 45):
+        cv2.line(image, (start, 200), (min(start + 28, 340), 200), (0, 0, 0), 3)
+        cv2.line(image, (200, start), (200, min(start + 28, 340)), (0, 0, 0), 3)
+    detector = FieldFeatureDetector(
+        config(),
+        static_map=static_map(),
+        max_observation_age_ms=100.0,
+        ground_projector=projector(),
+    )
+
+    result = detector.detect(
+        frame(image),
+        image,
+        valid_mask=valid_mask(image),
+        result_timestamp_ns=1_100_000,
+    )
+
+    assert result.center_cross is None
 
 
 def test_center_cross_recovers_low_contrast_rotated_axes_with_clutter() -> None:

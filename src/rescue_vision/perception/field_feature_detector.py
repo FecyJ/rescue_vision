@@ -55,6 +55,7 @@ class _CenterAxisCandidate:
     segment: FloatPoint
     local_support: float
     gap_count: int
+    white_surround: float
 
 
 def _mask_for_ranges(
@@ -188,6 +189,29 @@ def _line_sample_fraction(mask: Uint8Array, segment: FloatPoint) -> float:
     u = np.clip(np.rint(samples[:, 0]).astype(np.intp), 0, width - 1)
     v = np.clip(np.rint(samples[:, 1]).astype(np.intp), 0, height - 1)
     return float(np.count_nonzero(mask[v, u])) / len(samples)
+
+
+def _line_white_surround_fraction(
+    white_mask: Uint8Array,
+    segment: FloatPoint,
+    offset: float,
+) -> float:
+    direction = segment[1] - segment[0]
+    length = float(np.linalg.norm(direction))
+    if length <= 1e-9:
+        return 0.0
+    normal = np.asarray((-direction[1], direction[0]), dtype=np.float64) / length
+    samples = np.linspace(segment[0], segment[1], max(8, round(length / 3.0)))
+    height, width = white_mask.shape
+    white_count = 0
+    total_count = 2 * len(samples)
+    for sign in (-1.0, 1.0):
+        shifted = np.rint(samples + sign * offset * normal).astype(np.intp)
+        u = shifted[:, 0]
+        v = shifted[:, 1]
+        inside = (u >= 0) & (u < width) & (v >= 0) & (v < height)
+        white_count += int(np.count_nonzero(white_mask[v[inside], u[inside]]))
+    return white_count / total_count
 
 
 def _line_side_contrast(
@@ -374,6 +398,37 @@ def _segment_intersection(
     if not (0.0 <= t <= 1.0 and 0.0 <= u <= 1.0):
         return None
     return np.asarray(p + t * r, dtype=np.float64)
+
+
+def _ray_polygon_intersection_distance(
+    origin: FloatPoint,
+    direction: npt.NDArray[np.float64],
+    polygon: FloatPoint,
+) -> float | None:
+    """Return the nearest forward ray intersection with a polygon boundary."""
+
+    direction_norm = float(np.linalg.norm(direction))
+    if direction_norm <= 1e-9:
+        return None
+    ray = direction / direction_norm
+    distances: list[float] = []
+    for index in range(len(polygon)):
+        start = polygon[index]
+        end = polygon[(index + 1) % len(polygon)]
+        edge = end - start
+        denominator = float(ray[0] * edge[1] - ray[1] * edge[0])
+        if math.isclose(denominator, 0.0, abs_tol=1e-9):
+            continue
+        offset = start - origin
+        ray_distance = float(
+            (offset[0] * edge[1] - offset[1] * edge[0]) / denominator
+        )
+        edge_fraction = float(
+            (offset[0] * ray[1] - offset[1] * ray[0]) / denominator
+        )
+        if ray_distance >= 0.0 and 0.0 <= edge_fraction <= 1.0:
+            distances.append(ray_distance)
+    return min(distances) if distances else None
 
 
 class FieldFeatureDetector:
@@ -1077,9 +1132,10 @@ class FieldFeatureDetector:
         dark_mask: Uint8Array,
         local_line_mask: Uint8Array,
         valid_mask: Uint8Array,
+        white_floor_mask: Uint8Array,
         *,
         is_bev: bool,
-        anchor_points: tuple[FloatPoint, ...] = (),
+        anchor_polygons: tuple[FloatPoint, ...] = (),
     ) -> CenterCrossObservation | None:
         candidate_mask = cv2.bitwise_or(dark_mask, local_line_mask)
         raw_segments = _hough_segments(
@@ -1096,6 +1152,7 @@ class FieldFeatureDetector:
         )
         min_margin = diagonal * self._config.center_min_intersection_margin_fraction
         support_thickness = max(1, round(diagonal * 0.003))
+        surround_offset = max(2.0, diagonal * 0.008)
         gap_mask = cv2.dilate(
             dark_mask,
             np.ones((3, 3), dtype=np.uint8),
@@ -1124,13 +1181,28 @@ class FieldFeatureDetector:
                 < self._config.center_min_line_support_fraction
             ):
                 continue
+            white_surround = _line_white_surround_fraction(
+                white_floor_mask,
+                segment,
+                surround_offset,
+            )
+            if (
+                white_surround
+                < self._config.center_min_white_surround_fraction
+            ):
+                continue
             if _mask_distance_at(
                 distance_from_invalid,
                 np.mean(segment, axis=0),
             ) < min_margin:
                 continue
             candidates.append(
-                _CenterAxisCandidate(segment, local_support, gap_count)
+                _CenterAxisCandidate(
+                    segment,
+                    local_support,
+                    gap_count,
+                    white_surround,
+                )
             )
         candidates = _deduplicate_center_axes(
             candidates,
@@ -1162,7 +1234,7 @@ class FieldFeatureDetector:
                 if intersection is None:
                     continue
                 anchor_aligned = False
-                if anchor_points:
+                if anchor_polygons:
                     cosine_threshold = math.cos(
                         math.radians(
                             self._config.center_perpendicular_tolerance_deg
@@ -1173,13 +1245,17 @@ class FieldFeatureDetector:
                         first[1] - first[0],
                         second[1] - second[0],
                     )
-                    for anchor_point in anchor_points:
+                    minimum_anchor_distance = (
+                        diagonal * self._config.center_min_axis_span_fraction
+                    )
+                    for anchor_polygon in anchor_polygons:
+                        anchor_point = np.mean(anchor_polygon, axis=0)
                         anchor_direction = anchor_point - intersection
                         anchor_norm = float(np.linalg.norm(anchor_direction))
                         if anchor_norm <= 1e-9:
                             continue
-                        if any(
-                            abs(
+                        for axis_direction in axis_directions:
+                            alignment = abs(
                                 float(
                                     np.dot(anchor_direction, axis_direction)
                                     / (
@@ -1188,10 +1264,28 @@ class FieldFeatureDetector:
                                     )
                                 )
                             )
-                            >= cosine_threshold
-                            for axis_direction in axis_directions
-                        ):
-                            anchor_aligned = True
+                            if alignment < cosine_threshold:
+                                continue
+                            intersection_distances = (
+                                _ray_polygon_intersection_distance(
+                                    intersection,
+                                    axis_direction,
+                                    anchor_polygon,
+                                ),
+                                _ray_polygon_intersection_distance(
+                                    intersection,
+                                    -axis_direction,
+                                    anchor_polygon,
+                                ),
+                            )
+                            if any(
+                                distance is not None
+                                and distance >= minimum_anchor_distance
+                                for distance in intersection_distances
+                            ):
+                                anchor_aligned = True
+                                break
+                        if anchor_aligned:
                             break
                 first_balance = _axis_balance(first, intersection)
                 second_balance = _axis_balance(second, intersection)
@@ -1214,6 +1308,10 @@ class FieldFeatureDetector:
                 score = (
                     _line_length(first) + _line_length(second)
                 ) * (0.5 + support) * min(first_balance, second_balance)
+                score *= 0.5 + 0.5 * min(
+                    first_candidate.white_surround,
+                    second_candidate.white_surround,
+                )
                 if anchor_aligned:
                     score += 2.0 * diagonal
                 if score > best_score:
@@ -1693,41 +1791,48 @@ class FieldFeatureDetector:
             ),
             cv2.bitwise_not(exclusion),
         )
-        center_anchor_points: list[FloatPoint] = []
+        white_floor_mask = cv2.inRange(
+            hsv,
+            np.asarray(
+                (0, 0, self._config.center_min_floor_value),
+                dtype=np.uint8,
+            ),
+            np.asarray(
+                (179, self._config.center_max_saturation, 255),
+                dtype=np.uint8,
+            ),
+        )
+        white_floor_mask[working.valid_mask == 0] = 0
+        center_anchor_polygons: list[FloatPoint] = []
         for safe_zone in safe_zones:
             if working.is_bev and safe_zone.polygon_ground is not None:
                 assert self._ground_projector is not None
                 zone_pixels = self._ground_projector.ground_to_bev_pixels(
                     safe_zone.polygon_ground
                 )
-                center_anchor_points.append(
-                    np.mean(
-                        np.asarray(
-                            [(pixel.u, pixel.v) for pixel in zone_pixels],
-                            dtype=np.float64,
-                        ),
-                        axis=0,
+                center_anchor_polygons.append(
+                    np.asarray(
+                        [(pixel.u, pixel.v) for pixel in zone_pixels],
+                        dtype=np.float64,
                     )
                 )
             else:
-                center_anchor_points.append(
-                    np.mean(
-                        np.asarray(
-                            [
-                                (pixel.u, pixel.v)
-                                for pixel in safe_zone.polygon_undistorted
-                            ],
-                            dtype=np.float64,
-                        ),
-                        axis=0,
+                center_anchor_polygons.append(
+                    np.asarray(
+                        [
+                            (pixel.u, pixel.v)
+                            for pixel in safe_zone.polygon_undistorted
+                        ],
+                        dtype=np.float64,
                     )
                 )
         center_cross = self._center_cross(
             center_mask,
             local_line_mask,
             working.valid_mask,
+            white_floor_mask,
             is_bev=working.is_bev,
-            anchor_points=tuple(center_anchor_points),
+            anchor_polygons=tuple(center_anchor_polygons),
         )
         boundary_features = (
             self._boundary_features(

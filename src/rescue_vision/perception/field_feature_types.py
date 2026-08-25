@@ -133,7 +133,9 @@ class FieldFeatureConfig:
     center_local_window_fraction: float
     center_local_contrast_threshold: int
     center_max_saturation: int
+    center_min_floor_value: int
     center_min_line_support_fraction: float
+    center_min_white_surround_fraction: float
     center_min_axis_balance_fraction: float
     center_min_intersection_margin_fraction: float
     boundary_canny_low_threshold: int
@@ -187,6 +189,7 @@ class FieldFeatureConfig:
         for name in (
             "center_local_contrast_threshold",
             "center_max_saturation",
+            "center_min_floor_value",
             "boundary_canny_low_threshold",
             "boundary_canny_high_threshold",
             "boundary_side_contrast_threshold",
@@ -213,6 +216,7 @@ class FieldFeatureConfig:
             "center_max_gap_fraction",
             "center_local_window_fraction",
             "center_min_line_support_fraction",
+            "center_min_white_surround_fraction",
             "center_min_axis_balance_fraction",
             "center_min_intersection_margin_fraction",
             "boundary_min_line_length_fraction",
@@ -223,6 +227,10 @@ class FieldFeatureConfig:
         if self.center_min_line_support_fraction <= 0.0:
             raise ValueError(
                 "center_min_line_support_fraction must be positive."
+            )
+        if self.center_min_white_surround_fraction <= 0.0:
+            raise ValueError(
+                "center_min_white_surround_fraction must be positive."
             )
         if not 0.0 < self.center_min_axis_balance_fraction < 0.5:
             raise ValueError(
