@@ -451,6 +451,11 @@ def test_breakup_safety_hold_does_not_oscillate_back_into_breakup() -> None:
             1,
             2,
             GroundPoint(500.0, 0.0),
+        ),
+        observation(
+            1,
+            2,
+            GroundPoint(520.0, 40.0),
             target_class=TargetClass.BLUE_DANGER,
         ),
     )
@@ -467,6 +472,11 @@ def test_breakup_safety_hold_does_not_oscillate_back_into_breakup() -> None:
             2,
             3,
             GroundPoint(500.0, 0.0),
+        ),
+        observation(
+            2,
+            3,
+            GroundPoint(520.0, 40.0),
             target_class=TargetClass.BLUE_DANGER,
         ),
     )
@@ -485,6 +495,62 @@ def test_breakup_safety_hold_does_not_oscillate_back_into_breakup() -> None:
     )
     assert still_held.state is Simulation20PointState.SAFETY_HOLD
     assert still_held.linear_velocity_m_s == 0.0
+
+
+def test_hazard_only_view_searches_in_place_without_forward_motion() -> None:
+    sequence = make_sequence(
+        config=runtime_config(breakup_settle_confirm_frames=1),
+    )
+    start_sequence(sequence)
+    danger = snapshot(
+        1,
+        2,
+        observation(
+            1,
+            2,
+            GroundPoint(500.0, 0.0),
+        ),
+    )
+    sequence.step(
+        2,
+        perception=danger,
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+    sequence.step(
+        3,
+        perception=snapshot(
+            2,
+            3,
+            observation(
+                2,
+                3,
+                GroundPoint(500.0, 0.0),
+                target_class=TargetClass.BLUE_DANGER,
+            ),
+        ),
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+    searching = sequence.step(
+        4,
+        perception=snapshot(
+            3,
+            4,
+            observation(
+                3,
+                4,
+                GroundPoint(500.0, 0.0),
+                target_class=TargetClass.BLUE_DANGER,
+            ),
+        ),
+        pose=pose(heading=0.2),
+        cumulative_distance_m=0.0,
+    )
+    assert searching.state is Simulation20PointState.SCAN_GREEN
+    assert searching.reason == "hazard_only_view_search"
+    assert searching.linear_velocity_m_s == 0.0
+    assert searching.angular_velocity_rad_s != 0.0
 
 
 def test_four_green_deliveries_latch_finish_stop_and_twenty_points() -> None:

@@ -554,10 +554,12 @@ class Simulation20PointSequence:
         except (RuntimeError, ValueError) as exc:
             return self._terminal(timestamp_ns, f"world_update_failed:{exc}")
 
-        if self.state is Simulation20PointState.SAFETY_HOLD:
-            return self._decision(timestamp_ns, 0.0, 0.0, "safety_hold")
         if self.state is Simulation20PointState.RESET_TARGET_TRACKS:
             return self._step_reset_tracks(timestamp_ns, perception, pose, snapshot)
+        if self._hazard_only_view(perception):
+            return self._handle_hazard_only_view(timestamp_ns, snapshot)
+        if self.state is Simulation20PointState.SAFETY_HOLD:
+            return self._decision(timestamp_ns, 0.0, 0.0, "safety_hold")
         if self._breakup is not None:
             return self._step_breakup(
                 timestamp_ns,
@@ -711,6 +713,57 @@ class Simulation20PointSequence:
         )
         self._world_snapshot = snapshot
         return snapshot
+
+    @staticmethod
+    def _hazard_only_view(perception: PerceptionSnapshot | None) -> bool:
+        if (
+            perception is None
+            or perception.dropped_stale_age_ms is not None
+            or not perception.observations
+        ):
+            return False
+        hazard_classes = {TargetClass.UNKNOWN, TargetClass.BLUE_DANGER}
+        return all(
+            observation.target_class in hazard_classes
+            for observation in perception.observations
+        )
+
+    def _handle_hazard_only_view(
+        self,
+        timestamp_ns: int,
+        snapshot: WorldSnapshot,
+    ) -> SimulationDecision:
+        if self._transport.engaged_track_ids:
+            return self._hold(timestamp_ns, "hazard_only_during_transport")
+        if self._breakup is None:
+            self._selected_track_id = None
+            self._selected_plan = None
+            self._hold_resume_state = None
+            self.state = Simulation20PointState.SCAN_GREEN
+            self._scan_start_heading = None
+            self._scan_last_heading = None
+            self._scan_heading_span = 0.0
+        elif self.state is Simulation20PointState.SAFETY_HOLD:
+            self.state = (
+                self._hold_resume_state
+                or Simulation20PointState.BREAKUP_SAFETY_CHECK
+            )
+            self._hold_resume_state = None
+        posture = GripperPosture.CLOSED
+        breakup_state = getattr(self._breakup, "state", None)
+        if breakup_state in {
+            BreakupState.BREAKUP_RELEASE,
+            BreakupState.BREAKUP_OPEN_RETREAT,
+        }:
+            posture = GripperPosture.OPEN
+        return self._decision(
+            timestamp_ns,
+            0.0,
+            self._scan_velocity(),
+            "hazard_only_view_search",
+            posture=posture,
+            world_snapshot=snapshot,
+        )
 
     def _step_breakup(
         self,
