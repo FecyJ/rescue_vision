@@ -405,6 +405,26 @@ def test_perception_frame_renderer_keeps_latest_result_off_realtime_thread() -> 
         assert rendered.sequence == source_frame.sequence
         assert rendered.timestamp_ns == source_frame.timestamp_ns
         assert not np.array_equal(rendered.image_bgr, source_frame.image_bgr)
+        snapshot = renderer.latest_snapshot()
+        assert snapshot is not None
+        assert snapshot.frame_sequence == source_frame.sequence
+        assert len(snapshot.observations) == 1
+    finally:
+        renderer.stop()
+
+
+def test_perception_frame_renderer_initializes_detector_during_start() -> None:
+    calls: list[object] = []
+
+    def build_detector() -> TargetPoseDetector:
+        detector_instance = detector([[detection()]])
+        calls.append(detector_instance)
+        return detector_instance
+
+    renderer = PerceptionFrameRenderer(build_detector)
+    renderer.start()
+    try:
+        assert len(calls) == 1
     finally:
         renderer.stop()
 

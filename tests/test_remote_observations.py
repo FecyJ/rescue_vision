@@ -80,6 +80,25 @@ def test_session_status_round_trip_and_topic() -> None:
         )
 
 
+def test_observe_only_session_can_publish_perception_without_raw_video() -> None:
+    status = session_status(
+        access_mode=RemoteAccessMode.OBSERVE_ONLY,
+        motion_control_available=False,
+        gripper_control_available=False,
+        capture_control_available=False,
+        video_modes=(VideoFrameMode.PERCEPTION,),
+        vehicle_state_available=False,
+        capture_status_available=False,
+        vehicle_state_period_ms=None,
+        capture_status_period_ms=None,
+        video_nominal_fps=1.0,
+        max_linear_velocity_m_s=None,
+        max_angular_velocity_rad_s=None,
+    )
+
+    assert RemoteSessionStatus.from_payload(status.to_payload()) == status
+
+
 def test_session_status_rejects_unsafe_or_inconsistent_capabilities() -> None:
     with pytest.raises(ValueError, match="observe_only"):
         session_status(access_mode=RemoteAccessMode.OBSERVE_ONLY)

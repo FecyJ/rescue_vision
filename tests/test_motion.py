@@ -185,7 +185,7 @@ def system_status_frame(
     *,
     status_sequence: int = 1,
     controller_timestamp_us: int = 10_000,
-    system_flags: SystemFlags = SystemFlags.WATCHDOG_ARMED,
+    system_flags: SystemFlags = SystemFlags.PROTOCOL_READY,
     stop_reason: CarStopReason = CarStopReason.RUNNING,
     left_cdeg: int = 9000,
     right_cdeg: int = 9000,
@@ -371,6 +371,23 @@ def test_unchanged_wheel_target_is_refreshed_for_firmware_watchdog() -> None:
     ]
 
 
+def test_changing_wheel_target_is_throttled_to_watchdog_refresh_period() -> None:
+    channel = FakeCarChannel()
+    clock = FakeClock()
+    controller = MotionController(channel, limits(), monotonic_ns=clock)
+    controller.forward(0.20)
+
+    clock.advance(0.005)
+    assert not controller.update()
+    clock.advance(0.035)
+    assert controller.update()
+    assert controller.commanded_wheel_speeds_m_s == pytest.approx((0.02, 0.02))
+
+    clock.advance(0.005)
+    assert not controller.update()
+    assert len(channel.sent) == 1
+
+
 def test_active_control_loop_gap_soft_brakes_instead_of_resuming_target() -> None:
     channel = FakeCarChannel()
     clock = FakeClock()
@@ -551,6 +568,108 @@ def test_controller_discards_invalid_protocol_frames_before_valid_message() -> N
     assert controller.invalid_received_frames == 1
 
 
+def test_motion_synchronization_waits_for_matching_soft_brake_reply() -> None:
+    channel = FakeCarChannel(
+        [
+            system_status_frame(0, 1_000),
+            command_reply_frame(
+                1,
+                2_000,
+                command_sequence=0,
+                command_type=MessageType.SOFT_BRAKE,
+            ),
+        ]
+    )
+    controller = MotionController(channel, limits())
+    received: list[object] = []
+
+    controller.synchronize(on_message=received.append)
+
+    assert controller.motion_synchronized
+    assert not controller.needs_synchronization
+    assert channel.sent == [encode_soft_brake_command(0)]
+    assert isinstance(received[0], CarSystemStatus)
+    assert isinstance(received[1], CarCommandReply)
+
+
+def test_sequence_old_requests_soft_brake_resynchronization() -> None:
+    clock = FakeClock()
+    channel = FakeCarChannel(
+        [
+            command_reply_frame(
+                0,
+                1,
+                command_sequence=0,
+                command_type=MessageType.SOFT_BRAKE,
+            )
+        ]
+    )
+    controller = MotionController(channel, limits(), monotonic_ns=clock)
+    controller.synchronize()
+
+    controller.forward(0.1)
+    clock.advance(0.05)
+    assert controller.update()
+    channel.received.append(
+        command_reply_frame(
+            1,
+            2,
+            command_sequence=1,
+            command_type=MessageType.SET_WHEEL_SPEED,
+            result=CommandResult.SEQUENCE_OLD,
+        )
+    )
+    assert isinstance(controller.receive_message(timeout=0), CarCommandReply)
+
+    assert controller.needs_synchronization
+    assert controller.target_wheel_speeds_m_s == (0.0, 0.0)
+    assert channel.sent == [
+        encode_soft_brake_command(0),
+        encode_wheel_speed_command(1, 0.025, 0.025),
+        encode_soft_brake_command(2),
+    ]
+
+    channel.received.append(
+        command_reply_frame(
+            2,
+            3,
+            command_sequence=2,
+            command_type=MessageType.SOFT_BRAKE,
+        )
+    )
+    controller.synchronize()
+    assert controller.motion_synchronized
+
+
+def test_unacknowledged_wheel_stream_enters_soft_brake_resynchronization() -> None:
+    clock = FakeClock()
+    channel = FakeCarChannel(
+        [
+            command_reply_frame(
+                0,
+                1,
+                command_sequence=0,
+                command_type=MessageType.SOFT_BRAKE,
+            )
+        ]
+    )
+    controller = MotionController(channel, limits(), monotonic_ns=clock)
+    controller.synchronize()
+    controller.forward(0.1)
+
+    clock.advance(0.04)
+    assert controller.update()
+    clock.advance(0.04)
+    assert not controller.update()
+    clock.advance(0.04)
+    assert not controller.update()
+    clock.advance(0.04)
+    assert controller.update()
+
+    assert controller.needs_synchronization
+    assert channel.sent[-1] == encode_soft_brake_command(2)
+
+
 def test_parse_system_status_and_initial_gripper_target() -> None:
     status = parse_controller_frame(system_status_frame(7, 9_000))
 
@@ -561,7 +680,7 @@ def test_parse_system_status_and_initial_gripper_target() -> None:
         controller_timestamp_us=10_000,
         watchdog_timeout_ms=300,
         last_motion_command_age_ms=25,
-        system_flags=SystemFlags.WATCHDOG_ARMED,
+        system_flags=SystemFlags.PROTOCOL_READY,
         stop_reason=CarStopReason.RUNNING,
         servo_left_target_cdeg=9000,
         servo_right_target_cdeg=9000,

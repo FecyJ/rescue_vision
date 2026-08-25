@@ -6,10 +6,11 @@
 串口、TCP 服务、定位器或规划器。
 
 树莓派与 STM32 接口以
-[`docs/树莓派与单片机通信协议.md`](../../../docs/树莓派与单片机通信协议.md)
+[`docs/树莓派与单片机通信协议v2.md`](../../../docs/树莓派与单片机通信协议v2.md)
 为唯一权威。树莓派端已经使用 COBS、CRC16 和固定长度二进制消息统一运动、
-夹爪、固件看门狗及编码器/IMU 遥测，并删除旧文本协议兼容层；STM32 固件
-仍待实现和真机验收。
+夹爪、固件看门狗及编码器/IMU 遥测，并删除旧文本协议兼容层；当前控制器还会
+在打开 UART、重连或链路异常后等待 `SOFT_BRAKE accepted` 完成序号安全同步。
+真车联调和标定仍待验收。
 
 ## 常用类和函数
 
@@ -27,6 +28,8 @@
 | `set_gripper_angles()` | 左右舵机角度 degree | 同时下发严格 `[0, 180]` 角度 |
 | `gripper_target_angles_deg` | 无 | 启动遥测或本进程最近下发的左右舵机目标；尚无时为 `None` |
 | `soft_brake()` / `emergency_stop()` | 无 | 固件斜坡制动/紧急停止 |
+| `synchronize()` | 等待秒数、可选回调 | 发送 `SOFT_BRAKE` 并等待同序号 `accepted`；等待期间转发遥测 |
+| `needs_synchronization` / `motion_synchronized` / `link_degraded` | 无 | 查询序号同步和 STM32 粘滞链路健康；告警后不再发送非零轮速 |
 | `query_state()` | 无 | 请求固件立即返回状态 |
 | `receive_message()` | 可选等待秒数 | 丢弃损坏帧，返回编码器/IMU、系统状态或命令回复 |
 | `OdometryImu` | `ODOMETRY_IMU` | 同周期累计编码器、三轴 IMU、采样时间和质量位 |
@@ -86,6 +89,7 @@ if channel is None or controller is None:
 ```python
 with channel:
     try:
+        controller.synchronize()
         # 在这里执行下文的 drive、转向、回传处理等片段。
         ...
     finally:
@@ -237,9 +241,14 @@ if isinstance(message, OdometryImu):
         message.gyro_z_rad_s,
     )
 elif isinstance(message, CarSystemStatus):
-    # 只有新鲜且 watchdog_armed=True 的状态及真机停车验收才能作为保护证据。
+    # v2 没有 watchdog_armed wire bit；last_motion_command_age_ms 非空表示
+    # 固件已经收到过运动命令，链路健康位仍需单独检查。
     print(
         message.watchdog_timeout_ms,
+        message.protocol_ready,
+        message.reply_queue_full,
+        message.tx_degraded,
+        message.rx_degraded,
         message.watchdog_armed,
         message.emergency_stop_latched,
         message.stop_reason.name.lower(),

@@ -35,7 +35,8 @@ K0、完整相机外参和可配置三维形状估计目标地面中心、朝向
 | `FieldBoundaryConfig` | 共线/RANSAC、矩形公差、时序、边界带和遮挡参数 |
 | `RealtimeDetectionResult` | 实时检测结果，并明确记录是否丢弃了过期帧 |
 | `render_target_observations()` | 在同坐标系图像副本上叠加框、颜色掩码、K0、置信度和质量 |
-| `PerceptionFrameRenderer` | 单槽最新帧后台推理与可视化旁路；不阻塞相机/运动循环；`clear_latest()` 用于切换模式时丢弃旧结果 |
+| `PerceptionFrameRenderer` | 单槽最新帧后台推理与可视化旁路；`latest_snapshot()` 同步提供结构化观测；`clear_latest()` 丢弃旧结果 |
+| `PerceptionSnapshot` | 同一源帧的序号、采集/结果时间、目标观测和过期丢弃信息 |
 | `StaleObservationError` | 严格 `detect()` 在结果超过允许年龄时抛出的异常 |
 | `ModelDetection` | 后端输出；框和 K0 已反映射到去畸变原尺寸 |
 | `TargetObservation` | 下游跟踪、定位和评测消费的统一观测 |
@@ -152,6 +153,8 @@ renderer.start()
 
 创建并启动后，远程发布循环只提交最新的去畸变 `CameraFrame`，不等待推理：
 下例中的 `undistorted_frame` 由前文 `source` 读取并经过同一 `CameraModel` 准备。
+`start()` 会先创建并校验 Hailo/后处理资源；因此模型加载或设备装配错误会在
+应用进入运动/远程控制循环前失败。成功启动后，帧推理仍在独立线程中进行。
 
 ```python
 renderer.submit(undistorted_frame)

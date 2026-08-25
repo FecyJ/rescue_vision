@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
+from threading import Thread
 from typing import Any
 
 import cv2
@@ -13,6 +17,104 @@ import numpy as np
 from rescue_vision.geometry.camera_model import IMAGE_BORDER_FILL_VALUE
 from rescue_vision.geometry.types import UndistortedPixel
 from rescue_vision.perception.types import ModelDetection, UndistortedBoundingBox
+
+
+_ONNX_DUPLICATE_SCHEMA_PREFIX = (
+    b"Schema error: Trying to register schema with name "
+)
+_ONNX_DUPLICATE_SCHEMA_MARKER = b" but it is already registered from file "
+
+
+def _is_duplicate_onnx_schema_line(line: bytes) -> bool:
+    """识别系统 ONNX Runtime 重复注册 schema 的已知噪声行。"""
+
+    content = line.rstrip(b"\r\n")
+    return content.startswith(_ONNX_DUPLICATE_SCHEMA_PREFIX) and (
+        _ONNX_DUPLICATE_SCHEMA_MARKER in content
+    )
+
+
+def _write_all(file_descriptor: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(file_descriptor, view)
+        if written <= 0:
+            raise OSError("stderr forwarding made no progress")
+        view = view[written:]
+
+
+def _forward_onnx_session_stderr(read_fd: int, saved_stderr_fd: int) -> None:
+    """转发会话初始化 stderr，仅过滤精确匹配的重复 schema 行。"""
+
+    buffer = bytearray()
+    suppress_following_blank = False
+
+    def forward_line(line: bytes) -> None:
+        nonlocal suppress_following_blank
+        if _is_duplicate_onnx_schema_line(line):
+            suppress_following_blank = True
+            return
+        if suppress_following_blank and not line.strip(b"\r\n"):
+            suppress_following_blank = False
+            return
+        suppress_following_blank = False
+        try:
+            _write_all(saved_stderr_fd, line)
+        except OSError:
+            # If stderr has already been closed, continue draining the pipe so
+            # the ONNX constructor cannot deadlock on a full pipe.
+            return
+
+    try:
+        while True:
+            chunk = os.read(read_fd, 4096)
+            if not chunk:
+                break
+            buffer.extend(chunk)
+            while True:
+                newline_index = buffer.find(b"\n")
+                if newline_index < 0:
+                    break
+                line_end = newline_index + 1
+                forward_line(bytes(buffer[:line_end]))
+                del buffer[:line_end]
+        if buffer:
+            forward_line(bytes(buffer))
+    except OSError:
+        # The owning context closes the pipe during exceptional teardown.
+        return
+
+
+@contextmanager
+def _filter_duplicate_onnx_schema_stderr() -> Iterator[None]:
+    """仅在 ONNX 会话构造期间过滤已知的重复 schema 注册噪声。"""
+
+    saved_stderr_fd = os.dup(2)
+    read_fd, write_fd = os.pipe()
+    reader = Thread(
+        target=_forward_onnx_session_stderr,
+        args=(read_fd, saved_stderr_fd),
+        name="rescue-onnx-stderr-filter",
+        daemon=True,
+    )
+    redirected = False
+    try:
+        reader.start()
+        os.dup2(write_fd, 2)
+        redirected = True
+        os.close(write_fd)
+        write_fd = -1
+        yield
+    finally:
+        if redirected:
+            os.dup2(saved_stderr_fd, 2)
+        if write_fd >= 0:
+            os.close(write_fd)
+        reader.join(timeout=2.0)
+        if reader.is_alive():
+            raise RuntimeError("ONNX stderr filter worker did not stop.")
+        os.close(read_fd)
+        os.close(saved_stderr_fd)
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,7 +433,8 @@ class HailoYolo26PoseBackend:
                     f"HEF model size {self._model_size} does not match "
                     f"postprocess input_size {expected_model_size}."
                 )
-            self._onnx_session = ort.InferenceSession(str(postprocess_onnx_path))
+            with _filter_duplicate_onnx_schema_stderr():
+                self._onnx_session = ort.InferenceSession(str(postprocess_onnx_path))
         except BaseException:
             self.close()
             raise

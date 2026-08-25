@@ -86,10 +86,25 @@ def test_parse_command_reply() -> None:
     )
 
 
+def test_parse_command_reply_accepts_v2_sequence_old_result() -> None:
+    message = parse_controller_frame(
+        received(
+            MessageType.COMMAND_REPLY,
+            struct.pack(
+                "<HBB",
+                42,
+                MessageType.SET_WHEEL_SPEED,
+                CommandResult.SEQUENCE_OLD,
+            ),
+        )
+    )
+
+    assert message.result is CommandResult.SEQUENCE_OLD
+
+
 def test_parse_odometry_imu_preserves_wire_units_and_flags() -> None:
     flags = (
         SensorFlags.IMU_VALID
-        | SensorFlags.IMU_CALIBRATED
         | SensorFlags.LEFT_ENCODER_VALID
         | SensorFlags.RIGHT_ENCODER_VALID
     )
@@ -131,7 +146,13 @@ def test_parse_odometry_imu_preserves_wire_units_and_flags() -> None:
 
 
 def test_parse_system_status_decodes_sentinel_flags_and_angles() -> None:
-    flags = SystemFlags.WATCHDOG_ARMED | SystemFlags.GRIPPER_OUTPUT_AVAILABLE
+    flags = (
+        SystemFlags.PROTOCOL_READY
+        | SystemFlags.GRIPPER_OUTPUT_AVAILABLE
+        | SystemFlags.REPLY_QUEUE_FULL
+        | SystemFlags.TX_DEGRADED
+        | SystemFlags.RX_DEGRADED
+    )
     payload = struct.pack(
         "<HQHIHBHH",
         3,
@@ -158,8 +179,14 @@ def test_parse_system_status_decodes_sentinel_flags_and_angles() -> None:
         servo_left_target_cdeg=2725,
         servo_right_target_cdeg=16750,
     )
-    assert message.watchdog_armed
+    assert not message.watchdog_armed
+    assert message.protocol_ready
     assert not message.emergency_stop_latched
+    assert not message.motor_output_enabled
+    assert message.gripper_output_available
+    assert message.reply_queue_full
+    assert message.tx_degraded
+    assert message.rx_degraded
     assert message.servo_left_deg == pytest.approx(27.25)
 
 
@@ -185,7 +212,21 @@ def test_parser_rejects_crc_length_type_direction_enum_and_undefined_flags() -> 
         received(MessageType.COMMAND_REPLY, struct.pack("<HBB", 1, 0x10, 0xFF)),
         received(
             MessageType.ODOMETRY_IMU,
-            struct.pack("<HQqqiiiiiihH", 0, 1, 0, 0, 0, 0, 0, 0, 0, 9807, 2500, 1 << 15),
+            struct.pack(
+                "<HQqqiiiiiihH",
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                9807,
+                2500,
+                1 << 1,
+            ),
         ),
     ]
 

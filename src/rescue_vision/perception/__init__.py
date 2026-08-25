@@ -43,6 +43,7 @@ from rescue_vision.perception.target_ground_geometry import (
     TargetGroundGeometryEstimator,
 )
 from rescue_vision.perception.visualization import (
+    PerceptionSnapshot,
     PerceptionFrameRenderer,
     render_target_observations,
 )
@@ -108,5 +109,6 @@ __all__ = [
     "StartZoneObservation",
     "UndistortedBoundingBox",
     "PerceptionFrameRenderer",
+    "PerceptionSnapshot",
     "render_target_observations",
 ]

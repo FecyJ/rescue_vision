@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from threading import Event, Lock, Thread
 from time import monotonic_ns
 
@@ -23,6 +24,17 @@ _TARGET_COLORS: dict[TargetClass, tuple[int, int, int]] = {
 }
 _K0_COLOR = (0, 0, 255)
 _STALE_COLOR = (0, 0, 255)
+
+
+@dataclass(frozen=True, slots=True)
+class PerceptionSnapshot:
+    """后台目标推理的最新结构化结果。"""
+
+    frame_sequence: int
+    capture_timestamp_ns: int
+    result_timestamp_ns: int
+    observations: tuple[TargetObservation, ...]
+    dropped_stale_age_ms: float | None = None
 
 
 def _target_color(target_class: TargetClass) -> tuple[int, int, int]:
@@ -173,10 +185,11 @@ def render_target_observations(
 class PerceptionFrameRenderer:
     """使用最新帧旁路运行 perception，并保留最新可视化结果。
 
-    构造函数只保存 detector factory，不创建 Hailo/推理资源。调用方必须显式
-    ``start()``；第一次提交帧时才创建 detector。``submit()`` 只保留最新待处理
-    帧，不会让相机或运动安全循环等待推理。``stop()`` 会在后台线程结束后
-    关闭 detector。
+    构造函数只保存 detector factory。调用方必须显式 ``start()``；``start()``
+    会在进入后台帧处理前完成 detector/Hailo 资源初始化，因此模型加载失败会
+    在资源装配阶段暴露，不会在车辆开始运动后突然占用控制进程。``submit()``
+    只保留最新待处理帧，不会让相机或运动安全循环等待推理。``stop()`` 会在
+    后台线程结束后关闭 detector。
     """
 
     def __init__(
@@ -190,6 +203,7 @@ class PerceptionFrameRenderer:
         self._lock = Lock()
         self._pending_frame: CameraFrame | None = None
         self._latest_frame: CameraFrame | None = None
+        self._latest_snapshot: PerceptionSnapshot | None = None
         self._worker_error: BaseException | None = None
         self._detector: TargetPoseDetector | None = None
         self._stop_event = Event()
@@ -208,19 +222,37 @@ class PerceptionFrameRenderer:
         with self._lock:
             self._pending_frame = None
             self._latest_frame = None
+            self._latest_snapshot = None
             self._worker_error = None
             self._detector = None
-        self._thread = Thread(
-            target=self._worker_loop,
-            name="rescue-perception-video",
-            daemon=True,
-        )
-        self._started = True
+        detector: TargetPoseDetector | None = None
         try:
+            detector = self._detector_factory()
+            if detector is None:
+                raise RuntimeError(
+                    "Perception video mode requires an enabled Hailo detector."
+                )
+            with self._lock:
+                self._detector = detector
+            self._thread = Thread(
+                target=self._worker_loop,
+                name="rescue-perception-video",
+                daemon=True,
+            )
+            self._started = True
             self._thread.start()
-        except BaseException:
+        except BaseException as start_error:
             self._started = False
             self._thread = None
+            if detector is not None:
+                try:
+                    detector.close()
+                except BaseException as close_error:
+                    start_error.add_note(
+                        f"perception detector cleanup also failed: {close_error!r}"
+                    )
+            with self._lock:
+                self._detector = None
             raise
 
     def submit(self, frame: CameraFrame) -> None:
@@ -238,6 +270,14 @@ class PerceptionFrameRenderer:
         with self._lock:
             return self._latest_frame
 
+    def latest_snapshot(self) -> PerceptionSnapshot | None:
+        """返回与最新渲染帧同源的观测；没有完成推理时返回 ``None``。"""
+
+        self._require_started()
+        self._raise_worker_error()
+        with self._lock:
+            return self._latest_snapshot
+
     def clear_latest(self) -> None:
         """丢弃模式切换前的结果和待处理帧，不影响 detector 生命周期。"""
 
@@ -245,6 +285,7 @@ class PerceptionFrameRenderer:
         self._raise_worker_error()
         with self._lock:
             self._latest_frame = None
+            self._latest_snapshot = None
             self._pending_frame = None
 
     def check_health(self) -> None:
@@ -276,7 +317,14 @@ class PerceptionFrameRenderer:
             raise RuntimeError("Perception video renderer failed.") from error
 
     def _worker_loop(self) -> None:
-        detector: TargetPoseDetector | None = None
+        with self._lock:
+            detector = self._detector
+        if detector is None:
+            with self._lock:
+                self._worker_error = RuntimeError(
+                    "Perception video mode detector was not initialized."
+                )
+            return
         try:
             while not self._stop_event.is_set():
                 self._condition.wait(timeout=0.05)
@@ -287,14 +335,6 @@ class PerceptionFrameRenderer:
                         self._pending_frame = None
                     if frame is None:
                         break
-                    if detector is None:
-                        detector = self._detector_factory()
-                        if detector is None:
-                            raise RuntimeError(
-                                "Perception video mode requires an enabled "
-                                "Hailo detector."
-                            )
-                        self._detector = detector
                     result = detector.detect_realtime(
                         frame,
                         frame.image_bgr,
@@ -315,8 +355,20 @@ class PerceptionFrameRenderer:
                             "perception_stale_dropped": result.stale_dropped,
                         },
                     )
+                    completed_ns = max(
+                        (item.result_timestamp_ns for item in result.observations),
+                        default=monotonic_ns(),
+                    )
+                    snapshot = PerceptionSnapshot(
+                        frame_sequence=frame.sequence,
+                        capture_timestamp_ns=frame.timestamp_ns,
+                        result_timestamp_ns=completed_ns,
+                        observations=result.observations,
+                        dropped_stale_age_ms=result.dropped_stale_age_ms,
+                    )
                     with self._lock:
                         self._latest_frame = rendered
+                        self._latest_snapshot = snapshot
         except BaseException as error:
             with self._lock:
                 self._worker_error = error
@@ -328,3 +380,6 @@ class PerceptionFrameRenderer:
                     with self._lock:
                         if self._worker_error is None:
                             self._worker_error = error
+                with self._lock:
+                    if self._detector is detector:
+                        self._detector = None

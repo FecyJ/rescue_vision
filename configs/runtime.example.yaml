@@ -46,7 +46,8 @@ remote:
   io_timeout_ms: 100.0
   # 控制消息不能静默丢弃；观察消息按 topic 合并并丢旧保新。
   control_queue_capacity: 32
-  # manual-capture 同时保留视频、车辆状态和地图三个最新 topic。
+  # manual-capture 同时保留视频、车辆状态和地图三个最新 topic；固定解团
+  # observe_only 旁路只需视频，但保留 3 可直接复用本配置。
   observation_queue_capacity: 3
   max_header_bytes: 4096
   # 默认容纳单帧 JPEG/地图快照；仍需按实际分辨率和网络验证。
@@ -76,9 +77,13 @@ motion:
     left_wheel_radius_mm: null
     # 右轮有效滚动半径，单位 mm；测量条件和反标方法与左轮相同，允许左右不同。
     right_wheel_radius_mm: null
-    # 静止时机器人 +z 轴陀螺角速度的平均零偏，单位 rad/s。车辆水平、静止、
-    # 电机停止并预热后采集至少 30 s，剔除搬动/碰撞段后取均值；左转为正。
+    # 静止时 STM32 原始 gyro_z 角速度的平均零偏，单位 rad/s。车辆水平、静止、
+    # 电机停止并预热后采集至少 30 s，剔除搬动/碰撞段后取均值。
     gyro_z_bias_rad_s: null
+    # 将 STM32 上报的 gyro_z 及上述原始零偏乘以此符号，转换为定位规范的
+    # “左转为正、右转为负”。若实测左转为负、右转为正，填写 -1；已符合
+    # 定位规范时填写 1。只允许 -1 或 1，无单位。
+    gyro_z_sign: 1
   gripper:
     # 必须先测得安全端点和舵机联动角度和，再启用持续扳机控制。
     enabled: false
@@ -89,6 +94,77 @@ motion:
     full_travel_time_s: null
     # 每组开/闭端点的左右角之和必须等于该值；示例值需按本车机械结构复核。
     angle_sum_deg: 194.0
+  cluster_breakup:
+    # 仅用于有物理急停、人员全程监督的解团试验；不是完整比赛入口。
+    enabled: false
+    # 从约定出发姿态直行越过减速带，编码器累计机器人中心路程。
+    departure_distance_m: 0.55
+    departure_speed_m_s: 0.15
+    # 搜索方向显式选择 left/right；角速度始终填写正数。
+    search_direction: left
+    search_angular_velocity_rad_s: 0.45
+    search_timeout_s: 12.0
+    cluster_min_detections: 2
+    # 目标团包围框中心相对半幅图像的允许误差及连续确认帧数。
+    center_tolerance_ratio: 0.08
+    center_confirm_frames: 3
+    center_kp_rad_s: 1.20
+    center_max_angular_velocity_rad_s: 0.55
+    approach_speed_m_s: 0.12
+    # 最近有效 K0 地面点进入该前向距离后，保持闭爪并开始定距冲散；
+    # 到达冲散距离后原地开爪，按 motion.gripper.full_travel_time_s 保持，
+    # 再闭爪退离。
+    gripper_open_distance_mm: 260.0
+    breakup_speed_m_s: 0.25
+    breakup_distance_m: 0.25
+    # 冲散到达后先原地开爪释放，再合拢并退出接触区。
+    retreat_speed_m_s: 0.10
+    retreat_distance_m: 0.10
+    scan_green_angular_velocity_rad_s: 0.35
+    green_confirm_frames: 2
+    target_loss_timeout_ms: 500.0
+    motion_phase_timeout_s: 10.0
+
+simulation_20_point:
+  # 仅在已完成软件离线回放、真车门禁和现场确认后显式开启。
+  enabled: false
+  target_delivery_count: 4
+  prepush_offset_mm: 180.0
+  robot_footprint_radius_mm: 160.0
+  target_half_extent_mm: 25.0
+  safety_margin_mm: 80.0
+  delivery_inset_mm: 35.0
+  max_position_uncertainty_mm: 120.0
+  max_heading_uncertainty_rad: 0.20
+  target_max_age_ms: 250.0
+  scan_min_heading_span_rad: 6.283185307179586
+  scan_angular_velocity_rad_s: 0.30
+  navigation_speed_m_s: 0.12
+  navigation_angular_kp_rad_s: 1.0
+  navigation_max_angular_velocity_rad_s: 0.45
+  navigation_position_tolerance_mm: 40.0
+  navigation_heading_tolerance_rad: 0.10
+  approach_speed_m_s: 0.08
+  alignment_kp_rad_s: 1.2
+  alignment_max_angular_velocity_rad_s: 0.35
+  engage_distance_mm: 90.0
+  engage_lateral_tolerance_mm: 35.0
+  contact_corridor_length_mm: 140.0
+  push_speed_m_s: 0.07
+  push_angular_kp_rad_s: 0.8
+  push_max_angular_velocity_rad_s: 0.25
+  retreat_speed_m_s: 0.08
+  retreat_distance_m: 0.20
+  retreat_clear_distance_mm: 180.0
+  delivery_confirm_frames: 3
+  disengage_confirm_frames: 3
+  max_breakup_attempts_per_delivery: 2
+  max_breakup_attempts_total: 8
+  breakup_settle_confirm_frames: 3
+  min_breakup_progress_mm: 20.0
+  min_green_clearance_mm: 80.0
+  corridor_sample_step_mm: 40.0
+  completed_target_exclusion_mm: 120.0
 
 tracking:
   confirmation_hits: 2

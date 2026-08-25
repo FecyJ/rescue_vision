@@ -609,6 +609,7 @@ class OdometryRuntimeConfig:
     left_wheel_radius_mm: float | None
     right_wheel_radius_mm: float | None
     gyro_z_bias_rad_s: float | None
+    gyro_z_sign: int
 
     def build_calibration(self) -> OdometryCalibration | None:
         if not self.enabled:
@@ -622,7 +623,185 @@ class OdometryRuntimeConfig:
             self.left_wheel_radius_mm,
             self.right_wheel_radius_mm,
             self.gyro_z_bias_rad_s,
+            self.gyro_z_sign,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterBreakupRuntimeConfig:
+    """固定出发姿态下的中心目标团解团测试参数。"""
+
+    enabled: bool
+    departure_distance_m: float
+    departure_speed_m_s: float
+    search_direction: str
+    search_angular_velocity_rad_s: float
+    search_timeout_s: float
+    cluster_min_detections: int
+    center_tolerance_ratio: float
+    center_confirm_frames: int
+    center_kp_rad_s: float
+    center_max_angular_velocity_rad_s: float
+    approach_speed_m_s: float
+    gripper_open_distance_mm: float
+    breakup_speed_m_s: float
+    breakup_distance_m: float
+    retreat_speed_m_s: float
+    retreat_distance_m: float
+    scan_green_angular_velocity_rad_s: float
+    green_confirm_frames: int
+    target_loss_timeout_ms: float
+    motion_phase_timeout_s: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("enabled must be a boolean.")
+        if self.search_direction not in {"left", "right"}:
+            raise ValueError("search_direction must be left or right.")
+        for name in (
+            "departure_distance_m",
+            "departure_speed_m_s",
+            "search_angular_velocity_rad_s",
+            "search_timeout_s",
+            "center_tolerance_ratio",
+            "center_kp_rad_s",
+            "center_max_angular_velocity_rad_s",
+            "approach_speed_m_s",
+            "gripper_open_distance_mm",
+            "breakup_speed_m_s",
+            "breakup_distance_m",
+            "retreat_speed_m_s",
+            "retreat_distance_m",
+            "scan_green_angular_velocity_rad_s",
+            "target_loss_timeout_ms",
+            "motion_phase_timeout_s",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive.")
+        if self.center_tolerance_ratio > 1.0:
+            raise ValueError("center_tolerance_ratio must be <= 1.0.")
+        for name in (
+            "cluster_min_detections",
+            "center_confirm_frames",
+            "green_confirm_frames",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer.")
+
+
+@dataclass(frozen=True, slots=True)
+class Simulation20PointRuntimeConfig:
+    """单车四次绿色物资转运的受限模拟赛参数。"""
+
+    enabled: bool
+    target_delivery_count: int
+    prepush_offset_mm: float
+    robot_footprint_radius_mm: float
+    target_half_extent_mm: float
+    safety_margin_mm: float
+    delivery_inset_mm: float
+    max_position_uncertainty_mm: float
+    max_heading_uncertainty_rad: float
+    target_max_age_ms: float
+    scan_min_heading_span_rad: float
+    scan_angular_velocity_rad_s: float
+    navigation_speed_m_s: float
+    navigation_angular_kp_rad_s: float
+    navigation_max_angular_velocity_rad_s: float
+    navigation_position_tolerance_mm: float
+    navigation_heading_tolerance_rad: float
+    approach_speed_m_s: float
+    alignment_kp_rad_s: float
+    alignment_max_angular_velocity_rad_s: float
+    engage_distance_mm: float
+    engage_lateral_tolerance_mm: float
+    contact_corridor_length_mm: float
+    push_speed_m_s: float
+    push_angular_kp_rad_s: float
+    push_max_angular_velocity_rad_s: float
+    retreat_speed_m_s: float
+    retreat_distance_m: float
+    retreat_clear_distance_mm: float
+    delivery_confirm_frames: int
+    disengage_confirm_frames: int
+    max_breakup_attempts_per_delivery: int
+    max_breakup_attempts_total: int
+    breakup_settle_confirm_frames: int
+    min_breakup_progress_mm: float
+    min_green_clearance_mm: float
+    corridor_sample_step_mm: float
+    completed_target_exclusion_mm: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("enabled must be a boolean.")
+        if (
+            isinstance(self.target_delivery_count, bool)
+            or not isinstance(self.target_delivery_count, int)
+            or self.target_delivery_count != 4
+        ):
+            raise ValueError(
+                "target_delivery_count must be exactly 4 for the 20-point flow."
+            )
+        for name in (
+            "prepush_offset_mm",
+            "robot_footprint_radius_mm",
+            "target_half_extent_mm",
+            "safety_margin_mm",
+            "delivery_inset_mm",
+            "max_position_uncertainty_mm",
+            "max_heading_uncertainty_rad",
+            "target_max_age_ms",
+            "scan_min_heading_span_rad",
+            "scan_angular_velocity_rad_s",
+            "navigation_speed_m_s",
+            "navigation_angular_kp_rad_s",
+            "navigation_max_angular_velocity_rad_s",
+            "navigation_position_tolerance_mm",
+            "navigation_heading_tolerance_rad",
+            "approach_speed_m_s",
+            "alignment_kp_rad_s",
+            "alignment_max_angular_velocity_rad_s",
+            "engage_distance_mm",
+            "engage_lateral_tolerance_mm",
+            "contact_corridor_length_mm",
+            "push_speed_m_s",
+            "push_angular_kp_rad_s",
+            "push_max_angular_velocity_rad_s",
+            "retreat_speed_m_s",
+            "retreat_distance_m",
+            "retreat_clear_distance_mm",
+            "min_breakup_progress_mm",
+            "min_green_clearance_mm",
+            "corridor_sample_step_mm",
+            "completed_target_exclusion_mm",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive.")
+        for name in (
+            "delivery_confirm_frames",
+            "disengage_confirm_frames",
+            "max_breakup_attempts_per_delivery",
+            "max_breakup_attempts_total",
+            "breakup_settle_confirm_frames",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer.")
+        if self.max_heading_uncertainty_rad >= math.pi:
+            raise ValueError("max_heading_uncertainty_rad must be less than pi.")
+        if self.navigation_heading_tolerance_rad >= math.pi:
+            raise ValueError(
+                "navigation_heading_tolerance_rad must be less than pi."
+            )
+        if self.navigation_position_tolerance_mm >= self.prepush_offset_mm:
+            raise ValueError(
+                "navigation_position_tolerance_mm must be smaller than "
+                "prepush_offset_mm."
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -636,6 +815,7 @@ class MotionRuntimeConfig:
     max_remote_command_valid_for_ms: int
     gripper: GripperRuntimeConfig
     odometry: OdometryRuntimeConfig
+    cluster_breakup: ClusterBreakupRuntimeConfig
 
     def build_controller(
         self,
@@ -884,6 +1064,7 @@ class AppConfig:
     uart: UartConfig
     remote: RemoteConfig
     motion: MotionRuntimeConfig
+    simulation_20_point: Simulation20PointRuntimeConfig
     tracking: TrackingConfig
     world: WorldRuntimeConfig
     mission: MissionConfig
@@ -992,6 +1173,19 @@ class AppConfig:
             wheel_track_m=self.motion.wheel_track_m,
         )
 
+    def build_simulation_20_point_sequence(self) -> Simulation20PointSequence:
+        """按本配置装配受限 20 分模拟赛纯逻辑流程。"""
+
+        if not self.simulation_20_point.enabled:
+            raise RuntimeError(
+                "simulation_20_point.enabled must be true to build the flow."
+            )
+        from rescue_vision.app.simulation_20_point import (
+            Simulation20PointSequence,
+        )
+
+        return Simulation20PointSequence.from_app_config(self)
+
 
 def load_runtime_config(path: str | Path) -> AppConfig:
     """从 YAML 加载运行配置；未知字段和无效值均视为错误。"""
@@ -1009,6 +1203,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "uart",
             "remote",
             "motion",
+            "simulation_20_point",
             "tracking",
             "world",
             "mission",
@@ -1253,6 +1448,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "max_remote_command_valid_for_ms",
             "gripper",
             "odometry",
+            "cluster_breakup",
         },
         "motion",
     )
@@ -1372,6 +1568,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "left_wheel_radius_mm",
             "right_wheel_radius_mm",
             "gyro_z_bias_rad_s",
+            "gyro_z_sign",
         },
         "motion.odometry",
     )
@@ -1403,6 +1600,13 @@ def load_runtime_config(path: str | Path) -> AppConfig:
                 minimum=minimum,
             )
         )
+    gyro_z_sign = odometry_raw.get("gyro_z_sign", 1)
+    if (
+        isinstance(gyro_z_sign, bool)
+        or not isinstance(gyro_z_sign, int)
+        or gyro_z_sign not in {-1, 1}
+    ):
+        raise ValueError("motion.odometry.gyro_z_sign must be exactly -1 or 1.")
     if odometry_enabled and (
         not motion_enabled
         or encoder_counts is None
@@ -1417,9 +1621,99 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         left_wheel_radius_mm=odometry_floats["left_wheel_radius_mm"],
         right_wheel_radius_mm=odometry_floats["right_wheel_radius_mm"],
         gyro_z_bias_rad_s=odometry_floats["gyro_z_bias_rad_s"],
+        gyro_z_sign=gyro_z_sign,
     )
     if odometry.enabled:
         odometry.build_calibration()
+    breakup_raw = _mapping(
+        motion_raw.get("cluster_breakup", {}),
+        "motion.cluster_breakup",
+    )
+    breakup_keys = {
+        "enabled",
+        "departure_distance_m",
+        "departure_speed_m_s",
+        "search_direction",
+        "search_angular_velocity_rad_s",
+        "search_timeout_s",
+        "cluster_min_detections",
+        "center_tolerance_ratio",
+        "center_confirm_frames",
+        "center_kp_rad_s",
+        "center_max_angular_velocity_rad_s",
+        "approach_speed_m_s",
+        "gripper_open_distance_mm",
+        "breakup_speed_m_s",
+        "breakup_distance_m",
+        "retreat_speed_m_s",
+        "retreat_distance_m",
+        "scan_green_angular_velocity_rad_s",
+        "green_confirm_frames",
+        "target_loss_timeout_ms",
+        "motion_phase_timeout_s",
+    }
+    _reject_unknown(breakup_raw, breakup_keys, "motion.cluster_breakup")
+    breakup_enabled = breakup_raw.get("enabled", False)
+    if not isinstance(breakup_enabled, bool):
+        raise ValueError("motion.cluster_breakup.enabled must be a boolean.")
+
+    def breakup_float(name: str, default: float) -> float:
+        return _finite_float(
+            breakup_raw.get(name, default),
+            f"motion.cluster_breakup.{name}",
+            minimum=0.001,
+        )
+
+    center_tolerance_ratio = breakup_float("center_tolerance_ratio", 0.08)
+    if center_tolerance_ratio > 1.0:
+        raise ValueError(
+            "motion.cluster_breakup.center_tolerance_ratio must be <= 1.0."
+        )
+    cluster_breakup = ClusterBreakupRuntimeConfig(
+        enabled=breakup_enabled,
+        departure_distance_m=breakup_float("departure_distance_m", 0.55),
+        departure_speed_m_s=breakup_float("departure_speed_m_s", 0.15),
+        search_direction=_string(
+            breakup_raw.get("search_direction", "left"),
+            "motion.cluster_breakup.search_direction",
+        ),
+        search_angular_velocity_rad_s=breakup_float(
+            "search_angular_velocity_rad_s", 0.45
+        ),
+        search_timeout_s=breakup_float("search_timeout_s", 12.0),
+        cluster_min_detections=_positive_int(
+            breakup_raw.get("cluster_min_detections", 2),
+            "motion.cluster_breakup.cluster_min_detections",
+        ),
+        center_tolerance_ratio=center_tolerance_ratio,
+        center_confirm_frames=_positive_int(
+            breakup_raw.get("center_confirm_frames", 3),
+            "motion.cluster_breakup.center_confirm_frames",
+        ),
+        center_kp_rad_s=breakup_float("center_kp_rad_s", 1.2),
+        center_max_angular_velocity_rad_s=breakup_float(
+            "center_max_angular_velocity_rad_s", 0.55
+        ),
+        approach_speed_m_s=breakup_float("approach_speed_m_s", 0.12),
+        gripper_open_distance_mm=breakup_float(
+            "gripper_open_distance_mm", 260.0
+        ),
+        breakup_speed_m_s=breakup_float("breakup_speed_m_s", 0.25),
+        breakup_distance_m=breakup_float("breakup_distance_m", 0.25),
+        retreat_speed_m_s=breakup_float("retreat_speed_m_s", 0.10),
+        retreat_distance_m=breakup_float("retreat_distance_m", 0.10),
+        scan_green_angular_velocity_rad_s=breakup_float(
+            "scan_green_angular_velocity_rad_s", 0.35
+        ),
+        green_confirm_frames=_positive_int(
+            breakup_raw.get("green_confirm_frames", 2),
+            "motion.cluster_breakup.green_confirm_frames",
+        ),
+        target_loss_timeout_ms=breakup_float(
+            "target_loss_timeout_ms", 500.0
+        ),
+        motion_phase_timeout_s=breakup_float("motion_phase_timeout_s", 10.0),
+    )
     motion = MotionRuntimeConfig(
         enabled=motion_enabled,
         wheel_track_m=wheel_track_m,
@@ -1446,7 +1740,212 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         max_remote_command_valid_for_ms=max_remote_validity,
         gripper=gripper,
         odometry=odometry,
+        cluster_breakup=cluster_breakup,
     )
+    if cluster_breakup.enabled:
+        if not motion.enabled or not motion.gripper.enabled or not odometry.enabled:
+            raise ValueError(
+                "Enabled motion.cluster_breakup requires motion, gripper and "
+                "odometry to be enabled."
+            )
+        for name in (
+            "departure_speed_m_s",
+            "approach_speed_m_s",
+            "breakup_speed_m_s",
+            "retreat_speed_m_s",
+        ):
+            if getattr(cluster_breakup, name) > motion.max_linear_velocity_m_s:
+                raise ValueError(
+                    f"motion.cluster_breakup.{name} exceeds "
+                    "motion.max_linear_velocity_m_s."
+                )
+        for name in (
+            "search_angular_velocity_rad_s",
+            "center_max_angular_velocity_rad_s",
+            "scan_green_angular_velocity_rad_s",
+        ):
+            if getattr(cluster_breakup, name) > motion.max_angular_velocity_rad_s:
+                raise ValueError(
+                    f"motion.cluster_breakup.{name} exceeds "
+                    "motion.max_angular_velocity_rad_s."
+                )
+
+    simulation_raw = _mapping(
+        root.get("simulation_20_point", {}),
+        "simulation_20_point",
+    )
+    simulation_keys = {
+        "enabled",
+        "target_delivery_count",
+        "prepush_offset_mm",
+        "robot_footprint_radius_mm",
+        "target_half_extent_mm",
+        "safety_margin_mm",
+        "delivery_inset_mm",
+        "max_position_uncertainty_mm",
+        "max_heading_uncertainty_rad",
+        "target_max_age_ms",
+        "scan_min_heading_span_rad",
+        "scan_angular_velocity_rad_s",
+        "navigation_speed_m_s",
+        "navigation_angular_kp_rad_s",
+        "navigation_max_angular_velocity_rad_s",
+        "navigation_position_tolerance_mm",
+        "navigation_heading_tolerance_rad",
+        "approach_speed_m_s",
+        "alignment_kp_rad_s",
+        "alignment_max_angular_velocity_rad_s",
+        "engage_distance_mm",
+        "engage_lateral_tolerance_mm",
+        "contact_corridor_length_mm",
+        "push_speed_m_s",
+        "push_angular_kp_rad_s",
+        "push_max_angular_velocity_rad_s",
+        "retreat_speed_m_s",
+        "retreat_distance_m",
+        "retreat_clear_distance_mm",
+        "delivery_confirm_frames",
+        "disengage_confirm_frames",
+        "max_breakup_attempts_per_delivery",
+        "max_breakup_attempts_total",
+        "breakup_settle_confirm_frames",
+        "min_breakup_progress_mm",
+        "min_green_clearance_mm",
+        "corridor_sample_step_mm",
+        "completed_target_exclusion_mm",
+    }
+    _reject_unknown(simulation_raw, simulation_keys, "simulation_20_point")
+    simulation_enabled = simulation_raw.get("enabled", False)
+    if not isinstance(simulation_enabled, bool):
+        raise ValueError("simulation_20_point.enabled must be a boolean.")
+
+    def simulation_float(name: str, default: float) -> float:
+        return _finite_float(
+            simulation_raw.get(name, default),
+            f"simulation_20_point.{name}",
+            minimum=0.001,
+        )
+
+    simulation_20_point = Simulation20PointRuntimeConfig(
+        enabled=simulation_enabled,
+        target_delivery_count=_positive_int(
+            simulation_raw.get("target_delivery_count", 4),
+            "simulation_20_point.target_delivery_count",
+        ),
+        prepush_offset_mm=simulation_float("prepush_offset_mm", 180.0),
+        robot_footprint_radius_mm=simulation_float(
+            "robot_footprint_radius_mm", 160.0
+        ),
+        target_half_extent_mm=simulation_float("target_half_extent_mm", 25.0),
+        safety_margin_mm=simulation_float("safety_margin_mm", 80.0),
+        delivery_inset_mm=simulation_float("delivery_inset_mm", 35.0),
+        max_position_uncertainty_mm=simulation_float(
+            "max_position_uncertainty_mm", 120.0
+        ),
+        max_heading_uncertainty_rad=simulation_float(
+            "max_heading_uncertainty_rad", 0.20
+        ),
+        target_max_age_ms=simulation_float("target_max_age_ms", 250.0),
+        scan_min_heading_span_rad=simulation_float(
+            "scan_min_heading_span_rad", 2.0 * math.pi
+        ),
+        scan_angular_velocity_rad_s=simulation_float(
+            "scan_angular_velocity_rad_s", 0.30
+        ),
+        navigation_speed_m_s=simulation_float("navigation_speed_m_s", 0.12),
+        navigation_angular_kp_rad_s=simulation_float(
+            "navigation_angular_kp_rad_s", 1.0
+        ),
+        navigation_max_angular_velocity_rad_s=simulation_float(
+            "navigation_max_angular_velocity_rad_s", 0.45
+        ),
+        navigation_position_tolerance_mm=simulation_float(
+            "navigation_position_tolerance_mm", 40.0
+        ),
+        navigation_heading_tolerance_rad=simulation_float(
+            "navigation_heading_tolerance_rad", 0.10
+        ),
+        approach_speed_m_s=simulation_float("approach_speed_m_s", 0.08),
+        alignment_kp_rad_s=simulation_float("alignment_kp_rad_s", 1.2),
+        alignment_max_angular_velocity_rad_s=simulation_float(
+            "alignment_max_angular_velocity_rad_s", 0.35
+        ),
+        engage_distance_mm=simulation_float("engage_distance_mm", 90.0),
+        engage_lateral_tolerance_mm=simulation_float(
+            "engage_lateral_tolerance_mm", 35.0
+        ),
+        contact_corridor_length_mm=simulation_float(
+            "contact_corridor_length_mm", 140.0
+        ),
+        push_speed_m_s=simulation_float("push_speed_m_s", 0.07),
+        push_angular_kp_rad_s=simulation_float("push_angular_kp_rad_s", 0.8),
+        push_max_angular_velocity_rad_s=simulation_float(
+            "push_max_angular_velocity_rad_s", 0.25
+        ),
+        retreat_speed_m_s=simulation_float("retreat_speed_m_s", 0.08),
+        retreat_distance_m=simulation_float("retreat_distance_m", 0.20),
+        retreat_clear_distance_mm=simulation_float(
+            "retreat_clear_distance_mm", 180.0
+        ),
+        delivery_confirm_frames=_positive_int(
+            simulation_raw.get("delivery_confirm_frames", 3),
+            "simulation_20_point.delivery_confirm_frames",
+        ),
+        disengage_confirm_frames=_positive_int(
+            simulation_raw.get("disengage_confirm_frames", 3),
+            "simulation_20_point.disengage_confirm_frames",
+        ),
+        max_breakup_attempts_per_delivery=_positive_int(
+            simulation_raw.get("max_breakup_attempts_per_delivery", 2),
+            "simulation_20_point.max_breakup_attempts_per_delivery",
+        ),
+        max_breakup_attempts_total=_positive_int(
+            simulation_raw.get("max_breakup_attempts_total", 8),
+            "simulation_20_point.max_breakup_attempts_total",
+        ),
+        breakup_settle_confirm_frames=_positive_int(
+            simulation_raw.get("breakup_settle_confirm_frames", 3),
+            "simulation_20_point.breakup_settle_confirm_frames",
+        ),
+        min_breakup_progress_mm=simulation_float(
+            "min_breakup_progress_mm", 20.0
+        ),
+        min_green_clearance_mm=simulation_float(
+            "min_green_clearance_mm", 80.0
+        ),
+        corridor_sample_step_mm=simulation_float(
+            "corridor_sample_step_mm", 40.0
+        ),
+        completed_target_exclusion_mm=simulation_float(
+            "completed_target_exclusion_mm", 120.0
+        ),
+    )
+    if simulation_20_point.enabled:
+        for name in (
+            "navigation_speed_m_s",
+            "approach_speed_m_s",
+            "push_speed_m_s",
+            "retreat_speed_m_s",
+        ):
+            if getattr(simulation_20_point, name) > motion.max_linear_velocity_m_s:
+                raise ValueError(
+                    f"simulation_20_point.{name} exceeds "
+                    "motion.max_linear_velocity_m_s."
+                )
+        for name in (
+            "scan_angular_velocity_rad_s",
+            "navigation_max_angular_velocity_rad_s",
+            "alignment_max_angular_velocity_rad_s",
+            "push_max_angular_velocity_rad_s",
+        ):
+            if (
+                getattr(simulation_20_point, name)
+                > motion.max_angular_velocity_rad_s
+            ):
+                raise ValueError(
+                    f"simulation_20_point.{name} exceeds "
+                    "motion.max_angular_velocity_rad_s."
+                )
 
     tracking_raw = _mapping(
         root.get("tracking", {}),
@@ -2884,15 +3383,15 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         ),
     )
     if fusion.enabled and (
-        not localization_enabled
+        not motion.enabled
+        or motion.wheel_track_m is None
         or not motion.odometry.enabled
         or not uart.enabled
-        or not perception.field_features.enabled
-        or not geometry.ground_mapping_enabled
     ):
         raise ValueError(
-            "Enabled localization.fusion requires localization, UART, "
-            "motion.odometry, field features and ground mapping."
+            "Enabled localization.fusion requires motion with wheel_track_m, "
+            "UART and motion.odometry; visual field features and ground mapping "
+            "are only required by the visual localization path."
         )
     localization = LocalizationRuntimeConfig(center_cross_localization, fusion)
 
@@ -2993,6 +3492,40 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         backend_score_threshold=backend_score_threshold,
         max_detections=max_detections,
     )
+    if cluster_breakup.enabled and (
+        not hailo.enabled or not geometry.ground_mapping_enabled
+    ):
+        raise ValueError(
+            "Enabled motion.cluster_breakup requires Hailo and ground mapping."
+        )
+    if simulation_20_point.enabled:
+        if world.team_color is TeamColor.UNKNOWN:
+            raise ValueError(
+                "Enabled simulation_20_point requires world.team_color to "
+                "be red or blue."
+            )
+        if not cluster_breakup.enabled:
+            raise ValueError(
+                "Enabled simulation_20_point requires "
+                "motion.cluster_breakup.enabled=true."
+            )
+        if not localization.fusion.enabled:
+            raise ValueError(
+                "Enabled simulation_20_point requires "
+                "localization.fusion.enabled=true."
+            )
+        if not hailo.enabled or not geometry.ground_mapping_enabled:
+            raise ValueError(
+                "Enabled simulation_20_point requires Hailo and ground mapping."
+            )
+        if remote.enabled and (
+            remote.role is not RemoteRole.SERVER
+            or remote.access_mode is not RemoteAccessMode.OBSERVE_ONLY
+        ):
+            raise ValueError(
+                "simulation_20_point remote access must be a server in "
+                "observe_only mode."
+            )
 
     return AppConfig(
         camera,
@@ -3002,6 +3535,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         uart,
         remote,
         motion,
+        simulation_20_point,
         tracking,
         world,
         mission,

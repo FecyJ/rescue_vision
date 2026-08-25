@@ -88,7 +88,7 @@ def test_manual_motion_log_round_trip_preserves_monotonic_time_sources(
             controller_timestamp_us=65_000,
             watchdog_timeout_ms=300,
             last_motion_command_age_ms=15,
-            system_flags=SystemFlags.WATCHDOG_ARMED,
+            system_flags=SystemFlags.PROTOCOL_READY,
             stop_reason=CarStopReason.RUNNING,
             servo_left_target_cdeg=9000,
             servo_right_target_cdeg=9000,

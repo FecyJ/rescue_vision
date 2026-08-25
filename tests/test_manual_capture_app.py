@@ -48,6 +48,7 @@ from rescue_vision.data.check_recording import inspect_recording
 from rescue_vision.motion import (
     CarStopReason,
     CarSystemStatus,
+    CommandResult,
     ExecutedRemoteGripper,
     ExecutedRemoteMotion,
     GripperCalibration,
@@ -102,12 +103,49 @@ class FailingSource(FakeSource):
 class FakeCarChannel:
     def __init__(self) -> None:
         self.sent: list[bytes] = []
+        self.received = [
+            ReceivedUartFrame(
+                sequence=0,
+                received_timestamp_ns=time.monotonic_ns(),
+                payload=pack_protocol_frame(
+                    MessageType.COMMAND_REPLY,
+                    struct.pack(
+                        "<HBB",
+                        0,
+                        int(MessageType.SOFT_BRAKE),
+                        int(CommandResult.ACCEPTED),
+                    ),
+                ),
+            )
+        ]
 
     def send_frame(self, payload: bytes) -> None:
         self.sent.append(payload)
 
+    def queue_soft_brake_reply(self) -> None:
+        if not self.sent or self.sent[-1][0] != MessageType.SOFT_BRAKE:
+            raise AssertionError("expected a SOFT_BRAKE before queuing its reply")
+        command_sequence = struct.unpack("<H", self.sent[-1][1:-2])[0]
+        self.received.append(
+            ReceivedUartFrame(
+                sequence=len(self.sent),
+                received_timestamp_ns=time.monotonic_ns(),
+                payload=pack_protocol_frame(
+                    MessageType.COMMAND_REPLY,
+                    struct.pack(
+                        "<HBB",
+                        command_sequence,
+                        int(MessageType.SOFT_BRAKE),
+                        int(CommandResult.ACCEPTED),
+                    ),
+                ),
+            )
+        )
+
     def receive_frame(self, timeout: float | None = None):
         del timeout
+        if self.received:
+            return self.received.pop(0)
         raise TimeoutError
 
 
@@ -134,13 +172,15 @@ class TelemetryAfterMotionChannel(FakeCarChannel):
                         1_000,
                         300,
                         10,
-                        int(SystemFlags.WATCHDOG_ARMED),
+                        int(SystemFlags.PROTOCOL_READY),
                         int(CarStopReason.RUNNING),
                         9000,
                         9000,
                     ),
                 ),
             )
+        if self.received:
+            return self.received.pop(0)
         raise TimeoutError
 
 
@@ -354,7 +394,6 @@ def test_session_uart_callback_fans_out_odometry_once() -> None:
         imu_temperature_cdeg=2500,
         sensor_flags=(
             SensorFlags.IMU_VALID
-            | SensorFlags.IMU_CALIBRATED
             | SensorFlags.LEFT_ENCODER_VALID
             | SensorFlags.RIGHT_ENCODER_VALID
         ),
@@ -613,6 +652,7 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
         config_snapshot={},
         pipeline=pipeline,
     )
+    car.queue_soft_brake_reply()
     second_connection = FakeConnection([])
     with pytest.raises(RemoteDisconnectedError):
         run_manual_capture_session(
@@ -1095,7 +1135,10 @@ def test_recording_queue_overflow_faults_capture_and_requires_stop(
 
     assert capture.faulted
     assert capture.recorder is None
-    assert car.sent == [encode_soft_brake_command(0)]
+    assert car.sent == [
+        encode_soft_brake_command(0),
+        encode_soft_brake_command(1),
+    ]
 
 
 def test_manual_capture_rejects_competition_observe_only_mode() -> None:
@@ -1322,7 +1365,7 @@ def test_vehicle_state_tracks_gripper_command_and_firmware_angles() -> None:
             controller_timestamp_us=5_000,
             watchdog_timeout_ms=300,
             last_motion_command_age_ms=10,
-            system_flags=SystemFlags.WATCHDOG_ARMED,
+            system_flags=SystemFlags.PROTOCOL_READY,
             stop_reason=CarStopReason.RUNNING,
             servo_left_target_cdeg=2700,
             servo_right_target_cdeg=16700,
@@ -1453,4 +1496,7 @@ def test_camera_failure_faults_capture_and_stops_motion(tmp_path) -> None:
 
     assert capture.faulted
     assert capture.stop_reason is CaptureStopReason.CAMERA_ERROR
-    assert car.sent == [encode_soft_brake_command(0)]
+    assert car.sent == [
+        encode_soft_brake_command(0),
+        encode_soft_brake_command(1),
+    ]

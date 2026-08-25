@@ -814,6 +814,7 @@ class ManualCaptureRuntime:
                     on_other_control=self._handle_other_control,
                     on_cycle=self._cycle,
                     poll_interval_s=0.02,
+                    synchronize_on_start=True,
                 )
         finally:
             if self.gripper_executor is not None:
@@ -1105,7 +1106,7 @@ class ManualCaptureRuntime:
                 return
         if frame is None or frame.sequence == self.last_sent_video_sequence:
             return
-        _send_video_frame(
+        send_video_frame(
             self.connection,
             frame,
             self.pipeline,
@@ -1316,7 +1317,7 @@ def run_manual_capture_session(
             capture.close()
 
 
-def _send_video_frame(
+def send_video_frame(
     connection: RemoteMessageConnection,
     frame: CameraFrame,
     pipeline: CameraPipeline,

@@ -112,6 +112,12 @@ for message in motion_controller.drain_messages():
         fusion.submit_odometry(message)
 ```
 
+这一步可以单独作为“编码器+IMU 航位推算”阶段运行，不要求启用
+`localization.enabled`、`perception.field_features` 或调用相机视觉定位。估计的
+绝对坐标起点来自 `localization.fusion.initial_pose`，因此它是带初始位姿假设和
+随时间累积漂移的连续 `FieldPose2D`，不是现场绝对定位证据。配置
+`allow_wheel_only` 还可以决定 IMU 无效时是否允许短时双编码器退化。
+
 视觉处理承接前文的 `pose_observation`。先验必须查询相机采集时刻；得到唯一解后
 再提交，融合器会在最近历史状态纠偏并重放后续预测：
 
@@ -147,6 +153,8 @@ else:
 
 - 状态为场地 `x/y/heading` 与 `gyro_z` 零偏；编码器负责平移和差速转角，陀螺仪
   负责短时航向。加速度只标记静止、倾斜、撞击或饱和，不二次积分平面位置。
+- `motion.odometry.gyro_z_sign` 在输入边界把线路读数及原始静态零偏转换为内部
+  左转为正；融合状态、`FieldPose2D.heading_rad` 和下游接口不随硬件极性改变。
 - 配置起点仅在进程启动后的首个有效编码器基线使用一次。控制器时间倒退、序号
   反向、超期、计数跳变或编码器失效会清除连续位姿；之后只能由可靠绝对视觉重建。
 - IMU 暂时无效可按配置退化为纯轮式预测并放大协方差；编码器无效时不会退化为

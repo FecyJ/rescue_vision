@@ -295,6 +295,7 @@ def test_strict_config_and_geometry_build(tmp_path) -> None:
     path = tmp_path / "runtime.yaml"
     path.write_text(config_text(), encoding="utf-8")
     config = load_runtime_config(path)
+    assert not config.motion.cluster_breakup.enabled
     geometry = config.build_geometry()
     assert geometry is not None
     assert geometry.camera_model.image_size == (32, 24)
@@ -456,7 +457,8 @@ localization:
     encoder_counts_per_revolution: 4096
     left_wheel_radius_mm: 32.0
     right_wheel_radius_mm: 31.8
-    gyro_z_bias_rad_s: 0.01""",
+    gyro_z_bias_rad_s: 0.01
+    gyro_z_sign: -1""",
     )
     path = tmp_path / "runtime.yaml"
     path.write_text(text, encoding="utf-8")
@@ -466,8 +468,51 @@ localization:
 
     assert estimator is not None
     assert estimator.calibration.encoder_counts_per_revolution == 4096
+    assert estimator.calibration.gyro_z_sign == -1
     assert estimator.config.initial_pose.position == FieldPoint(10.0, -20.0)
     assert estimator.config.initial_pose.heading_rad == pytest.approx(np.pi / 2)
+
+
+def test_odometry_imu_fusion_can_build_without_visual_localization(tmp_path) -> None:
+    text = config_text(
+        ground_mapping_enabled=False,
+        extra="""
+localization:
+  enabled: false
+  fusion:
+    enabled: true
+    initial_pose:
+      x_mm: -1350.0
+      y_mm: -1350.0
+      heading_deg: 90.0
+      position_uncertainty_mm: 100.0
+      heading_uncertainty_deg: 10.0
+      confidence: 0.5
+""",
+    )
+    text = text.replace("uart:\n  enabled: false", "uart:\n  enabled: true")
+    text = text.replace("  device: null", "  device: /dev/ttyAMA0", 1)
+    text = text.replace(
+        "motion:\n  enabled: false\n  wheel_track_m: null",
+        """motion:
+  enabled: true
+  wheel_track_m: 0.2
+  odometry:
+    enabled: true
+    encoder_counts_per_revolution: 4096
+    left_wheel_radius_mm: 32.0
+    right_wheel_radius_mm: 31.8
+    gyro_z_bias_rad_s: 0.01
+    gyro_z_sign: -1""",
+    )
+    path = tmp_path / "runtime-wheel-imu.yaml"
+    path.write_text(text, encoding="utf-8")
+
+    loaded = load_runtime_config(path)
+
+    assert not loaded.localization.center_cross.enabled
+    assert not loaded.perception.field_features.enabled
+    assert loaded.build_odometry_imu_fusion() is not None
 
 
 def test_enabled_fusion_requires_odometry_calibration(tmp_path) -> None:

@@ -20,7 +20,6 @@ from rescue_vision.motion import OdometryImu, SensorFlags
 
 FLAGS = (
     SensorFlags.IMU_VALID
-    | SensorFlags.IMU_CALIBRATED
     | SensorFlags.LEFT_ENCODER_VALID
     | SensorFlags.RIGHT_ENCODER_VALID
 )
@@ -184,6 +183,27 @@ def test_wheel_radius_difference_and_gyro_bias_are_applied() -> None:
     assert result.position_uncertainty_mm > 20.0
 
 
+def test_negative_raw_left_turn_is_converted_to_positive_canonical_yaw() -> None:
+    estimator = OdometryImuFusion(
+        config(initial_pose=FieldPose2D(FieldPoint(0.0, 0.0), 0.0)),
+        OdometryCalibration(
+            1000,
+            100.0 / (2.0 * math.pi),
+            100.0 / (2.0 * math.pi),
+            0.1,
+            -1,
+        ),
+        wheel_track_m=0.2,
+    )
+    estimator.submit_odometry(odom(0, 10_000, 0, 0, gyro_z_rad_s=0.1))
+    result = estimator.submit_odometry(
+        odom(1, 20_000, 1, 1, gyro_z_rad_s=-0.9)
+    )
+
+    assert result.pose is not None
+    assert result.pose.heading_rad > 0.0
+
+
 def test_forward_drop_is_accepted_but_reverse_sequence_clears_pose() -> None:
     estimator = fusion()
     estimator.submit_odometry(odom(10, 10_000, 0, 0))
@@ -295,3 +315,5 @@ def test_configuration_rejects_invalid_values() -> None:
         config(history_duration_ms=10.0, max_visual_alignment_error_ms=20.0)
     with pytest.raises(ValueError, match="encoder_counts"):
         OdometryCalibration(0, 10.0, 10.0, 0.0)
+    with pytest.raises(ValueError, match="gyro_z_sign"):
+        OdometryCalibration(1000, 10.0, 10.0, 0.0, 0)

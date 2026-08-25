@@ -50,7 +50,7 @@ def system_status(sequence: int) -> CarSystemStatus:
         watchdog_timeout_ms=300,
         last_motion_command_age_ms=None,
         system_flags=(
-            SystemFlags.WATCHDOG_ARMED
+            SystemFlags.PROTOCOL_READY
             | SystemFlags.GRIPPER_OUTPUT_AVAILABLE
         ),
         stop_reason=CarStopReason.STARTUP,
@@ -87,7 +87,7 @@ def test_message_formatting_exposes_units_flags_and_reply_result() -> None:
     assert "temp_c=36.25" in odom_line
     assert "imu_valid" in odom_line
     assert "reason=startup" in status_line
-    assert "watchdog_armed" in status_line
+    assert "protocol_ready" in status_line
     assert "command=query_status result=accepted" in reply_line
 
 

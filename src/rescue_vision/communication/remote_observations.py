@@ -287,8 +287,10 @@ class RemoteSessionStatus:
             raise ValueError(
                 "capture control requires video and capture status."
             )
-        if self.video_stream_available and VideoFrameMode.RAW not in self.video_modes:
-            raise ValueError("video_modes must include raw when video is available.")
+        if self.video_stream_available and not self.video_modes:
+            raise ValueError(
+                "video_modes must include at least one mode when video is available."
+            )
         if not self.video_stream_available and self.video_modes:
             raise ValueError("video_modes must be empty when video is unavailable.")
         if self.motion_control_available != (

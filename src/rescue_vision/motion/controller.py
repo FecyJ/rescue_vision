@@ -8,9 +8,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from rescue_vision.motion.protocol import (
+    CarCommandReply,
     CarFrameChannel,
     CarSystemStatus,
+    CommandResult,
     ControllerProtocolError,
+    MessageType,
     ParsedCarMessage,
     encode_emergency_stop_command,
     encode_gripper_command,
@@ -23,10 +26,16 @@ from rescue_vision.motion.protocol import (
 
 _WHEEL_COMMAND_REFRESH_NS = 40_000_000
 _MAX_ACTIVE_UPDATE_GAP_NS = 100_000_000
+_WHEEL_REPLY_TIMEOUT_NS = 100_000_000
+_MAX_PENDING_WHEEL_COMMANDS = 4
 
 
 class MotionControlTimingError(RuntimeError):
     """活动运动控制循环停顿过久，已先发送柔和停车。"""
+
+
+class MotionSynchronizationError(RuntimeError):
+    """STM32 运动序号安全同步未在规定时间内完成。"""
 
 
 def _positive_finite(value: object, location: str) -> float:
@@ -113,6 +122,13 @@ class MotionController:
         self._command_sequence = 0
         self._gripper_target_angles_deg: tuple[float, float] | None = None
         self._has_gripper_command = False
+        self._pending_wheel_commands: dict[int, int] = {}
+        self._last_wheel_ack_ns: int | None = None
+        self._synchronization_enforced = False
+        self._synchronization_sequence: int | None = None
+        self._synchronization_acknowledged = False
+        self._emergency_stop_latched = False
+        self._link_degraded = False
         self.invalid_received_frames = 0
 
     @property
@@ -132,6 +148,99 @@ class MotionController:
         """返回启动遥测或本进程最近下发的左右舵机目标角度。"""
 
         return self._gripper_target_angles_deg
+
+    @property
+    def pending_wheel_command_count(self) -> int:
+        """返回尚未收到 `COMMAND_REPLY` 的轮速命令数量。"""
+
+        return len(self._pending_wheel_commands)
+
+    @property
+    def last_wheel_ack_timestamp_ns(self) -> int | None:
+        """返回最近一条 `SET_WHEEL_SPEED accepted` 的本机时间。"""
+
+        return self._last_wheel_ack_ns
+
+    @property
+    def motion_synchronized(self) -> bool:
+        """返回当前运动序号是否已通过 `SOFT_BRAKE` 安全同步。"""
+
+        return not self._synchronization_enforced or (
+            self._synchronization_acknowledged
+            and self._synchronization_sequence is None
+        )
+
+    @property
+    def needs_synchronization(self) -> bool:
+        """返回生产控制循环是否必须等待 `SOFT_BRAKE` 回复。"""
+
+        return self._synchronization_enforced and not self.motion_synchronized
+
+    @property
+    def emergency_stop_latched(self) -> bool:
+        """返回是否已经观察到急停锁存；协议没有远程解除动作。"""
+
+        return self._emergency_stop_latched
+
+    @property
+    def link_degraded(self) -> bool:
+        """返回是否观察到 STM32 本次启动期间的粘滞链路健康告警。"""
+
+        return self._link_degraded
+
+    def synchronize(
+        self,
+        *,
+        timeout_s: float = 0.5,
+        on_message: Callable[[ParsedCarMessage], None] | None = None,
+    ) -> None:
+        """发送 `SOFT_BRAKE` 并等待同序号的 `accepted` 回复。
+
+        该方法应在每次打开 UART、重连或检测到运动序号/链路异常后调用。
+        运动遥测可能在等待期间到达；若提供 ``on_message``，这些消息会按
+        到达顺序交给调用方，避免为等待回复而丢弃定位数据。
+        """
+
+        if (
+            isinstance(timeout_s, bool)
+            or not isinstance(timeout_s, (int, float))
+            or not 0.0 < float(timeout_s) < float("inf")
+        ):
+            raise ValueError(
+                f"timeout_s must be finite and > 0, got {timeout_s!r}."
+            )
+        if on_message is not None and not callable(on_message):
+            raise TypeError("on_message must be callable or None.")
+
+        self._synchronization_enforced = True
+        if self._synchronization_sequence is None:
+            self._send_soft_brake()
+        sequence = self._synchronization_sequence
+        assert sequence is not None
+        deadline_ns = self._now() + round(float(timeout_s) * 1_000_000_000)
+        while not self.motion_synchronized:
+            remaining_ns = deadline_ns - self._now()
+            if remaining_ns <= 0:
+                raise MotionSynchronizationError(
+                    "Timed out waiting for SOFT_BRAKE accepted reply "
+                    f"for command_sequence={sequence}."
+                )
+            try:
+                message = self.receive_message(
+                    timeout=remaining_ns / 1_000_000_000.0
+                )
+            except TimeoutError as exc:
+                raise MotionSynchronizationError(
+                    "Timed out waiting for SOFT_BRAKE accepted reply "
+                    f"for command_sequence={sequence}."
+                ) from exc
+            if on_message is not None:
+                on_message(message)
+
+        if self._emergency_stop_latched:
+            # SOFT_BRAKE is allowed to acknowledge while the emergency stop is
+            # latched, but it must never make motion available again.
+            return
 
     def set_wheel_speeds(
         self,
@@ -162,6 +271,20 @@ class MotionController:
                 "now_ns must not precede the previous acceleration update: "
                 f"{current_ns} < {self._last_acceleration_update_ns}."
             )
+        if self._emergency_stop_latched:
+            self._reset_acceleration_state_at(current_ns)
+            return False
+        if self._link_degraded:
+            self._reset_acceleration_state_at(current_ns)
+            return False
+        if self.needs_synchronization:
+            self._reset_acceleration_state_at(current_ns)
+            return False
+        if self._synchronization_enforced and self._wheel_ack_health_failed(
+            current_ns
+        ):
+            self._request_synchronization()
+            return True
         elapsed_s = (
             current_ns - self._last_acceleration_update_ns
         ) / 1_000_000_000.0
@@ -189,18 +312,29 @@ class MotionController:
             round(next_left * 1000.0),
             round(next_right * 1000.0),
         )
-        changed = next_wire_speeds_mm_s != self._last_sent_wheel_speeds_mm_s
         refresh_due = (
             current_ns - self._last_wheel_command_ns
             >= _WHEEL_COMMAND_REFRESH_NS
         )
         self._commanded_wheel_speeds_m_s = (next_left, next_right)
-        if not changed and not refresh_due:
+        # The application safety loop may run every 5 ms, but the STM32
+        # command/reply path is intentionally refreshed at 25 Hz.  Sending
+        # every acceleration quantization step creates more outstanding
+        # replies than the bounded UART path can acknowledge and causes the
+        # safety resynchronization to soft-brake an otherwise healthy drive.
+        if not refresh_due:
+            return False
+        if self._synchronization_enforced and self._pending_wheel_commands:
+            # Keep advancing the local slew-limited value, then send the
+            # newest value after the previous command is acknowledged.  A
+            # missing reply still reaches _wheel_ack_health_failed above.
             return False
         sequence = self._next_command_sequence()
         self._channel.send_frame(
             encode_wheel_speed_command(sequence, next_left, next_right)
         )
+        if self._synchronization_enforced:
+            self._pending_wheel_commands[sequence] = current_ns
         self._last_sent_wheel_speeds_mm_s = next_wire_speeds_mm_s
         self._last_wheel_command_ns = current_ns
         return True
@@ -317,14 +451,12 @@ class MotionController:
     def soft_brake(self) -> None:
         """按固件减速度斜坡制动到静止。"""
 
-        self._channel.send_frame(
-            encode_soft_brake_command(self._next_command_sequence())
-        )
-        self._reset_acceleration_state()
+        self._send_soft_brake()
 
     def emergency_stop(self) -> None:
         """触发固件急停。"""
 
+        self._emergency_stop_latched = True
         self._channel.send_frame(
             encode_emergency_stop_command(self._next_command_sequence())
         )
@@ -357,6 +489,7 @@ class MotionController:
                         (deadline_ns - self._now()) / 1_000_000_000.0,
                     )
                 continue
+            self._observe_message(message)
             if (
                 isinstance(message, CarSystemStatus)
                 and not self._has_gripper_command
@@ -378,12 +511,89 @@ class MotionController:
                 return tuple(messages)
 
     def _reset_acceleration_state(self) -> None:
+        self._reset_acceleration_state_at(self._now())
+
+    def _reset_acceleration_state_at(self, current_ns: int) -> None:
         self._target_wheel_speeds_m_s = (0.0, 0.0)
         self._commanded_wheel_speeds_m_s = (0.0, 0.0)
         self._last_sent_wheel_speeds_mm_s = (0, 0)
-        current_ns = self._now()
         self._last_acceleration_update_ns = current_ns
         self._last_wheel_command_ns = current_ns
+
+    def _send_soft_brake(self) -> None:
+        sequence = self._next_command_sequence()
+        self._channel.send_frame(encode_soft_brake_command(sequence))
+        self._pending_wheel_commands.clear()
+        self._last_wheel_ack_ns = None
+        self._synchronization_sequence = (
+            sequence if self._synchronization_enforced else None
+        )
+        if self._synchronization_enforced:
+            self._synchronization_acknowledged = False
+        self._reset_acceleration_state()
+
+    def _request_synchronization(self) -> None:
+        self._synchronization_enforced = True
+        if self._synchronization_sequence is None:
+            self._send_soft_brake()
+
+    def _wheel_ack_health_failed(self, current_ns: int) -> bool:
+        if len(self._pending_wheel_commands) >= _MAX_PENDING_WHEEL_COMMANDS:
+            return True
+        if not self._pending_wheel_commands:
+            return False
+        oldest_pending_ns = min(self._pending_wheel_commands.values())
+        reference_ns = oldest_pending_ns
+        if self._last_wheel_ack_ns is not None:
+            reference_ns = max(reference_ns, self._last_wheel_ack_ns)
+        return current_ns - reference_ns >= _WHEEL_REPLY_TIMEOUT_NS
+
+    def _observe_message(self, message: ParsedCarMessage) -> None:
+        if isinstance(message, CarCommandReply):
+            if message.command_type is MessageType.SET_WHEEL_SPEED:
+                self._pending_wheel_commands.pop(message.command_sequence, None)
+                if message.result is CommandResult.ACCEPTED:
+                    self._last_wheel_ack_ns = message.received_timestamp_ns
+                elif message.result is CommandResult.SEQUENCE_OLD:
+                    self._request_synchronization()
+                elif message.result is CommandResult.EMERGENCY_STOP_LATCHED:
+                    self._emergency_stop_latched = True
+                    self._reset_acceleration_state()
+                else:
+                    self._request_synchronization()
+            if (
+                message.command_type is MessageType.SOFT_BRAKE
+                and self._synchronization_sequence == message.command_sequence
+            ):
+                if message.result is CommandResult.ACCEPTED:
+                    self._synchronization_sequence = None
+                    self._synchronization_acknowledged = True
+                elif message.result is CommandResult.EMERGENCY_STOP_LATCHED:
+                    self._emergency_stop_latched = True
+                    self._synchronization_sequence = None
+                    self._synchronization_acknowledged = True
+                else:
+                    raise MotionSynchronizationError(
+                        "STM32 rejected SOFT_BRAKE synchronization with "
+                        f"{message.result.name.lower()}."
+                    )
+        elif isinstance(message, CarSystemStatus):
+            if message.emergency_stop_latched:
+                self._emergency_stop_latched = True
+                self._reset_acceleration_state()
+            if (
+                message.reply_queue_full
+                or message.tx_degraded
+                or message.rx_degraded
+            ):
+                self._link_degraded = True
+            if (
+                not message.protocol_ready
+                or message.reply_queue_full
+                or message.tx_degraded
+                or message.rx_degraded
+            ):
+                self._request_synchronization()
 
     def _next_command_sequence(self) -> int:
         sequence = self._command_sequence

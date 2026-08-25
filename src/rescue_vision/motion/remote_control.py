@@ -571,13 +571,33 @@ def run_remote_motion(
     on_other_control: Callable[[ReceivedRemoteMessage], None] | None = None,
     on_cycle: Callable[[], None] | None = None,
     poll_interval_s: float = 0.05,
+    synchronize_on_start: bool = False,
+    synchronization_timeout_s: float = 0.5,
 ) -> None:
     """循环执行远程运动，并为应用装配层提供有界的同线程钩子。"""
 
     if not 0.0 < poll_interval_s <= 0.1:
         raise ValueError("poll_interval_s must be in (0, 0.1].")
+    if (
+        isinstance(synchronization_timeout_s, bool)
+        or not isinstance(synchronization_timeout_s, (int, float))
+        or not 0.0 < float(synchronization_timeout_s) < float("inf")
+    ):
+        raise ValueError(
+            "synchronization_timeout_s must be finite and > 0."
+        )
     try:
+        if synchronize_on_start:
+            executor.controller.synchronize(
+                timeout_s=float(synchronization_timeout_s),
+                on_message=on_car_message,
+            )
         while not stop_requested():
+            if executor.controller.needs_synchronization:
+                executor.controller.synchronize(
+                    timeout_s=float(synchronization_timeout_s),
+                    on_message=on_car_message,
+                )
             timed_out = executor.check_timeout()
             if not timed_out:
                 executor.controller.update()

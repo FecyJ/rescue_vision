@@ -25,7 +25,6 @@ class FusionQuality(str, Enum):
     FUSED = "fused"
     WHEEL_ONLY = "wheel_only"
     DROPPED_TELEMETRY = "dropped_telemetry"
-    IMU_UNCALIBRATED = "imu_uncalibrated"
     TILT_DETECTED = "tilt_detected"
     IMPACT_DETECTED = "impact_detected"
     VISUAL_REJECTED = "visual_rejected"
@@ -39,6 +38,7 @@ class OdometryCalibration:
     left_wheel_radius_mm: float
     right_wheel_radius_mm: float
     gyro_z_bias_rad_s: float
+    gyro_z_sign: int = 1
 
     def __post_init__(self) -> None:
         if (
@@ -53,6 +53,12 @@ class OdometryCalibration:
                 raise ValueError(f"{name} must be finite and positive.")
         if not math.isfinite(float(self.gyro_z_bias_rad_s)):
             raise ValueError("gyro_z_bias_rad_s must be finite.")
+        if (
+            isinstance(self.gyro_z_sign, bool)
+            or not isinstance(self.gyro_z_sign, int)
+            or self.gyro_z_sign not in {-1, 1}
+        ):
+            raise ValueError("gyro_z_sign must be exactly -1 or 1.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,9 +280,6 @@ class OdometryImuFusion:
             imu_usable = bool(flags & SensorFlags.IMU_VALID) and not bool(
                 flags & SensorFlags.GYRO_SATURATED
             )
-            if not bool(flags & SensorFlags.IMU_CALIBRATED):
-                qualities.add(FusionQuality.IMU_UNCALIBRATED)
-                imu_usable = False
             if not imu_usable:
                 if not self.config.allow_wheel_only:
                     self._lose_continuity()
@@ -295,7 +298,11 @@ class OdometryImuFusion:
             prediction = _Prediction(
                 distance_mm=(left_mm + right_mm) / 2.0,
                 encoder_heading_rad=(right_mm - left_mm) / self._track_mm,
-                gyro_z_rad_s=message.gyro_z_rad_s if imu_usable else None,
+                gyro_z_rad_s=(
+                    self.calibration.gyro_z_sign * message.gyro_z_rad_s
+                    if imu_usable
+                    else None
+                ),
                 dt_s=dt_s,
                 covariance_scale=covariance_scale,
                 qualities=frozenset(qualities),
@@ -584,7 +591,10 @@ class OdometryImuFusion:
                 pose.position.x,
                 pose.position.y,
                 pose.heading_rad,
-                self.calibration.gyro_z_bias_rad_s,
+                (
+                    self.calibration.gyro_z_sign
+                    * self.calibration.gyro_z_bias_rad_s
+                ),
             ],
             dtype=np.float64,
         )

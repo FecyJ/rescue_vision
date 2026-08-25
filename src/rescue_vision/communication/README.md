@@ -220,6 +220,12 @@ session_status = RemoteSessionStatus(
 )
 ```
 
+视频可用时 `video_modes` 至少声明一种真实可发布的模式，不再强制包含 `raw`。
+手动采集通常声明 `raw` 并按客户端选择增加 `perception`/`bev`；固定流程解团的
+`observe_only` 会话只声明并发送 `perception`，不会额外发送原图或 BEV；解团
+模拟赛同时按 `map_state` 能力发送编码器+IMU 位姿 JSON。状态、地图和图像都通过
+有界旁路提交，不能让观察端连接、JPEG 编码或 JSON 序列化阻塞运动循环。
+
 在前文 `with remote_connection` 内，把它作为首条可靠观察发送：
 
 ```python
@@ -293,6 +299,8 @@ remote_connection.send_observation(
 实时路径。地图和车辆最新状态使用相同入口。
 运行应用必须为所有需要同时保留的最新值 topic 预留槽位；当前手动采集同时
 发布视频、车辆状态和地图，因此 `observation_queue_capacity` 至少为 `3`。
+固定流程解团发布 perception 视频和 `map/state` 位姿 JSON，不发布车辆状态；它
+至少需要两个观察队列槽位，默认示例配置的 `3` 仍然适用。
 
 会话状态、采集状态等不可被覆盖的关键消息应使用
 `send_reliable_observation()`：
@@ -391,6 +399,8 @@ remote_connection.send_control(
 后台旁路生成，坐标为机器人局部 `BevPixel`，不是场地地图或定位结果。车端
 启用场地定位旁路时，BEV JPEG 可以叠加同帧中心十字、安全区和终端关联；客户端
 不得从叠加颜色反推机器状态，结构化全局位姿只读取 `observation/map/state`。
+解团观察会话没有实时视频义务，默认最多每秒发布一张新 perception 可视化图；
+定位 JSON 由独立旁路按约 200 ms 发布；未连接观察端时流程照常运行。
 
 ## 10. 仓库内参考客户端
 

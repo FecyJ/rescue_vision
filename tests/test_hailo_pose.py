@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pytest
 
 from rescue_vision.geometry.camera_model import IMAGE_BORDER_FILL_VALUE
 from rescue_vision.perception.hailo_yolo26_pose import (
     HailoYolo26PoseBackend,
+    _filter_duplicate_onnx_schema_stderr,
     letterbox_bgr_to_rgb,
     map_hef_outputs_to_onnx_inputs,
     parse_yolo26_pose_output,
@@ -129,3 +132,19 @@ def test_backend_validates_mapping_before_hardware_import(tmp_path) -> None:
             max_detections=10,
             score_threshold=0.25,
         )
+
+
+def test_onnx_schema_filter_preserves_non_duplicate_stderr(capfd) -> None:
+    duplicate = (
+        b"Schema error: Trying to register schema with name Add "
+        b"(domain:  version: 1) from file ./onnx/defs/math/old.cc line 2627, "
+        b"but it is already registered from file ./onnx/defs/math/old.cc line 2627\n\n"
+    )
+    real_error = b"ONNX Runtime: genuine initialization failure\n"
+
+    with _filter_duplicate_onnx_schema_stderr():
+        os.write(2, duplicate + real_error)
+
+    captured = capfd.readouterr().err
+    assert "Schema error: Trying to register schema" not in captured
+    assert real_error.decode() in captured

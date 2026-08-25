@@ -43,11 +43,11 @@ class CommandResult(IntEnum):
     OUT_OF_RANGE = 1
     EMERGENCY_STOP_LATCHED = 2
     DEVICE_UNAVAILABLE = 3
+    SEQUENCE_OLD = 4
 
 
 class SensorFlags(IntFlag):
     IMU_VALID = 1 << 0
-    IMU_CALIBRATED = 1 << 1
     LEFT_ENCODER_VALID = 1 << 2
     RIGHT_ENCODER_VALID = 1 << 3
     GYRO_SATURATED = 1 << 4
@@ -56,10 +56,13 @@ class SensorFlags(IntFlag):
 
 
 class SystemFlags(IntFlag):
-    WATCHDOG_ARMED = 1 << 0
+    PROTOCOL_READY = 1 << 0
     EMERGENCY_STOP_LATCHED = 1 << 1
     MOTOR_OUTPUT_ENABLED = 1 << 2
     GRIPPER_OUTPUT_AVAILABLE = 1 << 3
+    REPLY_QUEUE_FULL = 1 << 4
+    TX_DEGRADED = 1 << 5
+    RX_DEGRADED = 1 << 6
 
 
 class CarStopReason(IntEnum):
@@ -342,12 +345,43 @@ class CarSystemStatus:
             _bounded_int(value, 0, 18000, name)
 
     @property
+    def protocol_ready(self) -> bool:
+        return bool(self.system_flags & SystemFlags.PROTOCOL_READY)
+
+    @property
     def watchdog_armed(self) -> bool:
-        return bool(self.system_flags & SystemFlags.WATCHDOG_ARMED)
+        """Whether the controller has accepted a motion heartbeat.
+
+        v2 no longer allocates a ``watchdog_armed`` status bit.  The presence
+        of a motion-command age is the only protocol-level indication that
+        the communication watchdog has received a motion command.
+        """
+
+        return self.last_motion_command_age_ms is not None
 
     @property
     def emergency_stop_latched(self) -> bool:
         return bool(self.system_flags & SystemFlags.EMERGENCY_STOP_LATCHED)
+
+    @property
+    def motor_output_enabled(self) -> bool:
+        return bool(self.system_flags & SystemFlags.MOTOR_OUTPUT_ENABLED)
+
+    @property
+    def gripper_output_available(self) -> bool:
+        return bool(self.system_flags & SystemFlags.GRIPPER_OUTPUT_AVAILABLE)
+
+    @property
+    def reply_queue_full(self) -> bool:
+        return bool(self.system_flags & SystemFlags.REPLY_QUEUE_FULL)
+
+    @property
+    def tx_degraded(self) -> bool:
+        return bool(self.system_flags & SystemFlags.TX_DEGRADED)
+
+    @property
+    def rx_degraded(self) -> bool:
+        return bool(self.system_flags & SystemFlags.RX_DEGRADED)
 
     @property
     def servo_left_deg(self) -> float:
@@ -375,6 +409,11 @@ def _verify_frame(frame: ReceivedUartFrame) -> tuple[MessageType, bytes]:
         )
     if len(frame.payload) < 3:
         raise ControllerProtocolError("Protocol frame is shorter than type and CRC.")
+    if len(frame.payload) > MAX_DECODED_FRAME_BYTES:
+        raise ControllerProtocolError(
+            f"Protocol frame has {len(frame.payload)} decoded bytes; "
+            f"maximum is {MAX_DECODED_FRAME_BYTES}."
+        )
     body = frame.payload[:-2]
     expected_crc = _CRC_STRUCT.unpack(frame.payload[-2:])[0]
     actual_crc = crc16_ccitt_false(body)
