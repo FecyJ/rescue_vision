@@ -431,6 +431,36 @@ def test_odometry_fusion_pump_submit_does_not_wait_for_slow_fusion() -> None:
     assert fusion.messages[0].telemetry_sequence == 0
 
 
+def test_odometry_fusion_startup_wait_services_callback() -> None:
+    class _DelayedReadyFusion:
+        def __init__(self) -> None:
+            self.latest_calls = 0
+
+        def submit_odometry(self, _message: OdometryImu) -> None:
+            pass
+
+        def latest_estimate(self, _timestamp_ns: int) -> SimpleNamespace:
+            self.latest_calls += 1
+            return SimpleNamespace(
+                pose=None if self.latest_calls == 1 else object()
+            )
+
+    fusion = _DelayedReadyFusion()
+    pump = OdometryFusionPump(fusion)  # type: ignore[arg-type]
+    pump.start()
+    callbacks = 0
+
+    def service_uart() -> None:
+        nonlocal callbacks
+        callbacks += 1
+
+    try:
+        pump.wait_until_ready(timeout_s=0.2, on_wait=service_uart)
+        assert callbacks == 1
+    finally:
+        pump.stop()
+
+
 def test_breakup_search_direction_can_be_right() -> None:
     sequence = ClusterBreakupSequence(
         breakup_config(search_direction="right"),
@@ -491,6 +521,11 @@ class _RecordingPerception:
         pass
 
 
+class _SlowStartingPerception(_RecordingPerception):
+    def start(self) -> None:
+        time.sleep(0.12)
+
+
 def test_camera_prepare_runs_outside_control_caller() -> None:
     source = _OneFrameSource()
     perception = _RecordingPerception()
@@ -506,6 +541,27 @@ def test_camera_prepare_runs_outside_control_caller() -> None:
         assert time.monotonic() - started_at < 0.05
         assert perception.submitted.wait(timeout=1.0)
         pump.check_health()
+    finally:
+        pump.stop()
+
+
+def test_camera_startup_wait_can_service_uart_callback() -> None:
+    source = _OneFrameSource()
+    perception = _SlowStartingPerception()
+    pump = CameraPerceptionPump(source, lambda frame: frame, perception)
+    ticks = 0
+
+    def service_uart() -> None:
+        nonlocal ticks
+        ticks += 1
+
+    started_at = time.monotonic()
+    startup_thread = pump.start_in_background()
+    try:
+        assert time.monotonic() - started_at < 0.05
+        pump.wait_until_started(startup_thread, on_wait=service_uart)
+        assert ticks > 0
+        assert perception.submitted.wait(timeout=1.0)
     finally:
         pump.stop()
 

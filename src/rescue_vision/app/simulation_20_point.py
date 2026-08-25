@@ -16,6 +16,7 @@ from enum import Enum
 from pathlib import Path
 import signal
 import time
+from threading import Thread
 from typing import Protocol
 
 from rescue_vision.app.cluster_breakup import (
@@ -2056,6 +2057,7 @@ def _run_hardware(
     latest_snapshot: PerceptionSnapshot | None = None
     stop_requested = False
     camera_started = False
+    camera_start_thread: Thread | None = None
     fusion_started = False
     active_motion_since_ns: int | None = None
     last_reported_state: Simulation20PointState | None = None
@@ -2073,6 +2075,17 @@ def _run_hardware(
         elif isinstance(message, CarSystemStatus):
             latest_status = message
 
+    def service_uart_during_camera_startup() -> None:
+        """在相机/Hailo 预热期间继续排空车端遥测。"""
+
+        controller.update(now_ns=time.monotonic_ns())
+        for message in controller.drain_messages():
+            consume(message)
+        if latest_status is not None and latest_status.emergency_stop_latched:
+            raise RuntimeError(
+                "STM32 emergency stop is latched during camera startup."
+            )
+
     signal.signal(signal.SIGTERM, request_stop)
     try:
         fusion_pump.start()
@@ -2080,11 +2093,17 @@ def _run_hardware(
         if remote_transport is not None:
             remote_transport.start()
         with _MotionChannelContext():
-            camera_pump.start()
-            camera_started = True
+            # Hailo/相机预热与运动通道同步并行；等待预热期间主线程仍排空
+            # UART，避免 100 Hz 遥测在启动门禁处挤满接收队列。
+            camera_start_thread = camera_pump.start_in_background()
             controller.synchronize(on_message=consume)
+            camera_pump.wait_until_started(
+                camera_start_thread,
+                on_wait=service_uart_during_camera_startup,
+            )
+            camera_started = True
             controller.query_state()
-            fusion_pump.wait_until_ready()
+            fusion_pump.wait_until_ready(on_wait=service_uart_during_camera_startup)
             # The first completed perception snapshot is a start gate; the
             # controller remains synchronized and stopped while waiting for it.
             while latest_snapshot is None and not stop_requested:
@@ -2243,7 +2262,7 @@ def _run_hardware(
             controller.soft_brake()
     finally:
         try:
-            if camera_started:
+            if camera_start_thread is not None or camera_started:
                 camera_pump.stop()
         finally:
             try:

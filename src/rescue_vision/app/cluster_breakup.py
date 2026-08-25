@@ -109,7 +109,9 @@ class CameraPerceptionPump:
         self._stop_event = Event()
         self._error_lock = Lock()
         self._worker_error: BaseException | None = None
+        self._startup_error: BaseException | None = None
         self._thread: Thread | None = None
+        self._startup_thread: Thread | None = None
         self._started = False
 
     def start(self) -> None:
@@ -140,6 +142,72 @@ class CameraPerceptionPump:
             self._thread = None
             raise
 
+    def start_in_background(self) -> Thread:
+        """并行启动相机/Hailo；调用方可同时消费 UART 并执行同步。"""
+
+        if self._started:
+            raise RuntimeError("CameraPerceptionPump is already started.")
+        if self._startup_thread is not None and self._startup_thread.is_alive():
+            raise RuntimeError("CameraPerceptionPump startup is already running.")
+        with self._error_lock:
+            self._startup_error = None
+
+        def bootstrap() -> None:
+            try:
+                self.start()
+            except BaseException as exc:
+                with self._error_lock:
+                    self._startup_error = exc
+
+        thread = Thread(
+            target=bootstrap,
+            name="rescue-cluster-breakup-camera-start",
+            daemon=True,
+        )
+        self._startup_thread = thread
+        thread.start()
+        return thread
+
+    def wait_until_started(
+        self,
+        thread: Thread | None = None,
+        *,
+        timeout_s: float = 15.0,
+        on_wait: Callable[[], None] | None = None,
+    ) -> None:
+        """等待异步启动完成，同时允许调用方继续服务 UART。"""
+
+        if (
+            isinstance(timeout_s, bool)
+            or not isinstance(timeout_s, (int, float))
+            or not math.isfinite(float(timeout_s))
+            or float(timeout_s) <= 0.0
+        ):
+            raise ValueError("timeout_s must be finite and positive.")
+        if on_wait is not None and not callable(on_wait):
+            raise TypeError("on_wait must be callable or None.")
+        startup_thread = thread or self._startup_thread
+        if startup_thread is None:
+            raise RuntimeError("CameraPerceptionPump has no background startup.")
+        deadline = time.monotonic() + float(timeout_s)
+        while startup_thread.is_alive():
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0.0:
+                raise RuntimeError("CameraPerceptionPump startup timed out.")
+            startup_thread.join(timeout=min(0.01, remaining_s))
+            if on_wait is not None:
+                on_wait()
+        if startup_thread.is_alive():
+            raise RuntimeError("CameraPerceptionPump startup timed out.")
+        self._startup_thread = None
+        with self._error_lock:
+            error = self._startup_error
+            self._startup_error = None
+        if error is not None:
+            raise RuntimeError("Camera/perception input pump failed to start.") from error
+        if not self._started:
+            raise RuntimeError("Camera/perception input pump did not start.")
+
     def check_health(self) -> None:
         if not self._started:
             raise RuntimeError("CameraPerceptionPump is not started.")
@@ -147,6 +215,10 @@ class CameraPerceptionPump:
         self._perception.check_health()
 
     def stop(self) -> None:
+        startup_thread = self._startup_thread
+        if startup_thread is not None and startup_thread.is_alive():
+            startup_thread.join(timeout=15.0)
+        self._startup_thread = None
         if not self._started:
             return
         self._stop_event.set()
@@ -1078,8 +1150,13 @@ class OdometryFusionPump:
         self._raise_worker_error()
         return self._fusion.latest_estimate(timestamp_ns)
 
-    def wait_until_ready(self, *, timeout_s: float = 0.5) -> None:
-        """在尚未运动的同步阶段等待首个有效融合状态。"""
+    def wait_until_ready(
+        self,
+        *,
+        timeout_s: float = 0.5,
+        on_wait: Callable[[], None] | None = None,
+    ) -> None:
+        """等待首个有效融合状态，并允许调用方继续消费 UART。"""
 
         if (
             isinstance(timeout_s, bool)
@@ -1087,6 +1164,8 @@ class OdometryFusionPump:
             or not 0.0 < float(timeout_s) < float("inf")
         ):
             raise ValueError("timeout_s must be finite and positive.")
+        if on_wait is not None and not callable(on_wait):
+            raise TypeError("on_wait must be callable or None.")
         self._require_started()
         deadline = time.monotonic() + float(timeout_s)
         while True:
@@ -1094,6 +1173,8 @@ class OdometryFusionPump:
             estimate = self._fusion.latest_estimate(time.monotonic_ns())
             if estimate.pose is not None:
                 return
+            if on_wait is not None:
+                on_wait()
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
                 raise RuntimeError(
@@ -1671,6 +1752,7 @@ def _run_hardware(
     last_posture: GripperPosture | None = None
     latest_snapshot: PerceptionSnapshot | None = None
     camera_perception_started = False
+    camera_start_thread: Thread | None = None
     next_progress_ns = 0
     latest_status: CarSystemStatus | None = None
     active_motion_since_ns: int | None = None
@@ -1691,10 +1773,25 @@ def _run_hardware(
         elif isinstance(message, CarSystemStatus):
             latest_status = message
 
+    def service_uart_during_camera_startup() -> None:
+        """在相机/Hailo 预热期间继续排空车端遥测。"""
+
+        nonlocal latest_status
+        controller.update(now_ns=time.monotonic_ns())
+        for message in controller.drain_messages():
+            if isinstance(message, OdometryImu):
+                consume_odometry(message)
+            elif isinstance(message, CarSystemStatus):
+                latest_status = message
+                if message.emergency_stop_latched:
+                    raise RuntimeError(
+                        "STM32 emergency stop is latched during camera startup."
+                    )
+
     def synchronize_controller() -> None:
         controller.synchronize(on_message=handle_sync_message)
         if fusion_pump is not None:
-            fusion_pump.wait_until_ready()
+            fusion_pump.wait_until_ready(on_wait=service_uart_during_camera_startup)
 
     try:
         fusion_pump_started = False
@@ -1706,9 +1803,15 @@ def _run_hardware(
             remote_transport.start()
         with channel:
             try:
-                camera_perception.start()
-                camera_perception_started = True
+                # Hailo/相机预热与运动通道同步并行；等待预热期间主线程仍排空
+                # UART，避免 100 Hz 遥测在启动门禁处挤满接收队列。
+                camera_start_thread = camera_perception.start_in_background()
                 synchronize_controller()
+                camera_perception.wait_until_started(
+                    camera_start_thread,
+                    on_wait=service_uart_during_camera_startup,
+                )
+                camera_perception_started = True
                 controller.query_state()
                 while not stop_requested:
                     if controller.needs_synchronization:
@@ -1904,7 +2007,7 @@ def _run_hardware(
                 try:
                     controller.soft_brake()
                 finally:
-                    if camera_perception_started:
+                    if camera_start_thread is not None or camera_perception_started:
                         camera_perception.stop()
     finally:
         try:
