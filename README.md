@@ -2,7 +2,7 @@
 
 2027 工创赛“智能救援”赛项的上位机视觉工程，目标平台为 Raspberry Pi 5、Hailo-8L 和 Camera Module 3 NoIR Wide。
 
-当前已完成相机、标定与地面几何、严格配置、录制回放、数据集工具、离线评测、COBS/CRC16 UART 帧通道及 STM32 二进制协议树莓派端、直接 TCP 远程消息通道、差速与双舵机夹爪控制、受监督手动驾驶采集入口、统一目标观测、Hailo YOLO Pose 后端、四类目标传统视觉地面几何估计基线、传统视觉场地特征观测与时序局部场界三态掩膜基线、中心十字绝对位姿候选与同帧红蓝安全区方向锚定、编码器/IMU 二维连续融合与延迟视觉纠偏、连续场地图远程发布，以及可用合成事件运行的目标跟踪、最小世界模型和规则状态机；尚未完成 STM32 新协议固件与真车标定验收、正式四类目标模型、完整区域/对手感知、规划、脚本运动采集、固件失联看门狗闭环、真实接触/交付证据适配和比赛应用入口。这不是可直接参赛的完整程序。
+当前已完成相机、标定与地面几何、严格配置、录制回放、数据集工具、离线评测、COBS/CRC16 UART 帧通道及 STM32 二进制协议树莓派端、直接 TCP 远程消息通道、差速与双舵机夹爪控制、受监督手动驾驶采集入口、统一目标观测、Hailo YOLO Pose 后端、四类目标传统视觉地面几何估计基线、传统视觉场地特征观测与时序局部场界三态掩膜基线、中心十字绝对位姿候选与同帧红蓝安全区方向锚定、编码器/IMU 二维连续融合与延迟视觉纠偏、连续场地图远程发布，以及可用合成事件运行的目标跟踪、最小世界模型、规则状态机和受限四绿色物资 20 分模拟赛初版编排入口；尚未完成 STM32 新协议固件与真车标定验收、正式四类目标模型、完整区域/对手感知、现场接触/交付证据、固件失联看门狗闭环和正式比赛应用。这不是可直接参赛的完整程序。
 
 ## 快速上手
 
@@ -40,9 +40,10 @@ python -m pytest
 | 采集棋盘、求内参或地面映射 | [标定说明](src/rescue_vision/calibration/README.md) |
 | 标注或部署四类目标模型 | [Pose 模型约定](docs/Pose视觉模型约定.md) |
 | 对接独立 PyQt/手柄采集客户端 | [电脑端通信协议交接](docs/电脑端通信协议.md) |
-| 对接 STM32、编码器或 IMU | [树莓派与单片机通信协议](docs/树莓派与单片机通信协议.md) |
+| 对接 STM32、编码器或 IMU | [树莓派与单片机通信协议 v2](docs/树莓派与单片机通信协议v2.md) |
 | 开发新模块 | [项目结构](docs/项目结构.md) → [后续优先级](docs/后续优先级.md) |
 | 理解比赛类别和安全规则 | [赛题约束与视觉需求](docs/赛题约束与视觉需求.md) |
+| 实现单车 20 分模拟赛闭环 | [20 分模拟赛流程设计](docs/20分模拟赛流程设计.md) |
 | 查数据或评测 JSONL 格式 | [数据集与评测 schema](docs/数据集与评测.md) |
 | 修改仓库 | [AGENTS.md](AGENTS.md) |
 
@@ -57,8 +58,8 @@ python -m pytest
 | [`geometry`](src/rescue_vision/geometry/README.md) | 已实现 | 去畸变、显式坐标类型、地面/三维点投影与 BEV 转换 |
 | [`config`](src/rescue_vision/config/README.md) | 已实现 | 安全默认配置、静态场地、UART/远程/motion/夹爪机械标定/几何/模型和感知算法装配 |
 | [`communication`](src/rescue_vision/communication/README.md) | 已实现基础设施 | COBS UART 帧、直接 TCP 远程消息、raw/perception/BEV 图传、轻量动态地图 JSON、运动/夹爪/采集严格 schema 和有界队列；比赛发布器待接入 |
-| [`motion`](src/rescue_vision/motion/README.md) | 已实现基础设施 | STM32 固定二进制协议、差速运动、持续扳机双舵机夹爪、单轮加速度限制和远程超时保护；新固件待实现 |
-| [`app`](src/rescue_vision/app/README.md) | 已实现手动采集入口 | 赛外受监督驾驶、仅相机远程调试、持续夹爪控制、raw/perception/BEV 图传、动态车辆位姿状态、采集控制与状态装配；比赛入口待实现 |
+| [`motion`](src/rescue_vision/motion/README.md) | 已实现基础设施 | STM32 v2 固定二进制协议、序号安全同步、差速运动、持续扳机双舵机夹爪、单轮加速度限制和远程超时保护；真车联调与标定待验收 |
+| [`app`](src/rescue_vision/app/README.md) | 已实现受限初版 | 受监督驾驶/采集、固定出发解团试验、四绿色物资 20 分模拟赛软件流程、编码器+IMU航位推算和不阻塞 observe_only 图传；真车门禁与正式比赛能力待验收 |
 | [`data`](src/rescue_vision/data/README.md) | 已实现 | 记录检查、清单生成和按会话防泄漏划分 |
 | [`evaluation`](src/rescue_vision/evaluation/README.md) | 已实现 | 分类、地面误差、时延和失败样例报告 |
 | [`perception`](src/rescue_vision/perception/README.md) | 已实现基础设施 | Pose 框/K0、ROI HSV 分类分割、四类可配置三维模板地面中心估计，以及安全区、无编号出发区、中心十字、低精度边界候选和时序局部场界三态掩膜；硬遮挡默认关闭，正式模型、实物精度与树莓派性能待验证 |
@@ -66,7 +67,7 @@ python -m pytest
 | [`tracking`](src/rescue_vision/tracking/README.md) | 已实现纯逻辑 | 时间关联、轨迹确认、短时遮挡、衰减和删除 |
 | [`world`](src/rescue_vision/world/README.md) | 已实现纯逻辑 | 固定物理地图、红蓝任务区域派生、动态目标、危险状态、对手占据和不确定性 |
 | [`mission`](src/rescue_vision/mission/README.md) | 已实现纯逻辑 | 首次/容量/伤员/危险规则、安全降级和抽象动作 |
-| 定位至比赛应用主链路 | 部分实现 | 连续融合已接入手动采集场地图；世界模型定位消费、真实区域/接触证据、规划、正式动作到运动控制的适配和比赛入口待完成 |
+| 定位至比赛应用主链路 | 受限初版 | 20 分流程已接入跟踪、世界模型、规则状态机、受限导航、几何接触/交付证据和运动意图；真实区域/接触传感器、真车参数与正式比赛扩展待完成 |
 
 各包常用 API、命令和实际对接示例见 [`src/rescue_vision/README.md`](src/rescue_vision/README.md)。
 
@@ -100,13 +101,25 @@ RemoteMessageConnection → DebugMotionCommand → RemoteMotionExecutor
 RemoteMessageConnection → DebugGripperCommand → RemoteGripperExecutor
                                                  ↓
                                       MotionController → UART
+
+PerceptionFrameRenderer → RemotePerceptionPublisher → RemoteMessageConnection
+                         （observe_only perception JPEG；独立低频旁路）
+
+OdometryImu → OdometryImuFusion → FieldPose2D
+             （20 分模拟赛临时阶段；暂不提交视觉位姿纠偏）
+
+FieldPose2D → RemoteLocalizationPublisher → observation/map/state
+              （独立低频 JSON 旁路）
+
+PerceptionSnapshot + FieldPose2D → Simulation20PointSequence
+                                  → 单目标推送/交付证据 → MotionController
 ```
 
 - 像素必须区分 `RawPixel` 与 `UndistortedPixel`；地面点使用 `GroundPoint`，单位 mm。
 - `CameraModel` 是去畸变唯一权威；`GroundProjector` 是去畸变像素与机器人地面/三维投影的唯一权威。
 - 实时路径只处理最新帧；录像、显示和日志使用有界旁路。
 - 危险目标允许 `unknown`/疑似危险，不得用总体指标掩盖危险类漏检。
-- 规则状态机只消费显式世界、接触、交付和安全证据；当前真实证据提供者尚未完成。
+- 规则状态机只消费显式世界、接触、交付和安全证据；20 分初版提供保守几何证据适配，真实接触传感器和现场交付验收尚未完成。
 - 场地特征检测只输出去畸变像素和可选机器人地面观测，不在定位完成前伪造 `FieldPoint` 或直接修改世界模型。
 - 目标地面几何估计保留 K0 接触锚点和中心的语义区别；拟合不充分时中心为 `None`，不会用检测框中心兜底。
 - 原始录像、批量图片、标定临时输出、正式数据集和模型权重不提交 Git。
@@ -200,6 +213,8 @@ GroundPoint ── 中心十字绝对观测 + 编码器/IMU 连续融合 ──>
 | `rescue-vision-check-recording` | 检查单次采集的完整性、帧率、丢帧和元数据 |
 | `rescue-vision-manifest` | 记录目录转严格数据清单 |
 | `rescue-vision-manual-capture` | 受监督手动驾驶与车载运动采集 |
+| `rescue-vision-cluster-breakup` | 固定出发姿态的受监督解团与绿色扫描试验 |
+| `rescue-vision-simulation-20-point` | 受限四绿色物资 20 分模拟赛初版入口 |
 | `rescue-vision-split` | 按 `recording_id` 整组划分 |
 | `rescue-vision-evaluate` | 生成离线评测报告 |
 

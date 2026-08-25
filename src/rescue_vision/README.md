@@ -4,10 +4,10 @@
 
 ## 1. 加载运行配置和共享资产
 
-仓库尚未实现比赛应用入口；赛外手动采集已有独立入口。下面是后续比赛主循环
-应采用的分段装配方式。配置只在
-启动时加载一次，具体相机、标定、模型和阈值都来自本机
-`configs/runtime.yaml`：
+仓库现在包含受限四绿色物资 20 分模拟赛的初版应用入口；赛外手动采集和固定
+解团试验仍是独立入口。配置只在启动时加载一次，具体相机、标定、模型、阈值和
+模拟赛动作参数都来自本机 YAML。正式比赛能力、真车看门狗和真实接触/交付证据
+仍未验收。
 
 ```python
 from rescue_vision.config import load_runtime_config
@@ -22,7 +22,84 @@ if backend is None:
     raise RuntimeError("任务感知必须在 runtime.yaml 中启用 Hailo")
 ```
 
-## 2. 创建配置选择的相机源
+## 2. 装配 20 分模拟赛初版流程
+
+生产车端使用专用临时配置；它明确要求 `simulation_20_point.enabled=true`、
+编码器/IMU 融合、目标团解团、Hailo、地面映射和 `observe_only` 观察端。装配只
+创建纯逻辑编排对象，不打开相机、UART 或网络：
+
+```python
+from rescue_vision.config import load_runtime_config
+
+config = load_runtime_config("configs/runtime.simulation-20min.yaml")
+flow = config.build_simulation_20_point_sequence()
+```
+
+资源由车端 CLI 统一创建和关闭；普通调用方不要复制运动限值、解团距离、场地区域
+或交付阈值。启动前把实际 STM32 状态、首个相机观测和 `observe_only` 能力组成
+`SimulationPreflight`，确认失败会锁存零运动终止：
+
+```python
+from rescue_vision.app import SimulationPreflight
+from time import monotonic_ns
+
+preflight = flow.preflight(
+    monotonic_ns(),
+    SimulationPreflight(
+        telemetry_fresh=True,
+        watchdog_armed=True,
+        emergency_stop_clear=True,
+        zero_speed_command_accepted=True,
+        camera_observation_fresh=True,
+        observe_only_remote=True,
+    ),
+)
+if preflight.state.value == "terminal_stop":
+    raise RuntimeError(preflight.reason)
+flow.start(monotonic_ns())
+```
+
+每个运动周期只传入旁路已经完成的最新 `PerceptionSnapshot`、
+`FusedPoseEstimate` 和编码器累计路程；三者分别由相机/Hailo、编码器/IMU 融合器
+和 UART 消费回调产生。返回值是轻量控制意图，必须由 `MotionController` 提交，
+`TERMINAL_STOP`/`FINISH_STOP` 只允许零速：
+
+```python
+decision = flow.step(
+    monotonic_ns(),
+    perception=latest_perception_snapshot,
+    pose=latest_fused_pose_estimate,
+    cumulative_distance_m=latest_encoder_distance_m,
+    health=latest_side_path_health,
+)
+if decision.state.value in {"terminal_stop", "finish_stop"}:
+    motion_controller.soft_brake()
+else:
+    motion_controller.drive_wheel_limited(
+        decision.linear_velocity_m_s,
+        decision.angular_velocity_rad_s,
+    )
+```
+
+流程会先调用现有 `ClusterBreakupSequence`，再重置目标轨迹，按最小航向覆盖筛选
+单个绿色普通物资，执行旋转—直行—旋转、近场对准、几何单目标接触、保守推送、
+完全进入己方物资区验证和退离；第四个唯一 `delivery_id` 被规则状态机接受后
+进入 `FINISH_STOP`，展示值为 `4 × 5 = 20`。几何接触证据不能替代真实接触开关，
+因此该入口仍受真车门禁和现场验收限制。
+
+车端实际命令：
+
+```bash
+rescue-vision-simulation-20-point \
+  --config configs/runtime.simulation-20min.yaml \
+  --supervised-physical-stop-ready
+```
+
+该命令会在后台启动最新帧相机/推理、编码器融合和可选观察图传；旁路异常会传播
+到统一停车路径。未完成 STM32 看门狗闭环前不得把 `--supervised-physical-stop-ready`
+视为比赛安全证明。
+
+## 3. 创建配置选择的相机源
 
 以下片段承接前文 `config`，只创建对象，尚未打开相机：
 
@@ -43,7 +120,7 @@ source = source_class(
 )
 ```
 
-## 3. 创建感知和纯逻辑对象
+## 4. 创建感知和纯逻辑对象
 
 以下片段继续使用前文的 `config`、`geometry` 和 `backend`：
 
@@ -90,7 +167,7 @@ from time import monotonic_ns
 mission.start(monotonic_ns())
 ```
 
-## 4. 运行一帧感知到世界模型的主链路
+## 5. 运行一帧感知到世界模型的主链路
 
 以下片段复用前文全部对象。相机与 Hailo 后端由上下文管理器释放：
 
@@ -163,9 +240,9 @@ with source, detector:
             # 接口接入前不在这里伪造全局目标坐标。
         )
 
-        # 真实接触、交付和电控安全适配器尚未实现；应用入口完成后，
-        # 在这里把它们组成 TransportStatus/SafetySignals/DeliveryEvidence，
-        # 再调用 mission.step(snapshot, ...) 输出不可被规划器覆盖的抽象动作。
+        # 20 分初版由 Simulation20PointSequence 统一生成
+        # TransportStatus/DeliveryEvidence，并把 mission 的停车决定传给运动入口；
+        # 其它正式比赛动作仍不能在这里自行扩展规则。
 ```
 
 `ground_mapping_enabled: false` 时仍可运行图像检测，但 `observation.ground_point` 为 `None`。相机、Hailo 和窗口都必须通过上下文管理或 `try/finally` 释放。
@@ -174,13 +251,13 @@ with source, detector:
 
 | 子包 | 常用入口 | 对接责任 |
 | --- | --- | --- |
-| [`app`](app/README.md) | `run_manual_capture_session()`、`LatestCenterCrossLocalization`、`rescue-vision-manual-capture` | 赛外受监督手动驾驶、车载采集和连续融合动态地图状态发布装配 |
+| [`app`](app/README.md) | `run_manual_capture_session()`、`ClusterBreakupSequence`、`Simulation20PointSequence`、`RemotePerceptionTransport`、`RemoteLocalizationPublisher`、`OdometryImuFusion`、`LatestCenterCrossLocalization`、三个 `rescue-vision-*` 入口 | 赛外受监督手动驾驶/采集、固定流程解团试验、受限四绿色物资 20 分流程、编码器+IMU航位推算、异步 observe_only perception/位姿图传和连续融合动态地图装配 |
 | [`config`](config/README.md) | `load_runtime_config()`、`GripperRuntimeConfig`、`AppConfig.build_geometry()`、`HailoConfig.build_backend()` | 启动时严格加载、机械标定和装配 |
 | [`camera`](camera/README.md) | `FrameSource`、`CameraFrame`、`Picamera2Source`、`RecordingSource` | 产生带时间和序号的最新帧 |
-| [`communication`](communication/README.md) | `UartFrameChannel`、`RemoteMessageConnection`、`VideoModeCommand`、`VideoFrameAttributes`、`MapStateObservation`、`RemoteSessionStatus` | COBS UART、直接 TCP 远程消息、可选择 raw/perception/BEV 图传及轻量 FieldPoint 动态状态 schema |
+| [`communication`](communication/README.md) | `UartFrameChannel`、`RemoteMessageConnection`、`VideoModeCommand`、`VideoFrameAttributes`、`MapStateObservation`、`RemoteSessionStatus` | COBS UART、直接 TCP 远程消息、可选择 raw/perception/BEV 图传（可声明 perception-only）及轻量 FieldPoint 动态状态 schema |
 | [`motion`](motion/README.md) | `MotionController`、`MotionLimits`、`GripperCalibration`、`RemoteMotionExecutor`、`RemoteGripperExecutor`、`run_remote_motion` | 差速运动、持续夹爪双舵机、Rescue Car 协议和远程调试执行 |
 | [`geometry`](geometry/README.md) | `CameraModel`、`GroundProjector`、显式坐标类型（含 `MapPixel`） | 去畸变及像素/地面/BEV 转换 |
-| [`perception`](perception/README.md) | `TargetPoseDetector`、`PerceptionFrameRenderer`、`TargetGroundGeometryEstimator`、`FieldFeatureDetector`、`FieldBoundaryEstimator` | 任务目标、最新帧可视化旁路、地面几何、静态场地特征和局部场界三态掩膜 |
+| [`perception`](perception/README.md) | `TargetPoseDetector`、`PerceptionFrameRenderer`、`PerceptionSnapshot`、`TargetGroundGeometryEstimator`、`FieldFeatureDetector`、`FieldBoundaryEstimator` | 任务目标、最新帧结构化/可视化旁路、地面几何、静态场地特征和局部场界三态掩膜 |
 | [`localization`](localization/README.md) | `CenterCrossLocalizer`、`OdometryImuFusion`、`FusedPoseEstimate` | 中心十字绝对位姿与编码器/IMU 连续融合、延迟视觉纠偏 |
 | [`tracking`](tracking/README.md) | `MultiTargetTracker`、`TrackedTarget`、`TrackStatus` | 时间关联、遮挡和轨迹生命周期 |
 | [`world`](world/README.md) | `StaticFieldMap`、`WorldModel`、`WorldSnapshot`、`HazardState` | 固定物理地图、任务区域派生、动态目标、对手占据和不确定性 |

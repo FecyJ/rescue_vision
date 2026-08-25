@@ -17,6 +17,14 @@ from rescue_vision.app.cluster_breakup import (
     RemotePerceptionTransport,
 )
 from rescue_vision.app.manual_capture import run_manual_capture_session
+from rescue_vision.app.simulation_20_point import (
+    GreenTransportPlan,
+    Simulation20PointSequence,
+    Simulation20PointState,
+    SimulationDecision,
+    SimulationHealth,
+    SimulationPreflight,
+)
 
 __all__ = [
     "LatestCenterCrossLocalization",
@@ -32,4 +40,10 @@ __all__ = [
     "RemotePerceptionPublisher",
     "RemotePerceptionTransport",
     "run_manual_capture_session",
+    "GreenTransportPlan",
+    "Simulation20PointSequence",
+    "Simulation20PointState",
+    "SimulationDecision",
+    "SimulationHealth",
+    "SimulationPreflight",
 ]

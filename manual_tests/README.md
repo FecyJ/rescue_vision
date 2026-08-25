@@ -18,6 +18,8 @@
 - `remote_link.py --config PATH`：在树莓派侧以 `remote.role: server` 监听电脑端客户端，连接后发送协议要求的最小会话状态，并持续打印收到的 control；该状态有意声明所有业务能力不可用，所以正式客户端应保持控制禁用。仅验证连接可使用 `observe_only`；用自制底层客户端检查 control 帧时使用 `debug_control`。
 - `remote_video.py --config PATH`：发送真实相机的最新 JPEG 帧和周期会话状态，接收电脑端的原图/perception 图像模式请求，但不接收或执行运动、夹爪和采集控制。
 - `remote_capture.py`：兼容旧人工命令的薄包装；正式入口为 `rescue-vision-manual-capture`。
+- `motion_minimal.py`：按配置以低速直行一小段，打开 UART 后先等待 v2
+  `SOFT_BRAKE accepted` 安全同步，周期刷新轮速并在退出时柔和停车。
 - `stm32_monitor.py`：默认只读监测配置中的 STM32 COBS/CRC16 UART，周期显示
   编码器/IMU、系统状态、实际频率、序号丢帧和协议错误；可选只发送一次
   `QUERY_STATUS`，不发送运动或夹爪命令。
@@ -57,12 +59,52 @@ python manual_tests/stm32_monitor.py \
 `protocol_error` 表示 CRC、长度、类型、方向、枚举或状态位错误，
 `*_missing/duplicate/regression` 分别表示遥测序号缺失、重复或倒退。串口可能
 按批到达，因此定位时间必须看 `ODOM sample_us`，不能用终端打印间隔积分。
+监测器显示的是 STM32 线路原始 `gyro_z`；正式融合会再乘
+`motion.odometry.gyro_z_sign`。人工左右转一次确认极性：若原始数据左转为负、
+右转为正，配置 `-1`；若左转为正、右转为负，配置 `1`。
 
 数据采集不另建重复的硬件脚本：用
 `rescue-vision-record --frames 200 --display` 执行真机短录，再用
 `rescue-vision-check-recording RECORDING --display` 可视化回放并完成图片
 解码、帧率、丢帧和元数据验收。完整步骤见
 [`docs/数据采集工具使用.md`](../docs/数据采集工具使用.md)。
+
+## 最小运动检查
+
+在架空轮，或已确认物理急停可立即触发且操作员全程监督的条件下运行：
+
+```bash
+python manual_tests/motion_minimal.py \
+  --config configs/runtime.yaml \
+  --supervised-physical-stop-ready
+```
+
+默认以 `0.05 m/s` 前进 `1 s`。可用 `--speed-m-s` 和
+`--duration-seconds` 调整测试值，但仍受 `motion` 配置硬限制约束。脚本会在
+运动前完成运动序号安全同步，运动期间持续调用 `MotionController.update()`，
+同时非阻塞排空 STM32 回传，
+因此不能用一次 `drive()` 后长时间 `sleep` 替代；正常结束、Ctrl+C 或异常都会
+先发送 `SOFT_BRAKE`，这不能替代物理急停或固件看门狗。
+
+## 轮子启动 `sample_overrun` 检查
+
+该脚本只打开 UART，不打开相机、Hailo 或远程控制；必须在架空轮、物理急停就绪
+且人员全程监督时运行。它先完成 `SOFT_BRAKE` 序号同步，再以低速启动轮子，
+持续排空 `ODOMETRY_IMU`，首次收到 `sample_overrun` 就停车并打印遥测序号、
+STM32 采样时间和编码器计数：
+
+```bash
+PYTHONPATH=src .venv/bin/python \
+  manual_tests/motion_sample_overrun.py \
+  --config configs/runtime.simulation-20min.yaml \
+  --speed-m-s 0.05 \
+  --duration-seconds 5 \
+  --supervised-physical-stop-ready
+```
+
+检测到异常时默认返回 0 但输出 `RESULT=sample_overrun_detected`，方便现场收集
+日志；需要让脚本以失败状态退出时增加 `--fail-on-overrun`。该脚本不会忽略或
+降级 `sample_overrun`，不能用来证明固件采样链路已经合格。
 
 ## 传统视觉场地特征离线检查
 
@@ -234,7 +276,9 @@ print(session.get_providers())
 PY
 ```
 
-输出包含 `['CPUExecutionProvider']` 表示 ONNX 后处理会话已创建。该噪声来自系统依赖层；不要在项目代码中全局重定向 `stderr`，否则会同时吞掉真正的相机和推理错误。
+输出包含 `['CPUExecutionProvider']` 表示 ONNX 后处理会话已创建。正式 Hailo 后端只在
+`InferenceSession` 构造的窄作用域内过滤完全匹配的重复注册行，并把其他 stderr
+原样转发；本段直接调用 ONNX Runtime，仍可能看到这类系统依赖噪声。
 
 ## 最小图传检查
 
@@ -288,3 +332,36 @@ rescue-vision-manual-capture \
 时发送两个状态均为 `false`；释放、命令超时或断线只停止角度继续变化，不会
 自动开合，也不能直接套用协议说明书中的示例角度。逐次核对 UART/车辆状态中
 的左右目标角之和始终为 `motion.gripper.angle_sum_deg`，包括从不满足该和约束的旧目标首次开始运动时。
+
+## 固定流程解团检查
+
+只在空旷、已划出中心目标区、物理急停可立即触发且人员全程监督时运行：
+
+```bash
+rescue-vision-cluster-breakup \
+  --config configs/runtime.yaml \
+  --supervised-physical-stop-ready
+```
+
+若 `runtime.yaml` 启用了 `remote`，该流程必须使用 `role: server` 和
+`access_mode: observe_only`。它不会等待电脑端连接；连接成功后只向观察端发送
+`observation/video/frame` 中的 perception 识别可视化 JPEG，默认每秒最多一帧，
+并通过 `observation/map/state` 发送编码器+IMU的 `FieldPoint` 位姿 JSON；两条
+观察旁路都不参与运动决策。
+
+首次上车把 `departure_distance_m`、`breakup_speed_m_s`、
+`breakup_distance_m` 和 `retreat_distance_m` 调到保守小值，并依次验收：
+
+1. 架空轮确认左右编码器有效、前进累计路程为正、配置的左右搜索方向正确；
+2. 不放目标，只验证定距越障后左转，超时和 Ctrl-C 均停车；
+3. 放置静止目标团但禁用电机，核对联合框中心和 K0 前向距离触发位置；
+4. 低速短行程张爪推送，确认倒退退出接触区后才合爪；
+5. 解团后连续两帧识别绿色，终端打印 `green_found` 并停车。
+
+记录实际路程误差、目标团居中误差、张爪触发距离、每类物块最大位移及是否出现
+夹持、钻车底或接近场界/安全区。该检查没有通过前不得提高冲散速度或用于比赛。
+若报 `departure_timeout`，查看每秒 `progress`：两轮距离接近零表示电机未动或
+编码器未累计；左右距离异号表示固件方向违反“前进均为正”的协议；两轮同号但
+中心距离不足则核对减速带卡阻、轮半径、每圈计数和阶段超时，不要直接扩大超时。
+若 `motor_output=false`，继续查看 `stop_reason`、`watchdog` 和 `estop`；先修复
+固件使能、急停复位或命令拒绝原因，不得通过伪造里程或跳过定距门禁继续流程。

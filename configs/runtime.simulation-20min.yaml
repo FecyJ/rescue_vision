@@ -1,0 +1,459 @@
+# 20 分模拟赛临时配置：目标 perception + 编码器/IMU 航位推算。
+# 不启用中心十字/安全区视觉定位；后续视觉纠偏应在独立配置或显式改动后加入。
+
+camera:
+  backend: rpicam_vid
+  image_size: [2304, 1296]
+  fps: 20
+  lens_position: 0.9687536954879761
+
+geometry:
+  # 正式任务数据统一使用去畸变图；当前启用最新可用内参。
+  intrinsics_enabled: true
+  intrinsics_path: ../src/rescue_vision/calibration/output/intrinsics_20260723_154106/selected_calibration.json
+  # 正式全范围地面映射尚未完成；当前仅启用近场调试产物。
+  ground_mapping_enabled: true
+  # 当前四站位仅覆盖近场；此调试外参的 BEV 验收范围为 x=-100..500 mm、y=±500 mm。
+  ground_mapping_path: ../src/rescue_vision/calibration/output/ground_mapping_debug_near_field_20260823_092445_925685/ground_mapping_debug_near_field.json
+
+recording:
+  queue_capacity: 8
+  image_format: jpg
+
+processing:
+  # 当前树莓派场地特征链路约 175–250 ms；调试阶段允许一帧（2 FPS）内的
+  # 视觉证据参与定位，仍拒绝更旧结果，避免断流后沿用历史位置。
+  max_observation_age_ms: 500.0
+
+uart:
+  enabled: true
+  device: /dev/serial0
+  read_timeout_ms: 100.0
+  write_timeout_ms: 100.0
+  receive_queue_capacity: 256
+
+motion:
+  enabled: true
+  # 两驱动轮“有效轮距”，单位 m。不是简单量外侧宽度；应通过多次低速原地整圈，
+  # 用编码器累计距离和实测转角反标，使正反转的平均航向误差最小。
+  wheel_track_m: 0.275
+  # 以下是赛外调试的车端硬上限，远程请求超限会停车并报错，不会静默截断。
+  max_linear_velocity_m_s: 0.25
+  max_angular_velocity_rad_s: 1.0
+  max_wheel_velocity_m_s: 0.30
+  # 单轮目标速度变化率；0.5 m/s² 时从静止到 0.30 m/s 约需 0.6 秒。
+  max_wheel_acceleration_m_s2: 0.50
+  max_remote_command_valid_for_ms: 500
+  odometry:
+    # 下列值未完成真车测量前保持关闭；融合定位也必须保持关闭。
+    enabled: true
+    # 单个驱动轮机械转一整圈对应的累计编码器计数，单位 count/rev；必须包含
+    # 正交编码倍频、减速比和固件实际累计口径，左右轮前进时都应递增。
+    encoder_counts_per_revolution: 836
+    # 左轮有效滚动半径，单位 mm；在实际轮胎、胎压和典型载荷下用多段定距
+    # 直线反标，不要直接照抄标称半径。
+    left_wheel_radius_mm: 33
+    # 右轮有效滚动半径，单位 mm；与左轮独立反标，允许左右不同。
+    right_wheel_radius_mm: 33
+    # 静止时 STM32 原始 gyro_z 角速度平均零偏，单位 rad/s；水平静止、电机停止、
+    # IMU 预热后采集至少 30 s，剔除搬动/碰撞段取均值。
+    gyro_z_bias_rad_s: 0.0
+    # 将 STM32 上报的 gyro_z 及上述原始零偏乘以此符号，转换为定位规范的
+    # “左转为正、右转为负”。本车实测左转为负、右转为正，因此填写 -1。
+    # 只允许 -1 或 1，无单位。
+    gyro_z_sign: -1
+  gripper:
+    # 未完成本车机械端点与全行程时间验证前保持禁用。
+    enabled: true
+    open_left_angle_deg: 86
+    open_right_angle_deg: 104
+    closed_left_angle_deg: 166
+    closed_right_angle_deg: 24
+    full_travel_time_s: 1
+    # 每组开/闭端点的左右角之和必须等于该值；示例值需按本车机械结构复核。
+    angle_sum_deg: 190.0
+  cluster_breakup:
+    # 仅用于有物理急停、人员全程监督的解团试验；不是完整比赛入口。
+    enabled: true
+    search_direction: right
+    # 从约定出发姿态直行越过减速带，编码器累计机器人中心路程。
+    departure_distance_m: 0.6
+    departure_speed_m_s: 0.15
+    # 左转为正；找到至少两个模型观测后切换为目标团居中。
+    search_angular_velocity_rad_s: 0.45
+    search_timeout_s: 12.0
+    cluster_min_detections: 2
+    # 目标团包围框中心相对半幅图像的允许误差及连续确认帧数。
+    center_tolerance_ratio: 0.08
+    center_confirm_frames: 3
+    center_kp_rad_s: 1.20
+    center_max_angular_velocity_rad_s: 0.55
+    approach_speed_m_s: 0.12
+    # 最近有效 K0 地面点进入该前向距离后，保持闭爪并开始定距冲散；
+    # 到达冲散距离后原地开爪，按 motion.gripper.full_travel_time_s 保持，
+    # 再闭爪退离。
+    gripper_open_distance_mm: 200.0
+    breakup_speed_m_s: 0.25
+    breakup_distance_m: 0.25
+    # 冲散到达后先原地开爪释放，再合拢并退出接触区。
+    retreat_speed_m_s: 0.10
+    retreat_distance_m: 0.25
+    scan_green_angular_velocity_rad_s: 0.35
+    green_confirm_frames: 2
+    target_loss_timeout_ms: 500.0
+    motion_phase_timeout_s: 10.0
+
+simulation_20_point:
+  # 初版四次单个绿色物资推送；真实运行仍受 STM32 看门狗/急停和现场确认门禁约束。
+  enabled: true
+  target_delivery_count: 4
+  prepush_offset_mm: 180.0
+  robot_footprint_radius_mm: 160.0
+  target_half_extent_mm: 25.0
+  safety_margin_mm: 80.0
+  delivery_inset_mm: 35.0
+  max_position_uncertainty_mm: 120.0
+  max_heading_uncertainty_rad: 0.20
+  target_max_age_ms: 250.0
+  scan_min_heading_span_rad: 6.283185307179586
+  scan_angular_velocity_rad_s: 0.30
+  navigation_speed_m_s: 0.12
+  navigation_angular_kp_rad_s: 1.0
+  navigation_max_angular_velocity_rad_s: 0.45
+  navigation_position_tolerance_mm: 40.0
+  navigation_heading_tolerance_rad: 0.10
+  approach_speed_m_s: 0.08
+  alignment_kp_rad_s: 1.2
+  alignment_max_angular_velocity_rad_s: 0.35
+  engage_distance_mm: 90.0
+  engage_lateral_tolerance_mm: 35.0
+  contact_corridor_length_mm: 140.0
+  push_speed_m_s: 0.07
+  push_angular_kp_rad_s: 0.8
+  push_max_angular_velocity_rad_s: 0.25
+  retreat_speed_m_s: 0.08
+  retreat_distance_m: 0.20
+  retreat_clear_distance_mm: 180.0
+  delivery_confirm_frames: 3
+  disengage_confirm_frames: 3
+  max_breakup_attempts_per_delivery: 2
+  max_breakup_attempts_total: 8
+  breakup_settle_confirm_frames: 3
+  min_breakup_progress_mm: 20.0
+  min_green_clearance_mm: 80.0
+  corridor_sample_step_mm: 40.0
+  completed_target_exclusion_mm: 120.0
+
+remote:
+  enabled: true
+  role: server
+  host: 0.0.0.0
+  port: 8765
+  access_mode: observe_only
+  # 直接连接受控现场局域网，不使用密钥或认证握手。
+  connect_timeout_ms: 2000.0
+  io_timeout_ms: 1000.0
+  control_queue_capacity: 32
+  observation_queue_capacity: 3
+  max_header_bytes: 4096
+  max_payload_bytes: 2097152
+
+tracking:
+  confirmation_hits: 2
+  max_association_ground_mm: 250.0
+  min_association_iou: 0.10
+  max_coast_ms: 600.0
+  confidence_decay_per_second: 0.8
+  min_confidence: 0.15
+
+world:
+  max_visual_age_ms: 250.0
+  opponent_max_age_ms: 500.0
+  danger_confirm_threshold: 0.60
+  danger_suspect_threshold: 0.15
+  unknown_suspect_threshold: 0.50
+  # 抽签后设为 red 或 blue；unknown 时只生成 field 语义，不把固定红蓝区
+  # 猜成己方/对方区域。
+  team_color: blue
+  # 固定物理地图的唯一配置权威。坐标均为 FieldPoint 毫米：中心十字为原点，
+  # +x 沿水平基准线向右，+y 沿竖直基准线指向红色安全区。
+  static_map:
+    center_cross:
+      # 该值按坐标定义必须保持 [0, 0]；不能用它补偿标定或场地误差。
+      intersection_field_mm: [0.0, 0.0]
+      # 四条射线的固定终端语义供定位消歧。plain_boundary 在 ±x 重复，因此
+      # 单独看到普通边界仍保留 180° 歧义；红/蓝安全区任一可靠观测可定向。
+      terminals:
+        positive_x: plain_boundary
+        negative_x: plain_boundary
+        positive_y: red_safe_zone
+        negative_y: blue_safe_zone
+    # 以下 3000 mm 场界、600×300 mm 安全区和 300 mm 出发区来自命题示意图，
+    # 是启动地图而非现场测量真值；现场尺寸或布置变化时只改这里。
+    # 安全区多边形描述彩色有效区域，不包含外侧 660 mm 围栏厚度。
+    regions:
+      - region_id: field
+        kind: field
+        polygon_field_mm:
+          - [-1500.0, -1500.0]
+          - [1500.0, -1500.0]
+          - [1500.0, 1500.0]
+          - [-1500.0, 1500.0]
+      - region_id: red-material
+        kind: red_material
+        polygon_field_mm:
+          - [-300.0, 1200.0]
+          - [0.0, 1200.0]
+          - [0.0, 1500.0]
+          - [-300.0, 1500.0]
+      - region_id: red-injured
+        kind: red_injured
+        polygon_field_mm:
+          - [0.0, 1200.0]
+          - [300.0, 1200.0]
+          - [300.0, 1500.0]
+          - [0.0, 1500.0]
+      - region_id: blue-injured
+        kind: blue_injured
+        polygon_field_mm:
+          - [-300.0, -1500.0]
+          - [0.0, -1500.0]
+          - [0.0, -1200.0]
+          - [-300.0, -1200.0]
+      - region_id: blue-material
+        kind: blue_material
+        polygon_field_mm:
+          - [0.0, -1500.0]
+          - [300.0, -1500.0]
+          - [300.0, -1200.0]
+          - [0.0, -1200.0]
+      # 四个出发区共用 start_zone kind，以稳定 region_id 区分编号。
+      - region_id: start-1
+        kind: start_zone
+        polygon_field_mm:
+          - [-1500.0, 1200.0]
+          - [-1200.0, 1200.0]
+          - [-1200.0, 1500.0]
+          - [-1500.0, 1500.0]
+      - region_id: start-2
+        kind: start_zone
+        polygon_field_mm:
+          - [1200.0, 1200.0]
+          - [1500.0, 1200.0]
+          - [1500.0, 1500.0]
+          - [1200.0, 1500.0]
+      - region_id: start-3
+        kind: start_zone
+        polygon_field_mm:
+          - [-1500.0, -1500.0]
+          - [-1200.0, -1500.0]
+          - [-1200.0, -1200.0]
+          - [-1500.0, -1200.0]
+      - region_id: start-4
+        kind: start_zone
+        polygon_field_mm:
+          - [1200.0, -1500.0]
+          - [1500.0, -1500.0]
+          - [1500.0, -1200.0]
+          - [1200.0, -1200.0]
+
+mission:
+  match_duration_s: 180.0
+  no_motion_timeout_s: 15.0
+  opponent_contact_timeout_s: 10.0
+  danger_avoid_distance_mm: 500.0
+  target_priority: [orange_injured, black_core, green_supply]
+
+perception:
+  detection_threshold: 0.25
+  k0_threshold: 0.25
+  color_classifier:
+    # 仅按当前 Camera Module 3 NoIR Wide、固定焦点和本次现场视野实拍校准；
+    # 更换材料、曝光、白平衡或照明后必须重新采样。
+    ranges:
+      green_supply:
+        # V=85 与 black_core 的 V<=84 保持严格不重叠。
+        - lower: [68, 50, 85]
+          upper: [88, 255, 255]
+      black_core:
+        - lower: [0, 0, 0]
+          upper: [179, 255, 84]
+      orange_injured:
+        - lower: [0, 55, 105]
+          upper: [22, 255, 255]
+        - lower: [170, 55, 105]
+          upper: [179, 255, 255]
+      blue_danger:
+        - lower: [96, 50, 110]
+          upper: [112, 255, 255]
+    min_color_fraction: 0.15
+    min_color_dominance: 0.70
+    min_dominance_margin: 0.20
+    morphology_kernel_size: 3
+    open_iterations: 1
+    close_iterations: 1
+    min_component_area_fraction: 0.002
+  field_features:
+    # 模拟赛第一阶段不运行场地特征/中心十字视觉定位。
+    enabled: false
+    colors:
+      # 初值取自命题文件示意图而非官方色卡，只用于搭建和离线初调。
+      safe_red:
+        - lower: [0, 80, 80]
+          upper: [12, 255, 255]
+        - lower: [170, 80, 80]
+          upper: [179, 255, 255]
+        # 当前红方安全区材料在 Camera Module 3 NoIR Wide 与现场白平衡下
+        # 呈亮紫红色；V 下限用于排除同色相但明显更暗的紫色围栏。
+        - lower: [138, 90, 105]
+          upper: [160, 255, 255]
+      safe_blue:
+        # 当前蓝方安全区参考图 1%–99% 为 H=96..110、S=79..195、
+        # V=89..198；上下界留少量现场光照余量。
+        - lower: [96, 70, 85]
+          upper: [112, 255, 210]
+      start_magenta:
+        - lower: [140, 80, 80]
+          upper: [165, 255, 255]
+      entrance_purple:
+        - lower: [130, 60, 50]
+          upper: [160, 255, 255]
+      dark_marking:
+        - lower: [0, 0, 0]
+          upper: [179, 255, 80]
+    morphology:
+      kernel_size: 5
+      open_iterations: 1
+      close_iterations: 2
+    region_filter:
+      min_area_fraction: 0.002
+      min_rectangularity: 0.55
+      # 同时容纳命题图内外尺寸和制造、标定误差；现场数据到位后收紧。
+      dimension_tolerance_fraction: 0.40
+    safe_zone:
+      entrance_color_fraction: 0.10
+      divider_dark_fraction: 0.10
+    center_cross:
+      # 当前真实 BEV 的短轴约 138 px；0.15 可稳定保留，仍拒绝零散短边。
+      min_axis_span_fraction: 0.15
+      max_gap_fraction: 0.06
+      min_gap_count: 2
+      perpendicular_tolerance_deg: 15.0
+      # 真实 BEV 中中心线常呈低对比灰色连续细线；局部暗线与点划线证据并用。
+      local_window_fraction: 0.015
+      local_contrast_threshold: 10
+      max_saturation: 80
+      min_floor_value: 120
+      min_line_support_fraction: 0.10
+      min_white_surround_fraction: 0.60
+      min_axis_balance_fraction: 0.08
+      min_intersection_margin_fraction: 0.02
+    boundary:
+      canny_low_threshold: 50
+      canny_high_threshold: 150
+      min_line_length_fraction: 0.20
+      corner_tolerance_deg: 20.0
+      max_features: 8
+      min_vertical_support_count: 3
+      side_contrast_threshold: 15
+
+  field_boundary:
+    enabled: false
+    hard_mask_enabled: false
+    min_candidate_confidence: 0.25
+    min_confirmations: 2
+    max_missed_frames: 1
+    line_angle_tolerance_deg: 12.0
+    line_distance_tolerance_mm: 120.0
+    ransac_inlier_distance_mm: 60.0
+    rectangle_tolerance_fraction: 0.20
+    boundary_band_mm: 120.0
+    segment_extension_mm: 150.0
+    min_filter_confidence: 0.55
+    max_mask_age_ms: 150.0
+    mask_blur_radius_px: 5
+    neutral_fill_bgr: [114, 114, 114]
+
+hailo:
+  enabled: true
+  hef_path: ../../hailo-models/simv1_1_2/model.hef
+  postprocess_onnx_path: ../../hailo-models/simv1_1_2/postprocess.onnx
+  output_mapping_path: ../../hailo-models/simv1_1_2/onnx_split_config.json
+  raw_classes:
+    - green_supply
+    - black_core
+    - orange_injured
+    - blue_danger
+  class_mapping:
+    green_supply: green_supply
+    black_core: black_core
+    orange_injured: orange_injured
+    blue_danger: blue_danger
+  backend_score_threshold: 0.01
+  max_detections: 100
+
+localization:
+  # 第一阶段关闭中心十字/安全区视觉定位；fusion 仍独立运行编码器+IMU。
+  enabled: false
+  # 从十字交点沿四条基准线射线搜索同帧安全区或场界终端。
+  ray_min_forward_distance_mm: 500.0
+  ray_max_forward_distance_mm: 1800.0
+  ray_max_lateral_distance_mm: 120.0
+  ray_angle_tolerance_deg: 10.0
+  min_anchor_confidence: 0.25
+  max_prior_heading_innovation_deg: 20.0
+  # 无实场误差标定前只提供保守下限，不能当作已验证精度。
+  position_uncertainty_floor_mm: 20.0
+  heading_uncertainty_floor_deg: 3.0
+  fusion:
+    # 第一阶段只使用编码器+IMU；后续视觉定位通过 submit_visual() 作为纠偏输入。
+    enabled: true
+    # 配置起点只在进程启动后的首个有效编码器基线使用一次；控制器重启后不会复用。
+    initial_pose:
+      # 轮轴中点的场地 x，单位 mm；中心十字为零点，+x 沿水平基准线向右。
+      x_mm: -1350.0
+      # 轮轴中点的场地 y，单位 mm；+y 指向红色安全区。
+      y_mm: -1350.0
+      # 机器人前向相对场地 +x 的逆时针航向，单位 degree。
+      heading_deg: 90.0
+      # 起始 x/y 的保守 1σ 标准差，单位 mm；覆盖人工摆车和测量重复性。
+      position_uncertainty_mm: 100.0
+      # 起始航向的保守 1σ 标准差，单位 degree。
+      heading_uncertainty_deg: 10.0
+      # 起始位姿可信度，无单位，范围 [0, 1]；不替代上述协方差。
+      confidence: 0.5
+    # 编码器单步平移的相对 1σ 噪声，无单位；0.02 表示本步距离的 2%。
+    encoder_distance_noise_fraction: 0.02
+    # 单个遥测周期内编码器差速转角的 1σ 噪声，单位 degree/sample。
+    encoder_heading_noise_std_deg: 1.0
+    # 单帧 +z 陀螺角速度白噪声 1σ，单位 rad/s；由静止数据去均值后估计。
+    gyro_noise_std_rad_s: 0.03
+    # +z 陀螺零偏随机游走强度，单位 rad/s/√s；融合器按该值乘 √dt 增加协方差。
+    gyro_bias_random_walk_std_rad_s_per_sqrt_s: 0.001
+    # 静止在线零偏更新的角速度观测 1σ，单位 rad/s。
+    stationary_gyro_noise_std_rad_s: 0.01
+    # 静止判定允许的单周期左右编码器绝对增量，单位 count/sample。
+    stationary_encoder_delta_count: 0
+    # IMU 无效/陀螺饱和时是否允许短时纯双编码器退化。
+    allow_wheel_only: true
+    # 纯轮式退化的过程协方差乘数，无单位，必须 >= 1。
+    wheel_only_covariance_scale: 4.0
+    # 遥测正向丢帧但累计计数仍合法时的协方差乘数，无单位，必须 >= 1。
+    dropped_sample_covariance_scale: 3.0
+    # 相邻 STM32 实际采样时间最大间隔，单位 ms；超出即中断连续定位。
+    max_sample_interval_ms: 50.0
+    # 融合状态最大允许年龄，单位 ms；超时后地图清除机器人位姿。
+    max_telemetry_age_ms: 100.0
+    # 单轮累计计数可对应的最大物理轮缘速度，单位 mm/s；用于拒绝计数跳变。
+    max_encoder_speed_mm_s: 1000.0
+    # 视觉采集时间与最近融合历史状态的最大对齐误差，单位 ms。
+    max_visual_alignment_error_ms: 30.0
+    # 三维 x/y/heading 创新的马氏距离平方门限，无单位；越大越宽松。
+    visual_innovation_gate: 16.27
+    # 延迟视觉纠偏的状态历史长度，单位 ms；覆盖实测视觉 P95 延迟，且不得小于
+    # max_visual_alignment_error_ms。
+    history_duration_ms: 1000.0
+    # 相对直立 +z 的最大允许倾角，单位 degree；超出时增大协方差。
+    max_tilt_deg: 20.0
+    # 加速度模长相对标准重力 9807 mm/s² 的最大允许偏差，单位 mm/s²。
+    impact_accel_threshold_mm_s2: 4000.0

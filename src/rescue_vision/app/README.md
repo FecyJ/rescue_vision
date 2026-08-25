@@ -2,19 +2,32 @@
 
 本包只放跨相机、通信和运动模块的实际运行入口。当前实现
 `rescue-vision-manual-capture`，用于赛外、人员全程监督的低速车载运动采集，
-也支持单片机未上电时的仅相机远程调试；
-比赛自主应用仍未实现。
+也支持单片机未上电时的仅相机远程调试；另有
+`rescue-vision-cluster-breakup` 用于固定出发姿态下的受监督解团试验，以及
+`rescue-vision-simulation-20-point` 用于四个绿色普通物资的受限 20 分模拟赛初版。
+后者已实现软件行为编排和真实旁路装配，但 STM32 看门狗、真车参数、真实接触/交付
+证据和现场验收仍未完成，不能当作正式比赛程序。
 
 ## 常用入口
 
 | 入口 | 输入与生命周期 | 输出或语义 |
 | --- | --- | --- |
 | `rescue-vision-manual-capture` | `runtime.yaml`、车端输出根目录和显式监督确认 | 完整装配 TCP/UART/相机/运动/夹爪/记录；推荐生产入口 |
+| `rescue-vision-cluster-breakup` | `runtime.yaml` 和显式监督确认 | 定距越障、目标团搜索/居中、闭爪定距冲散、原地开爪释放、闭爪退离并扫描绿色；找到绿色后停车 |
+| `rescue-vision-simulation-20-point` | `runtime.simulation-20min.yaml` 和显式监督确认 | 复用现有解团，跟踪/世界模型/规则门禁、受限预推导航、单绿色推送、交付验证、退离和四次完成停车 |
+| `ClusterBreakupSequence(...).step()` | `ClusterBreakupRuntimeConfig`、`motion.gripper.full_travel_time_s`、同一单调时间轴、编码器累计路程和最新 `PerceptionSnapshot` | 纯逻辑流程决策；不创建相机、Hailo、UART 或电机；冲散后按夹爪全行程时间保持开爪 |
+| `EncoderTravelTracker.submit()` | 带有效双编码器的 `OdometryImu` | 使用运行配置机械标定产生机器人中心累计有符号路程 |
+| `OdometryImuFusion.submit_odometry()` | 同一 UART 消费链路中的 `OdometryImu` | 解团临时配置只输出编码器+IMU 连续 `FieldPose2D`；不调用 `submit_visual()` |
+| `OdometryFusionPump` | `OdometryImu` 有界队列和 `OdometryImuFusion` | 顺序处理融合，不阻塞运动刷新线程；队列满或 worker 异常进入停车路径 |
+| `CameraPerceptionPump` | `FrameSource`、去畸变函数和目标感知旁路 | 在独立线程完成取帧/去畸变/推理提交，不占用运动刷新线程 |
+| `RemotePerceptionPublisher` / `RemoteLocalizationPublisher` / `RemotePerceptionTransport` | `observe_only` TCP 连接、已渲染 perception 帧和编码器+IMU估计 | 异步接受一个观察端；独立旁路发送 perception JPEG 与 `map/state` 位姿 JSON，不发送原图/BEV |
+| `send_video_frame()` | 已准备好的 `CameraFrame`、`CameraPipeline` 和已启动远程连接 | 在调用线程编码并提交带坐标/标定属性的 JPEG；实时入口应放在独立旁路调用 |
 | `build_camera_pipeline()` | 已加载的 `AppConfig` | 创建但不启动配置选择的真机源、可选去畸变和地面映射 |
 | `build_session_status()` | 同一 `AppConfig`、服务实例 ID、视频 FPS 和可用模式 | 创建声明运动、夹爪、视频模式、车辆和采集能力的会话状态 |
 | `run_manual_capture_session()` | 已启动连接、可选运动/夹爪执行器、采集会话、相机管线和可选 perception/BEV 旁路 | 运行单个完整车辆或仅相机 TCP 会话；断线/故障时清理当前记录 |
 | `BevFrameRenderer` | 已加载且包含 BEV 配置的 `GroundProjector`；显式 `start/stop` | 有界丢旧保新的后台 BEV 生成旁路；输出保留源帧号和采集时间 |
 | `LatestCenterCrossLocalization` | 场地检测器、中心十字定位器、有效像素掩码和可选 `OdometryImuFusion`；显式 `start/stop` | 有界视觉旁路；完整车辆输出连续融合位姿，仅相机模式保留新鲜单帧视觉语义 |
+| `Simulation20PointSequence` | `Simulation20PointRuntimeConfig`、跟踪器、世界模型、mission 和现有 `ClusterBreakupSequence` | 只读取完成的最新快照并返回轻量线速度/角速度/夹爪意图；任何旁路等待由调用方负责 |
 
 `run_manual_capture_session()` 不创建或打开硬件资源。调用方传入
 `RemoteMotionExecutor`，并在 `motion.gripper.enabled=true` 时传入共享同一个
@@ -24,6 +37,98 @@
 正式装配由下文 CLI 从运行配置完成，普通调用方不应另写一套设备、限值、
 机械端点或协议参数。
 
+## 20 分模拟赛初版
+
+先从专用配置装配流程；这一步只创建纯逻辑对象，不打开相机、UART、Hailo 或
+TCP。配置中的 `simulation_20_point` 是动作和安全裕量的唯一权威：
+
+```python
+from rescue_vision.config import load_runtime_config
+
+config = load_runtime_config("configs/runtime.simulation-20min.yaml")
+flow = config.build_simulation_20_point_sequence()
+```
+
+启动前由真实车端同步、相机旁路和观察端装配出门禁证据。所有字段都必须来自实际
+状态，不得用配置默认值冒充硬件状态；下面的布尔值仅表示调用方已经完成对应
+检查：
+
+```python
+from time import monotonic_ns
+from rescue_vision.app import Simulation20PointState, SimulationPreflight
+
+ready = flow.preflight(
+    monotonic_ns(),
+    SimulationPreflight(
+        telemetry_fresh=True,
+        watchdog_armed=True,
+        emergency_stop_clear=True,
+        zero_speed_command_accepted=True,
+        camera_observation_fresh=True,
+        observe_only_remote=True,
+    ),
+)
+if ready.state is Simulation20PointState.TERMINAL_STOP:
+    raise RuntimeError(ready.reason)
+flow.start(monotonic_ns())
+```
+
+`flow.start()` 记录一轮唯一启动时刻并进入现有解团流程。后续每个控制周期把相机
+推理线程已经完成的 `PerceptionSnapshot`、编码器/IMU 融合器的
+`FusedPoseEstimate`、UART 消费回调维护的累计中心路程（单位 m）和旁路健康快照
+传入 `step()`：
+
+```python
+decision = flow.step(
+    monotonic_ns(),
+    perception=latest_perception_snapshot,
+    pose=latest_fused_pose_estimate,
+    cumulative_distance_m=latest_encoder_distance_m,
+    health=latest_side_path_health,
+)
+```
+
+返回的 `SimulationDecision.linear_velocity_m_s`、
+`angular_velocity_rad_s` 是机器人轮轴中点参考的差速 twist，角速度左转为正；
+夹爪姿态只允许 `open/closed` 两个已标定端点。调用方把它交给同一
+`MotionController`，不能在 `TERMINAL_STOP` 或 `FINISH_STOP` 覆盖为非零速度：
+
+```python
+if decision.state in {
+    Simulation20PointState.TERMINAL_STOP,
+    Simulation20PointState.FINISH_STOP,
+}:
+    motion_controller.soft_brake()
+else:
+    motion_controller.drive_wheel_limited(
+        decision.linear_velocity_m_s,
+        decision.angular_velocity_rad_s,
+    )
+```
+
+流程的顺序是：现有解团 → 轨迹重置/稳定确认 → 最小航向扫描 → 易搬运绿色筛选 →
+预推点和保守走廊 → 对准/几何单目标接触 → 单目标推送 → 己方物资区内缩区域的
+连续完全进入证据 → 退离确认。完成四个不同的有效 `delivery_id` 后进入
+`FINISH_STOP`，`valid_green_deliveries=4`、`score_points=20`。目标丢失、危险/未知
+目标、第二目标进入接触走廊、定位/视觉过期、证据不足和旁路故障分别进入安全保持
+或终止停车；安全保持不会自动恢复，必须由外部新鲜证据调用
+`resume_after_safety_hold()`。
+
+真实车入口负责资源生命周期：启动顺序为 UART/运动同步、融合旁路、观察服务、
+相机/感知旁路；退出顺序为软制动、停止相机/感知、停止观察服务、停止融合旁路、
+关闭 UART。相机等待、Hailo 推理、JPEG、TCP 和写盘不在 `step()` 内执行。
+
+命令行入口：
+
+```bash
+rescue-vision-simulation-20-point \
+  --config configs/runtime.simulation-20min.yaml \
+  --supervised-physical-stop-ready
+```
+
+未完成 STM32 看门狗真车闭环前，命令仍要求物理急停和全程监督；观察端只能是
+`observe_only`，不能下发运动、夹爪或状态跳转命令。
+
 ## 手动采集入口
 
 先从 `configs/runtime.yaml` 加载唯一运行配置。必须启用相机、UART、motion 和
@@ -32,7 +137,7 @@ remote server，并将 `remote.access_mode` 明确设为 `debug_control`：
 ```bash
 rescue-vision-manual-capture \
   --config configs/runtime.yaml \
-  --output-root /data/rescue-targets/manual \
+  --output-root data/rescue-targets/manual \
   --supervised-physical-stop-ready \
   --enable-localization \
   --video-fps 2
@@ -113,6 +218,59 @@ rescue-vision-manual-capture \
 完整车辆模式中的 UART 异常同样会退出；仅相机模式根本不打开 UART，因此不受
 未上电单片机影响。
 
+## 目标团解团试验
+
+该入口只验证模拟赛的前置动作，不是完整 20 分比赛程序。先在
+`configs/runtime.yaml` 启用并实测 `motion`、`motion.odometry`、
+`motion.gripper`、`motion.cluster_breakup`、地面映射和 Hailo 模型，然后运行：
+
+```bash
+rescue-vision-cluster-breakup \
+  --config configs/runtime.simulation-20min.yaml \
+  --supervised-physical-stop-ready
+```
+
+流程按配置执行：等待有效编码器 → 固定距离直行越过减速带 → 按
+`search_direction: left|right` 持续转向搜索至少
+`cluster_min_detections` 个模型观测 → 用观测框联合中心做比例居中 → 低速接近。
+最近有效 K0 地面点进入 `gripper_open_distance_mm` 后，夹爪保持闭合，车辆以
+`breakup_speed_m_s` 推进 `breakup_distance_m`；到达后原地停车并切到已标定张开端点，
+保持 `motion.gripper.full_travel_time_s` 后切回闭合端点，再以
+`retreat_speed_m_s` 倒退 `retreat_distance_m`。最后进入 `SCAN_GREEN` 左转
+扫描，连续看到配置帧数的 `green_supply` 后停车退出。当前不会继续接近或交付
+绿色目标。
+
+`configs/runtime.simulation-20min.yaml` 是从当前车端 `runtime.yaml` 复制的临时配置：
+保留目标 perception 所需的 Hailo 和地面映射，关闭 `localization.enabled` 及
+`perception.field_features.enabled`，但开启 `localization.fusion.enabled`。
+解团入口把每条有效 `OdometryImu` 同时送入固定距离里程计和
+`OdometryImuFusion`，当前只消费编码器+IMU预测；初始场地位姿来自配置的
+`localization.fusion.initial_pose`，连续估计会在 `progress` 中打印。尚未接入
+中心十字、安全区或其他视觉位姿纠偏；后续只需在独立视觉旁路中调用
+`fusion.submit_visual()`。
+
+取帧和全尺寸去畸变在独立输入旁路运行，Hailo 推理再使用单槽最新帧后台旁路；
+运动循环只刷新轮速、排空 UART 并消费最新结构化观测。观测过期、
+目标团丢失、编码器无效/跳变、阶段超时、相机/Hailo/UART 异常以及退出都会走停车
+路径。所有距离、速度、角度、确认帧数和超时均来自
+`motion.cluster_breakup`，不能在入口中另写一套参数。
+入口每秒输出机器人中心/左右轮累计路程、原始编码器计数及目标/已下发轮速。
+同一行还输出 STM32 的 `motor_output`、`watchdog`、`estop`、`stop_reason` 和
+最近运动命令年龄；任何命令回复不是 `accepted` 或急停已经锁存都会立即停车。
+请求运动 750 ms 后新鲜状态仍报告电机输出关闭，也会直接报出电控未使能，
+不再等到定距阶段超时。
+
+当 `remote.enabled=true` 时，入口要求 `remote.role: server` 和
+`remote.access_mode: observe_only`，并在独立线程监听一个观察客户端；没有客户端
+不会等待或阻塞模拟赛流程。客户端接入后先收到会话状态，随后只在 perception
+后台产生新识别结果时收到带框、颜色掩码、K0、置信度和质量信息的
+`observation/video/frame` JPEG，默认由 `--observer-image-interval-seconds 1`
+限频；同时按会话声明的 `map_state` 能力收到约 200 ms 一次的
+`observation/map/state` 编码器+IMU位姿 JSON。JPEG/JSON 编码、队列提交和 TCP
+写入均不在运动循环执行；观察连接/发布旁路发生故障时主循环会尽快进入已有停车路径。
+定距出发时若左右轮程明显反向，会立即停车并报告前进编码器符号不符合冻结协议；
+不得在树莓派端取绝对值或增加符号补偿掩盖固件方向错误。
+
 ## 安全边界
 
 当前固件协议没有可验证的看门狗和急停锁存状态。命令因此默认拒绝启动；只有
@@ -129,4 +287,6 @@ rescue-vision-manual-capture \
 才声明 `gripper_control=true`。车辆状态中的舵机角度来自 STM32
 `CarState`，不代表有物理位置传感器或已经完成抓取。
 
-脚本运动模式不属于本入口，已后调到手动采集和固件安全闭环之后。
+解团试验仍不是比赛模式：当前固件看门狗未经真车验收，所以必须保留物理急停和
+全程监督。当前流程在冲散距离结束后原地开爪释放，再合拢并倒退；仍需现场确认
+机械结构不会形成抓取或承载。
