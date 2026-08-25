@@ -100,6 +100,8 @@ motion:
     open_right_angle_deg: null
     closed_left_angle_deg: null
     closed_right_angle_deg: null
+    transport_left_angle_deg: null
+    transport_right_angle_deg: null
     full_travel_time_s: null
     angle_sum_deg: null
 tracking:
@@ -1033,6 +1035,8 @@ def test_motion_config_builds_controller_without_opening_uart(tmp_path) -> None:
     open_right_angle_deg: null
     closed_left_angle_deg: null
     closed_right_angle_deg: null
+    transport_left_angle_deg: null
+    transport_right_angle_deg: null
     full_travel_time_s: null
     angle_sum_deg: null""",
             """  gripper:
@@ -1041,6 +1045,8 @@ def test_motion_config_builds_controller_without_opening_uart(tmp_path) -> None:
     open_right_angle_deg: 180.0
     closed_left_angle_deg: 90.0
     closed_right_angle_deg: 110.0
+    transport_left_angle_deg: 50.0
+    transport_right_angle_deg: 150.0
     full_travel_time_s: 1.5
     angle_sum_deg: 200.0""",
         ),
@@ -1064,6 +1070,9 @@ def test_motion_config_builds_controller_without_opening_uart(tmp_path) -> None:
     assert gripper_executor.controller is controller
     assert gripper_executor.calibration.full_travel_time_s == pytest.approx(1.5)
     assert gripper_executor.calibration.angle_sum_deg == pytest.approx(200.0)
+    assert gripper_executor.calibration.transport_angles_deg == pytest.approx(
+        (50.0, 150.0)
+    )
 
 
 def test_motion_acceleration_limit_must_be_positive(tmp_path) -> None:

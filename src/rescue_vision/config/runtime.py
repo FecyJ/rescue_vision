@@ -576,6 +576,8 @@ class GripperRuntimeConfig:
     open_right_angle_deg: float | None
     closed_left_angle_deg: float | None
     closed_right_angle_deg: float | None
+    transport_left_angle_deg: float | None
+    transport_right_angle_deg: float | None
     full_travel_time_s: float | None
     angle_sum_deg: float | None
 
@@ -588,6 +590,8 @@ class GripperRuntimeConfig:
         assert self.open_right_angle_deg is not None
         assert self.closed_left_angle_deg is not None
         assert self.closed_right_angle_deg is not None
+        assert self.transport_left_angle_deg is not None
+        assert self.transport_right_angle_deg is not None
         assert self.full_travel_time_s is not None
         assert self.angle_sum_deg is not None
         from rescue_vision.motion import GripperCalibration
@@ -599,6 +603,8 @@ class GripperRuntimeConfig:
             closed_right_angle_deg=self.closed_right_angle_deg,
             full_travel_time_s=self.full_travel_time_s,
             angle_sum_deg=self.angle_sum_deg,
+            transport_left_angle_deg=self.transport_left_angle_deg,
+            transport_right_angle_deg=self.transport_right_angle_deg,
         )
 
 
@@ -1491,6 +1497,8 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "open_right_angle_deg",
             "closed_left_angle_deg",
             "closed_right_angle_deg",
+            "transport_left_angle_deg",
+            "transport_right_angle_deg",
             "full_travel_time_s",
             "angle_sum_deg",
         },
@@ -1509,6 +1517,8 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "open_right_angle_deg",
             "closed_left_angle_deg",
             "closed_right_angle_deg",
+            "transport_left_angle_deg",
+            "transport_right_angle_deg",
         )
     }
     travel_time_raw = gripper_raw.get("full_travel_time_s")
@@ -1546,8 +1556,8 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         or angle_sum_deg is None
     ):
         raise ValueError(
-            "Enabled motion.gripper requires four endpoint angles and "
-            "full_travel_time_s and angle_sum_deg."
+            "Enabled motion.gripper requires open, closed and transport "
+            "angles plus full_travel_time_s and angle_sum_deg."
         )
     gripper = GripperRuntimeConfig(
         enabled=gripper_enabled,
@@ -1555,6 +1565,8 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         open_right_angle_deg=gripper_values["open_right_angle_deg"],
         closed_left_angle_deg=gripper_values["closed_left_angle_deg"],
         closed_right_angle_deg=gripper_values["closed_right_angle_deg"],
+        transport_left_angle_deg=gripper_values["transport_left_angle_deg"],
+        transport_right_angle_deg=gripper_values["transport_right_angle_deg"],
         full_travel_time_s=full_travel_time_s,
         angle_sum_deg=angle_sum_deg,
     )

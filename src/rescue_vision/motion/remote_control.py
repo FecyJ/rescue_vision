@@ -72,7 +72,7 @@ class RemoteGripperResult(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class GripperCalibration:
-    """远程连续控制所需的双舵机机械端点和速度标定。"""
+    """远程连续控制所需的双舵机机械端点、运输姿态和速度标定。"""
 
     open_left_angle_deg: float
     open_right_angle_deg: float
@@ -80,6 +80,8 @@ class GripperCalibration:
     closed_right_angle_deg: float
     full_travel_time_s: float
     angle_sum_deg: float
+    transport_left_angle_deg: float | None = None
+    transport_right_angle_deg: float | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -138,6 +140,72 @@ class GripperCalibration:
                     f"{self.angle_sum_deg:g} degrees, "
                     f"got {left} + {right} = {angle_sum}."
                 )
+        transport_values = (
+            self.transport_left_angle_deg,
+            self.transport_right_angle_deg,
+        )
+        if any(value is not None for value in transport_values):
+            if any(value is None for value in transport_values):
+                raise ValueError(
+                    "transport gripper posture requires both left and right angles."
+                )
+            assert (
+                self.transport_left_angle_deg is not None
+                and self.transport_right_angle_deg is not None
+            )
+            for name, value in (
+                ("transport_left_angle_deg", self.transport_left_angle_deg),
+                ("transport_right_angle_deg", self.transport_right_angle_deg),
+            ):
+                converted = _finite_float(value, name)
+                if not 0.0 <= converted <= 180.0:
+                    raise ValueError(
+                        f"{name} must be in [0, 180], got {value!r}."
+                    )
+                object.__setattr__(self, name, converted)
+            if not math.isclose(
+                self.transport_left_angle_deg + self.transport_right_angle_deg,
+                self.angle_sum_deg,
+                rel_tol=1e-12,
+                abs_tol=1e-9,
+            ):
+                raise ValueError(
+                    "Gripper transport angles must sum to "
+                    f"{self.angle_sum_deg:g} degrees, got "
+                    f"{self.transport_left_angle_deg} + "
+                    f"{self.transport_right_angle_deg}."
+                )
+            for name, value, opened, closed in (
+                (
+                    "transport_left_angle_deg",
+                    self.transport_left_angle_deg,
+                    self.open_left_angle_deg,
+                    self.closed_left_angle_deg,
+                ),
+                (
+                    "transport_right_angle_deg",
+                    self.transport_right_angle_deg,
+                    self.open_right_angle_deg,
+                    self.closed_right_angle_deg,
+                ),
+            ):
+                assert value is not None
+                if not min(opened, closed) < value < max(opened, closed):
+                    raise ValueError(
+                        f"{name} must lie strictly between its open and closed "
+                        f"endpoints, got {value!r}."
+                    )
+
+    @property
+    def transport_angles_deg(self) -> tuple[float, float] | None:
+        """返回单物块运输时的左右局部打开姿态；未配置时返回 ``None``。"""
+
+        if (
+            self.transport_left_angle_deg is None
+            or self.transport_right_angle_deg is None
+        ):
+            return None
+        return self.transport_left_angle_deg, self.transport_right_angle_deg
 
 
 @dataclass(frozen=True, slots=True)

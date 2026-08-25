@@ -109,6 +109,7 @@ UART/TCP 生命周期和 motion 的停止语义分别见相邻模块 README，�
 | `enabled` | 是否允许装配并宣告远程夹爪能力 |
 | `open_left_angle_deg` / `open_right_angle_deg` | 当前车辆完全张开时的左右安全目标角度 |
 | `closed_left_angle_deg` / `closed_right_angle_deg` | 当前车辆完全闭合时的左右安全目标角度 |
+| `transport_left_angle_deg` / `transport_right_angle_deg` | 单个物块收入后的局部打开运输姿态；必须严格位于开/闭端点之间 |
 | `full_travel_time_s` | 单方向持续按下时，从一个端点匀速到另一端点的时间 |
 | `angle_sum_deg` | 舵机联动约束的左右角度和；开、闭端点及运行中目标都必须满足该值 |
 
@@ -117,6 +118,8 @@ UART/TCP 生命周期和 motion 的停止语义分别见相邻模块 README，�
 不满足该和约束或开闭端点相同的配置。执行器以左角为单一自由度并始终用
 `right = motion.gripper.angle_sum_deg - left` 构造远程下发；
 客户端只发送按下/松开 boolean，不读取这些机械值。
+运输姿态目前只作为机械标定输出，不会自动改变现有解团或模拟赛状态机；使用前
+需要在真车上确认单个物块不会滑落、夹持或形成违规抓取。
 
 `motion.odometry` 是编码器机械量、IMU 原始静态零偏和 `gyro_z` 极性的唯一配置；轮距继续复用
 `motion.wheel_track_m`，定位配置不得复制。`localization.fusion.initial_pose`

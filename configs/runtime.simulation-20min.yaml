@@ -69,6 +69,9 @@ motion:
     open_right_angle_deg: 104
     closed_left_angle_deg: 166
     closed_right_angle_deg: 24
+    # 单个物块运输时的局部打开姿态；初始值约为从全开向全闭 35%，需真车复核。
+    transport_left_angle_deg: 114
+    transport_right_angle_deg: 76
     full_travel_time_s: 1
     # 每组开/闭端点的左右角之和必须等于该值；示例值需按本车机械结构复核。
     angle_sum_deg: 190.0

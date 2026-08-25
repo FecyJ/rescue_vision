@@ -176,6 +176,8 @@ def gripper_calibration() -> GripperCalibration:
         closed_right_angle_deg=114.0,
         full_travel_time_s=1.0,
         angle_sum_deg=194.0,
+        transport_left_angle_deg=50.0,
+        transport_right_angle_deg=144.0,
     )
 
 
@@ -242,6 +244,34 @@ def test_gripper_calibration_rejects_unsafe_endpoints_and_travel_time() -> None:
         GripperCalibration(20.0, 160.0, 80.0, 114.0, 1.0, 194.0)
     with pytest.raises(ValueError, match="angle_sum_deg"):
         GripperCalibration(20.0, 174.0, 80.0, 114.0, 1.0, 0.0)
+
+
+def test_gripper_calibration_exposes_single_object_transport_posture() -> None:
+    calibration = gripper_calibration()
+    assert calibration.transport_angles_deg == pytest.approx((50.0, 144.0))
+
+    with pytest.raises(ValueError, match="transport angles must sum"):
+        GripperCalibration(
+            20.0,
+            174.0,
+            80.0,
+            114.0,
+            1.0,
+            194.0,
+            50.0,
+            145.0,
+        )
+    with pytest.raises(ValueError, match="strictly between"):
+        GripperCalibration(
+            20.0,
+            174.0,
+            80.0,
+            114.0,
+            1.0,
+            194.0,
+            20.0,
+            174.0,
+        )
 
 
 def test_motion_functions_encode_differential_drive_and_stops() -> None:

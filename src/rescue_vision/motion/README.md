@@ -38,7 +38,8 @@
 | `drain_messages()` | 无 | 非阻塞排空当前 UART 回传 |
 | `RemoteMotionExecutor.execute()` | `ReceivedRemoteMessage` | 校验远程运动消息后执行 |
 | `RemoteMotionExecutor.check_timeout()` | 可选本机单调时间 ns | 到期时停车，返回是否触发 |
-| `GripperCalibration` | 左右开/闭端点、角度和与固定速度全行程时间 | 严格验证安全范围及每组端点相加为 `angle_sum_deg` |
+| `GripperCalibration` | 左右开/闭端点、单物块运输半开姿态、角度和与固定速度全行程时间 | 严格验证安全范围、三组姿态角度和及运输姿态位于开闭端点之间 |
+| `transport_angles_deg` | 无 | 返回 `(left, right)` 单物块运输半开姿态；未配置时为 `None` |
 | `RemoteGripperExecutor.execute()` | `ReceivedRemoteMessage` | 接受一帧持续夹爪扳机状态 |
 | `RemoteGripperExecutor.update()` | 可选本机单调时间 ns | 按按压方向以配置速度渐进下发舵机目标 |
 | `RemoteGripperExecutor.check_timeout()` / `stop()` | 可选本机单调时间 ns | 超时或退出时停止推进，保留当前角度 |
@@ -66,7 +67,7 @@ right = linear + angular × wheel_track / 2
 ## 1. 从运行配置装配
 
 先在 `configs/runtime.yaml` 填入实测轮距和调试限速，并启用 `uart` 与
-`motion`。需要远程夹爪时，还要实测左右开/闭安全端点、
+`motion`。需要远程夹爪时，还要实测左右开/闭安全端点、单物块运输半开姿态、
 `angle_sum_deg` 和固定速度全行程时间，写入 `motion.gripper` 后单独启用。所有路径、设备名、机械参数和上限只从
 这份配置取得：
 

@@ -91,6 +91,9 @@ motion:
     open_right_angle_deg: null
     closed_left_angle_deg: null
     closed_right_angle_deg: null
+    # 单个物块收入后的局部打开运输姿态；启用夹爪前必须按本车实测填写。
+    transport_left_angle_deg: null
+    transport_right_angle_deg: null
     full_travel_time_s: null
     # 每组开/闭端点的左右角之和必须等于该值；示例值需按本车机械结构复核。
     angle_sum_deg: 194.0
