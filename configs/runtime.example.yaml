@@ -55,6 +55,8 @@ remote:
 motion:
   # 未测得真实轮距前保持禁用；启用还要求 uart.enabled=true。
   enabled: false
+  # 两驱动轮“有效轮距”，单位 m。不是简单量外侧宽度；应通过多次低速原地整圈，
+  # 用编码器累计距离和实测转角反标，使正反转的平均航向误差最小。
   wheel_track_m: null
   # 以下是赛外调试的车端硬上限，远程请求超限会停车并报错，不会静默截断。
   max_linear_velocity_m_s: 0.25
@@ -63,14 +65,30 @@ motion:
   # 单轮目标速度变化率；0.5 m/s² 时从静止到 0.30 m/s 约需 0.6 秒。
   max_wheel_acceleration_m_s2: 0.50
   max_remote_command_valid_for_ms: 500
+  odometry:
+    # 融合定位启用前必须用本车实测值替换；示例数值不是机械标定结果。
+    enabled: false
+    # 单个驱动轮机械转一整圈对应的累计编码器计数，单位 count/rev。
+    # 必须包含正交编码倍频、减速比和固件实际累计口径；左右轮前进时都应递增。
+    encoder_counts_per_revolution: null
+    # 左轮有效滚动半径，单位 mm。应在实际轮胎、胎压和典型载荷下用多段定距
+    # 直线反标；不要直接照抄轮胎标称半径。
+    left_wheel_radius_mm: null
+    # 右轮有效滚动半径，单位 mm；测量条件和反标方法与左轮相同，允许左右不同。
+    right_wheel_radius_mm: null
+    # 静止时机器人 +z 轴陀螺角速度的平均零偏，单位 rad/s。车辆水平、静止、
+    # 电机停止并预热后采集至少 30 s，剔除搬动/碰撞段后取均值；左转为正。
+    gyro_z_bias_rad_s: null
   gripper:
-    # 必须先测得安全端点；每组左右角之和必须为 194°，再启用持续扳机控制。
+    # 必须先测得安全端点和舵机联动角度和，再启用持续扳机控制。
     enabled: false
     open_left_angle_deg: null
     open_right_angle_deg: null
     closed_left_angle_deg: null
     closed_right_angle_deg: null
     full_travel_time_s: null
+    # 每组开/闭端点的左右角之和必须等于该值；示例值需按本车机械结构复核。
+    angle_sum_deg: 194.0
 
 tracking:
   confirmation_hits: 2
@@ -294,7 +312,11 @@ perception:
       local_window_fraction: 0.015
       local_contrast_threshold: 10
       max_saturation: 80
+      # 十字参考线位于白色地板；V 下限排除黑色背景和暗色货架。
+      min_floor_value: 120
       min_line_support_fraction: 0.10
+      # 在线两侧采样白地板，允许有色物块造成不超过约 40% 的局部遮挡。
+      min_white_surround_fraction: 0.60
       min_axis_balance_fraction: 0.08
       min_intersection_margin_fraction: 0.02
     boundary:
@@ -326,7 +348,7 @@ perception:
     neutral_fill_bgr: [114, 114, 114]
 
 localization:
-  # 只生成中心十字低频绝对位姿观测；不包含 IMU/编码器融合。
+  # 总开关控制中心十字绝对观测；连续融合另由 fusion.enabled 控制。
   enabled: false
   # 从十字交点沿四条基准线射线搜索同帧安全区或场界终端。
   ray_min_forward_distance_mm: 500.0
@@ -338,6 +360,66 @@ localization:
   # 无实场误差标定前只提供保守下限，不能当作已验证精度。
   position_uncertainty_floor_mm: 20.0
   heading_uncertainty_floor_deg: 3.0
+  fusion:
+    # 真实轮径、计数、轮距、零偏和噪声未标定前保持关闭。
+    enabled: false
+    # 物理 FieldPoint 坐标与全局航向；只在进程首个有效里程计基线使用一次。
+    initial_pose:
+      # 机器人轮轴中点在物理场地坐标中的 x，单位 mm；场地中心十字为零点，
+      # +x 沿水平基准线向右。测量发车摆放后的轮轴中点，不是车头或相机位置。
+      x_mm: 0.0
+      # 机器人轮轴中点在物理场地坐标中的 y，单位 mm；+y 指向红色安全区。
+      y_mm: 0.0
+      # 机器人前向相对场地 +x 的逆时针航向，单位 degree，运行时归一化到 ±180°。
+      heading_deg: 0.0
+      # 起始 x/y 的保守 1σ 标准差，单位 mm；应覆盖人工摆车和测量重复性。
+      position_uncertainty_mm: 100.0
+      # 起始航向的保守 1σ 标准差，单位 degree；应覆盖摆车角度重复性。
+      heading_uncertainty_deg: 10.0
+      # 起始位姿可信度，无单位，范围 [0, 1]；仅用于状态发布，不替代上述协方差。
+      confidence: 0.5
+    # 编码器单步平移的相对 1σ 噪声，无单位；例如 0.02 表示本步距离的 2%。
+    # 用重复直线/弧线的增量残差估计，不能用闭环总误差直接代替。
+    encoder_distance_noise_fraction: 0.02
+    # 每个遥测更新周期内，编码器差速转角的 1σ 噪声，单位 degree/sample。
+    # 用静止、直线和原地转向的编码器—外部基准残差标定。
+    encoder_heading_noise_std_deg: 1.0
+    # 单帧 +z 陀螺角速度白噪声 1σ，单位 rad/s；从静止预热数据去均值后估计。
+    gyro_noise_std_rad_s: 0.03
+    # +z 陀螺零偏随机游走强度，单位 rad/s/√s；比较多段静止窗口均值随时间的
+    # 漂移估计。融合器按该值乘 √dt 增加零偏协方差。
+    gyro_bias_random_walk_std_rad_s_per_sqrt_s: 0.001
+    # 确认静止时用于在线零偏更新的角速度观测 1σ，单位 rad/s。
+    stationary_gyro_noise_std_rad_s: 0.01
+    # 判定“编码器静止”允许的单周期左右计数绝对增量，单位 count/sample；
+    # 根据静止抖动实测设置，0 表示必须完全无计数变化。
+    stationary_encoder_delta_count: 0
+    # IMU 无效或陀螺饱和时是否允许短时仅使用双编码器；不影响编码器失效处理。
+    allow_wheel_only: true
+    # 纯轮式退化时过程协方差乘数，无单位，必须 >= 1；用 IMU 失效回放误差校准。
+    wheel_only_covariance_scale: 4.0
+    # 遥测序号正向跳过但累计计数仍合法时的协方差乘数，无单位，必须 >= 1。
+    dropped_sample_covariance_scale: 3.0
+    # 相邻 STM32 实际采样时间允许的最大间隔，单位 ms；超出即中断连续定位。
+    max_sample_interval_ms: 50.0
+    # 最新融合状态允许的最大年龄，单位 ms；按树莓派单调时钟判断，超时清除地图位姿。
+    max_telemetry_age_ms: 100.0
+    # 任一轮由累计计数反算的最大物理轮缘速度，单位 mm/s；应略高于实测极限，
+    # 用于拒绝计数跳变，不是运动指令限速。
+    max_encoder_speed_mm_s: 1000.0
+    # 视觉采集时间与最近融合历史状态允许的最大对齐误差，单位 ms。
+    max_visual_alignment_error_ms: 30.0
+    # 三维 x/y/heading 创新的马氏距离平方门限，无单位；越大越宽松，需用真实
+    # 正确观测和失败样例共同复核。
+    visual_innovation_gate: 16.27
+    # 保留用于延迟视觉纠偏和预测重放的状态历史长度，单位 ms；必须不小于
+    # max_visual_alignment_error_ms，并覆盖实测视觉端到端 P95 延迟。
+    history_duration_ms: 1000.0
+    # 相对机器人直立 +z 的最大允许倾角，单位 degree；超过时标记退化并增大协方差。
+    max_tilt_deg: 20.0
+    # 加速度模长与标准重力 9807 mm/s² 的最大允许偏差，单位 mm/s²；超过时标记
+    # 撞击/异常运动。应由静止、正常过减速带和受控碰撞样本分层确定。
+    impact_accel_threshold_mm_s2: 4000.0
 
 hailo:
   # 模板默认禁用；实际部署值写入不提交的 configs/runtime.yaml。

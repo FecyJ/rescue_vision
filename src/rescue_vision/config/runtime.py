@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -13,7 +14,12 @@ from rescue_vision.communication.remote_messages import RemoteTopic
 from rescue_vision.geometry.camera_model import CameraCalibration, CameraModel
 from rescue_vision.geometry.ground_projector import GroundProjector
 from rescue_vision.geometry.types import FieldPoint
-from rescue_vision.localization import CenterCrossLocalizerConfig
+from rescue_vision.localization import (
+    CenterCrossLocalizerConfig,
+    FieldPose2D,
+    FusionConfig,
+    OdometryCalibration,
+)
 from rescue_vision.mission import MissionConfig
 from rescue_vision.perception.types import (
     COLOR_TARGET_CLASSES,
@@ -60,7 +66,7 @@ if TYPE_CHECKING:
         RemoteGripperExecutor,
         RemoteMotionExecutor,
     )
-    from rescue_vision.localization import CenterCrossLocalizer
+    from rescue_vision.localization import CenterCrossLocalizer, OdometryImuFusion
     from rescue_vision.perception import TargetPoseDetector
 
 
@@ -364,7 +370,9 @@ def _perception_defaults() -> dict[str, Any]:
                 "local_window_fraction": 0.015,
                 "local_contrast_threshold": 10,
                 "max_saturation": 80,
+                "min_floor_value": 120,
                 "min_line_support_fraction": 0.10,
+                "min_white_surround_fraction": 0.60,
                 "min_axis_balance_fraction": 0.08,
                 "min_intersection_margin_fraction": 0.02,
             },
@@ -409,6 +417,34 @@ def _localization_defaults() -> dict[str, Any]:
         "max_prior_heading_innovation_deg": 20.0,
         "position_uncertainty_floor_mm": 20.0,
         "heading_uncertainty_floor_deg": 3.0,
+        "fusion": {
+            "enabled": False,
+            "initial_pose": {
+                "x_mm": 0.0,
+                "y_mm": 0.0,
+                "heading_deg": 0.0,
+                "position_uncertainty_mm": 100.0,
+                "heading_uncertainty_deg": 10.0,
+                "confidence": 0.5,
+            },
+            "encoder_distance_noise_fraction": 0.02,
+            "encoder_heading_noise_std_deg": 1.0,
+            "gyro_noise_std_rad_s": 0.03,
+            "gyro_bias_random_walk_std_rad_s_per_sqrt_s": 0.001,
+            "stationary_gyro_noise_std_rad_s": 0.01,
+            "stationary_encoder_delta_count": 0,
+            "allow_wheel_only": True,
+            "wheel_only_covariance_scale": 4.0,
+            "dropped_sample_covariance_scale": 3.0,
+            "max_sample_interval_ms": 50.0,
+            "max_telemetry_age_ms": 100.0,
+            "max_encoder_speed_mm_s": 1000.0,
+            "max_visual_alignment_error_ms": 30.0,
+            "visual_innovation_gate": 16.27,
+            "history_duration_ms": 1000.0,
+            "max_tilt_deg": 20.0,
+            "impact_accel_threshold_mm_s2": 4000.0,
+        },
     }
 
 
@@ -541,6 +577,7 @@ class GripperRuntimeConfig:
     closed_left_angle_deg: float | None
     closed_right_angle_deg: float | None
     full_travel_time_s: float | None
+    angle_sum_deg: float | None
 
     def build_calibration(self) -> GripperCalibration | None:
         """创建连续夹爪控制标定；禁用时返回 ``None``。"""
@@ -552,6 +589,7 @@ class GripperRuntimeConfig:
         assert self.closed_left_angle_deg is not None
         assert self.closed_right_angle_deg is not None
         assert self.full_travel_time_s is not None
+        assert self.angle_sum_deg is not None
         from rescue_vision.motion import GripperCalibration
 
         return GripperCalibration(
@@ -560,6 +598,30 @@ class GripperRuntimeConfig:
             closed_left_angle_deg=self.closed_left_angle_deg,
             closed_right_angle_deg=self.closed_right_angle_deg,
             full_travel_time_s=self.full_travel_time_s,
+            angle_sum_deg=self.angle_sum_deg,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OdometryRuntimeConfig:
+    enabled: bool
+    encoder_counts_per_revolution: int | None
+    left_wheel_radius_mm: float | None
+    right_wheel_radius_mm: float | None
+    gyro_z_bias_rad_s: float | None
+
+    def build_calibration(self) -> OdometryCalibration | None:
+        if not self.enabled:
+            return None
+        assert self.encoder_counts_per_revolution is not None
+        assert self.left_wheel_radius_mm is not None
+        assert self.right_wheel_radius_mm is not None
+        assert self.gyro_z_bias_rad_s is not None
+        return OdometryCalibration(
+            self.encoder_counts_per_revolution,
+            self.left_wheel_radius_mm,
+            self.right_wheel_radius_mm,
+            self.gyro_z_bias_rad_s,
         )
 
 
@@ -573,6 +635,7 @@ class MotionRuntimeConfig:
     max_wheel_acceleration_m_s2: float
     max_remote_command_valid_for_ms: int
     gripper: GripperRuntimeConfig
+    odometry: OdometryRuntimeConfig
 
     def build_controller(
         self,
@@ -807,6 +870,12 @@ class RuntimeGeometry:
 
 
 @dataclass(frozen=True, slots=True)
+class LocalizationRuntimeConfig:
+    center_cross: CenterCrossLocalizerConfig
+    fusion: FusionConfig
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     camera: CameraConfig
     geometry: GeometryConfig
@@ -819,7 +888,7 @@ class AppConfig:
     world: WorldRuntimeConfig
     mission: MissionConfig
     perception: PerceptionConfig
-    localization: CenterCrossLocalizerConfig
+    localization: LocalizationRuntimeConfig
     hailo: HailoConfig
 
     def build_camera_model(self) -> CameraModel | None:
@@ -889,7 +958,7 @@ class AppConfig:
         """Build center-cross localization when all geometric inputs exist."""
 
         if (
-            not self.localization.enabled
+            not self.localization.center_cross.enabled
             or not self.perception.field_features.enabled
             or not self.geometry.ground_mapping_enabled
             or ground_projector is None
@@ -898,9 +967,29 @@ class AppConfig:
         from rescue_vision.localization import CenterCrossLocalizer
 
         return CenterCrossLocalizer(
-            self.localization,
+            self.localization.center_cross,
             static_map=self.world.static_map,
             max_observation_age_ms=self.processing.max_observation_age_ms,
+        )
+
+    def build_odometry_imu_fusion(self) -> OdometryImuFusion | None:
+        """Build continuous localization without opening UART or camera resources."""
+
+        if not self.localization.fusion.enabled:
+            return None
+        if not self.motion.enabled or self.motion.wheel_track_m is None:
+            raise RuntimeError("Enabled localization fusion requires motion.")
+        calibration = self.motion.odometry.build_calibration()
+        if calibration is None:
+            raise RuntimeError(
+                "Enabled localization fusion requires motion.odometry."
+            )
+        from rescue_vision.localization import OdometryImuFusion
+
+        return OdometryImuFusion(
+            self.localization.fusion,
+            calibration,
+            wheel_track_m=self.motion.wheel_track_m,
         )
 
 
@@ -1163,6 +1252,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "max_wheel_acceleration_m_s2",
             "max_remote_command_valid_for_ms",
             "gripper",
+            "odometry",
         },
         "motion",
     )
@@ -1204,6 +1294,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "closed_left_angle_deg",
             "closed_right_angle_deg",
             "full_travel_time_s",
+            "angle_sum_deg",
         },
         "motion.gripper",
     )
@@ -1232,6 +1323,21 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             minimum=0.001,
         )
     )
+    angle_sum_raw = gripper_raw.get("angle_sum_deg")
+    angle_sum_deg = (
+        None
+        if angle_sum_raw is None
+        else _finite_float(
+            angle_sum_raw,
+            "motion.gripper.angle_sum_deg",
+            minimum=0.001,
+        )
+    )
+    if angle_sum_deg is not None and angle_sum_deg > 360.0:
+        raise ValueError(
+            "motion.gripper.angle_sum_deg must be <= 360, "
+            f"got {angle_sum_raw!r}."
+        )
     if gripper_enabled and not motion_enabled:
         raise ValueError(
             "Enabled motion.gripper requires motion.enabled=true."
@@ -1239,10 +1345,11 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     if gripper_enabled and (
         any(value is None for value in gripper_values.values())
         or full_travel_time_s is None
+        or angle_sum_deg is None
     ):
         raise ValueError(
             "Enabled motion.gripper requires four endpoint angles and "
-            "full_travel_time_s."
+            "full_travel_time_s and angle_sum_deg."
         )
     gripper = GripperRuntimeConfig(
         enabled=gripper_enabled,
@@ -1251,10 +1358,68 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         closed_left_angle_deg=gripper_values["closed_left_angle_deg"],
         closed_right_angle_deg=gripper_values["closed_right_angle_deg"],
         full_travel_time_s=full_travel_time_s,
+        angle_sum_deg=angle_sum_deg,
     )
     if gripper.enabled:
         # Reuse the motion-layer validation for distinct endpoints.
         gripper.build_calibration()
+    odometry_raw = _mapping(motion_raw.get("odometry", {}), "motion.odometry")
+    _reject_unknown(
+        odometry_raw,
+        {
+            "enabled",
+            "encoder_counts_per_revolution",
+            "left_wheel_radius_mm",
+            "right_wheel_radius_mm",
+            "gyro_z_bias_rad_s",
+        },
+        "motion.odometry",
+    )
+    odometry_enabled = odometry_raw.get("enabled", False)
+    if not isinstance(odometry_enabled, bool):
+        raise ValueError("motion.odometry.enabled must be a boolean.")
+    encoder_counts_raw = odometry_raw.get("encoder_counts_per_revolution")
+    encoder_counts = (
+        None
+        if encoder_counts_raw is None
+        else _positive_int(
+            encoder_counts_raw,
+            "motion.odometry.encoder_counts_per_revolution",
+        )
+    )
+    odometry_floats: dict[str, float | None] = {}
+    for name, minimum in (
+        ("left_wheel_radius_mm", 0.001),
+        ("right_wheel_radius_mm", 0.001),
+        ("gyro_z_bias_rad_s", -float("inf")),
+    ):
+        raw_value = odometry_raw.get(name)
+        odometry_floats[name] = (
+            None
+            if raw_value is None
+            else _finite_float(
+                raw_value,
+                f"motion.odometry.{name}",
+                minimum=minimum,
+            )
+        )
+    if odometry_enabled and (
+        not motion_enabled
+        or encoder_counts is None
+        or any(value is None for value in odometry_floats.values())
+    ):
+        raise ValueError(
+            "Enabled motion.odometry requires enabled motion and all calibration values."
+        )
+    odometry = OdometryRuntimeConfig(
+        enabled=odometry_enabled,
+        encoder_counts_per_revolution=encoder_counts,
+        left_wheel_radius_mm=odometry_floats["left_wheel_radius_mm"],
+        right_wheel_radius_mm=odometry_floats["right_wheel_radius_mm"],
+        gyro_z_bias_rad_s=odometry_floats["gyro_z_bias_rad_s"],
+    )
+    if odometry.enabled:
+        odometry.build_calibration()
     motion = MotionRuntimeConfig(
         enabled=motion_enabled,
         wheel_track_m=wheel_track_m,
@@ -1280,6 +1445,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         ),
         max_remote_command_valid_for_ms=max_remote_validity,
         gripper=gripper,
+        odometry=odometry,
     )
 
     tracking_raw = _mapping(
@@ -2070,7 +2236,9 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "local_window_fraction",
             "local_contrast_threshold",
             "max_saturation",
+            "min_floor_value",
             "min_line_support_fraction",
+            "min_white_surround_fraction",
             "min_axis_balance_fraction",
             "min_intersection_margin_fraction",
         },
@@ -2221,6 +2389,14 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             ),
             "perception.field_features.center_cross.max_saturation",
         ),
+        center_min_floor_value=_nonnegative_int(
+            _required(
+                center_raw,
+                "min_floor_value",
+                "perception.field_features.center_cross",
+            ),
+            "perception.field_features.center_cross.min_floor_value",
+        ),
         center_min_line_support_fraction=_threshold(
             _required(
                 center_raw,
@@ -2228,6 +2404,14 @@ def load_runtime_config(path: str | Path) -> AppConfig:
                 "perception.field_features.center_cross",
             ),
             "perception.field_features.center_cross.min_line_support_fraction",
+        ),
+        center_min_white_surround_fraction=_threshold(
+            _required(
+                center_raw,
+                "min_white_surround_fraction",
+                "perception.field_features.center_cross",
+            ),
+            "perception.field_features.center_cross.min_white_surround_fraction",
         ),
         center_min_axis_balance_fraction=_threshold(
             _required(
@@ -2422,6 +2606,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "max_prior_heading_innovation_deg",
             "position_uncertainty_floor_mm",
             "heading_uncertainty_floor_deg",
+            "fusion",
         },
         "localization",
     )
@@ -2438,7 +2623,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     )
     if min_anchor_confidence > 1.0:
         raise ValueError("localization.min_anchor_confidence must be <= 1.0.")
-    localization = CenterCrossLocalizerConfig(
+    center_cross_localization = CenterCrossLocalizerConfig(
         enabled=localization_enabled,
         ray_min_forward_distance_mm=_finite_float(
             _required(
@@ -2505,6 +2690,211 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             minimum=0.001,
         ),
     )
+    fusion_raw = _mapping(localization_raw["fusion"], "localization.fusion")
+    _reject_unknown(
+        fusion_raw,
+        {
+            "enabled",
+            "initial_pose",
+            "encoder_distance_noise_fraction",
+            "encoder_heading_noise_std_deg",
+            "gyro_noise_std_rad_s",
+            "gyro_bias_random_walk_std_rad_s_per_sqrt_s",
+            "stationary_gyro_noise_std_rad_s",
+            "stationary_encoder_delta_count",
+            "allow_wheel_only",
+            "wheel_only_covariance_scale",
+            "dropped_sample_covariance_scale",
+            "max_sample_interval_ms",
+            "max_telemetry_age_ms",
+            "max_encoder_speed_mm_s",
+            "max_visual_alignment_error_ms",
+            "visual_innovation_gate",
+            "history_duration_ms",
+            "max_tilt_deg",
+            "impact_accel_threshold_mm_s2",
+        },
+        "localization.fusion",
+    )
+    fusion_enabled = _required(fusion_raw, "enabled", "localization.fusion")
+    allow_wheel_only = _required(
+        fusion_raw, "allow_wheel_only", "localization.fusion"
+    )
+    if not isinstance(fusion_enabled, bool) or not isinstance(allow_wheel_only, bool):
+        raise ValueError(
+            "localization.fusion enabled flags must be booleans."
+        )
+    initial_pose_raw = _mapping(
+        _required(fusion_raw, "initial_pose", "localization.fusion"),
+        "localization.fusion.initial_pose",
+    )
+    _reject_unknown(
+        initial_pose_raw,
+        {
+            "x_mm",
+            "y_mm",
+            "heading_deg",
+            "position_uncertainty_mm",
+            "heading_uncertainty_deg",
+            "confidence",
+        },
+        "localization.fusion.initial_pose",
+    )
+    initial_confidence = _threshold(
+        _required(
+            initial_pose_raw,
+            "confidence",
+            "localization.fusion.initial_pose",
+        ),
+        "localization.fusion.initial_pose.confidence",
+    )
+    if initial_confidence > 1.0:
+        raise ValueError(
+            "localization.fusion.initial_pose.confidence must be <= 1."
+        )
+    fusion = FusionConfig(
+        enabled=fusion_enabled,
+        initial_pose=FieldPose2D(
+            FieldPoint(
+                _finite_float(
+                    _required(initial_pose_raw, "x_mm", "localization.fusion.initial_pose"),
+                    "localization.fusion.initial_pose.x_mm",
+                    minimum=-float("inf"),
+                ),
+                _finite_float(
+                    _required(initial_pose_raw, "y_mm", "localization.fusion.initial_pose"),
+                    "localization.fusion.initial_pose.y_mm",
+                    minimum=-float("inf"),
+                ),
+            ),
+            math.radians(
+                _finite_float(
+                    _required(
+                        initial_pose_raw,
+                        "heading_deg",
+                        "localization.fusion.initial_pose",
+                    ),
+                    "localization.fusion.initial_pose.heading_deg",
+                    minimum=-float("inf"),
+                )
+            ),
+        ),
+        initial_position_uncertainty_mm=_finite_float(
+            _required(
+                initial_pose_raw,
+                "position_uncertainty_mm",
+                "localization.fusion.initial_pose",
+            ),
+            "localization.fusion.initial_pose.position_uncertainty_mm",
+            minimum=0.001,
+        ),
+        initial_heading_uncertainty_rad=math.radians(
+            _finite_float(
+                _required(
+                    initial_pose_raw,
+                    "heading_uncertainty_deg",
+                    "localization.fusion.initial_pose",
+                ),
+                "localization.fusion.initial_pose.heading_uncertainty_deg",
+                minimum=0.001,
+            )
+        ),
+        initial_confidence=initial_confidence,
+        encoder_distance_noise_fraction=_finite_float(
+            fusion_raw["encoder_distance_noise_fraction"],
+            "localization.fusion.encoder_distance_noise_fraction",
+            minimum=0.0,
+        ),
+        encoder_heading_noise_std_rad=math.radians(
+            _finite_float(
+                fusion_raw["encoder_heading_noise_std_deg"],
+                "localization.fusion.encoder_heading_noise_std_deg",
+                minimum=0.001,
+            )
+        ),
+        gyro_noise_std_rad_s=_finite_float(
+            fusion_raw["gyro_noise_std_rad_s"],
+            "localization.fusion.gyro_noise_std_rad_s",
+            minimum=0.001,
+        ),
+        gyro_bias_random_walk_std_rad_s_per_sqrt_s=_finite_float(
+            fusion_raw["gyro_bias_random_walk_std_rad_s_per_sqrt_s"],
+            "localization.fusion.gyro_bias_random_walk_std_rad_s_per_sqrt_s",
+            minimum=0.000001,
+        ),
+        stationary_gyro_noise_std_rad_s=_finite_float(
+            fusion_raw["stationary_gyro_noise_std_rad_s"],
+            "localization.fusion.stationary_gyro_noise_std_rad_s",
+            minimum=0.000001,
+        ),
+        stationary_encoder_delta_count=_nonnegative_int(
+            fusion_raw["stationary_encoder_delta_count"],
+            "localization.fusion.stationary_encoder_delta_count",
+        ),
+        allow_wheel_only=allow_wheel_only,
+        wheel_only_covariance_scale=_finite_float(
+            fusion_raw["wheel_only_covariance_scale"],
+            "localization.fusion.wheel_only_covariance_scale",
+            minimum=1.0,
+        ),
+        dropped_sample_covariance_scale=_finite_float(
+            fusion_raw["dropped_sample_covariance_scale"],
+            "localization.fusion.dropped_sample_covariance_scale",
+            minimum=1.0,
+        ),
+        max_sample_interval_ms=_finite_float(
+            fusion_raw["max_sample_interval_ms"],
+            "localization.fusion.max_sample_interval_ms",
+            minimum=0.001,
+        ),
+        max_telemetry_age_ms=_finite_float(
+            fusion_raw["max_telemetry_age_ms"],
+            "localization.fusion.max_telemetry_age_ms",
+            minimum=0.001,
+        ),
+        max_encoder_speed_mm_s=_finite_float(
+            fusion_raw["max_encoder_speed_mm_s"],
+            "localization.fusion.max_encoder_speed_mm_s",
+            minimum=0.001,
+        ),
+        max_visual_alignment_error_ms=_finite_float(
+            fusion_raw["max_visual_alignment_error_ms"],
+            "localization.fusion.max_visual_alignment_error_ms",
+            minimum=0.001,
+        ),
+        visual_innovation_gate=_finite_float(
+            fusion_raw["visual_innovation_gate"],
+            "localization.fusion.visual_innovation_gate",
+            minimum=0.001,
+        ),
+        history_duration_ms=_finite_float(
+            fusion_raw["history_duration_ms"],
+            "localization.fusion.history_duration_ms",
+            minimum=0.001,
+        ),
+        max_tilt_deg=_finite_float(
+            fusion_raw["max_tilt_deg"],
+            "localization.fusion.max_tilt_deg",
+            minimum=0.001,
+        ),
+        impact_accel_threshold_mm_s2=_finite_float(
+            fusion_raw["impact_accel_threshold_mm_s2"],
+            "localization.fusion.impact_accel_threshold_mm_s2",
+            minimum=0.001,
+        ),
+    )
+    if fusion.enabled and (
+        not localization_enabled
+        or not motion.odometry.enabled
+        or not uart.enabled
+        or not perception.field_features.enabled
+        or not geometry.ground_mapping_enabled
+    ):
+        raise ValueError(
+            "Enabled localization.fusion requires localization, UART, "
+            "motion.odometry, field features and ground mapping."
+        )
+    localization = LocalizationRuntimeConfig(center_cross_localization, fusion)
 
     hailo_raw = _mapping(root.get("hailo", {}), "hailo")
     _reject_unknown(

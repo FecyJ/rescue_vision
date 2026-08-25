@@ -19,6 +19,7 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `AppConfig.build_geometry()` | 创建相机模型和可选地面映射 | 内参关闭时返回 `None`；只有内参时 projector 为 `None` |
 | `AppConfig.build_target_pose_detector()` | 按当前 Hailo、类别和 HSV 配置创建任务目标检测器 | Hailo 关闭时返回 `None`；返回对象接管 backend 生命周期 |
 | `AppConfig.build_center_cross_localizer()` | 创建中心十字绝对位姿观测器 | 定位、场地特征或地面映射任一不可用时返回 `None` |
+| `AppConfig.build_odometry_imu_fusion()` | 创建连续二维融合器 | 融合关闭时返回 `None`；启用时要求 motion、UART 和里程计机械标定 |
 | `UartConfig.build_channel()` | 创建协议无关 UART 行通道 | UART 关闭时返回 `None`；创建时尚不打开设备 |
 | `RemoteConfig.build_server()` | 创建树莓派直接 TCP 服务端 | 远程关闭时返回 `None`；创建时尚不监听 |
 | `RemoteConfig.connect_client()` | 仓库内参考客户端建立直接 TCP 连接 | 只用于互操作/人工检查；独立电脑端不得依赖 |
@@ -44,8 +45,9 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `ProcessingConfig` | `max_observation_age_ms` |
 | `UartConfig` | 设备名、波特率、读写超时、有界接收容量和最大行长度 |
 | `RemoteConfig` | 服务端/客户端、观察/调试权限、连接/IO 超时和有界队列 |
-| `MotionRuntimeConfig` | 实测轮距、车体/车轮速度上限、单轮加速度上限、远程命令有效期和 `gripper` |
-| `GripperRuntimeConfig` | 能力开关、左右开/闭安全角度和固定速度全行程时间 |
+| `MotionRuntimeConfig` | 实测轮距、车体/车轮速度上限、单轮加速度上限、远程命令有效期、`odometry` 和 `gripper` |
+| `OdometryRuntimeConfig` | 每圈计数、左右有效轮径和静态 `gyro_z` 零偏 |
+| `GripperRuntimeConfig` | 能力开关、左右开/闭安全角度、角度和与固定速度全行程时间 |
 | `TrackingConfig` | 关联、确认、滑行、衰减和删除阈值 |
 | `WorldRuntimeConfig` | 世界阈值、`TeamColor`、`StaticFieldMap` 及任务区域派生 |
 | `MissionConfig` | 比赛计时、安全超时、避让距离和目标优先级 |
@@ -55,6 +57,7 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `FieldFeatureConfig` | 场地颜色、形态学、公差、点划线和边界候选阈值 |
 | `FieldBoundaryConfig` | 共线拟合、矩形公差、时序确认、边界带、时效和遮挡开关 |
 | `CenterCrossLocalizerConfig` | 终端射线关联、锚点置信度、先验创新和不确定度下限 |
+| `LocalizationRuntimeConfig` / `FusionConfig` | 中心十字配置，以及起点、噪声、时效、物理跳变、视觉门控和历史长度 |
 | `HailoConfig` | 模型资产、身份、类别映射和后端粗筛阈值 |
 | `RuntimeGeometry` | `camera_model`、可选 `ground_projector` |
 
@@ -87,6 +90,9 @@ motion_executor = config.motion.build_remote_executor(motion_controller)
 gripper_executor = config.motion.build_remote_gripper_executor(
     motion_controller
 )
+
+# 只创建纯逻辑融合状态；不会再打开一个串口读取器。
+localization_fusion = config.build_odometry_imu_fusion()
 ```
 
 UART/TCP 生命周期和 motion 的停止语义分别见相邻模块 README，不要把
@@ -101,12 +107,18 @@ UART/TCP 生命周期和 motion 的停止语义分别见相邻模块 README，�
 | `open_left_angle_deg` / `open_right_angle_deg` | 当前车辆完全张开时的左右安全目标角度 |
 | `closed_left_angle_deg` / `closed_right_angle_deg` | 当前车辆完全闭合时的左右安全目标角度 |
 | `full_travel_time_s` | 单方向持续按下时，从一个端点匀速到另一端点的时间 |
+| `angle_sum_deg` | 舵机联动约束的左右角度和；开、闭端点及运行中目标都必须满足该值 |
 
 四个角度单位都是 degree，范围 `[0, 180]`。每组端点必须满足
-`left + right = 194°`；因此左右任一角都不能小于 `14°`。加载器会拒绝
+`left + right = motion.gripper.angle_sum_deg`。加载器会拒绝缺少角度和、
 不满足该和约束或开闭端点相同的配置。执行器以左角为单一自由度并始终用
-`right = 194° - left` 构造远程下发；
+`right = motion.gripper.angle_sum_deg - left` 构造远程下发；
 客户端只发送按下/松开 boolean，不读取这些机械值。
+
+`motion.odometry` 是编码器机械量和 IMU 静态零偏的唯一配置；轮距继续复用
+`motion.wheel_track_m`，定位配置不得复制。`localization.fusion.initial_pose`
+使用固定物理 `FieldPoint` 和全局航向，只在进程首个有效遥测基线使用一次。
+模板默认关闭融合，真车启用前必须实测每圈计数、左右有效轮径、轮距和零偏。
 
 ## 3. 装配几何对象
 

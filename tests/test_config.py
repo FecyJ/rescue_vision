@@ -101,6 +101,7 @@ motion:
     closed_left_angle_deg: null
     closed_right_angle_deg: null
     full_travel_time_s: null
+    angle_sum_deg: null
 tracking:
   confirmation_hits: 2
   max_association_ground_mm: 250.0
@@ -250,7 +251,9 @@ perception:
       local_window_fraction: 0.015
       local_contrast_threshold: 10
       max_saturation: 80
+      min_floor_value: 120
       min_line_support_fraction: 0.10
+      min_white_surround_fraction: 0.60
       min_axis_balance_fraction: 0.08
       min_intersection_margin_fraction: 0.02
     boundary:
@@ -419,6 +422,62 @@ localization:
     assert disabled_ground.build_center_cross_localizer(
         ground_projector=geometry.ground_projector
     ) is None
+
+
+def test_odometry_imu_fusion_builds_from_single_motion_calibration(tmp_path) -> None:
+    text = config_text(
+        extra="""
+localization:
+  enabled: true
+  fusion:
+    enabled: true
+    initial_pose:
+      x_mm: 10.0
+      y_mm: -20.0
+      heading_deg: 90.0
+      position_uncertainty_mm: 50.0
+      heading_uncertainty_deg: 5.0
+      confidence: 0.6
+"""
+    )
+    text = text.replace("uart:\n  enabled: false", "uart:\n  enabled: true")
+    text = text.replace("  device: null", "  device: /dev/ttyAMA0", 1)
+    text = text.replace(
+        "  field_features:\n    enabled: false",
+        "  field_features:\n    enabled: true",
+    )
+    text = text.replace(
+        "motion:\n  enabled: false\n  wheel_track_m: null",
+        """motion:
+  enabled: true
+  wheel_track_m: 0.2
+  odometry:
+    enabled: true
+    encoder_counts_per_revolution: 4096
+    left_wheel_radius_mm: 32.0
+    right_wheel_radius_mm: 31.8
+    gyro_z_bias_rad_s: 0.01""",
+    )
+    path = tmp_path / "runtime.yaml"
+    path.write_text(text, encoding="utf-8")
+
+    loaded = load_runtime_config(path)
+    estimator = loaded.build_odometry_imu_fusion()
+
+    assert estimator is not None
+    assert estimator.calibration.encoder_counts_per_revolution == 4096
+    assert estimator.config.initial_pose.position == FieldPoint(10.0, -20.0)
+    assert estimator.config.initial_pose.heading_rad == pytest.approx(np.pi / 2)
+
+
+def test_enabled_fusion_requires_odometry_calibration(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text(extra="localization:\n  enabled: true\n  fusion:\n    enabled: true\n"),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="motion.odometry"):
+        load_runtime_config(path)
 
 
 def test_disabled_hailo_does_not_create_target_pose_detector(tmp_path) -> None:
@@ -716,6 +775,16 @@ def test_target_ground_geometry_config_rejects_invalid_values(
             "center_max_saturation",
         ),
         (
+            "      min_floor_value: 120",
+            "      min_floor_value: 256",
+            "center_min_floor_value",
+        ),
+        (
+            "      min_white_surround_fraction: 0.60",
+            "      min_white_surround_fraction: 0.00",
+            "center_min_white_surround_fraction",
+        ),
+        (
             "      min_axis_balance_fraction: 0.08",
             "      min_axis_balance_fraction: 0.50",
             "center_min_axis_balance_fraction",
@@ -919,14 +988,16 @@ def test_motion_config_builds_controller_without_opening_uart(tmp_path) -> None:
     open_right_angle_deg: null
     closed_left_angle_deg: null
     closed_right_angle_deg: null
-    full_travel_time_s: null""",
+    full_travel_time_s: null
+    angle_sum_deg: null""",
             """  gripper:
     enabled: true
     open_left_angle_deg: 20.0
-    open_right_angle_deg: 174.0
-    closed_left_angle_deg: 80.0
-    closed_right_angle_deg: 114.0
-    full_travel_time_s: 1.5""",
+    open_right_angle_deg: 180.0
+    closed_left_angle_deg: 90.0
+    closed_right_angle_deg: 110.0
+    full_travel_time_s: 1.5
+    angle_sum_deg: 200.0""",
         ),
         encoding="utf-8",
     )
@@ -947,6 +1018,7 @@ def test_motion_config_builds_controller_without_opening_uart(tmp_path) -> None:
     assert gripper_executor is not None
     assert gripper_executor.controller is controller
     assert gripper_executor.calibration.full_travel_time_s == pytest.approx(1.5)
+    assert gripper_executor.calibration.angle_sum_deg == pytest.approx(200.0)
 
 
 def test_motion_acceleration_limit_must_be_positive(tmp_path) -> None:
@@ -960,6 +1032,20 @@ def test_motion_acceleration_limit_must_be_positive(tmp_path) -> None:
     )
 
     with pytest.raises(ValueError, match="max_wheel_acceleration_m_s2"):
+        load_runtime_config(path)
+
+
+def test_gripper_angle_sum_must_be_within_servo_range(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text().replace(
+            "    angle_sum_deg: null",
+            "    angle_sum_deg: 360.1",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="motion.gripper.angle_sum_deg"):
         load_runtime_config(path)
 
 

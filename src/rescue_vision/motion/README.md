@@ -35,7 +35,7 @@
 | `drain_messages()` | 无 | 非阻塞排空当前 UART 回传 |
 | `RemoteMotionExecutor.execute()` | `ReceivedRemoteMessage` | 校验远程运动消息后执行 |
 | `RemoteMotionExecutor.check_timeout()` | 可选本机单调时间 ns | 到期时停车，返回是否触发 |
-| `GripperCalibration` | 左右开/闭端点与固定速度全行程时间 | 严格验证安全范围及每组端点相加为 194° |
+| `GripperCalibration` | 左右开/闭端点、角度和与固定速度全行程时间 | 严格验证安全范围及每组端点相加为 `angle_sum_deg` |
 | `RemoteGripperExecutor.execute()` | `ReceivedRemoteMessage` | 接受一帧持续夹爪扳机状态 |
 | `RemoteGripperExecutor.update()` | 可选本机单调时间 ns | 按按压方向以配置速度渐进下发舵机目标 |
 | `RemoteGripperExecutor.check_timeout()` / `stop()` | 可选本机单调时间 ns | 超时或退出时停止推进，保留当前角度 |
@@ -63,8 +63,8 @@ right = linear + angular × wheel_track / 2
 ## 1. 从运行配置装配
 
 先在 `configs/runtime.yaml` 填入实测轮距和调试限速，并启用 `uart` 与
-`motion`。需要远程夹爪时，还要实测左右开/闭安全端点和固定速度全行程时间，
-写入 `motion.gripper` 后单独启用。所有路径、设备名、机械参数和上限只从
+`motion`。需要远程夹爪时，还要实测左右开/闭安全端点、
+`angle_sum_deg` 和固定速度全行程时间，写入 `motion.gripper` 后单独启用。所有路径、设备名、机械参数和上限只从
 这份配置取得：
 
 ```python
@@ -192,8 +192,8 @@ controller.set_gripper_angles(
 意外丢落；调用方退出前若确实需要释放，必须根据现场安全条件显式发送另一组
 已标定角度。10 Hz `CarSystemStatus` 中的舵机字段是固件目标角度，不是舵机
 物理位置反馈。
-低层 `set_gripper_angles()` 仍忠实编码调用方给出的两个角度；194° 和约束
-属于远程夹爪执行器及其 `GripperCalibration`，不会暗中改变其他直接调用方。
+低层 `set_gripper_angles()` 仍忠实编码调用方给出的两个角度；角度和约束属于
+远程夹爪执行器及其 `GripperCalibration`，不会暗中改变其他直接调用方。
 
 ## 6. 柔和停车和紧急停止
 
@@ -331,8 +331,8 @@ else:
 
 `update()` 从 `MotionController.gripper_target_angles_deg` 取得最近下发值或
 STM32 遥测目标；若旧目标不满足新约束，会先投影到
-`left + right = 194°` 的有效线段，随后只推进左角并以
-`right = 194° - left` 重建每条远程 UART 指令。尚未收到
+`left + right = calibration.angle_sum_deg` 的有效线段，随后只推进左角并以
+`right = calibration.angle_sum_deg - left` 重建每条远程 UART 指令。尚未收到
 任何目标时安全等待，不猜测启动角度。非法 envelope、
 按压状态或有效期会清除当前持续状态并抛出 `RemoteGripperError`。该执行器不会
 自行改变底盘速度；应用把异常传播到 `run_remote_motion()` 时，外层仍会先走

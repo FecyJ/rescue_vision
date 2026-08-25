@@ -70,9 +70,6 @@ class RemoteGripperResult(str, Enum):
     EXPIRED = "expired"
 
 
-_GRIPPER_ANGLE_SUM_DEG = 194.0
-
-
 @dataclass(frozen=True, slots=True)
 class GripperCalibration:
     """远程连续控制所需的双舵机机械端点和速度标定。"""
@@ -82,6 +79,7 @@ class GripperCalibration:
     closed_left_angle_deg: float
     closed_right_angle_deg: float
     full_travel_time_s: float
+    angle_sum_deg: float
 
     def __post_init__(self) -> None:
         for name in (
@@ -104,6 +102,13 @@ class GripperCalibration:
                 f"got {travel_time!r}."
             )
         object.__setattr__(self, "full_travel_time_s", travel_time)
+        angle_sum = _finite_float(self.angle_sum_deg, "angle_sum_deg")
+        if not 0.0 < angle_sum <= 360.0:
+            raise ValueError(
+                "angle_sum_deg must be in (0, 360], "
+                f"got {angle_sum!r}."
+            )
+        object.__setattr__(self, "angle_sum_deg", angle_sum)
         if self.open_left_angle_deg == self.closed_left_angle_deg:
             raise ValueError("Left gripper open and closed angles must differ.")
         if self.open_right_angle_deg == self.closed_right_angle_deg:
@@ -123,14 +128,14 @@ class GripperCalibration:
             angle_sum = left + right
             if not math.isclose(
                 angle_sum,
-                _GRIPPER_ANGLE_SUM_DEG,
+                self.angle_sum_deg,
                 rel_tol=1e-12,
                 abs_tol=1e-9,
             ):
                 raise ValueError(
                     "Gripper "
                     f"{state} angles must sum to "
-                    f"{_GRIPPER_ANGLE_SUM_DEG:g} degrees, "
+                    f"{self.angle_sum_deg:g} degrees, "
                     f"got {left} + {right} = {angle_sum}."
                 )
 
@@ -296,15 +301,16 @@ class RemoteGripperExecutor:
             )
             / self.calibration.full_travel_time_s
         )
-        # 把可能来自旧命令且不满足 194° 和约束的目标投影到有效线段，
+        # 把可能来自旧命令且不满足角度和约束的目标投影到有效线段，
         # 再只推进一个自由度；所有远程 UART 下发都重新构造右角。
-        minimum_left_angle = _GRIPPER_ANGLE_SUM_DEG - 180.0
+        minimum_left_angle = max(0.0, self.calibration.angle_sum_deg - 180.0)
+        maximum_left_angle = min(180.0, self.calibration.angle_sum_deg)
         projected_left_angle = (
             current_angles[0]
-            + (_GRIPPER_ANGLE_SUM_DEG - current_angles[1])
+            + (self.calibration.angle_sum_deg - current_angles[1])
         ) / 2.0
         current_left_angle = min(
-            180.0,
+            maximum_left_angle,
             max(minimum_left_angle, projected_left_angle),
         )
         next_left_angle = _move_toward(
@@ -314,7 +320,7 @@ class RemoteGripperExecutor:
         )
         next_angles = (
             next_left_angle,
-            _GRIPPER_ANGLE_SUM_DEG - next_left_angle,
+            self.calibration.angle_sum_deg - next_left_angle,
         )
         if next_angles == current_angles:
             return False
