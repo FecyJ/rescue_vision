@@ -158,7 +158,7 @@ with source, detector:
             tracks=tracks,
             robot_field_point=robot_field_point,
             # 中心十字没有唯一解时传 None，世界模型保留明确不确定性。
-            # 本示例尚未注入时间对齐的 IMU/编码器先验；完整融合未实现。
+            # 完整车辆入口会从 OdometryImuFusion 查询该采集时刻的先验。
             # ground_geometry_result 当前提供机器人系中心/足迹；后续规划
             # 接口接入前不在这里伪造全局目标坐标。
         )
@@ -174,14 +174,14 @@ with source, detector:
 
 | 子包 | 常用入口 | 对接责任 |
 | --- | --- | --- |
-| [`app`](app/README.md) | `run_manual_capture_session()`、`FieldMapSnapshotRenderer`、`LatestCenterCrossLocalization`、`rescue-vision-manual-capture` | 赛外受监督手动驾驶、车载采集和静态场地图/中心十字位姿远程发布装配 |
+| [`app`](app/README.md) | `run_manual_capture_session()`、`LatestCenterCrossLocalization`、`rescue-vision-manual-capture` | 赛外受监督手动驾驶、车载采集和连续融合动态地图状态发布装配 |
 | [`config`](config/README.md) | `load_runtime_config()`、`GripperRuntimeConfig`、`AppConfig.build_geometry()`、`HailoConfig.build_backend()` | 启动时严格加载、机械标定和装配 |
 | [`camera`](camera/README.md) | `FrameSource`、`CameraFrame`、`Picamera2Source`、`RecordingSource` | 产生带时间和序号的最新帧 |
-| [`communication`](communication/README.md) | `UartFrameChannel`、`RemoteMessageConnection`、`VideoModeCommand`、`VideoFrameAttributes`、`MapSnapshotAttributes`、`RemoteSessionStatus` | COBS UART、直接 TCP 远程消息、可选择 raw/perception/BEV 图传、FieldPoint/MapPixel 地图映射及可空机器人全局位姿 schema |
+| [`communication`](communication/README.md) | `UartFrameChannel`、`RemoteMessageConnection`、`VideoModeCommand`、`VideoFrameAttributes`、`MapStateObservation`、`RemoteSessionStatus` | COBS UART、直接 TCP 远程消息、可选择 raw/perception/BEV 图传及轻量 FieldPoint 动态状态 schema |
 | [`motion`](motion/README.md) | `MotionController`、`MotionLimits`、`GripperCalibration`、`RemoteMotionExecutor`、`RemoteGripperExecutor`、`run_remote_motion` | 差速运动、持续夹爪双舵机、Rescue Car 协议和远程调试执行 |
 | [`geometry`](geometry/README.md) | `CameraModel`、`GroundProjector`、显式坐标类型（含 `MapPixel`） | 去畸变及像素/地面/BEV 转换 |
 | [`perception`](perception/README.md) | `TargetPoseDetector`、`PerceptionFrameRenderer`、`TargetGroundGeometryEstimator`、`FieldFeatureDetector`、`FieldBoundaryEstimator` | 任务目标、最新帧可视化旁路、地面几何、静态场地特征和局部场界三态掩膜 |
-| [`localization`](localization/README.md) | `CenterCrossLocalizer`、`FieldPose2D`、`CenterCrossPoseObservation` | 中心十字绝对位姿候选、同帧方向锚定和先验门控 |
+| [`localization`](localization/README.md) | `CenterCrossLocalizer`、`OdometryImuFusion`、`FusedPoseEstimate` | 中心十字绝对位姿与编码器/IMU 连续融合、延迟视觉纠偏 |
 | [`tracking`](tracking/README.md) | `MultiTargetTracker`、`TrackedTarget`、`TrackStatus` | 时间关联、遮挡和轨迹生命周期 |
 | [`world`](world/README.md) | `StaticFieldMap`、`WorldModel`、`WorldSnapshot`、`HazardState` | 固定物理地图、任务区域派生、动态目标、对手占据和不确定性 |
 | [`mission`](mission/README.md) | `MissionStateMachine`、`replay_mission()`、`MissionDecision` | 规则、安全降级和抽象动作 |

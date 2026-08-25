@@ -2,7 +2,7 @@
 
 2027 工创赛“智能救援”赛项的上位机视觉工程，目标平台为 Raspberry Pi 5、Hailo-8L 和 Camera Module 3 NoIR Wide。
 
-当前已完成相机、标定与地面几何、严格配置、录制回放、数据集工具、离线评测、COBS/CRC16 UART 帧通道及 STM32 二进制协议树莓派端、直接 TCP 远程消息通道、差速与双舵机夹爪控制、受监督手动驾驶采集入口、统一目标观测、Hailo YOLO Pose 后端、四类目标传统视觉地面几何估计基线、传统视觉场地特征观测与时序局部场界三态掩膜基线、中心十字绝对位姿候选与同帧红蓝安全区方向锚定、静态场地图及新鲜唯一机器人位姿远程发布，以及可用合成事件运行的目标跟踪、最小世界模型和规则状态机；尚未完成 STM32 新协议固件、正式四类目标模型、IMU/编码器融合与完整定位、完整区域/对手感知、规划、脚本运动采集、固件失联看门狗闭环、真实接触/交付证据适配和比赛应用入口。这不是可直接参赛的完整程序。
+当前已完成相机、标定与地面几何、严格配置、录制回放、数据集工具、离线评测、COBS/CRC16 UART 帧通道及 STM32 二进制协议树莓派端、直接 TCP 远程消息通道、差速与双舵机夹爪控制、受监督手动驾驶采集入口、统一目标观测、Hailo YOLO Pose 后端、四类目标传统视觉地面几何估计基线、传统视觉场地特征观测与时序局部场界三态掩膜基线、中心十字绝对位姿候选与同帧红蓝安全区方向锚定、编码器/IMU 二维连续融合与延迟视觉纠偏、连续场地图远程发布，以及可用合成事件运行的目标跟踪、最小世界模型和规则状态机；尚未完成 STM32 新协议固件与真车标定验收、正式四类目标模型、完整区域/对手感知、规划、脚本运动采集、固件失联看门狗闭环、真实接触/交付证据适配和比赛应用入口。这不是可直接参赛的完整程序。
 
 ## 快速上手
 
@@ -56,17 +56,17 @@ python -m pytest
 | [`calibration`](src/rescue_vision/calibration/README.md) | 已实现 | 棋盘/ChArUco 采集、三模型内参比较和固定机器人多位置地面映射 |
 | [`geometry`](src/rescue_vision/geometry/README.md) | 已实现 | 去畸变、显式坐标类型、地面/三维点投影与 BEV 转换 |
 | [`config`](src/rescue_vision/config/README.md) | 已实现 | 安全默认配置、静态场地、UART/远程/motion/夹爪机械标定/几何/模型和感知算法装配 |
-| [`communication`](src/rescue_vision/communication/README.md) | 已实现基础设施 | COBS UART 帧、直接 TCP 远程消息、raw/perception/BEV 图传、带可空全局位姿的场地图、运动/夹爪/采集严格 schema 和有界队列；比赛发布器待接入 |
+| [`communication`](src/rescue_vision/communication/README.md) | 已实现基础设施 | COBS UART 帧、直接 TCP 远程消息、raw/perception/BEV 图传、轻量动态地图 JSON、运动/夹爪/采集严格 schema 和有界队列；比赛发布器待接入 |
 | [`motion`](src/rescue_vision/motion/README.md) | 已实现基础设施 | STM32 固定二进制协议、差速运动、持续扳机双舵机夹爪、单轮加速度限制和远程超时保护；新固件待实现 |
-| [`app`](src/rescue_vision/app/README.md) | 已实现手动采集入口 | 赛外受监督驾驶、仅相机远程调试、持续夹爪控制、raw/perception/BEV 图传、静态场地图与中心十字位姿发布、采集控制与状态装配；比赛入口待实现 |
+| [`app`](src/rescue_vision/app/README.md) | 已实现手动采集入口 | 赛外受监督驾驶、仅相机远程调试、持续夹爪控制、raw/perception/BEV 图传、动态车辆位姿状态、采集控制与状态装配；比赛入口待实现 |
 | [`data`](src/rescue_vision/data/README.md) | 已实现 | 记录检查、清单生成和按会话防泄漏划分 |
 | [`evaluation`](src/rescue_vision/evaluation/README.md) | 已实现 | 分类、地面误差、时延和失败样例报告 |
 | [`perception`](src/rescue_vision/perception/README.md) | 已实现基础设施 | Pose 框/K0、ROI HSV 分类分割、四类可配置三维模板地面中心估计，以及安全区、无编号出发区、中心十字、低精度边界候选和时序局部场界三态掩膜；硬遮挡默认关闭，正式模型、实物精度与树莓派性能待验证 |
-| [`localization`](src/rescue_vision/localization/README.md) | 已实现视觉观测基础 | 中心十字四向位姿候选、同帧红蓝安全区方向锚定和先验门控；跨帧关联、连续融合与远场精度待实现/验证 |
+| [`localization`](src/rescue_vision/localization/README.md) | 已实现融合基础 | 中心十字四向候选、方向锚定、编码器/IMU 误差状态 EKF、延迟视觉纠偏和连续性降级；真车参数、远场精度与性能待验证 |
 | [`tracking`](src/rescue_vision/tracking/README.md) | 已实现纯逻辑 | 时间关联、轨迹确认、短时遮挡、衰减和删除 |
 | [`world`](src/rescue_vision/world/README.md) | 已实现纯逻辑 | 固定物理地图、红蓝任务区域派生、动态目标、危险状态、对手占据和不确定性 |
 | [`mission`](src/rescue_vision/mission/README.md) | 已实现纯逻辑 | 首次/容量/伤员/危险规则、安全降级和抽象动作 |
-| 定位至比赛应用主链路 | 部分实现 | 中心十字视觉位姿观测已实现；连续融合、真实区域/接触证据、规划、正式动作到运动控制的适配和比赛入口待完成 |
+| 定位至比赛应用主链路 | 部分实现 | 连续融合已接入手动采集场地图；世界模型定位消费、真实区域/接触证据、规划、正式动作到运动控制的适配和比赛入口待完成 |
 
 各包常用 API、命令和实际对接示例见 [`src/rescue_vision/README.md`](src/rescue_vision/README.md)。
 
@@ -89,7 +89,9 @@ FrameSource → CameraFrame → CameraModel → 去畸变帧
                                                               ↓
                                                CenterCrossPoseObservation
                                                               ↓
-                                                IMU/编码器融合（未实现）
+                                               OdometryImuFusion
+                                                       ↓
+                                             连续 FieldPose2D / 地图
 
 RemoteMessageConnection → DebugMotionCommand → RemoteMotionExecutor
                                                 ↓
@@ -125,7 +127,7 @@ RemoteMessageConnection → DebugGripperCommand → RemoteGripperExecutor
 | `GroundPoint(x, y)` 机器人地面系 | `RobotPoint3D` 的 `z = 0` 平面，原点仍为两驱动轮接地点中点；`x` 向前，`y` 向左 | mm | K0 接触点、目标地面几何、地面特征和局部跟踪；这是机器人相对坐标，不是场地全局坐标 |
 | `BevPixel(u, v)` 鸟瞰图像素系 | BEV 图左上角为原点；`u` 向右，`v` 向下；图像上方是机器人前方，左侧是机器人左方 | 像素 | 按 `BevConfig` 从机器人地面系生成的局部鸟瞰图 |
 | `FieldPoint(x, y)` 场地全局系 | 原点为场地中心十字点划线交点；`x` 沿水平点划线向右，`y` 沿竖直点划线指向红色安全区 | mm | 定位后的机器人/目标位置、静态区域和对手占据多边形 |
-| `MapPixel(u, v)` 场地图像素系 | 场地图 PNG 左上角为原点；`u` 向右，`v` 向下；不是相机像素或 `BevPixel` | 像素 | `MapSnapshotAttributes` 与 `FieldPoint` 之间的显示映射 |
+| `MapPixel(u, v)` 电脑端场地图像素系 | 电脑端固化底图左上角为原点；`u` 向右，`v` 向下 | 像素 | 电脑端绘制 `MapStateObservation` 的 FieldPoint 动态覆盖 |
 
 标定内部还使用 OpenCV 相机三维系：原点在相机光心，`x` 向图像右方、`y`
 向图像下方、`z` 沿光轴向前，单位 mm。它没有单独的公共点类型，只出现在
@@ -145,7 +147,7 @@ UndistortedPixel ── GroundProjector（z=0）──↔ GroundPoint ──↔ 
     │
     └─ Hailo letterbox（内部临时）↔ 模型输入像素
 
-GroundPoint ── 唯一 FieldPose2D（中心十字观测已实现）──> FieldPoint ──↔ MapPixel
+GroundPoint ── 中心十字绝对观测 + 编码器/IMU 连续融合 ──> FieldPoint ──↔ MapPixel
 ```
 
 - `CameraModel` 是 `RawPixel → UndistortedPixel` 的唯一实现；`GroundProjector`
@@ -159,8 +161,8 @@ GroundPoint ── 唯一 FieldPose2D（中心十字观测已实现）──> Fi
 - `FieldPoint` 的零点和方向固定对应官方《规则讲解》场地图（第 37 页）：中心
   十字点划线交点为原点，`+x` 沿水平点划线向右，`+y` 沿竖直点划线指向红色
   安全区；红蓝方抽签不改变这个物理坐标方向。
-- `FieldPoint` 与 `GroundPoint` 不能直接互换。中心十字没有唯一位姿或连续
-  定位尚不可用时，世界模型保留缺失的 `FieldPoint`，不能把机器人局部地面点
+- `FieldPoint` 与 `GroundPoint` 不能直接互换。中心十字没有唯一位姿且连续
+  融合没有有效绝对锚点时，世界模型保留缺失的 `FieldPoint`，不能把机器人局部地面点
   伪装成场地全局点。
 
 ### 内部和显示侧的局部像素
@@ -176,8 +178,8 @@ GroundPoint ── 唯一 FieldPose2D（中心十字观测已实现）──> Fi
 - 通信中的 raw/perception JPEG 使用 `raw_pixel` 或 `undistorted_pixel` 标记，
   后者必须携带匹配的 `calibration_id`；两种图像都遵循左上原点、`u` 右、`v`
   下。BEV JPEG 使用 `bev_pixel` 并携带机器人地面范围和 `mm_per_pixel`；
-  它不是定位后的场地图。场地图 PNG 使用 `MapPixel`，通过场地范围映射到 `FieldPoint`，它不是
-  相机像素，也不是 `BevPixel`：
+  它不是定位后的场地图。电脑端静态底图使用 `MapPixel` 并在本地映射
+  `FieldPoint`；车端不再发送场地图 PNG：
 
   ```text
   u_map = (x - field_min_x_mm) / (field_max_x_mm - field_min_x_mm) * (width - 1)
