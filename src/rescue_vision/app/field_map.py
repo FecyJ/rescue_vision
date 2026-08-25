@@ -10,15 +10,23 @@ import cv2
 import numpy as np
 
 from rescue_vision.camera.frame import CameraFrame
-from rescue_vision.communication import MapSnapshotAttributes
-from rescue_vision.communication.remote_observations import TeamColor as RemoteTeamColor
-from rescue_vision.geometry.types import FieldPoint
+from rescue_vision.communication.remote_observations import (
+    MapSnapshotAttributes,
+    TeamColor as RemoteTeamColor,
+)
+from rescue_vision.geometry.ground_projector import GroundProjector
+from rescue_vision.geometry.types import FieldPoint, GroundPoint
 from rescue_vision.localization import (
     CenterCrossLocalizer,
     CenterCrossPoseObservation,
     FieldPose2D,
+    OdometryImuFusion,
 )
-from rescue_vision.perception import FieldFeatureDetector
+from rescue_vision.motion import OdometryImu
+from rescue_vision.perception import (
+    FieldFeatureDetectionResult,
+    FieldFeatureDetector,
+)
 from rescue_vision.world.static_map import (
     PhysicalRegionKind,
     StaticFieldMap,
@@ -87,6 +95,145 @@ class MapRobotPose:
 class EncodedMapSnapshot:
     png_bytes: bytes
     attributes: MapSnapshotAttributes
+
+
+def _ground_to_bev_points(
+    projector: GroundProjector,
+    points: tuple[GroundPoint, ...],
+) -> np.ndarray:
+    pixels = projector.ground_to_bev_pixels(points)
+    return np.asarray(
+        [(round(pixel.u), round(pixel.v)) for pixel in pixels],
+        dtype=np.int32,
+    )
+
+
+def _draw_bev_label(
+    image: np.ndarray,
+    text_value: str,
+    point: tuple[int, int],
+    color: tuple[int, int, int],
+) -> None:
+    origin = (point[0] + 5, point[1] - 5)
+    cv2.putText(
+        image,
+        text_value,
+        origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (0, 0, 0),
+        3,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        image,
+        text_value,
+        origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        color,
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def render_field_localization_bev(
+    frame: CameraFrame,
+    projector: GroundProjector,
+    result: FieldFeatureDetectionResult,
+    observation: CenterCrossPoseObservation,
+) -> CameraFrame:
+    """Render same-frame safe zones, center cross and terminal evidence on BEV."""
+
+    if not isinstance(frame, CameraFrame):
+        raise TypeError("frame must be a CameraFrame.")
+    if (
+        not isinstance(projector, GroundProjector)
+        or projector.bev_config is None
+    ):
+        raise ValueError("projector must provide a BEV configuration.")
+    if not isinstance(result, FieldFeatureDetectionResult):
+        raise TypeError("result must be a FieldFeatureDetectionResult.")
+    if not isinstance(observation, CenterCrossPoseObservation):
+        raise TypeError("observation must be a CenterCrossPoseObservation.")
+    if (
+        result.frame_sequence != frame.sequence
+        or observation.frame_sequence != frame.sequence
+    ):
+        raise ValueError("BEV overlay inputs must belong to the same frame sequence.")
+
+    image = projector.make_bev_image(frame.image_bgr)
+    for zone in result.safe_zones:
+        if zone.polygon_ground is None:
+            continue
+        color = (
+            (0, 0, 255)
+            if zone.physical_color.value == "red"
+            else (255, 0, 0)
+        )
+        polygon = _ground_to_bev_points(projector, zone.polygon_ground)
+        tinted = image.copy()
+        cv2.fillPoly(tinted, [polygon], color)
+        cv2.addWeighted(tinted, 0.18, image, 0.82, 0.0, dst=image)
+        cv2.polylines(image, [polygon], True, color, 3, cv2.LINE_AA)
+        center = tuple(np.rint(np.mean(polygon, axis=0)).astype(int))
+        _draw_bev_label(
+            image,
+            f"SAFE {zone.physical_color.value}",
+            (int(center[0]), int(center[1])),
+            color,
+        )
+
+    cross = result.center_cross
+    if cross is not None:
+        for axis in cross.axes:
+            if axis.start_ground is None or axis.end_ground is None:
+                continue
+            pixels = _ground_to_bev_points(
+                projector,
+                (axis.start_ground, axis.end_ground),
+            )
+            cv2.line(
+                image,
+                tuple(pixels[0]),
+                tuple(pixels[1]),
+                (0, 220, 0),
+                3,
+                cv2.LINE_AA,
+            )
+        if cross.intersection_ground is not None:
+            center_pixel = _ground_to_bev_points(
+                projector,
+                (cross.intersection_ground,),
+            )[0]
+            center_tuple = (int(center_pixel[0]), int(center_pixel[1]))
+            cv2.circle(image, center_tuple, 7, (0, 255, 255), 2, cv2.LINE_AA)
+            _draw_bev_label(image, "CROSS", center_tuple, (0, 255, 255))
+            for terminal in observation.terminals:
+                if terminal.distance_mm is None:
+                    continue
+                endpoint = GroundPoint(
+                    cross.intersection_ground.x
+                    + terminal.direction_forward * terminal.distance_mm,
+                    cross.intersection_ground.y
+                    + terminal.direction_left * terminal.distance_mm,
+                )
+                endpoint_pixel = _ground_to_bev_points(projector, (endpoint,))[0]
+                cv2.line(
+                    image,
+                    center_tuple,
+                    (int(endpoint_pixel[0]), int(endpoint_pixel[1])),
+                    (255, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+    return CameraFrame(
+        sequence=frame.sequence,
+        timestamp_ns=frame.timestamp_ns,
+        image_bgr=image,
+        metadata=frame.metadata,
+    )
 
 
 def _map_bounds(static_map: StaticFieldMap) -> tuple[float, float, float, float]:
@@ -285,7 +432,7 @@ class FieldMapSnapshotRenderer:
 
 
 class LatestCenterCrossLocalization:
-    """Run center-cross localization on a bounded latest-frame side path."""
+    """Coordinate bounded visual localization with optional continuous fusion."""
 
     def __init__(
         self,
@@ -294,6 +441,8 @@ class LatestCenterCrossLocalization:
         *,
         valid_mask: np.ndarray,
         max_pose_age_ms: float,
+        fusion: OdometryImuFusion | None = None,
+        ground_projector: GroundProjector | None = None,
     ) -> None:
         self._detector = detector
         self._localizer = localizer
@@ -315,11 +464,23 @@ class LatestCenterCrossLocalization:
         self._max_pose_age_ns = round(age_ms * 1_000_000)
         if self._max_pose_age_ns <= 0:
             raise ValueError("max_pose_age_ms must be positive.")
+        if fusion is not None and not isinstance(fusion, OdometryImuFusion):
+            raise TypeError("fusion must be an OdometryImuFusion or None.")
+        self._fusion = fusion
+        if ground_projector is not None and (
+            not isinstance(ground_projector, GroundProjector)
+            or ground_projector.bev_config is None
+        ):
+            raise ValueError(
+                "ground_projector must provide a BEV configuration or be None."
+            )
+        self._ground_projector = ground_projector
         self._event = threading.Event()
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._pending: CameraFrame | None = None
         self._latest: CenterCrossPoseObservation | None = None
+        self._latest_bev_frame: CameraFrame | None = None
         self._error: BaseException | None = None
         self._thread: threading.Thread | None = None
 
@@ -331,6 +492,7 @@ class LatestCenterCrossLocalization:
         with self._lock:
             self._pending = None
             self._latest = None
+            self._latest_bev_frame = None
             self._error = None
         self._thread = threading.Thread(
             target=self._run,
@@ -347,6 +509,25 @@ class LatestCenterCrossLocalization:
             self._pending = frame
         self._event.set()
 
+    def submit_odometry(self, message: OdometryImu) -> None:
+        """Consume odometry distributed by the application's sole UART reader."""
+
+        self._raise_error()
+        if self._fusion is not None:
+            self._fusion.submit_odometry(message)
+
+    def latest_bev_frame(self) -> CameraFrame | None:
+        """Return the newest same-frame annotated BEV, if configured."""
+
+        self._raise_error()
+        with self._lock:
+            return self._latest_bev_frame
+
+    def clear_latest_bev(self) -> None:
+        self._raise_error()
+        with self._lock:
+            self._latest_bev_frame = None
+
     def latest_robot_pose(self, current_timestamp_ns: int) -> MapRobotPose | None:
         self._raise_error()
         if (
@@ -355,6 +536,21 @@ class LatestCenterCrossLocalization:
             or current_timestamp_ns < 0
         ):
             raise ValueError("current_timestamp_ns must be a non-negative integer.")
+        if self._fusion is not None:
+            estimate = self._fusion.latest_estimate(current_timestamp_ns)
+            if estimate.pose is None or estimate.estimate_timestamp_ns is None:
+                return None
+            assert estimate.position_uncertainty_mm is not None
+            assert estimate.heading_uncertainty_rad is not None
+            assert estimate.anchor_source is not None
+            return MapRobotPose(
+                estimate.pose,
+                estimate.estimate_timestamp_ns,
+                estimate.confidence,
+                estimate.position_uncertainty_mm,
+                estimate.heading_uncertainty_rad,
+                f"fused_{estimate.anchor_source}",
+            )
         with self._lock:
             observation = self._latest
         if (
@@ -420,10 +616,52 @@ class LatestCenterCrossLocalization:
                     # cannot keep displaying stale localization.
                     with self._lock:
                         self._latest = None
+                        if self._ground_projector is not None:
+                            image = self._ground_projector.make_bev_image(
+                                frame.image_bgr
+                            )
+                            cv2.putText(
+                                image,
+                                "FIELD STALE",
+                                (10, 24),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.55,
+                                (0, 0, 255),
+                                2,
+                                cv2.LINE_AA,
+                            )
+                            self._latest_bev_frame = CameraFrame(
+                                frame.sequence,
+                                frame.timestamp_ns,
+                                image,
+                                frame.metadata,
+                            )
                     continue
-                observation = self._localizer.localize(result)
+                prior_pose = None
+                if self._fusion is not None:
+                    prior_pose = self._fusion.pose_at(
+                        result.capture_timestamp_ns
+                    ).pose
+                observation = (
+                    self._localizer.localize(result)
+                    if self._fusion is None
+                    else self._localizer.localize(result, prior_pose=prior_pose)
+                )
+                if self._fusion is not None:
+                    self._fusion.submit_visual(observation)
+                bev_frame = (
+                    None
+                    if self._ground_projector is None
+                    else render_field_localization_bev(
+                        frame,
+                        self._ground_projector,
+                        result,
+                        observation,
+                    )
+                )
                 with self._lock:
                     self._latest = observation
+                    self._latest_bev_frame = bev_frame
         except BaseException as exc:
             self._error = exc
             self._stop.set()

@@ -93,13 +93,13 @@ def build_camera_session_status(
         capture_control_available=capture_control_available,
         video_stream_available=True,
         video_modes=video_modes,
-        map_snapshot_available=False,
+        map_state_available=False,
         vehicle_state_available=False,
         capture_status_available=capture_control_available,
         target_heading_control_available=False,
         session_status_period_ms=SESSION_STATUS_PERIOD_MS,
         vehicle_state_period_ms=None,
-        map_snapshot_period_ms=None,
+        map_state_period_ms=None,
         capture_status_period_ms=(
             CAPTURE_STATUS_PERIOD_MS
             if capture_control_available

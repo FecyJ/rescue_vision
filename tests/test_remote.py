@@ -296,7 +296,7 @@ def test_observe_only_client_cannot_submit_control() -> None:
     try:
         with pytest.raises(RemotePolicyError, match="Outbound control"):
             computer.send_control(RemoteTopic.DEBUG_MOTION.value, b"{}")
-        robot.send_observation(RemoteTopic.MAP_SNAPSHOT.value, b"map")
+        robot.send_observation(RemoteTopic.MAP_STATE.value, b"map")
         assert computer.receive_observation(timeout=1.0).payload == b"map"
     finally:
         computer.stop()

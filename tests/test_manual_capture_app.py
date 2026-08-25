@@ -21,7 +21,6 @@ from rescue_vision.app.manual_capture import (
     build_session_status,
     run_manual_capture_session,
 )
-from rescue_vision.app.field_map import FieldMapSnapshotRenderer
 from rescue_vision.camera.frame import CameraFrame
 from rescue_vision.communication import (
     CaptureAction,
@@ -30,6 +29,7 @@ from rescue_vision.communication import (
     DebugGripperCommand,
     DebugMotionCommand,
     ImageCoordinateSystem,
+    MapStateObservation,
     MotionControlMode,
     ReceivedRemoteMessage,
     ReceivedUartFrame,
@@ -38,6 +38,7 @@ from rescue_vision.communication import (
     RemoteRole,
     RemoteStream,
     RemoteTopic,
+    TeamColor as RemoteTeamColor,
     VehicleSafetyMode,
     VehicleStateObservation,
     VideoFrameMode,
@@ -53,23 +54,20 @@ from rescue_vision.motion import (
     MotionController,
     MotionLimits,
     MessageType,
+    OdometryImu,
     RemoteGripperExecutor,
     RemoteGripperResult,
     RemoteMotionExecutor,
     RemoteMotionResult,
+    SensorFlags,
     SystemFlags,
     encode_soft_brake_command,
     pack_protocol_frame,
 )
 from rescue_vision.geometry.ground_projector import BevConfig, GroundProjector
-from rescue_vision.geometry.types import FieldPoint
 from rescue_vision.world import (
-    PhysicalRegionKind,
-    PhysicalStaticRegion,
     TeamColor,
-    default_static_field_map,
 )
-from rescue_vision.world.static_map import StaticFieldMap
 
 
 class FakeSource:
@@ -253,12 +251,15 @@ class PollingServer:
 
 
 class CountingDrainController:
-    def __init__(self) -> None:
+    def __init__(self, messages: tuple[object, ...] = ()) -> None:
         self.drain_count = 0
+        self.messages = messages
 
     def drain_messages(self) -> tuple[object, ...]:
         self.drain_count += 1
-        return ()
+        messages = self.messages
+        self.messages = ()
+        return messages
 
 
 def _received(topic: RemoteTopic, payload: bytes, sequence: int):
@@ -296,6 +297,7 @@ def _gripper_calibration() -> GripperCalibration:
         closed_left_angle_deg=80.0,
         closed_right_angle_deg=114.0,
         full_travel_time_s=1.0,
+        angle_sum_deg=194.0,
     )
 
 
@@ -314,6 +316,64 @@ def test_accept_wait_drains_uart_between_tcp_polls() -> None:
     assert accepted is connection
     assert controller.drain_count == 3
     assert server.accept_timeouts == [0.1, 0.1, 0.1]
+
+
+def test_accept_wait_distributes_uart_messages_to_localization() -> None:
+    connection = object()
+    server = PollingServer(connection, timeouts_before_connection=1)
+    telemetry = object()
+    controller = CountingDrainController((telemetry,))
+    received: list[object] = []
+
+    accepted = _accept_with_shutdown(
+        server,  # type: ignore[arg-type]
+        controller,  # type: ignore[arg-type]
+        timeout_s=1.0,
+        stop_requested=lambda: False,
+        on_car_message=received.append,  # type: ignore[arg-type]
+    )
+
+    assert accepted is connection
+    assert received == [telemetry]
+
+
+def test_session_uart_callback_fans_out_odometry_once() -> None:
+    telemetry = OdometryImu(
+        uart_sequence=1,
+        received_timestamp_ns=2_000_000,
+        telemetry_sequence=1,
+        sample_timestamp_us=1000,
+        left_encoder_count=10,
+        right_encoder_count=11,
+        gyro_x_urad_s=0,
+        gyro_y_urad_s=0,
+        gyro_z_urad_s=0,
+        accel_x_mm_s2=0,
+        accel_y_mm_s2=0,
+        accel_z_mm_s2=9807,
+        imu_temperature_cdeg=2500,
+        sensor_flags=(
+            SensorFlags.IMU_VALID
+            | SensorFlags.IMU_CALIBRATED
+            | SensorFlags.LEFT_ENCODER_VALID
+            | SensorFlags.RIGHT_ENCODER_VALID
+        ),
+    )
+    runtime = object.__new__(ManualCaptureRuntime)
+    vehicle_messages: list[object] = []
+    recorded_messages: list[object] = []
+    localization_messages: list[object] = []
+    runtime.vehicle = SimpleNamespace(on_car_message=vehicle_messages.append)
+    runtime.capture = SimpleNamespace(record_car_message=recorded_messages.append)
+    runtime.map_localization = SimpleNamespace(
+        submit_odometry=localization_messages.append
+    )
+
+    runtime._on_car_message(telemetry)
+
+    assert vehicle_messages == [telemetry]
+    assert recorded_messages == [telemetry]
+    assert localization_messages == [telemetry]
 
 
 def test_session_status_only_advertises_configured_gripper() -> None:
@@ -364,30 +424,13 @@ def test_camera_only_session_publishes_static_map_with_unlocalized_robot(
         config_snapshot={},
         pipeline=pipeline,
     )
-    landmarks = default_static_field_map()
-    static_map = StaticFieldMap(
-        landmarks.center_cross,
-        (
-            PhysicalStaticRegion(
-                "field",
-                PhysicalRegionKind.FIELD,
-                (
-                    FieldPoint(-100.0, -100.0),
-                    FieldPoint(100.0, -100.0),
-                    FieldPoint(100.0, 100.0),
-                    FieldPoint(-100.0, 100.0),
-                ),
-            ),
-        ),
-    )
-    renderer = FieldMapSnapshotRenderer(static_map, TeamColor.UNKNOWN)
     connection = FakeConnection([])
     status = build_session_status(
         config,
         server_instance_id="test-server",
         video_fps=10.0,
         camera_only=True,
-        map_snapshot_available=True,
+        map_state_available=True,
     )
 
     with pytest.raises(RemoteDisconnectedError):
@@ -400,26 +443,20 @@ def test_camera_only_session_publishes_static_map_with_unlocalized_robot(
             status,
             video_fps=10.0,
             jpeg_quality=80,
-            map_renderer=renderer,
+            map_state_available=True,
+            map_team_color=RemoteTeamColor.UNKNOWN,
         )
 
     map_payload = next(
         payload
         for topic, payload in connection.observations
-        if topic == RemoteTopic.MAP_SNAPSHOT.value
+        if topic == RemoteTopic.MAP_STATE.value
     )
-    map_attributes = next(
-        attributes
-        for topic, attributes in connection.observation_attributes
-        if topic == RemoteTopic.MAP_SNAPSHOT.value
-    )
-    assert (
-        cv2.imdecode(np.frombuffer(map_payload, np.uint8), cv2.IMREAD_COLOR)
-        is not None
-    )
-    assert map_attributes["coordinate_system"] == "field_mm"
-    assert map_attributes["robot_localized"] is False
-    assert map_attributes["robot_x_mm"] is None
+    map_state = MapStateObservation.from_payload(map_payload)
+    assert map_state.team_color is RemoteTeamColor.UNKNOWN
+    assert not map_state.robot_localized
+    assert map_state.robot_x_mm is None
+    assert map_state.targets == ()
 
 
 def test_accept_timeout_is_a_clean_stop(monkeypatch) -> None:
@@ -878,6 +915,47 @@ def test_bev_renderer_keeps_latest_result_off_motion_loop() -> None:
         renderer.stop()
 
 
+def test_remote_bev_prefers_same_frame_localization_overlay() -> None:
+    plain = CameraFrame(7, 11, np.zeros((30, 40, 3), np.uint8))
+    annotated_image = np.zeros((30, 40, 3), np.uint8)
+    annotated_image[:, :] = (0, 0, 255)
+    annotated = CameraFrame(7, 11, annotated_image)
+    projector = GroundProjector(
+        np.eye(3),
+        BevConfig(0.0, 300.0, 0.0, 400.0, 10.0),
+    )
+    runtime = object.__new__(ManualCaptureRuntime)
+    runtime.latest_frame = plain
+    runtime.video_mode = VideoFrameMode.BEV
+    runtime.map_localization = SimpleNamespace(
+        latest_bev_frame=lambda: annotated,
+    )
+    runtime.bev_renderer = SimpleNamespace(latest=lambda: plain)
+    runtime.minimum_rendered_sequence = None
+    runtime.last_sent_video_sequence = None
+    runtime.connection = FakeConnection([])
+    runtime.pipeline = CameraPipeline(
+        FakeSource(plain),
+        None,
+        ImageCoordinateSystem.UNDISTORTED_PIXEL,
+        "test-calibration",
+        projector,
+    )
+    runtime.jpeg_quality = 100
+
+    runtime._send_current_video()
+
+    payload = next(
+        payload
+        for topic, payload in runtime.connection.observations
+        if topic == RemoteTopic.VIDEO_FRAME.value
+    )
+    decoded = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
+    assert decoded is not None
+    assert float(np.mean(decoded[:, :, 2])) > 240.0
+    assert float(np.mean(decoded[:, :, :2])) < 10.0
+
+
 def test_manual_session_publishes_bev_with_robot_ground_mapping(tmp_path) -> None:
     config = _config()
     source_frame = CameraFrame(
@@ -1128,7 +1206,8 @@ def test_manual_cycle_services_motion_between_slow_image_operations(
         jpeg_quality=80,
         perception_renderer=None,
         bev_renderer=None,
-        map_renderer=None,
+        map_state_available=False,
+        map_team_color=None,
         map_localization=None,
         stop_requested=lambda: False,
         safety_mode=VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP,
@@ -1143,6 +1222,82 @@ def test_manual_cycle_services_motion_between_slow_image_operations(
         if payload[0] == MessageType.SET_WHEEL_SPEED
     ]
     assert wheel_commands == [(30, 30), (60, 60)]
+
+
+def test_idle_manual_cycle_only_prepares_frames_at_video_rate(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class Clock:
+        def __init__(self) -> None:
+            self.timestamp_ns = 0
+
+        def __call__(self) -> int:
+            return self.timestamp_ns
+
+        def advance(self, seconds: float) -> None:
+            self.timestamp_ns += round(seconds * 1e9)
+
+    class CountingPipeline:
+        def __init__(self, source) -> None:
+            self.source = source
+            self.coordinate_system = ImageCoordinateSystem.RAW_PIXEL
+            self.calibration_id = None
+            self.ground_projector = None
+            self.prepare_count = 0
+
+        def prepare(self, frame):
+            self.prepare_count += 1
+            return frame
+
+    clock = Clock()
+    monkeypatch.setattr(manual_capture_module.time, "monotonic_ns", clock)
+    frame = CameraFrame(
+        sequence=0,
+        timestamp_ns=0,
+        image_bgr=np.zeros((3, 4, 3), dtype=np.uint8),
+    )
+    config = _config()
+    pipeline = CountingPipeline(FakeSource(frame))
+    capture = CaptureSession(
+        output_root=tmp_path,
+        config=config,
+        config_snapshot={},
+        pipeline=pipeline,
+    )
+    runtime = ManualCaptureRuntime(
+        connection=FakeConnection([]),
+        executor=None,
+        gripper_executor=None,
+        capture=capture,
+        pipeline=pipeline,
+        session_status=build_session_status(
+            config,
+            server_instance_id="video-rate-test",
+            video_fps=2.0,
+            camera_only=True,
+        ),
+        video_fps=2.0,
+        jpeg_quality=80,
+        perception_renderer=None,
+        bev_renderer=None,
+        map_state_available=False,
+        map_team_color=None,
+        map_localization=None,
+        stop_requested=lambda: False,
+        safety_mode=VehicleSafetyMode.UNAVAILABLE,
+    )
+
+    runtime._cycle()
+    for _ in range(10):
+        runtime._cycle()
+    assert pipeline.prepare_count == 1
+    assert pipeline.source.read_count == 1
+
+    clock.advance(0.5)
+    runtime._cycle()
+    assert pipeline.prepare_count == 2
+    assert pipeline.source.read_count == 2
 
 
 def test_vehicle_state_tracks_gripper_command_and_firmware_angles() -> None:

@@ -37,7 +37,8 @@
 | `VideoFrameMode` | 图像内容枚举 | 原图、推理叠加图或机器人局部地面 BEV |
 | `RemoteSessionStatus` | 会话权限、能力、限值和周期 | TCP 建立后的首条业务消息 |
 | `VideoFrameAttributes` | JPEG 帧 header attributes | 严格尺寸、坐标系、时间和标定身份 |
-| `MapSnapshotAttributes` | PNG 场地图元数据 | 固定 `FieldPoint`/`MapPixel` 映射，并原子携带可空的新鲜机器人全局位姿、置信度和不确定度 |
+| `MapStateObservation` | 轻量动态地图 JSON | FieldPoint 机器人位姿、已确认目标、时间、置信度和不确定度 |
+| `MapTargetState` | 动态地图目标项 | 唯一轨迹 ID、类别、FieldPoint 位置和质量 |
 | `VehicleStateObservation` | 车辆观察 JSON | UART、轮速、夹爪角度、显式安全模式和命令 ID |
 | `CaptureStatusObservation` | 采集观察 JSON schema | 当前记录状态及最近请求结果 |
 
@@ -204,13 +205,13 @@ session_status = RemoteSessionStatus(
     capture_control_available=False,
     video_stream_available=True,
     video_modes=(VideoFrameMode.RAW,),
-    map_snapshot_available=False,
+    map_state_available=False,
     vehicle_state_available=False,
     capture_status_available=False,
     target_heading_control_available=False,
     session_status_period_ms=1_000,
     vehicle_state_period_ms=None,
-    map_snapshot_period_ms=None,
+    map_state_period_ms=None,
     capture_status_period_ms=None,
     video_nominal_fps=15.0,
     max_linear_velocity_m_s=None,
@@ -387,7 +388,9 @@ remote_connection.send_control(
 图像上叠加目标框、颜色掩码、K0、置信度和质量信息的结果。车端只保留最新待
 推理帧，推理旁路故障会终止当前会话，不会把未经声明的原图伪装成
 `perception`。`bev` 仅在可用地面映射包含 BEV 配置时声明；它在独立最新帧
-后台旁路生成，坐标为机器人局部 `BevPixel`，不是场地地图或定位结果。
+后台旁路生成，坐标为机器人局部 `BevPixel`，不是场地地图或定位结果。车端
+启用场地定位旁路时，BEV JPEG 可以叠加同帧中心十字、安全区和终端关联；客户端
+不得从叠加颜色反推机器状态，结构化全局位姿只读取 `observation/map/state`。
 
 ## 10. 仓库内参考客户端
 
@@ -543,35 +546,14 @@ Python 包；其唯一跨项目依据是
 | `control/debug/capture` | 电脑 → 树莓派 | `DebugCaptureCommand` JSON |
 | `control/video/mode` | 电脑 → 树莓派 | `VideoModeCommand` JSON；不执行车辆动作 |
 | `observation/video/frame` | 树莓派 → 电脑 | JPEG 与含实际 `mode` 的 `VideoFrameAttributes` |
-| `observation/map/snapshot` | 树莓派 → 电脑 | PNG 与 `MapSnapshotAttributes` |
+| `observation/map/state` | 树莓派 → 电脑 | `MapStateObservation` JSON |
 | `observation/vehicle/state` | 树莓派 → 电脑 | `VehicleStateObservation` JSON |
 | `observation/capture/status` | 树莓派 → 电脑 | `CaptureStatusObservation` JSON |
 
-接收 `observation/map/snapshot` 后，调用方应沿用 header 中的同一组场地边界，
-把解码 PNG 的 `(u, v)` 明确包装为 `MapPixel`；不要把它当作相机像素或 BEV
-像素。以下函数承接已经解析好的 `map_attributes`，返回场地全局坐标：
-
-```python
-from rescue_vision.communication import MapSnapshotAttributes
-from rescue_vision.geometry.types import FieldPoint, MapPixel
-
-
-def map_pixel_to_field(
-    map_attributes: MapSnapshotAttributes,
-    u: float,
-    v: float,
-) -> FieldPoint:
-    return map_attributes.map_pixel_to_field(MapPixel(u=u, v=v))
-```
-
-在这套映射中，PNG 中心十字对应场地 `FieldPoint(0, 0)`；向右增大 `u` 对应
-场地 `+x`，向红色安全区方向增大场地 `+y` 对应减小 PNG `v`。映射的边界和
-反向转换由 `MapSnapshotAttributes` 统一执行。
-
-`robot_localized=true` 时，`robot_x_mm`、`robot_y_mm`、
-`robot_heading_rad`、定位采集时间、置信度、不确定度和来源必须全部存在；为
-false 时必须全部为 `None`。调用方不得把上一帧位置带入 unlocalized 快照。
-PNG 绘制由 `app.FieldMapSnapshotRenderer` 完成，通信包只维护严格线级契约。
+电脑端持有静态场地图和 `FieldPoint → UI 像素` 映射；车端不再绘制或发送
+PNG。`robot.localized=true` 时全部定位字段必须存在，为 false 时全部为 null；
+客户端必须清除旧机器人位置。`targets` 只包含已经确认且具有 FieldPoint 的
+轨迹，当前无全局目标提供者时为空数组，不能用机器人局部坐标填充。
 
 `DebugMotionCommand.linear_velocity_m_s` 正负表示前后，
 `angular_velocity_rad_s` 逆时针为正。`TARGET_HEADING` 必须声明 `field` 或

@@ -124,10 +124,10 @@ class BevPixel:
 @dataclass(frozen=True, slots=True)
 class MapPixel:
     """
-    场地图 PNG 中的显示像素坐标。
+    电脑端固化场地图中的显示像素坐标。
 
     原点在 PNG 左上角，``u`` 向右、``v`` 向下；它不是相机像素，也不是
-    `BevPixel`。`MapSnapshotAttributes` 负责它与 `FieldPoint` 的映射。
+    `BevPixel`。它与 `FieldPoint` 的映射由电脑端静态底图负责。
     """
 
     u: float

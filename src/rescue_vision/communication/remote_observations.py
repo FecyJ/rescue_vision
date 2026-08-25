@@ -164,13 +164,13 @@ class RemoteSessionStatus:
     capture_control_available: bool
     video_stream_available: bool
     video_modes: tuple[VideoFrameMode, ...]
-    map_snapshot_available: bool
+    map_state_available: bool
     vehicle_state_available: bool
     capture_status_available: bool
     target_heading_control_available: bool
     session_status_period_ms: int
     vehicle_state_period_ms: int | None
-    map_snapshot_period_ms: int | None
+    map_state_period_ms: int | None
     capture_status_period_ms: int | None
     video_nominal_fps: float | None
     max_linear_velocity_m_s: float | None
@@ -196,7 +196,7 @@ class RemoteSessionStatus:
             "gripper_control_available",
             "capture_control_available",
             "video_stream_available",
-            "map_snapshot_available",
+            "map_state_available",
             "vehicle_state_available",
             "capture_status_available",
             "target_heading_control_available",
@@ -218,8 +218,8 @@ class RemoteSessionStatus:
             "vehicle_state_period_ms",
         )
         map_period = _optional_positive_int(
-            self.map_snapshot_period_ms,
-            "map_snapshot_period_ms",
+            self.map_state_period_ms,
+            "map_state_period_ms",
         )
         capture_period = _optional_positive_int(
             self.capture_status_period_ms,
@@ -247,7 +247,7 @@ class RemoteSessionStatus:
             )
         for name, converted in (
             ("vehicle_state_period_ms", vehicle_period),
-            ("map_snapshot_period_ms", map_period),
+            ("map_state_period_ms", map_period),
             ("capture_status_period_ms", capture_period),
             ("video_nominal_fps", video_fps),
             ("max_linear_velocity_m_s", linear_limit),
@@ -302,9 +302,9 @@ class RemoteSessionStatus:
             raise ValueError(
                 "vehicle_state_period_ms presence must match availability."
             )
-        if self.map_snapshot_available != (map_period is not None):
+        if self.map_state_available != (map_period is not None):
             raise ValueError(
-                "map_snapshot_period_ms presence must match availability."
+                "map_state_period_ms presence must match availability."
             )
         if self.capture_status_available != (capture_period is not None):
             raise ValueError(
@@ -328,7 +328,7 @@ class RemoteSessionStatus:
                     "capture_control": self.capture_control_available,
                     "video_stream": self.video_stream_available,
                     "video_modes": [mode.value for mode in self.video_modes],
-                    "map_snapshot": self.map_snapshot_available,
+                    "map_state": self.map_state_available,
                     "vehicle_state": self.vehicle_state_available,
                     "capture_status": self.capture_status_available,
                     "target_heading_control": (
@@ -338,7 +338,7 @@ class RemoteSessionStatus:
                 "periods": {
                     "session_status_ms": self.session_status_period_ms,
                     "vehicle_state_ms": self.vehicle_state_period_ms,
-                    "map_snapshot_ms": self.map_snapshot_period_ms,
+                    "map_state_ms": self.map_state_period_ms,
                     "capture_status_ms": self.capture_status_period_ms,
                     "video_nominal_fps": self.video_nominal_fps,
                 },
@@ -385,7 +385,7 @@ class RemoteSessionStatus:
                 "capture_control",
                 "video_stream",
                 "video_modes",
-                "map_snapshot",
+                "map_state",
                 "vehicle_state",
                 "capture_status",
                 "target_heading_control",
@@ -397,7 +397,7 @@ class RemoteSessionStatus:
             {
                 "session_status_ms",
                 "vehicle_state_ms",
-                "map_snapshot_ms",
+                "map_state_ms",
                 "capture_status_ms",
                 "video_nominal_fps",
             },
@@ -431,7 +431,7 @@ class RemoteSessionStatus:
             )
             if isinstance(capabilities["video_modes"], list)
             else capabilities["video_modes"],
-            map_snapshot_available=capabilities["map_snapshot"],
+            map_state_available=capabilities["map_state"],
             vehicle_state_available=capabilities["vehicle_state"],
             capture_status_available=capabilities["capture_status"],
             target_heading_control_available=capabilities[
@@ -439,7 +439,7 @@ class RemoteSessionStatus:
             ],
             session_status_period_ms=periods["session_status_ms"],
             vehicle_state_period_ms=periods["vehicle_state_ms"],
-            map_snapshot_period_ms=periods["map_snapshot_ms"],
+            map_state_period_ms=periods["map_state_ms"],
             capture_status_period_ms=periods["capture_status_ms"],
             video_nominal_fps=periods["video_nominal_fps"],
             max_linear_velocity_m_s=limits["max_linear_velocity_m_s"],
@@ -828,6 +828,257 @@ class MapSnapshotAttributes:
                 "localization_heading_uncertainty_rad"
             ],
             localization_source=attributes["localization_source"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MapTargetState:
+    """一个已确认且已经转换到 FieldPoint 的动态目标。"""
+
+    track_id: int
+    target_class: str
+    x_mm: float
+    y_mm: float
+    observation_timestamp_ns: int
+    confidence: float
+    position_uncertainty_mm: float
+
+    def __post_init__(self) -> None:
+        _non_negative_int(self.track_id, "track_id")
+        object.__setattr__(
+            self,
+            "target_class",
+            _identifier(self.target_class, "target_class"),
+        )
+        for name in ("x_mm", "y_mm"):
+            object.__setattr__(self, name, _finite_float(getattr(self, name), name))
+        _non_negative_int(
+            self.observation_timestamp_ns,
+            "observation_timestamp_ns",
+        )
+        confidence = _finite_float(self.confidence, "confidence")
+        if not 0.0 <= confidence <= 1.0:
+            raise ValueError("confidence must be in [0, 1].")
+        object.__setattr__(self, "confidence", confidence)
+        uncertainty = _positive_float(
+            self.position_uncertainty_mm,
+            "position_uncertainty_mm",
+        )
+        object.__setattr__(self, "position_uncertainty_mm", uncertainty)
+
+    def to_document(self) -> dict[str, object]:
+        return {
+            "track_id": self.track_id,
+            "class": self.target_class,
+            "x_mm": self.x_mm,
+            "y_mm": self.y_mm,
+            "observation_timestamp_ns": self.observation_timestamp_ns,
+            "confidence": self.confidence,
+            "position_uncertainty_mm": self.position_uncertainty_mm,
+        }
+
+    @classmethod
+    def from_document(cls, document: object) -> MapTargetState:
+        if not isinstance(document, dict):
+            raise ValueError("map target must be an object.")
+        _require_exact_keys(
+            document,
+            {
+                "track_id",
+                "class",
+                "x_mm",
+                "y_mm",
+                "observation_timestamp_ns",
+                "confidence",
+                "position_uncertainty_mm",
+            },
+            "MapTargetState",
+        )
+        return cls(
+            track_id=document["track_id"],
+            target_class=document["class"],
+            x_mm=document["x_mm"],
+            y_mm=document["y_mm"],
+            observation_timestamp_ns=document["observation_timestamp_ns"],
+            confidence=document["confidence"],
+            position_uncertainty_mm=document["position_uncertainty_mm"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MapStateObservation:
+    """电脑端静态底图上需要叠加的轻量动态状态。"""
+
+    state_sequence: int
+    timestamp_ns: int
+    team_color: TeamColor
+    robot_localized: bool
+    robot_x_mm: float | None
+    robot_y_mm: float | None
+    robot_heading_rad: float | None
+    localization_timestamp_ns: int | None
+    localization_confidence: float | None
+    localization_position_uncertainty_mm: float | None
+    localization_heading_uncertainty_rad: float | None
+    localization_source: str | None
+    targets: tuple[MapTargetState, ...] = ()
+
+    def __post_init__(self) -> None:
+        _non_negative_int(self.state_sequence, "state_sequence")
+        _non_negative_int(self.timestamp_ns, "timestamp_ns")
+        if not isinstance(self.team_color, TeamColor):
+            raise ValueError("team_color must be TeamColor.")
+        _boolean(self.robot_localized, "robot_localized")
+        robot_values = (
+            self.robot_x_mm,
+            self.robot_y_mm,
+            self.robot_heading_rad,
+            self.localization_timestamp_ns,
+            self.localization_confidence,
+            self.localization_position_uncertainty_mm,
+            self.localization_heading_uncertainty_rad,
+            self.localization_source,
+        )
+        if self.robot_localized != all(value is not None for value in robot_values):
+            raise ValueError(
+                "robot localization fields must all be present exactly when "
+                "robot_localized=true."
+            )
+        if self.robot_localized:
+            for name in ("robot_x_mm", "robot_y_mm", "robot_heading_rad"):
+                object.__setattr__(
+                    self,
+                    name,
+                    _finite_float(getattr(self, name), name),
+                )
+            assert self.robot_heading_rad is not None
+            if not -math.pi <= self.robot_heading_rad <= math.pi:
+                raise ValueError("robot_heading_rad must be in [-pi, pi].")
+            assert self.localization_timestamp_ns is not None
+            _non_negative_int(
+                self.localization_timestamp_ns,
+                "localization_timestamp_ns",
+            )
+            if self.localization_timestamp_ns > self.timestamp_ns:
+                raise ValueError(
+                    "localization_timestamp_ns must not exceed timestamp_ns."
+                )
+            assert self.localization_confidence is not None
+            confidence = _finite_float(
+                self.localization_confidence,
+                "localization_confidence",
+            )
+            if not 0.0 <= confidence <= 1.0:
+                raise ValueError("localization_confidence must be in [0, 1].")
+            object.__setattr__(self, "localization_confidence", confidence)
+            for name in (
+                "localization_position_uncertainty_mm",
+                "localization_heading_uncertainty_rad",
+            ):
+                object.__setattr__(
+                    self,
+                    name,
+                    _positive_float(getattr(self, name), name),
+                )
+            assert self.localization_source is not None
+            object.__setattr__(
+                self,
+                "localization_source",
+                _identifier(self.localization_source, "localization_source"),
+            )
+        if (
+            not isinstance(self.targets, tuple)
+            or any(not isinstance(target, MapTargetState) for target in self.targets)
+        ):
+            raise ValueError("targets must be a tuple of MapTargetState values.")
+        track_ids = tuple(target.track_id for target in self.targets)
+        if len(track_ids) != len(set(track_ids)):
+            raise ValueError("targets must have unique track_id values.")
+        if any(target.observation_timestamp_ns > self.timestamp_ns for target in self.targets):
+            raise ValueError("target timestamps must not exceed map timestamp_ns.")
+
+    def to_payload(self) -> bytes:
+        return _encode_json(
+            {
+                "state_sequence": self.state_sequence,
+                "timestamp_ns": self.timestamp_ns,
+                "coordinate_system": "field_mm",
+                "team_color": self.team_color.value,
+                "robot": {
+                    "localized": self.robot_localized,
+                    "x_mm": self.robot_x_mm,
+                    "y_mm": self.robot_y_mm,
+                    "heading_rad": self.robot_heading_rad,
+                    "localization_timestamp_ns": self.localization_timestamp_ns,
+                    "confidence": self.localization_confidence,
+                    "position_uncertainty_mm": (
+                        self.localization_position_uncertainty_mm
+                    ),
+                    "heading_uncertainty_rad": (
+                        self.localization_heading_uncertainty_rad
+                    ),
+                    "source": self.localization_source,
+                },
+                "targets": [target.to_document() for target in self.targets],
+            }
+        )
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> MapStateObservation:
+        document = _decode_json_object(payload, "MapStateObservation")
+        _require_exact_keys(
+            document,
+            {
+                "state_sequence",
+                "timestamp_ns",
+                "coordinate_system",
+                "team_color",
+                "robot",
+                "targets",
+            },
+            "MapStateObservation",
+        )
+        if document["coordinate_system"] != "field_mm":
+            raise ValueError("coordinate_system must be 'field_mm'.")
+        robot = document["robot"]
+        if not isinstance(robot, dict):
+            raise ValueError("robot must be an object.")
+        _require_exact_keys(
+            robot,
+            {
+                "localized",
+                "x_mm",
+                "y_mm",
+                "heading_rad",
+                "localization_timestamp_ns",
+                "confidence",
+                "position_uncertainty_mm",
+                "heading_uncertainty_rad",
+                "source",
+            },
+            "MapStateObservation.robot",
+        )
+        targets = document["targets"]
+        if not isinstance(targets, list):
+            raise ValueError("targets must be an array.")
+        return cls(
+            state_sequence=document["state_sequence"],
+            timestamp_ns=document["timestamp_ns"],
+            team_color=_enum_value(TeamColor, document["team_color"], "team_color"),
+            robot_localized=robot["localized"],
+            robot_x_mm=robot["x_mm"],
+            robot_y_mm=robot["y_mm"],
+            robot_heading_rad=robot["heading_rad"],
+            localization_timestamp_ns=robot["localization_timestamp_ns"],
+            localization_confidence=robot["confidence"],
+            localization_position_uncertainty_mm=robot[
+                "position_uncertainty_mm"
+            ],
+            localization_heading_uncertainty_rad=robot[
+                "heading_uncertainty_rad"
+            ],
+            localization_source=robot["source"],
+            targets=tuple(MapTargetState.from_document(item) for item in targets),
         )
 
 

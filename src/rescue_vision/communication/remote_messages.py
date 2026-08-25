@@ -19,7 +19,7 @@ class RemoteTopic(str, Enum):
     VIDEO_MODE = "control/video/mode"
     SESSION_STATUS = "observation/session/status"
     VIDEO_FRAME = "observation/video/frame"
-    MAP_SNAPSHOT = "observation/map/snapshot"
+    MAP_STATE = "observation/map/state"
     VEHICLE_STATE = "observation/vehicle/state"
     CAPTURE_STATUS = "observation/capture/status"
 

@@ -10,7 +10,8 @@ from rescue_vision.communication import (
     CaptureRequestResult,
     CaptureStatusObservation,
     ImageCoordinateSystem,
-    MapSnapshotAttributes,
+    MapStateObservation,
+    MapTargetState,
     RemoteAccessMode,
     RemoteSessionStatus,
     RemoteTopic,
@@ -22,7 +23,6 @@ from rescue_vision.communication import (
     VideoFrameAttributes,
     VideoFrameMode,
 )
-from rescue_vision.geometry.types import FieldPoint, MapPixel
 
 
 def session_status(**overrides: object) -> RemoteSessionStatus:
@@ -36,13 +36,13 @@ def session_status(**overrides: object) -> RemoteSessionStatus:
         "capture_control_available": True,
         "video_stream_available": True,
         "video_modes": (VideoFrameMode.RAW, VideoFrameMode.PERCEPTION),
-        "map_snapshot_available": False,
+        "map_state_available": False,
         "vehicle_state_available": True,
         "capture_status_available": True,
         "target_heading_control_available": False,
         "session_status_period_ms": 1000,
         "vehicle_state_period_ms": 100,
-        "map_snapshot_period_ms": None,
+        "map_state_period_ms": None,
         "capture_status_period_ms": 500,
         "video_nominal_fps": 15.0,
         "max_linear_velocity_m_s": 0.25,
@@ -171,98 +171,70 @@ def test_video_attributes_round_trip_and_coordinate_binding() -> None:
         VideoFrameAttributes.from_attributes(unexpected)
 
 
-def test_map_attributes_round_trip_and_bounds() -> None:
-    attributes = MapSnapshotAttributes(
-        snapshot_sequence=2,
-        timestamp_ns=400,
-        width=800,
-        height=600,
-        field_min_x_mm=-2000.0,
-        field_max_x_mm=2000.0,
-        field_min_y_mm=-1500.0,
-        field_max_y_mm=1500.0,
-        team_color=TeamColor.RED,
-    )
-
-    assert (
-        MapSnapshotAttributes.from_attributes(attributes.to_attributes())
-        == attributes
-    )
-    invalid = dict(attributes.to_attributes())
-    invalid["coordinate_system"] = "ground_mm"
-    with pytest.raises(ValueError, match="field_mm"):
-        MapSnapshotAttributes.from_attributes(invalid)
-    with pytest.raises(ValueError, match="at least 2"):
-        MapSnapshotAttributes(
-            snapshot_sequence=0,
-            timestamp_ns=0,
-            width=1,
-            height=1,
-            field_min_x_mm=-1.0,
-            field_max_x_mm=1.0,
-            field_min_y_mm=-1.0,
-            field_max_y_mm=1.0,
-            team_color=TeamColor.UNKNOWN,
-        )
-
-
-def test_map_attributes_carry_strict_localized_robot_pose() -> None:
-    attributes = MapSnapshotAttributes(
-        snapshot_sequence=3,
+def test_map_state_round_trip_with_robot_and_confirmed_target() -> None:
+    state = MapStateObservation(
+        state_sequence=3,
         timestamp_ns=1_000,
-        width=400,
-        height=400,
-        field_min_x_mm=-1500.0,
-        field_max_x_mm=1500.0,
-        field_min_y_mm=-1500.0,
-        field_max_y_mm=1500.0,
         team_color=TeamColor.BLUE,
         robot_localized=True,
         robot_x_mm=100.0,
         robot_y_mm=-200.0,
         robot_heading_rad=0.5,
-        localization_capture_timestamp_ns=900,
+        localization_timestamp_ns=900,
         localization_confidence=0.75,
         localization_position_uncertainty_mm=30.0,
         localization_heading_uncertainty_rad=0.1,
         localization_source="blue_safe_zone",
+        targets=(
+            MapTargetState(
+                track_id=7,
+                target_class="green_supply",
+                x_mm=-200.0,
+                y_mm=300.0,
+                observation_timestamp_ns=850,
+                confidence=0.8,
+                position_uncertainty_mm=40.0,
+            ),
+        ),
     )
 
-    assert (
-        MapSnapshotAttributes.from_attributes(attributes.to_attributes())
-        == attributes
-    )
-    invalid = attributes.to_attributes()
-    invalid["robot_x_mm"] = None
-    with pytest.raises(ValueError, match="all robot localization"):
-        MapSnapshotAttributes.from_attributes(invalid)
+    assert MapStateObservation.from_payload(state.to_payload()) == state
+    assert RemoteTopic.MAP_STATE.value == "observation/map/state"
 
 
-def test_field_map_mapping_uses_center_cross_and_red_positive_y() -> None:
-    attributes = MapSnapshotAttributes(
-        snapshot_sequence=0,
-        timestamp_ns=0,
-        width=801,
-        height=601,
-        field_min_x_mm=-2000.0,
-        field_max_x_mm=2000.0,
-        field_min_y_mm=-1500.0,
-        field_max_y_mm=1500.0,
-        team_color=TeamColor.RED,
-    )
-
-    center = attributes.field_to_map_pixel(FieldPoint(0.0, 0.0))
-    right = attributes.field_to_map_pixel(FieldPoint(100.0, 0.0))
-    red_side = attributes.field_to_map_pixel(FieldPoint(0.0, 100.0))
-
-    assert center == MapPixel(400.0, 300.0)
-    assert right.u > center.u
-    assert right.v == center.v
-    assert red_side.u == center.u
-    assert red_side.v < center.v
-    assert attributes.map_pixel_to_field(center) == FieldPoint(0.0, 0.0)
-    assert attributes.map_pixel_to_field(right) == FieldPoint(100.0, 0.0)
-    assert attributes.map_pixel_to_field(red_side) == FieldPoint(0.0, 100.0)
+def test_map_state_rejects_partial_robot_and_duplicate_targets() -> None:
+    with pytest.raises(ValueError, match="all be present"):
+        MapStateObservation(
+            state_sequence=0,
+            timestamp_ns=100,
+            team_color=TeamColor.UNKNOWN,
+            robot_localized=True,
+            robot_x_mm=0.0,
+            robot_y_mm=None,
+            robot_heading_rad=0.0,
+            localization_timestamp_ns=90,
+            localization_confidence=0.5,
+            localization_position_uncertainty_mm=10.0,
+            localization_heading_uncertainty_rad=0.1,
+            localization_source="prior",
+        )
+    target = MapTargetState(1, "green_supply", 0.0, 0.0, 90, 0.5, 10.0)
+    with pytest.raises(ValueError, match="unique track_id"):
+        MapStateObservation(
+            state_sequence=0,
+            timestamp_ns=100,
+            team_color=TeamColor.UNKNOWN,
+            robot_localized=False,
+            robot_x_mm=None,
+            robot_y_mm=None,
+            robot_heading_rad=None,
+            localization_timestamp_ns=None,
+            localization_confidence=None,
+            localization_position_uncertainty_mm=None,
+            localization_heading_uncertainty_rad=None,
+            localization_source=None,
+            targets=(target, target),
+        )
 
 
 def test_vehicle_state_round_trip_and_safety_invariants() -> None:

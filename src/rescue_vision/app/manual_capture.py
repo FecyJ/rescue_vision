@@ -33,6 +33,7 @@ from rescue_vision.communication import (
     DebugGripperCommand,
     DebugMotionCommand,
     ImageCoordinateSystem,
+    MapStateObservation,
     ReceivedRemoteMessage,
     RemoteAccessMode,
     RemoteDisconnectedError,
@@ -42,6 +43,7 @@ from rescue_vision.communication import (
     RemoteStream,
     RemoteTcpServer,
     RemoteTopic,
+    TeamColor as RemoteTeamColor,
     UartError,
     VehicleMotionState,
     VehicleSafetyMode,
@@ -65,6 +67,7 @@ from rescue_vision.motion import (
     ExecutedRemoteGripper,
     ExecutedRemoteMotion,
     MotionController,
+    OdometryImu,
     MANUAL_MOTION_LOG_FILENAME,
     MANUAL_MOTION_STREAM_NAME,
     ManualMotionLogWriter,
@@ -76,15 +79,12 @@ from rescue_vision.motion import (
     run_remote_motion,
 )
 from rescue_vision.perception import PerceptionFrameRenderer
-from rescue_vision.app.field_map import (
-    FieldMapSnapshotRenderer,
-    LatestCenterCrossLocalization,
-)
+from rescue_vision.app.field_map import LatestCenterCrossLocalization
 SESSION_STATUS_PERIOD_MS = 1_000
 VEHICLE_STATUS_PERIOD_MS = 100
 CAMERA_ONLY_VEHICLE_STATUS_PERIOD_MS = 500
 CAPTURE_STATUS_PERIOD_MS = 500
-MAP_SNAPSHOT_PERIOD_MS = 500
+MAP_STATE_PERIOD_MS = 200
 CAMERA_ONLY_CONTROL_BATCH_LIMIT = 32
 
 
@@ -583,6 +583,12 @@ class CaptureSession:
                 timestamp_ns=timestamp_ns,
             )
 
+    @property
+    def recording_active(self) -> bool:
+        """是否正在记录完整相机与运动辅助流。"""
+
+        return self.recorder is not None
+
     def _close_recording_resources(self, recorder: FrameRecorder) -> None:
         motion_log = self.motion_log
         self.motion_log = None
@@ -744,7 +750,8 @@ class ManualCaptureRuntime:
         jpeg_quality: int,
         perception_renderer: PerceptionFrameRenderer | None,
         bev_renderer: BevFrameRenderer | None,
-        map_renderer: FieldMapSnapshotRenderer | None,
+        map_state_available: bool,
+        map_team_color: RemoteTeamColor | None,
         map_localization: LatestCenterCrossLocalization | None,
         stop_requested: Callable[[], bool],
         safety_mode: VehicleSafetyMode,
@@ -759,7 +766,8 @@ class ManualCaptureRuntime:
         self.jpeg_quality = jpeg_quality
         self.perception_renderer = perception_renderer
         self.bev_renderer = bev_renderer
-        self.map_renderer = map_renderer
+        self.map_state_available = map_state_available
+        self.map_team_color = map_team_color
         self.map_localization = map_localization
         self.stop_requested = stop_requested
         if (executor is None) != (not session_status.motion_control_available):
@@ -768,9 +776,13 @@ class ManualCaptureRuntime:
             )
         if gripper_executor is not None and executor is None:
             raise ValueError("gripper_executor requires a motion executor.")
-        if (map_renderer is None) != (not session_status.map_snapshot_available):
+        if map_state_available != session_status.map_state_available:
             raise ValueError(
-                "map_renderer presence must match map_snapshot_available."
+                "map_state_available must match session map availability."
+            )
+        if map_state_available != (map_team_color is not None):
+            raise ValueError(
+                "map_team_color presence must match map_state_available."
             )
         self.vehicle = VehicleState(safety_mode=safety_mode)
         self.video_mode = VideoFrameMode.RAW
@@ -783,7 +795,8 @@ class ManualCaptureRuntime:
         self.next_session_status_ns = now_ns + SESSION_STATUS_PERIOD_MS * 1_000_000
         self.next_vehicle_status_ns = now_ns + VEHICLE_STATUS_PERIOD_MS * 1_000_000
         self.next_capture_status_ns = now_ns + CAPTURE_STATUS_PERIOD_MS * 1_000_000
-        self.next_map_snapshot_ns = now_ns
+        self.next_map_state_ns = now_ns
+        self.map_state_sequence = 0
 
     def run(self) -> None:
         self._send_initial_status()
@@ -824,6 +837,8 @@ class ManualCaptureRuntime:
     def _on_car_message(self, message: ParsedCarMessage) -> None:
         self.vehicle.on_car_message(message)
         self.capture.record_car_message(message)
+        if self.map_localization is not None and isinstance(message, OdometryImu):
+            self.map_localization.submit_odometry(message)
 
     def _on_motion(self, outcome: ExecutedRemoteMotion) -> None:
         self.vehicle.on_motion(outcome)
@@ -848,20 +863,39 @@ class ManualCaptureRuntime:
                     command_id=timed_out_command_id,
                     timestamp_ns=time.monotonic_ns(),
                 )
-        try:
-            frame = self.pipeline.source.read(timeout=0.01)
-        except TimeoutError:
-            frame = None
-            if time.monotonic_ns() - self.last_camera_frame_ns >= 1_000_000_000:
+        now_before_prepare_ns = time.monotonic_ns()
+        read_due = (
+            self.latest_frame is None
+            or self.capture.recording_active
+            or now_before_prepare_ns >= self.next_video_ns
+            or (
+                self.map_localization is not None
+                and now_before_prepare_ns >= self.next_map_state_ns
+            )
+        )
+        frame = None
+        if read_due:
+            try:
+                frame = self.pipeline.source.read(timeout=0.01)
+            except TimeoutError:
+                if (
+                    now_before_prepare_ns - self.last_camera_frame_ns
+                    >= 1_000_000_000
+                ):
+                    self.capture.fail(CaptureStopReason.CAMERA_ERROR)
+                    raise RuntimeError(
+                        "Camera produced no frame for 1.0 seconds; "
+                        "manual driving was stopped."
+                    )
+            except BaseException:
                 self.capture.fail(CaptureStopReason.CAMERA_ERROR)
-                raise RuntimeError(
-                    "Camera produced no frame for 1.0 seconds; "
-                    "manual driving was stopped."
-                )
-        except BaseException:
-            self.capture.fail(CaptureStopReason.CAMERA_ERROR)
-            raise
-        if frame is not None:
+                raise
+        prepare_due = (
+            self.latest_frame is None
+            or self.capture.recording_active
+            or now_before_prepare_ns >= self.next_video_ns
+        )
+        if frame is not None and prepare_due:
             try:
                 self.latest_frame = self.pipeline.prepare(frame)
             except BaseException:
@@ -917,11 +951,11 @@ class ManualCaptureRuntime:
             self.next_capture_status_ns = (
                 now_ns + CAPTURE_STATUS_PERIOD_MS * 1_000_000
             )
-        if now_ns >= self.next_map_snapshot_ns:
+        if now_ns >= self.next_map_state_ns:
             self._service_motion_safety()
-            self._send_map_snapshot(now_ns)
+            self._send_map_state(now_ns)
             self._service_motion_safety()
-            self.next_map_snapshot_ns = now_ns + MAP_SNAPSHOT_PERIOD_MS * 1_000_000
+            self.next_map_state_ns = now_ns + MAP_STATE_PERIOD_MS * 1_000_000
 
     def _service_motion_safety(self) -> None:
         """在同步旁路工作之间刷新轮速或执行到期停车。"""
@@ -947,8 +981,8 @@ class ManualCaptureRuntime:
             )
         self._send_capture_status()
         now_ns = time.monotonic_ns()
-        self._send_map_snapshot(now_ns)
-        self.next_map_snapshot_ns = now_ns + MAP_SNAPSHOT_PERIOD_MS * 1_000_000
+        self._send_map_state(now_ns)
+        self.next_map_state_ns = now_ns + MAP_STATE_PERIOD_MS * 1_000_000
 
     def _handle_other_control(self, message: ReceivedRemoteMessage) -> None:
         if (
@@ -974,6 +1008,7 @@ class ManualCaptureRuntime:
                 raise ValueError("BEV video mode is not configured.")
             self.video_mode = command.mode
             self.last_sent_video_sequence = None
+            self.next_video_ns = 0
             if command.mode in (VideoFrameMode.PERCEPTION, VideoFrameMode.BEV):
                 renderer = (
                     self.perception_renderer
@@ -982,6 +1017,11 @@ class ManualCaptureRuntime:
                 )
                 assert renderer is not None
                 renderer.clear_latest()
+                if (
+                    command.mode is VideoFrameMode.BEV
+                    and self.map_localization is not None
+                ):
+                    self.map_localization.clear_latest_bev()
                 self.minimum_rendered_sequence = (
                     None if self.latest_frame is None else self.latest_frame.sequence
                 )
@@ -1047,7 +1087,16 @@ class ManualCaptureRuntime:
         elif self.video_mode is VideoFrameMode.BEV:
             if self.bev_renderer is None:
                 raise RuntimeError("BEV video mode is not configured.")
-            frame = self.bev_renderer.latest()
+            annotated_frame = (
+                None
+                if self.map_localization is None
+                else self.map_localization.latest_bev_frame()
+            )
+            frame = (
+                annotated_frame
+                if annotated_frame is not None
+                else self.bev_renderer.latest()
+            )
             if frame is None:
                 return
             if self.minimum_rendered_sequence is None:
@@ -1072,23 +1121,41 @@ class ManualCaptureRuntime:
             content_type="application/json",
         )
 
-    def _send_map_snapshot(self, timestamp_ns: int) -> None:
-        if self.map_renderer is None:
+    def _send_map_state(self, timestamp_ns: int) -> None:
+        if not self.map_state_available:
             return
+        assert self.map_team_color is not None
         robot = (
             None
             if self.map_localization is None
             else self.map_localization.latest_robot_pose(timestamp_ns)
         )
-        snapshot = self.map_renderer.render(
+        state = MapStateObservation(
+            state_sequence=self.map_state_sequence,
             timestamp_ns=timestamp_ns,
-            robot=robot,
+            team_color=self.map_team_color,
+            robot_localized=robot is not None,
+            robot_x_mm=None if robot is None else robot.pose.position.x,
+            robot_y_mm=None if robot is None else robot.pose.position.y,
+            robot_heading_rad=None if robot is None else robot.pose.heading_rad,
+            localization_timestamp_ns=(
+                None if robot is None else robot.capture_timestamp_ns
+            ),
+            localization_confidence=None if robot is None else robot.confidence,
+            localization_position_uncertainty_mm=(
+                None if robot is None else robot.position_uncertainty_mm
+            ),
+            localization_heading_uncertainty_rad=(
+                None if robot is None else robot.heading_uncertainty_rad
+            ),
+            localization_source=None if robot is None else robot.source,
+            targets=(),
         )
+        self.map_state_sequence += 1
         self.connection.send_observation(
-            RemoteTopic.MAP_SNAPSHOT.value,
-            snapshot.png_bytes,
-            content_type="image/png",
-            attributes=snapshot.attributes.to_attributes(),
+            RemoteTopic.MAP_STATE.value,
+            state.to_payload(),
+            content_type="application/json",
             sender_timestamp_ns=timestamp_ns,
         )
 
@@ -1131,7 +1198,7 @@ def build_session_status(
     video_fps: float,
     video_modes: tuple[VideoFrameMode, ...] = (VideoFrameMode.RAW,),
     camera_only: bool = False,
-    map_snapshot_available: bool = False,
+    map_state_available: bool = False,
 ) -> RemoteSessionStatus:
     if not isinstance(camera_only, bool):
         raise TypeError("camera_only must be a boolean.")
@@ -1148,7 +1215,7 @@ def build_session_status(
         capture_control_available=True,
         video_stream_available=True,
         video_modes=video_modes,
-        map_snapshot_available=map_snapshot_available,
+        map_state_available=map_state_available,
         vehicle_state_available=True,
         capture_status_available=True,
         target_heading_control_available=False,
@@ -1158,8 +1225,8 @@ def build_session_status(
             if camera_only
             else VEHICLE_STATUS_PERIOD_MS
         ),
-        map_snapshot_period_ms=(
-            MAP_SNAPSHOT_PERIOD_MS if map_snapshot_available else None
+        map_state_period_ms=(
+            MAP_STATE_PERIOD_MS if map_state_available else None
         ),
         capture_status_period_ms=CAPTURE_STATUS_PERIOD_MS,
         video_nominal_fps=video_fps,
@@ -1187,7 +1254,8 @@ def run_manual_capture_session(
     jpeg_quality: int,
     perception_renderer: PerceptionFrameRenderer | None = None,
     bev_renderer: BevFrameRenderer | None = None,
-    map_renderer: FieldMapSnapshotRenderer | None = None,
+    map_state_available: bool = False,
+    map_team_color: RemoteTeamColor | None = None,
     map_localization: LatestCenterCrossLocalization | None = None,
     stop_requested: Callable[[], bool] = lambda: False,
     safety_mode: VehicleSafetyMode = VehicleSafetyMode.UNAVAILABLE,
@@ -1203,7 +1271,8 @@ def run_manual_capture_session(
         jpeg_quality=jpeg_quality,
         perception_renderer=perception_renderer,
         bev_renderer=bev_renderer,
-        map_renderer=map_renderer,
+        map_state_available=map_state_available,
+        map_team_color=map_team_color,
         map_localization=map_localization,
         stop_requested=stop_requested,
         safety_mode=safety_mode,
@@ -1308,6 +1377,7 @@ def _accept_with_shutdown(
     *,
     timeout_s: float,
     stop_requested: Callable[[], bool],
+    on_car_message: Callable[[ParsedCarMessage], None] | None = None,
 ) -> RemoteMessageConnection | None:
     deadline = time.monotonic() + timeout_s
     while not stop_requested():
@@ -1315,7 +1385,9 @@ def _accept_with_shutdown(
         # while no remote client is connected. Keep the UART's bounded queue healthy
         # instead of leaving it unconsumed for the whole accept timeout.
         if controller is not None:
-            controller.drain_messages()
+            for message in controller.drain_messages():
+                if on_car_message is not None:
+                    on_car_message(message)
         remaining_s = deadline - time.monotonic()
         if remaining_s <= 0:
             return None
@@ -1376,7 +1448,7 @@ def main() -> None:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--accept-timeout-seconds", type=float, default=30.0)
-    parser.add_argument("--video-fps", type=float, default=10.0)
+    parser.add_argument("--video-fps", type=float, default=2.0)
     parser.add_argument("--jpeg-quality", type=int, default=80)
     parser.add_argument(
         "--camera-only",
@@ -1384,6 +1456,15 @@ def main() -> None:
         help=(
             "Run video, BEV and capture without opening UART or advertising "
             "motion/gripper control capabilities."
+        ),
+    )
+    parser.add_argument(
+        "--enable-localization",
+        action="store_true",
+        help=(
+            "Enable the CPU-heavy field-feature/localization side path. "
+            "Manual driving keeps it disabled unless requested; an enabled "
+            "localization.fusion config also enables it."
         ),
     )
     parser.add_argument(
@@ -1405,6 +1486,10 @@ def main() -> None:
     config_path = args.config.expanduser().resolve()
     output_root = args.output_root.expanduser().resolve()
     config = load_runtime_config(config_path)
+    localization_fusion = getattr(config.localization, "fusion", None)
+    enable_localization = args.enable_localization or bool(
+        getattr(localization_fusion, "enabled", False)
+    )
     _validate_mode(
         config,
         video_fps=args.video_fps,
@@ -1444,9 +1529,10 @@ def main() -> None:
         and pipeline.ground_projector.bev_config is not None
         else None
     )
-    map_renderer = (
-        FieldMapSnapshotRenderer(config.world.static_map, config.world.team_color)
-        if config.world.static_map.regions
+    map_state_available = bool(config.world.static_map.regions)
+    map_team_color = (
+        RemoteTeamColor(config.world.team_color.value)
+        if map_state_available
         else None
     )
     field_detector = (
@@ -1455,11 +1541,20 @@ def main() -> None:
             max_observation_age_ms=config.processing.max_observation_age_ms,
             ground_projector=pipeline.ground_projector,
         )
-        if pipeline.ground_projector is not None
+        if enable_localization and pipeline.ground_projector is not None
         else None
     )
-    center_cross_localizer = config.build_center_cross_localizer(
-        ground_projector=pipeline.ground_projector,
+    center_cross_localizer = (
+        config.build_center_cross_localizer(
+            ground_projector=pipeline.ground_projector,
+        )
+        if enable_localization
+        else None
+    )
+    odometry_imu_fusion = (
+        config.build_odometry_imu_fusion()
+        if enable_localization and not args.camera_only
+        else None
     )
     map_localization = (
         LatestCenterCrossLocalization(
@@ -1467,6 +1562,8 @@ def main() -> None:
             center_cross_localizer,
             valid_mask=pipeline.camera_model.valid_mask,
             max_pose_age_ms=config.processing.max_observation_age_ms,
+            fusion=odometry_imu_fusion,
+            ground_projector=pipeline.ground_projector,
         )
         if field_detector is not None
         and center_cross_localizer is not None
@@ -1503,6 +1600,15 @@ def main() -> None:
                         controller,
                         timeout_s=args.accept_timeout_seconds,
                         stop_requested=shutdown_requested.is_set,
+                        on_car_message=(
+                            None
+                            if map_localization is None
+                            else lambda message: (
+                                map_localization.submit_odometry(message)
+                                if isinstance(message, OdometryImu)
+                                else None
+                            )
+                        ),
                     )
                     if connection is None:
                         break
@@ -1519,7 +1625,7 @@ def main() -> None:
                         video_fps=args.video_fps,
                         video_modes=video_modes,
                         camera_only=args.camera_only,
-                        map_snapshot_available=map_renderer is not None,
+                        map_state_available=map_state_available,
                     )
                     try:
                         with connection:
@@ -1534,7 +1640,8 @@ def main() -> None:
                                 jpeg_quality=args.jpeg_quality,
                                 perception_renderer=perception_renderer,
                                 bev_renderer=bev_renderer,
-                                map_renderer=map_renderer,
+                                map_state_available=map_state_available,
+                                map_team_color=map_team_color,
                                 map_localization=map_localization,
                                 stop_requested=shutdown_requested.is_set,
                                 safety_mode=(

@@ -22,6 +22,9 @@
   编码器/IMU、系统状态、实际频率、序号丢帧和协议错误；可选只发送一次
   `QUERY_STATUS`，不发送运动或夹爪命令。
 
+手动驾驶默认关闭 CPU 较重的场地定位旁路；需要它时在命令中添加
+`--enable-localization`。这不会改变静态场地图发布，只控制实时场地特征线程。
+
 运行前先执行 `python -m pip install -e .`，并确保系统包和显示环境可用。
 
 ## STM32 串口监测
@@ -113,8 +116,8 @@ python manual_tests/cross_localization.py recordings/stationary_cross.mp4 \
 ```
 
 三个数依次是场地 `x_mm`、`y_mm` 和航向角 degree。该先验会原样用于每一帧，
-因此只适合静止录像或逐帧先验相同的受控检查；不得用于运动车辆视频冒充尚未
-实现的 IMU/编码器连续推算。
+因此只适合静止录像或逐帧先验相同的受控检查；不得用于运动车辆视频冒充
+`OdometryImuFusion` 的真实连续推算结果。
 
 ### 相机实时界面
 
@@ -148,8 +151,27 @@ BEV 窗口会半透明填充并标出 `CROSS`、`SAFE red`、`SAFE blue`；当�
 成功定位帧；没有唯一位姿时不会打印伪造结果，窗口仍显示候选和降级原因。
 
 实时相机输入一定是原始像素，脚本会使用当前 `CameraModel` 去畸变，因此
-`--camera` 不能与 `--already-undistorted` 同时使用。实时模式仍只是视觉定位
-检查，不提供运动控制或 IMU/编码器连续推算。
+`--camera` 不能与 `--already-undistorted` 同时使用。该脚本仍只检查视觉定位；
+完整编码器/IMU 融合由手动采集入口装配。
+
+## 编码器/IMU 连续融合真车验收
+
+先用 `stm32_monitor.py` 确认 `ODOMETRY_IMU` 稳定达到 100 Hz、机器人轴方向正确、
+静止加速度约为 `(0, 0, +9807) mm/s²`，并实测填写 `motion.wheel_track_m`、
+`motion.odometry` 和 `localization.fusion.initial_pose`。未完成标定前不得启用
+`localization.fusion.enabled`。
+
+启用后运行 `rescue-vision-manual-capture`，通过远程场地图记录每段开始/结束位置、
+航向、融合估计时间和主机接收时间。依次验收：
+
+1. 静止至少 30 秒，记录零偏收敛和停车位置/航向漂移。
+2. 定距直线、原地正反各一整圈、正反弧线，分别重复至少 5 次。
+3. 在物理急停和全程监督下制造短时 IMU invalid、正向遥测丢帧和 STM32 重启；
+   核对轮式降级、协方差增长、地图清除以及可靠中心十字重新锚定。
+4. 驶过中心十字前后测量闭环位置与航向误差，并记录 P50/P95 定位年龄。
+
+每项必须保存真实 `motion.jsonl`、相机 recording、测量基准和失败样例。当前只有
+合成轨迹 pytest，真车误差、长期温漂、UART 延迟分布和树莓派性能均为“未验证”。
 
 ## 相机、去畸变和 Hailo 联调
 
@@ -265,4 +287,4 @@ rescue-vision-manual-capture \
 `motion.gripper` 后再启用。按住左/右扳机时持续发送张开/闭合按压状态，松开
 时发送两个状态均为 `false`；释放、命令超时或断线只停止角度继续变化，不会
 自动开合，也不能直接套用协议说明书中的示例角度。逐次核对 UART/车辆状态中
-的左右目标角之和始终为 194°，包括从不满足该和约束的旧目标首次开始运动时。
+的左右目标角之和始终为 `motion.gripper.angle_sum_deg`，包括从不满足该和约束的旧目标首次开始运动时。

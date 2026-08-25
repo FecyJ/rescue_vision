@@ -10,16 +10,26 @@ from rescue_vision.app.field_map import (
     LatestCenterCrossLocalization,
     MapRobotPose,
     MapTargetMarker,
+    render_field_localization_bev,
 )
 from rescue_vision.camera.frame import CameraFrame
-from rescue_vision.geometry.types import FieldPoint
+from rescue_vision.geometry.ground_projector import BevConfig, GroundProjector
+from rescue_vision.geometry.types import FieldPoint, GroundPoint, UndistortedPixel
 from rescue_vision.localization import (
+    CenterCrossLocalizationQuality,
     CenterCrossPoseCandidate,
     CenterCrossPoseObservation,
     CenterCrossSelectionSource,
     FieldPose2D,
 )
-from rescue_vision.perception import RealtimeFieldFeatureResult
+from rescue_vision.perception import (
+    CenterCrossObservation,
+    FieldFeatureDetectionResult,
+    LineSegmentObservation,
+    RealtimeFieldFeatureResult,
+    SafeZoneColor,
+    SafeZoneObservation,
+)
 from rescue_vision.world import (
     PhysicalRegionKind,
     PhysicalStaticRegion,
@@ -87,6 +97,88 @@ def test_field_map_without_unique_pose_explicitly_reports_unlocalized() -> None:
     assert not snapshot.attributes.robot_localized
     assert snapshot.attributes.robot_x_mm is None
     assert snapshot.attributes.localization_capture_timestamp_ns is None
+
+
+def test_field_localization_bev_draws_safe_zone_and_center_cross() -> None:
+    bev = BevConfig(0.0, 40.0, -20.0, 20.0, 1.0)
+    projector = GroundProjector(
+        np.linalg.inv(GroundProjector.make_ground_to_bev_matrix(bev)),
+        bev,
+    )
+    frame = CameraFrame(4, 100, np.zeros((40, 40, 3), np.uint8))
+
+    def line(start: GroundPoint, end: GroundPoint) -> LineSegmentObservation:
+        return LineSegmentObservation(
+            UndistortedPixel(start.x, start.y),
+            UndistortedPixel(end.x, end.y),
+            start,
+            end,
+        )
+
+    cross = CenterCrossObservation(
+        axes=(
+            line(GroundPoint(5.0, 0.0), GroundPoint(35.0, 0.0)),
+            line(GroundPoint(20.0, -15.0), GroundPoint(20.0, 15.0)),
+        ),
+        intersection_undistorted=UndistortedPixel(20.0, 0.0),
+        intersection_ground=GroundPoint(20.0, 0.0),
+        confidence=0.8,
+        quality=frozenset(),
+    )
+    zone_ground = (
+        GroundPoint(28.0, -12.0),
+        GroundPoint(36.0, -12.0),
+        GroundPoint(36.0, -4.0),
+        GroundPoint(28.0, -4.0),
+    )
+    zone = SafeZoneObservation(
+        physical_color=SafeZoneColor.BLUE,
+        polygon_undistorted=tuple(
+            UndistortedPixel(point.x, point.y) for point in zone_ground
+        ),
+        polygon_ground=zone_ground,
+        entrance=None,
+        divider=None,
+        halves=(),
+        confidence=0.6,
+        quality=frozenset(),
+    )
+    result = FieldFeatureDetectionResult(
+        frame_sequence=4,
+        capture_timestamp_ns=100,
+        result_timestamp_ns=110,
+        image_size=(40, 40),
+        safe_zones=(zone,),
+        start_zones=(),
+        center_cross=cross,
+        boundary_features=(),
+    )
+    observation = CenterCrossPoseObservation(
+        frame_sequence=4,
+        capture_timestamp_ns=100,
+        result_timestamp_ns=110,
+        candidates=(),
+        terminals=(),
+        selected_pose=None,
+        selection_source=None,
+        confidence=0.0,
+        quality=frozenset(
+            {CenterCrossLocalizationQuality.NO_DIRECTION_ANCHOR}
+        ),
+    )
+
+    rendered = render_field_localization_bev(
+        frame,
+        projector,
+        result,
+        observation,
+    )
+
+    assert rendered.sequence == frame.sequence
+    assert rendered.timestamp_ns == frame.timestamp_ns
+    assert rendered.image_bgr.shape == (40, 40, 3)
+    assert np.any(rendered.image_bgr[:, :, 0] > 150)  # SAFE blue
+    assert np.any(rendered.image_bgr[:, :, 1] > 180)  # green CROSS axes
 
 
 class FakeDetector:
