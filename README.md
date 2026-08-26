@@ -40,7 +40,7 @@ python -m pytest
 | 采集棋盘、求内参或地面映射 | [标定说明](src/rescue_vision/calibration/README.md) |
 | 标注或部署四类目标模型 | [Pose 模型约定](docs/Pose视觉模型约定.md) |
 | 对接独立 PyQt/手柄采集客户端 | [电脑端通信协议交接](docs/电脑端通信协议.md) |
-| 对接 STM32、编码器或 IMU | [树莓派与单片机通信协议 v2](docs/树莓派与单片机通信协议v2.md) |
+| 对接 STM32、编码器或 IMU | [树莓派与单片机通信协议 v3](docs/树莓派与单片机通信协议v3.md) |
 | 开发新模块 | [项目结构](docs/项目结构.md) → [后续优先级](docs/后续优先级.md) |
 | 理解比赛类别和安全规则 | [赛题约束与视觉需求](docs/赛题约束与视觉需求.md) |
 | 实现单车 20 分模拟赛闭环 | [20 分模拟赛流程设计](docs/20分模拟赛流程设计.md) |
@@ -57,9 +57,9 @@ python -m pytest
 | [`calibration`](src/rescue_vision/calibration/README.md) | 已实现 | 棋盘/ChArUco 采集、三模型内参比较和固定机器人多位置地面映射 |
 | [`geometry`](src/rescue_vision/geometry/README.md) | 已实现 | 去畸变、显式坐标类型、地面/三维点投影与 BEV 转换 |
 | [`config`](src/rescue_vision/config/README.md) | 已实现 | 安全默认配置、静态场地、UART/远程/motion/夹爪机械标定/几何/模型和感知算法装配 |
-| [`communication`](src/rescue_vision/communication/README.md) | 已实现基础设施 | COBS UART 帧、直接 TCP 远程消息、raw/perception/BEV 图传、轻量动态地图 JSON、运动/夹爪/采集严格 schema 和有界队列；比赛发布器待接入 |
-| [`motion`](src/rescue_vision/motion/README.md) | 已实现基础设施 | STM32 v2 固定二进制协议、序号安全同步、差速运动、持续扳机双舵机夹爪、单轮加速度限制和远程超时保护；真车联调与标定待验收 |
-| [`app`](src/rescue_vision/app/README.md) | 已实现受限初版 | 受监督驾驶/采集、固定出发解团试验、四绿色物资 20 分模拟赛软件流程、编码器+IMU航位推算和不阻塞 observe_only 图传；真车门禁与正式比赛能力待验收 |
+| [`communication`](src/rescue_vision/communication/README.md) | 已实现基础设施 | COBS UART 帧、直接 TCP 远程消息、raw/perception/BEV 图传、轻量动态地图 JSON、运动/夹爪/采集严格 schema 和有界队列；20 分模拟赛 observe_only 发布器已接入，正式比赛发布器待验收 |
+| [`motion`](src/rescue_vision/motion/README.md) | 已实现基础设施 | STM32 v3 固定二进制协议、序号安全同步、差速运动、持续扳机双舵机夹爪、单轮加速度限制和远程超时保护；真车联调与 IMU 标定待验收 |
+| [`app`](src/rescue_vision/app/README.md) | 已实现受限初版 | 受监督驾驶/采集、固定出发解团试验、四绿色物资 20 分模拟赛软件流程、编码器+IMU航位推算和不阻塞 observe_only 图传/`map/state` 位姿发布；真车门禁与正式比赛能力待验收 |
 | [`data`](src/rescue_vision/data/README.md) | 已实现 | 记录检查、清单生成和按会话防泄漏划分 |
 | [`evaluation`](src/rescue_vision/evaluation/README.md) | 已实现 | 分类、地面误差、时延和失败样例报告 |
 | [`perception`](src/rescue_vision/perception/README.md) | 已实现基础设施 | Pose 框/K0、ROI HSV 分类分割、四类可配置三维模板地面中心估计，以及安全区、无编号出发区、中心十字、低精度边界候选和时序局部场界三态掩膜；硬遮挡默认关闭，正式模型、实物精度与树莓派性能待验证 |
@@ -106,7 +106,7 @@ PerceptionFrameRenderer → RemotePerceptionPublisher → RemoteMessageConnectio
                          （observe_only perception JPEG；独立低频旁路）
 
 OdometryImu → OdometryImuFusion → FieldPose2D
-             （20 分模拟赛临时阶段；暂不提交视觉位姿纠偏）
+             （树莓派先做温度零偏、交叉轴/比例和安装旋转校正；20 分模拟赛临时阶段暂不提交视觉位姿纠偏）
 
 FieldPose2D → RemoteLocalizationPublisher → observation/map/state
               （独立低频 JSON 旁路）

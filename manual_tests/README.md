@@ -20,6 +20,11 @@
 - `remote_capture.py`：兼容旧人工命令的薄包装；正式入口为 `rescue-vision-manual-capture`。
 - `motion_minimal.py`：按配置以低速直行一小段，打开 UART 后先等待 v2
   `SOFT_BRAKE accepted` 安全同步，周期刷新轮速并在退出时柔和停车。
+- `imu_rotation_monitor.py`：按配置低速原地旋转，周期打印 STM32 原始传感器系
+  `gyro_z`、编码器和状态位；只发送轮速心跳，`Ctrl+C` 或异常时柔和停车。
+- `safe_zone_straight_diagnostic.py`：只执行配置中的 `LEAVE_START` 越障直行段，
+  实时打印轮速目标/实际值、ODOMETRY_IMU 序号与双时钟间隔、编码器、IMU、UART
+  队列和 STM32 状态；发现连续 overrun 时停车。
 - `stm32_monitor.py`：默认只读监测配置中的 STM32 COBS/CRC16 UART，周期显示
   编码器/IMU、系统状态、实际频率、序号丢帧和协议错误；可选只发送一次
   `QUERY_STATUS`，不发送运动或夹爪命令。
@@ -59,9 +64,11 @@ python manual_tests/stm32_monitor.py \
 `protocol_error` 表示 CRC、长度、类型、方向、枚举或状态位错误，
 `*_missing/duplicate/regression` 分别表示遥测序号缺失、重复或倒退。串口可能
 按批到达，因此定位时间必须看 `ODOM sample_us`，不能用终端打印间隔积分。
-监测器显示的是 STM32 线路原始 `gyro_z`；正式融合会再乘
-`motion.odometry.gyro_z_sign`。人工左右转一次确认极性：若原始数据左转为负、
-右转为正，配置 `-1`；若左转为正、右转为负，配置 `1`。
+监测器显示的是 STM32 线路原始传感器坐标系 `gyro_z`；正式融合会先按
+`localization.fusion.imu_calibration` 做温度零偏、交叉轴/比例和安装旋转，再应用
+`motion.odometry.gyro_z_sign`。人工左右转一次确认变换后的极性：若原始数据左转为负、
+右转为正，配置 `-1`；若左转为正、右转为负，配置 `1`。矩阵必须先用静止重力方向和
+已知姿态标定，不能用单次搬运姿态直接填写。
 
 数据采集不另建重复的硬件脚本：用
 `rescue-vision-record --frames 200 --display` 执行真机短录，再用
@@ -86,6 +93,27 @@ python manual_tests/motion_minimal.py \
 因此不能用一次 `drive()` 后长时间 `sleep` 替代；正常结束、Ctrl+C 或异常都会
 先发送 `SOFT_BRAKE`，这不能替代物理急停或固件看门狗。
 
+## IMU 原地旋转监视
+
+在架空轮，或已确认物理急停可立即触发且操作员全程监督的条件下运行。脚本默认
+以 `0.15 rad/s` 左转，并持续到 `Ctrl+C`；`gyro_z` 是 STM32 线路原始传感器坐标系
+值，单位为 `rad/s`，不会在显示层重复应用树莓派的 `imu_calibration`：
+
+```bash
+PYTHONPATH=src .venv/bin/python \
+  manual_tests/imu_rotation_monitor.py \
+  --config configs/runtime.yaml \
+  --angular-velocity-rad-s 0.15 \
+  --direction left \
+  --supervised-physical-stop-ready
+```
+
+右转把 `--direction` 改为 `right`。`--print-interval-seconds` 只控制终端输出频率，
+不改变轮速刷新周期。脚本会在打开 UART 后先完成 `SOFT_BRAKE accepted` 安全同步，
+运动期间持续调用 `MotionController.update()` 和排空 UART；`Ctrl+C`、命令拒绝、急停
+锁存或其他异常均进入软停车。观察机器人系校准后的值应使用当前融合入口的
+`localization.fusion.imu_calibration`，不要把原始 `gyro_z` 直接与机器人系航向比较。
+
 ## 轮子启动 `sample_overrun` 检查
 
 该脚本只打开 UART，不打开相机、Hailo 或远程控制；必须在架空轮、物理急停就绪
@@ -104,7 +132,33 @@ PYTHONPATH=src .venv/bin/python \
 
 检测到异常时默认返回 0 但输出 `RESULT=sample_overrun_detected`，方便现场收集
 日志；需要让脚本以失败状态退出时增加 `--fail-on-overrun`。该脚本不会忽略或
-降级 `sample_overrun`，不能用来证明固件采样链路已经合格。
+降级 `sample_overrun`，不能用来证明固件采样链路已经合格。若状态中的
+`reply_queue_full`、`tx_degraded` 或 `rx_degraded` 为真，脚本会立即停车并退出：
+这些是本次 STM32 启动期间的粘滞告警，`SOFT_BRAKE` 序号重同步不会清除。
+排除串口接线、波特率、非法帧或多个进程同时读取串口后，必须复位或重新上电
+STM32，再重新运行检查。
+
+## 越障安全区直行诊断
+
+该脚本不启动相机、Hailo、目标搜索或解团，只执行
+`motion.cluster_breakup.departure_speed_m_s` 和
+`motion.cluster_breakup.departure_distance_m` 定义的 `LEAVE_START` 直行段。
+它会允许配置的单次 `max_interpolated_overrun_samples`，打印每个 overrun 的
+遥测序号、`sample_timestamp_us` 间隔、树莓派接收间隔、编码器差分、三轴 IMU、
+状态位及当时轮速；达到第二个连续 overrun 时停止。运行条件必须是架空轮，或
+物理急停可立即触发且操作员全程监督：
+
+```bash
+PYTHONPATH=src .venv/bin/python \
+  manual_tests/safe_zone_straight_diagnostic.py \
+  --config configs/runtime.simulation-20min.yaml \
+  --supervised-physical-stop-ready
+```
+
+`--speed-m-s`、`--distance-m` 可覆盖本次诊断值，但默认优先使用配置中的越障直行
+参数。`RESULT=departure_distance_reached` 表示达到编码器定距；退出码为 `2` 表示
+本次出现过 sample overrun 或连续 overrun 导致停止。`sample_dt_ms` 是 STM32 采样
+时间间隔，`host_dt_ms` 是树莓派接收时间间隔，不能用终端输出间隔代替。
 
 ## 传统视觉场地特征离线检查
 
@@ -198,9 +252,11 @@ BEV 窗口会半透明填充并标出 `CROSS`、`SAFE red`、`SAFE blue`；当�
 
 ## 编码器/IMU 连续融合真车验收
 
-先用 `stm32_monitor.py` 确认 `ODOMETRY_IMU` 稳定达到 100 Hz、机器人轴方向正确、
-静止加速度约为 `(0, 0, +9807) mm/s²`，并实测填写 `motion.wheel_track_m`、
-`motion.odometry` 和 `localization.fusion.initial_pose`。未完成标定前不得启用
+先用 `stm32_monitor.py` 确认 `ODOMETRY_IMU` 稳定达到 100 Hz、传感器原始轴方向和
+单位正确、静止加速度模长约为 `9807 mm/s²`，再用
+`localization.fusion.imu_calibration` 完整转换后检查机器人系约为
+`(0, 0, +9807) mm/s²`，并实测填写 `motion.wheel_track_m`、`motion.odometry` 和
+`localization.fusion.initial_pose`。未完成标定前不得启用
 `localization.fusion.enabled`。
 
 启用后运行 `rescue-vision-manual-capture`，通过远程场地图记录每段开始/结束位置、

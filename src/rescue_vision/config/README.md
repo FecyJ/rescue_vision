@@ -10,6 +10,9 @@
 cp configs/runtime.example.yaml configs/runtime.yaml
 ```
 
+当前格式不再包含 `mission.danger_avoid_distance_mm`；旧本机配置需删除该字段，
+否则严格加载会报告未知键。危险目标的实际路径检查由 20 分应用走廊规划负责。
+
 ## 常用类和函数
 
 | 入口 | 用途 | 重要返回语义 |
@@ -47,20 +50,20 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `UartConfig` | 设备名、波特率、读写超时、有界接收容量和最大行长度 |
 | `RemoteConfig` | 服务端/客户端、观察/调试权限、连接/IO 超时和有界队列 |
 | `MotionRuntimeConfig` | 实测轮距、车体/车轮速度上限、单轮加速度上限、远程命令有效期、`odometry`、`gripper` 和解团试验参数 |
-| `OdometryRuntimeConfig` | 每圈计数、左右有效轮径和静态 `gyro_z` 零偏 |
+| `OdometryRuntimeConfig` | 每圈计数、左右有效轮径和校准后机器人 `gyro_z` 极性 |
 | `GripperRuntimeConfig` | 能力开关、左右开/闭安全角度、角度和与固定速度全行程时间 |
 | `ClusterBreakupRuntimeConfig` | 定距出发、左右搜索方向、居中、接近、张爪冲散、张爪退出、停车合爪、闭爪退离和绿色扫描参数 |
 | `Simulation20PointRuntimeConfig` | 预推/走廊、扫描、接触、交付确认、退离和重复解团上限；目标交付数固定为 4 |
 | `TrackingConfig` | 关联、确认、滑行、衰减和删除阈值 |
 | `WorldRuntimeConfig` | 世界阈值、`TeamColor`、`StaticFieldMap` 及任务区域派生 |
-| `MissionConfig` | 比赛计时、安全超时、避让距离和目标优先级 |
+| `MissionConfig` | 比赛计时、安全超时和目标优先级；路径避障由应用规划器按实际走廊负责 |
 | `PerceptionConfig` | 目标检测/K0、ROI HSV、目标地面几何、静态场地特征和局部场界参数 |
 | `HsvColorClassifierConfig` | 四类 HSV 闭区间、颜色证据门槛和掩码去噪参数 |
 | `TargetGroundGeometryConfig` | 四类三维形状尺寸、搜索步长、评分权重和接受门限 |
 | `FieldFeatureConfig` | 场地颜色、形态学、公差、点划线和边界候选阈值 |
 | `FieldBoundaryConfig` | 共线拟合、矩形公差、时序确认、边界带、时效和遮挡开关 |
 | `CenterCrossLocalizerConfig` | 终端射线关联、锚点置信度、先验创新和不确定度下限 |
-| `LocalizationRuntimeConfig` / `FusionConfig` | 中心十字配置，以及起点、噪声、时效、物理跳变、视觉门控和历史长度 |
+| `LocalizationRuntimeConfig` / `FusionConfig` | 中心十字配置，以及起点、三轴 IMU 温度/矩阵校准、噪声、时效、物理跳变、视觉门控和历史长度 |
 | `HailoConfig` | 模型资产、身份、类别映射和后端粗筛阈值 |
 | `RuntimeGeometry` | `camera_model`、可选 `ground_projector` |
 
@@ -118,15 +121,22 @@ UART/TCP 生命周期和 motion 的停止语义分别见相邻模块 README，�
 不满足该和约束或开闭端点相同的配置。执行器以左角为单一自由度并始终用
 `right = motion.gripper.angle_sum_deg - left` 构造远程下发；
 客户端只发送按下/松开 boolean，不读取这些机械值。
-运输姿态目前只作为机械标定输出，不会自动改变现有解团或模拟赛状态机；使用前
-需要在真车上确认单个物块不会滑落、夹持或形成违规抓取。
+20 分模拟赛入口在 `APPROACH_GREEN` 及尚未通过接触确认的 `ENGAGE_GREEN` 下发
+运输局部打开姿态，接触和 mission 门禁通过后下发闭合端点；现有解团和远程扳机流程
+不会自动切换到运输姿态。使用前需要在真车上确认单个物块不会滑落、夹持或形成违规抓取。
 
-`motion.odometry` 是编码器机械量、IMU 原始静态零偏和 `gyro_z` 极性的唯一配置；轮距继续复用
-`motion.wheel_track_m`，定位配置不得复制。`localization.fusion.initial_pose`
-使用固定物理 `FieldPoint` 和全局航向，只在进程首个有效遥测基线使用一次。
-`gyro_z_sign` 只能为 `1` 或 `-1`，用于把 STM32 线路读数及其原始零偏统一转换
-为定位内部“左转为正、右转为负”；本车若实测左转为负应设为 `-1`。模板默认
-关闭融合，真车启用前必须实测每圈计数、左右有效轮径、轮距、零偏和极性。
+`motion.odometry` 是编码器机械量和 `gyro_z` 极性的唯一配置；轮距继续复用
+`motion.wheel_track_m`，定位配置不得复制。IMU 三轴温度零偏、比例/交叉轴矩阵和
+传感器到机器人系的安装旋转统一配置在 `localization.fusion.imu_calibration`，
+融合入口按 v3 协议规定的顺序应用一次。
+`localization.fusion.initial_pose` 使用固定物理 `FieldPoint` 和全局航向，只在进程首个
+有效遥测基线使用一次。`gyro_z_sign` 只能为 `1` 或 `-1`，用于把完成三轴校准和安装
+旋转后的机器人 `gyro_z` 转换为定位内部“左转为正、右转为负”；本车若实测左转为负
+应设为 `-1`。bias 与温度系数必须是有限三向量，比例/交叉轴矩阵必须有限且可逆，
+安装旋转必须是有限正交 3×3 右手旋转。模板的零值和单位阵不是实车标定结果。
+`localization.fusion.max_interpolated_overrun_samples` 控制可恢复的连续采样超期帧数；
+当前只允许 `0` 或 `1`，默认 `1` 表示单次双编码器有效异常会等待下一帧并插值 IMU，
+连续第二帧仍清除连续位姿。
 
 ## 3. 装配几何对象
 
