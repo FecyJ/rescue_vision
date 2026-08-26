@@ -540,6 +540,50 @@ def test_enabled_fusion_requires_odometry_calibration(tmp_path) -> None:
         load_runtime_config(path)
 
 
+def test_motion_odometry_overrun_budget_parsing(tmp_path) -> None:
+    def write_config(overrun_line: str, name: str) -> Path:
+        text = config_text()
+        text = text.replace("uart:\n  enabled: false", "uart:\n  enabled: true")
+        text = text.replace("  device: null", "  device: /dev/ttyAMA0", 1)
+        text = text.replace(
+            "motion:\n  enabled: false\n  wheel_track_m: null",
+            f"""motion:
+  enabled: true
+  wheel_track_m: 0.2
+  odometry:
+    enabled: true
+    encoder_counts_per_revolution: 4096
+    left_wheel_radius_mm: 32.0
+    right_wheel_radius_mm: 31.8
+    gyro_z_sign: -1{overrun_line}""",
+        )
+        path = tmp_path / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    loaded = load_runtime_config(write_config("", "default.yaml"))
+    assert loaded.motion.odometry.max_consecutive_overrun_samples == 1
+
+    loaded = load_runtime_config(
+        write_config("\n    max_consecutive_overrun_samples: 3", "budget.yaml")
+    )
+    assert loaded.motion.odometry.max_consecutive_overrun_samples == 3
+
+    loaded = load_runtime_config(
+        write_config(
+            "\n    max_consecutive_overrun_samples: null",
+            "disabled.yaml",
+        )
+    )
+    assert loaded.motion.odometry.max_consecutive_overrun_samples is None
+
+    with pytest.raises(
+        ValueError,
+        match="max_consecutive_overrun_samples",
+    ):
+        load_runtime_config(write_config("\n    max_consecutive_overrun_samples: -1", "invalid.yaml"))
+
+
 def test_disabled_hailo_does_not_create_target_pose_detector(tmp_path) -> None:
     path = tmp_path / "runtime.yaml"
     path.write_text(

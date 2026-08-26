@@ -183,8 +183,8 @@ def main() -> int:
     tracker = EncoderTravelTracker(
         calibration,
         max_wheel_velocity_m_s=config.motion.max_wheel_velocity_m_s,
-        max_interpolated_overrun_samples=(
-            config.localization.fusion.max_interpolated_overrun_samples
+        max_consecutive_overrun_samples=(
+            config.motion.odometry.max_consecutive_overrun_samples
         ),
     )
     stats = OverrunProbeStats(started_timestamp_ns=time.monotonic_ns())
@@ -293,8 +293,8 @@ def main() -> int:
         f"device={channel.device} speed_m_s={speed_m_s:.3f} "
         f"distance_m={distance_m:.3f} "
         f"max_duration_s={config.motion.cluster_breakup.motion_phase_timeout_s:.2f} "
-        f"max_interpolated_overrun_samples="
-        f"{config.localization.fusion.max_interpolated_overrun_samples}",
+        f"max_consecutive_overrun_samples="
+        f"{config.motion.odometry.max_consecutive_overrun_samples}",
         flush=True,
     )
 

@@ -664,6 +664,8 @@ class OdometryRuntimeConfig:
     left_wheel_radius_mm: float | None
     right_wheel_radius_mm: float | None
     gyro_z_sign: int
+    # 定距里程计允许的连续 SAMPLE_OVERRUN 帧数；None 表示不因此中止，仅保留计数。
+    max_consecutive_overrun_samples: int | None = 1
 
     def build_calibration(self) -> OdometryCalibration | None:
         if not self.enabled:
@@ -1628,6 +1630,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "left_wheel_radius_mm",
             "right_wheel_radius_mm",
             "gyro_z_sign",
+            "max_consecutive_overrun_samples",
         },
         "motion.odometry",
     )
@@ -1665,6 +1668,15 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         or gyro_z_sign not in {-1, 1}
     ):
         raise ValueError("motion.odometry.gyro_z_sign must be exactly -1 or 1.")
+    overrun_budget_raw = odometry_raw.get("max_consecutive_overrun_samples", 1)
+    max_consecutive_overrun_samples = (
+        None
+        if overrun_budget_raw is None
+        else _nonnegative_int(
+            overrun_budget_raw,
+            "motion.odometry.max_consecutive_overrun_samples",
+        )
+    )
     if odometry_enabled and (
         not motion_enabled
         or encoder_counts is None
@@ -1679,6 +1691,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         left_wheel_radius_mm=odometry_floats["left_wheel_radius_mm"],
         right_wheel_radius_mm=odometry_floats["right_wheel_radius_mm"],
         gyro_z_sign=gyro_z_sign,
+        max_consecutive_overrun_samples=max_consecutive_overrun_samples,
     )
     if odometry.enabled:
         odometry.build_calibration()

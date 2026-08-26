@@ -137,6 +137,10 @@ UART/TCP 生命周期和 motion 的停止语义分别见相邻模块 README，�
 `localization.fusion.max_interpolated_overrun_samples` 控制可恢复的连续采样超期帧数；
 当前只允许 `0` 或 `1`，默认 `1` 表示单次双编码器有效异常会等待下一帧并插值 IMU，
 连续第二帧仍清除连续位姿。
+`motion.odometry.max_consecutive_overrun_samples` 只约束解团/20 分流程中
+`EncoderTravelTracker` 的定距积分：允许的连续采样超期（`SAMPLE_OVERRUN`）帧数，
+超出即抛错停车；`null` 关闭该中止，仅保留计数诊断。默认 `1` 保持原行为；
+它不改变融合插值策略。
 
 ## 3. 装配几何对象
 

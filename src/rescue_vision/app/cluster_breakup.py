@@ -984,7 +984,7 @@ class EncoderTravelTracker:
         calibration: OdometryCalibration,
         *,
         max_wheel_velocity_m_s: float,
-        max_interpolated_overrun_samples: int = 1,
+        max_consecutive_overrun_samples: int | None = 1,
     ) -> None:
         if not isinstance(calibration, OdometryCalibration):
             raise TypeError("calibration must be an OdometryCalibration.")
@@ -992,17 +992,20 @@ class EncoderTravelTracker:
         if not math.isfinite(maximum) or maximum <= 0.0:
             raise ValueError("max_wheel_velocity_m_s must be finite and positive.")
         if (
-            isinstance(max_interpolated_overrun_samples, bool)
-            or not isinstance(max_interpolated_overrun_samples, int)
-            or not 0 <= max_interpolated_overrun_samples <= 1
+            max_consecutive_overrun_samples is not None
+            and (
+                isinstance(max_consecutive_overrun_samples, bool)
+                or not isinstance(max_consecutive_overrun_samples, int)
+                or max_consecutive_overrun_samples < 0
+            )
         ):
             raise ValueError(
-                "max_interpolated_overrun_samples must be 0 or 1, got "
-                f"{max_interpolated_overrun_samples!r}."
+                "max_consecutive_overrun_samples must be a non-negative integer "
+                f"or None, got {max_consecutive_overrun_samples!r}."
             )
         self._calibration = calibration
         self._maximum = maximum
-        self._max_interpolated_overrun_samples = max_interpolated_overrun_samples
+        self._max_consecutive_overrun_samples = max_consecutive_overrun_samples
         self._previous: OdometryImu | None = None
         self._distance_m = 0.0
         self._left_distance_m = 0.0
@@ -1064,12 +1067,13 @@ class EncoderTravelTracker:
         is_overrun = bool(message.sensor_flags & SensorFlags.SAMPLE_OVERRUN)
         if (
             is_overrun
+            and self._max_consecutive_overrun_samples is not None
             and self._consecutive_overrun_samples
-            >= self._max_interpolated_overrun_samples
+            >= self._max_consecutive_overrun_samples
         ):
             raise RuntimeError(
                 "Consecutive odometry sample overruns exceed the configured "
-                f"limit ({self._max_interpolated_overrun_samples}); "
+                f"limit ({self._max_consecutive_overrun_samples}); "
                 f"telemetry_sequence={message.telemetry_sequence}."
             )
         previous = self._previous
@@ -1735,8 +1739,8 @@ def _run_hardware(
     tracker = EncoderTravelTracker(
         calibration,
         max_wheel_velocity_m_s=config.motion.max_wheel_velocity_m_s,
-        max_interpolated_overrun_samples=(
-            config.localization.fusion.max_interpolated_overrun_samples
+        max_consecutive_overrun_samples=(
+            config.motion.odometry.max_consecutive_overrun_samples
         ),
     )
     odometry_fusion = config.build_odometry_imu_fusion()

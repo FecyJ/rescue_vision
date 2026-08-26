@@ -16,7 +16,7 @@
 | `rescue-vision-cluster-breakup` | `runtime.yaml` 和显式监督确认 | 定距越障、目标团搜索/居中、闭爪定距冲散、原地全开、张爪退出、停车合爪、闭爪退离并扫描绿色；找到绿色后停车 |
 | `rescue-vision-simulation-20-point` | `runtime.simulation-20min.yaml` 和显式监督确认 | 复用现有解团，跟踪/世界模型/规则门禁、受限预推导航、单绿色推送、接近时 transport 局部打开、接触确认后闭合、交付验证、退离、四次完成停车，并向 observe_only 观察端发布最新 `map/state` 位姿 |
 | `ClusterBreakupSequence(...).step()` | `ClusterBreakupRuntimeConfig`、`motion.gripper.full_travel_time_s`、同一单调时间轴、编码器累计路程和最新 `PerceptionSnapshot` | 纯逻辑流程决策；不创建相机、Hailo、UART 或电机；冲散后全开、张爪退出、停车合爪，再进入闭爪退离 |
-| `EncoderTravelTracker.submit()` | 带有效双编码器的 `OdometryImu`；默认允许单次 `sample_overrun` | 使用运行配置机械标定产生机器人中心累计有符号路程；连续异常超出配置预算时抛错 |
+| `EncoderTravelTracker.submit()` | 带有效双编码器的 `OdometryImu`；连续 `sample_overrun` 预算来自 `motion.odometry.max_consecutive_overrun_samples`，`null` 关闭中止仅保留计数 | 使用运行配置机械标定产生机器人中心累计有符号路程；连续异常超出配置预算时抛错 |
 | `OdometryImuFusion.submit_odometry()` | 同一 UART 消费链路中的 `OdometryImu` | 解团临时配置只输出编码器+IMU 连续 `FieldPose2D`；不调用 `submit_visual()` |
 | `OdometryFusionPump` | `OdometryImu` 有界队列和 `OdometryImuFusion` | 顺序处理融合，不阻塞运动刷新线程；队列满或 worker 异常进入停车路径 |
 | `CameraPerceptionPump` | `FrameSource`、去畸变函数和目标感知旁路 | 在独立线程完成取帧/去畸变/推理提交，不占用运动刷新线程 |
@@ -289,8 +289,9 @@ rescue-vision-cluster-breakup \
 
 取帧和全尺寸去畸变在独立输入旁路运行，Hailo 推理再使用单槽最新帧后台旁路；
 运动循环只刷新轮速、排空 UART 并消费最新结构化观测。观测过期、
-目标团丢失、编码器无效/跳变、连续里程计异常、阶段超时、相机/Hailo/UART 异常以及退出都会走停车
-路径。所有距离、速度、角度、确认帧数和超时均来自
+目标团丢失、编码器无效/跳变、连续里程计异常超出
+`motion.odometry.max_consecutive_overrun_samples` 预算、阶段超时、
+相机/Hailo/UART 异常以及退出都会走停车路径。所有距离、速度、角度、确认帧数和超时均来自
 `motion.cluster_breakup`，不能在入口中另写一套参数。
 入口每秒输出机器人中心/左右轮累计路程、原始编码器计数及目标/已下发轮速。
 同一行还输出 STM32 的 `motor_output`、`watchdog`、`estop`、`stop_reason` 和

@@ -2064,8 +2064,8 @@ def _run_hardware(
     encoder_tracker = EncoderTravelTracker(
         odometry_calibration,
         max_wheel_velocity_m_s=config.motion.max_wheel_velocity_m_s,
-        max_interpolated_overrun_samples=(
-            config.localization.fusion.max_interpolated_overrun_samples
+        max_consecutive_overrun_samples=(
+            config.motion.odometry.max_consecutive_overrun_samples
         ),
     )
     fusion = config.build_odometry_imu_fusion()

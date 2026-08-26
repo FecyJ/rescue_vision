@@ -143,9 +143,10 @@ STM32，再重新运行检查。
 该脚本不启动相机、Hailo、目标搜索或解团，只执行
 `motion.cluster_breakup.departure_speed_m_s` 和
 `motion.cluster_breakup.departure_distance_m` 定义的 `LEAVE_START` 直行段。
-它会允许配置的单次 `max_interpolated_overrun_samples`，打印每个 overrun 的
-遥测序号、`sample_timestamp_us` 间隔、树莓派接收间隔、编码器差分、三轴 IMU、
-状态位及当时轮速；达到第二个连续 overrun 时停止。运行条件必须是架空轮，或
+它会按 `motion.odometry.max_consecutive_overrun_samples` 允许配置的连续 overrun
+数量，打印每个 overrun 的遥测序号、`sample_timestamp_us` 间隔、树莓派接收间隔、
+编码器差分、三轴 IMU、状态位及当时轮速；超过该预算即停止（`null` 时不因超期
+停止，只打印诊断）。运行条件必须是架空轮，或
 物理急停可立即触发且操作员全程监督：
 
 ```bash
