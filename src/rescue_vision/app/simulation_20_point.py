@@ -438,6 +438,7 @@ class Simulation20PointSequence:
         self._rebreakup_mode = False
         self._hold_resume_state: Simulation20PointState | None = None
         self._safety_hold_reason: str | None = None
+        self._cycle_mission_decision: MissionDecision | None = None
 
     @classmethod
     def from_app_config(cls, config: AppConfig) -> Simulation20PointSequence:
@@ -582,16 +583,30 @@ class Simulation20PointSequence:
         except (RuntimeError, ValueError) as exc:
             return self._terminal(timestamp_ns, f"world_update_failed:{exc}")
 
-        if self.state is Simulation20PointState.RESET_TARGET_TRACKS:
-            return self._step_reset_tracks(timestamp_ns, perception, pose, snapshot)
+        mission_decision = self._evaluate_mission(snapshot, safety)
+        if mission_decision.terminal:
+            return self._terminal(
+                timestamp_ns,
+                f"mission_terminated:{mission_decision.reason}",
+                mission_decision=mission_decision,
+                world_snapshot=snapshot,
+            )
         if self.state is Simulation20PointState.SAFETY_HOLD:
+            # A latched hold always blocks motion. _evaluate_mission only
+            # enters a hold from regular states; breakup/reset/update states
+            # intentionally ignore non-terminal mission activity instead of
+            # interrupting their fixed encoder-driven actions.
             return self._decision(
                 timestamp_ns,
                 0.0,
                 0.0,
                 self._safety_hold_reason or "safety_hold",
+                mission_decision=mission_decision,
                 world_snapshot=snapshot,
             )
+
+        if self.state is Simulation20PointState.RESET_TARGET_TRACKS:
+            return self._step_reset_tracks(timestamp_ns, perception, pose, snapshot)
         if self._breakup is not None:
             return self._step_breakup(
                 timestamp_ns,
@@ -605,20 +620,6 @@ class Simulation20PointSequence:
             # the post-delivery track set before a coasting copy of the old
             # target can be interpreted as a new suspected hazard.
             return self._step_update_progress(timestamp_ns, pose, snapshot)
-
-        mission_decision = self._mission_gate(timestamp_ns, snapshot, safety)
-        if mission_decision is not None and (
-            mission_decision.terminal
-            or self.state is Simulation20PointState.SAFETY_HOLD
-        ):
-            return self._decision(
-                timestamp_ns,
-                0.0,
-                0.0,
-                mission_decision.reason,
-                mission_decision=mission_decision,
-                world_snapshot=snapshot,
-            )
 
         if self.state is Simulation20PointState.SCAN_GREEN:
             return self._step_scan(timestamp_ns, pose, snapshot, mission_decision)
@@ -1284,11 +1285,21 @@ class Simulation20PointSequence:
             engaged_track_ids=(self._selected_track_id,),
             contact_started_ns=timestamp_ns,
         )
-        mission_decision = self._mission_gate(timestamp_ns, snapshot, safety)
-        if mission_decision is not None and (
-            mission_decision.terminal
-            or mission_decision.action not in {AbstractAction.PUSH, AbstractAction.DELIVER}
-        ):
+        # Contact establishment is a boundary event like delivery evidence:
+        # re-evaluate within the same cycle so the rule machine judges the
+        # engagement with the fresh TransportStatus instead of the stale
+        # pre-contact decision from the top of step().
+        mission_decision = self._mission.step(
+            snapshot,
+            transport=self._transport,
+            safety=safety,
+        )
+        self._last_mission_decision = mission_decision
+        self._cycle_mission_decision = mission_decision
+        if mission_decision.terminal or mission_decision.action not in {
+            AbstractAction.PUSH,
+            AbstractAction.DELIVER,
+        }:
             return self._decision(
                 timestamp_ns,
                 0.0,
@@ -1330,13 +1341,9 @@ class Simulation20PointSequence:
             return self._hold(timestamp_ns, "pushing_target_stale")
         if pose is None or pose.pose is None:
             return self._hold(timestamp_ns, "pushing_pose_missing")
-        mission_decision = self._mission_gate(timestamp_ns, snapshot, safety)
-        if mission_decision is not None and (
-            mission_decision.terminal
-            or mission_decision.action
-            not in {AbstractAction.PUSH, AbstractAction.DELIVER}
-            or self.state is Simulation20PointState.SAFETY_HOLD
-        ):
+        mission_decision = self._cycle_mission_decision
+        assert mission_decision is not None
+        if mission_decision.action not in {AbstractAction.PUSH, AbstractAction.DELIVER}:
             return self._decision(
                 timestamp_ns,
                 0.0,
@@ -1391,19 +1398,8 @@ class Simulation20PointSequence:
         target = self._selected_target(snapshot)
         if target is None or not self._target_is_fresh(target, timestamp_ns):
             return self._hold(timestamp_ns, "delivery_target_missing")
-        mission_decision = self._mission_gate(timestamp_ns, snapshot, safety)
-        if mission_decision is not None and (
-            mission_decision.terminal
-            or self.state is Simulation20PointState.SAFETY_HOLD
-        ):
-            return self._decision(
-                timestamp_ns,
-                0.0,
-                0.0,
-                mission_decision.reason,
-                mission_decision=mission_decision,
-                world_snapshot=snapshot,
-            )
+        mission_decision = self._cycle_mission_decision
+        assert mission_decision is not None
         if not self._target_fully_entered(snapshot, target):
             self._delivery_confirm_count = 0
             return self._decision(
@@ -1440,7 +1436,12 @@ class Simulation20PointSequence:
             safety=safety,
             delivery=evidence,
         )
+        # The boundary event must reach the rule machine together with the
+        # same-cycle snapshot; repeating the plain evaluation above plus this
+        # delivery submission matches the historical contract and stays
+        # idempotent because both calls share one timestamp.
         self._last_mission_decision = mission_decision
+        self._cycle_mission_decision = mission_decision
         if mission_decision.terminal:
             return self._terminal(
                 timestamp_ns,
@@ -1492,16 +1493,8 @@ class Simulation20PointSequence:
                     "retreat_clear_transport",
                     world_snapshot=snapshot,
                 )
-        mission_decision = self._mission_gate(timestamp_ns, snapshot, safety)
-        if mission_decision is not None and mission_decision.terminal:
-            return self._decision(
-                timestamp_ns,
-                0.0,
-                0.0,
-                mission_decision.reason,
-                mission_decision=mission_decision,
-                world_snapshot=snapshot,
-            )
+        mission_decision = self._cycle_mission_decision
+        assert mission_decision is not None
         return self._decision(
             timestamp_ns,
             -self.config.retreat_speed_m_s,
@@ -1861,25 +1854,41 @@ class Simulation20PointSequence:
             and abs(target.ground_point.y) <= self.config.engage_lateral_tolerance_mm
         )
 
-    def _mission_gate(
+    def _evaluate_mission(
         self,
-        timestamp_ns: int,
         snapshot: WorldSnapshot,
         safety: SafetySignals,
-    ) -> MissionDecision | None:
+    ) -> MissionDecision:
+        """Advance the rule state machine exactly once per control cycle.
+
+        Terminal outcomes are enforced by ``step()`` for every state. A
+        non-terminal ``SAFETY_HOLD``/``AVOIDING`` activity only latches a hold
+        when it originates from a regular behaviour state; fixed encoder-driven
+        breakup/reset/update actions keep running so that brief vision gaps do
+        not interrupt them, while rule-level terminations still stop motion.
+        """
+
         decision = self._mission.step(
             snapshot,
             transport=self._transport,
             safety=safety,
         )
         self._last_mission_decision = decision
+        self._cycle_mission_decision = decision
         if decision.terminal:
-            self.state = Simulation20PointState.TERMINAL_STOP
             return decision
-        if decision.activity in {ActivityState.SAFETY_HOLD, ActivityState.AVOIDING}:
-            if self.state is not Simulation20PointState.SAFETY_HOLD:
-                self._hold_resume_state = self.state
-                self._safety_hold_reason = decision.reason
+        if (
+            decision.activity in {ActivityState.SAFETY_HOLD, ActivityState.AVOIDING}
+            and self._breakup is None
+            and self.state
+            not in {
+                Simulation20PointState.RESET_TARGET_TRACKS,
+                Simulation20PointState.UPDATE_PROGRESS,
+            }
+            and self.state is not Simulation20PointState.SAFETY_HOLD
+        ):
+            self._hold_resume_state = self.state
+            self._safety_hold_reason = decision.reason
             self.state = Simulation20PointState.SAFETY_HOLD
         return decision
 

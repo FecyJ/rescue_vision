@@ -22,7 +22,11 @@ from rescue_vision.app.simulation_20_point import (
 from rescue_vision.config import Simulation20PointRuntimeConfig, load_runtime_config
 from rescue_vision.geometry.types import FieldPoint, GroundPoint, UndistortedPixel
 from rescue_vision.localization import FieldPose2D, FusedPoseEstimate
-from rescue_vision.mission import MissionConfig, MissionStateMachine
+from rescue_vision.mission import (
+    MissionConfig,
+    MissionStateMachine,
+    TerminationReason,
+)
 from rescue_vision.perception import (
     ClassProbabilities,
     ColorSegmentationStatus,
@@ -165,6 +169,8 @@ def make_sequence(
     config: Simulation20PointRuntimeConfig | None = None,
     breakup: object | None = None,
     confirmation_hits: int = 1,
+    match_duration_s: float = 1000.0,
+    no_motion_timeout_s: float = 15.0,
 ) -> Simulation20PointSequence:
     regions = (
         StaticRegion(
@@ -199,8 +205,8 @@ def make_sequence(
         ),
         mission=MissionStateMachine(
             MissionConfig(
-                1000.0,
-                15.0,
+                match_duration_s,
+                no_motion_timeout_s,
                 10.0,
                 (
                     TargetClass.ORANGE_INJURED,
@@ -761,3 +767,108 @@ def test_four_green_deliveries_latch_finish_stop_and_twenty_points() -> None:
     )
     assert stopped.state is Simulation20PointState.FINISH_STOP
     assert stopped.linear_velocity_m_s == 0.0
+
+
+class _ParkedCenterBreakup:
+    def step(self, *, timestamp_ns, cumulative_distance_m, perception):
+        del cumulative_distance_m, perception
+        return BreakupDecision(
+            timestamp_ns,
+            BreakupState.CENTER_CLUSTER,
+            0.0,
+            0.0,
+            GripperPosture.CLOSED,
+            "center_cluster_parked",
+        )
+
+
+def test_match_timeout_during_breakup_latches_terminal_stop() -> None:
+    sequence = make_sequence(
+        breakup=_ApproachBreakup(),
+        match_duration_s=0.05,
+    )
+    start_sequence(sequence)
+    green = lambda frame, timestamp: snapshot(
+        frame,
+        timestamp,
+        observation(frame, timestamp, GroundPoint(600.0, 0.0)),
+    )
+
+    first = sequence.step(
+        2,
+        perception=green(1, 2),
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+    assert first.state is Simulation20PointState.APPROACH_CLUSTER
+    expired = sequence.step(
+        60_000_002,
+        perception=green(2, 60_000_002),
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+    assert expired.state is Simulation20PointState.TERMINAL_STOP
+    assert expired.linear_velocity_m_s == 0.0
+    assert expired.mission_decision is not None
+    assert (
+        expired.mission_decision.termination_reason
+        is TerminationReason.MATCH_TIMEOUT
+    )
+
+
+def test_no_motion_timeout_during_breakup_latches_terminal_stop() -> None:
+    sequence = make_sequence(breakup=_ParkedCenterBreakup())
+    start_sequence(sequence)
+
+    parked = sequence.step(
+        2,
+        perception=snapshot(1, 2, observation(1, 2, GroundPoint(600.0, 0.0))),
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+    assert parked.state is Simulation20PointState.CENTER_CLUSTER
+    assert parked.linear_velocity_m_s == 0.0
+    stalled = sequence.step(
+        16_000_000_002,
+        perception=snapshot(
+            2,
+            16_000_000_002,
+            observation(2, 16_000_000_002, GroundPoint(600.0, 0.0)),
+        ),
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+    assert stalled.state is Simulation20PointState.TERMINAL_STOP
+    assert stalled.mission_decision is not None
+    assert (
+        stalled.mission_decision.termination_reason
+        is TerminationReason.NO_MOTION_TIMEOUT
+    )
+
+
+def test_stale_vision_during_breakup_keeps_fixed_action() -> None:
+    sequence = make_sequence(breakup=_ApproachBreakup())
+    start_sequence(sequence)
+    green = lambda frame, timestamp: snapshot(
+        frame,
+        timestamp,
+        observation(frame, timestamp, GroundPoint(600.0, 0.0)),
+    )
+
+    approaching = sequence.step(
+        2,
+        perception=green(1, 2),
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+    assert approaching.state is Simulation20PointState.APPROACH_CLUSTER
+    stale = sequence.step(
+        600_000_002,
+        perception=None,
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+    # Non-terminal mission holds must not interrupt the fixed encoder-driven
+    # breakup approach; only rule-level terminations stop it.
+    assert stale.state is Simulation20PointState.APPROACH_CLUSTER
+    assert stale.linear_velocity_m_s == pytest.approx(0.1)
