@@ -14,7 +14,7 @@
 | --- | --- | --- |
 | `rescue-vision-manual-capture` | `runtime.yaml`、车端输出根目录和显式监督确认 | 完整装配 TCP/UART/相机/运动/夹爪/记录；推荐生产入口 |
 | `rescue-vision-cluster-breakup` | `runtime.yaml` 和显式监督确认 | 定距越障、目标团搜索/居中、闭爪定距冲散、原地全开、张爪退出、停车合爪、闭爪退离并扫描绿色；找到绿色后停车 |
-| `rescue-vision-simulation-20-point` | `runtime.simulation-20min.yaml` 和显式监督确认 | 复用现有解团，跟踪/世界模型/规则门禁、受限预推导航、单绿色推送、交付验证、退离和四次完成停车 |
+| `rescue-vision-simulation-20-point` | `runtime.simulation-20min.yaml` 和显式监督确认 | 复用现有解团，跟踪/世界模型/规则门禁、受限预推导航、单绿色推送、交付验证、退离、四次完成停车，并向 observe_only 观察端发布最新 `map/state` 位姿 |
 | `ClusterBreakupSequence(...).step()` | `ClusterBreakupRuntimeConfig`、`motion.gripper.full_travel_time_s`、同一单调时间轴、编码器累计路程和最新 `PerceptionSnapshot` | 纯逻辑流程决策；不创建相机、Hailo、UART 或电机；冲散后全开、张爪退出、停车合爪，再进入闭爪退离 |
 | `EncoderTravelTracker.submit()` | 带有效双编码器的 `OdometryImu` | 使用运行配置机械标定产生机器人中心累计有符号路程 |
 | `OdometryImuFusion.submit_odometry()` | 同一 UART 消费链路中的 `OdometryImu` | 解团临时配置只输出编码器+IMU 连续 `FieldPose2D`；不调用 `submit_visual()` |
@@ -247,9 +247,11 @@ rescue-vision-cluster-breakup \
 保持 `motion.gripper.full_travel_time_s` 完全打开，再以
 `retreat_speed_m_s` 张爪倒退 `gripper_open_retreat_distance_m`。到达后停车切回闭合
 端点，保持同一全行程时间，最后以 `retreat_speed_m_s` 闭爪倒退
-`retreat_distance_m`。最后进入 `SCAN_GREEN` 左转
+`retreat_distance_m`。最后进入 `SCAN_GREEN`，按配置的搜索方向原地
 扫描，连续看到配置帧数的 `green_supply` 后停车退出。当前不会继续接近或交付
-绿色目标。
+绿色目标；搜索方向始终由 `motion.cluster_breakup.search_direction` 决定，不在入口
+中固定为左转。解团阶段不额外插入 `BREAKUP_SAFETY_CHECK` 或危险/未知类别门禁；
+在非转运阶段若视野只有 `unknown`/`blue_danger`，流程继续原地搜索，不直接锁定零速。
 
 `configs/runtime.simulation-20min.yaml` 是从当前车端 `runtime.yaml` 复制的临时配置：
 保留目标 perception 所需的 Hailo 和地面映射，关闭 `localization.enabled` 及
