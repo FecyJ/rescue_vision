@@ -443,7 +443,7 @@ def test_side_path_failure_cannot_be_overridden_by_motion_request() -> None:
     assert decision.linear_velocity_m_s == 0.0
 
 
-def test_breakup_safety_waits_for_track_confirmation_before_approach() -> None:
+def test_breakup_approach_is_not_category_gated() -> None:
     sequence = make_sequence(
         breakup=_ApproachBreakup(),
         confirmation_hits=2,
@@ -454,23 +454,9 @@ def test_breakup_safety_waits_for_track_confirmation_before_approach() -> None:
         2,
         observation(1, 2, GroundPoint(500.0, 0.0)),
     )
-    safety_check = sequence.step(
+    approaching = sequence.step(
         2,
         perception=first,
-        pose=pose(),
-        cumulative_distance_m=0.0,
-    )
-    assert safety_check.state is Simulation20PointState.BREAKUP_SAFETY_CHECK
-    assert safety_check.linear_velocity_m_s == 0.0
-
-    confirmed = snapshot(
-        2,
-        3,
-        observation(2, 3, GroundPoint(500.0, 0.0)),
-    )
-    approaching = sequence.step(
-        3,
-        perception=confirmed,
         pose=pose(),
         cumulative_distance_m=0.0,
     )
@@ -478,7 +464,7 @@ def test_breakup_safety_waits_for_track_confirmation_before_approach() -> None:
     assert approaching.linear_velocity_m_s == pytest.approx(0.1)
 
 
-def test_breakup_safety_hold_does_not_oscillate_back_into_breakup() -> None:
+def test_blue_during_breakup_does_not_trigger_safety_hold() -> None:
     sequence = make_sequence(breakup=_ApproachBreakup())
     start_sequence(sequence)
     danger_1 = snapshot(
@@ -496,46 +482,25 @@ def test_breakup_safety_hold_does_not_oscillate_back_into_breakup() -> None:
             target_class=TargetClass.BLUE_DANGER,
         ),
     )
-    sequence.step(
+    approaching = sequence.step(
         2,
         perception=danger_1,
         pose=pose(),
         cumulative_distance_m=0.0,
     )
-    danger_2 = snapshot(
-        2,
+    assert approaching.state is Simulation20PointState.APPROACH_CLUSTER
+    assert approaching.linear_velocity_m_s == pytest.approx(0.1)
+    continuing = sequence.step(
         3,
-        observation(
-            2,
-            3,
-            GroundPoint(500.0, 0.0),
-        ),
-        observation(
-            2,
-            3,
-            GroundPoint(520.0, 40.0),
-            target_class=TargetClass.BLUE_DANGER,
-        ),
-    )
-    held = sequence.step(
-        3,
-        perception=danger_2,
+        perception=danger_1,
         pose=pose(),
         cumulative_distance_m=0.0,
     )
-    assert held.state is Simulation20PointState.SAFETY_HOLD
-    still_held = sequence.step(
-        4,
-        perception=danger_2,
-        pose=pose(),
-        cumulative_distance_m=0.0,
-    )
-    assert still_held.state is Simulation20PointState.SAFETY_HOLD
-    assert still_held.linear_velocity_m_s == 0.0
-    assert still_held.reason == held.reason
+    assert continuing.state is Simulation20PointState.APPROACH_CLUSTER
+    assert continuing.linear_velocity_m_s == pytest.approx(0.1)
 
 
-def test_hazard_only_view_searches_in_place_without_forward_motion() -> None:
+def test_blue_only_view_follows_normal_scan_without_special_branch() -> None:
     sequence = make_sequence(
         config=runtime_config(breakup_settle_confirm_frames=1),
     )
@@ -586,9 +551,68 @@ def test_hazard_only_view_searches_in_place_without_forward_motion() -> None:
         cumulative_distance_m=0.0,
     )
     assert searching.state is Simulation20PointState.SCAN_GREEN
-    assert searching.reason == "hazard_only_view_search"
+    assert searching.reason == "scan_green"
     assert searching.linear_velocity_m_s == 0.0
     assert searching.angular_velocity_rad_s != 0.0
+
+
+def test_precontact_blue_track_cancels_green_selection_without_transport() -> None:
+    sequence = make_sequence()
+    start_sequence(sequence)
+    sequence._breakup = None
+    sequence._selected_track_id = 1
+    sequence.state = Simulation20PointState.APPROACH_GREEN
+
+    decision = sequence.step(
+        2,
+        perception=snapshot(
+            1,
+            2,
+            observation(
+                1,
+                2,
+                GroundPoint(500.0, 0.0),
+                target_class=TargetClass.BLUE_DANGER,
+            ),
+        ),
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+
+    assert decision.state is Simulation20PointState.EVALUATE_EASY_GREEN
+    assert decision.selected_track_id is None
+    assert sequence._transport.engaged_track_ids == ()
+    assert decision.linear_velocity_m_s == 0.0
+
+
+def test_blue_in_prepush_corridor_cancels_plan_for_reselection() -> None:
+    sequence = make_sequence()
+    start_sequence(sequence)
+    sequence._breakup = None
+    sequence._selected_track_id = 1
+    sequence.state = Simulation20PointState.NAVIGATE_PREPUSH
+
+    decision = sequence.step(
+        2,
+        perception=snapshot(
+            1,
+            2,
+            observation(1, 2, GroundPoint(1200.0, 0.0)),
+            observation(
+                1,
+                2,
+                GroundPoint(800.0, 0.0),
+                target_class=TargetClass.BLUE_DANGER,
+            ),
+        ),
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+
+    assert decision.state is Simulation20PointState.EVALUATE_EASY_GREEN
+    assert decision.reason == "navigate_corridor_blocked_reselect_green"
+    assert decision.selected_track_id is None
+    assert decision.linear_velocity_m_s == 0.0
 
 
 def test_four_green_deliveries_latch_finish_stop_and_twenty_points() -> None:
@@ -666,26 +690,32 @@ def test_four_green_deliveries_latch_finish_stop_and_twenty_points() -> None:
             heading=float(prepush_heading),
         ).state is Simulation20PointState.ALIGN_GREEN
         push_heading = float(np.arctan2(1400.0, -target_x))
-        assert feed(
+        approaching = feed(
             target,
             x=plan.prepush_field.x,
             y=plan.prepush_field.y,
             heading=push_heading,
-        ).state is Simulation20PointState.APPROACH_GREEN
+        )
+        assert approaching.state is Simulation20PointState.APPROACH_GREEN
+        assert approaching.gripper_posture is GripperPosture.TRANSPORT
         contact_x = target.x - float(np.cos(push_heading)) * 80.0
         contact_y = target.y - float(np.sin(push_heading)) * 80.0
-        assert feed(
+        engaging = feed(
             target,
             x=contact_x,
             y=contact_y,
             heading=push_heading,
-        ).state is Simulation20PointState.ENGAGE_GREEN
-        assert feed(
+        )
+        assert engaging.state is Simulation20PointState.ENGAGE_GREEN
+        assert engaging.gripper_posture is GripperPosture.TRANSPORT
+        engaged = feed(
             target,
             x=contact_x,
             y=contact_y,
             heading=push_heading,
-        ).state is Simulation20PointState.PUSH_TO_MATERIAL_ZONE
+        )
+        assert engaged.state is Simulation20PointState.PUSH_TO_MATERIAL_ZONE
+        assert engaged.gripper_posture is GripperPosture.CLOSED
 
         destination = FieldPoint(0.0, 1400.0)
         assert feed(

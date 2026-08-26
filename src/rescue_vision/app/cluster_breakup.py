@@ -77,6 +77,7 @@ class BreakupState(str, Enum):
 
 class GripperPosture(str, Enum):
     CLOSED = "closed"
+    TRANSPORT = "transport"
     OPEN = "open"
 
 
@@ -2012,17 +2013,23 @@ def _run_hardware(
                         )
                         next_progress_ns = now_ns + 1_000_000_000
                     if decision.gripper_posture is not last_posture:
-                        angles = (
-                            (
+                        if decision.gripper_posture is GripperPosture.OPEN:
+                            angles = (
                                 gripper.open_left_angle_deg,
                                 gripper.open_right_angle_deg,
                             )
-                            if decision.gripper_posture is GripperPosture.OPEN
-                            else (
+                        elif decision.gripper_posture is GripperPosture.TRANSPORT:
+                            transport_angles = gripper.transport_angles_deg
+                            if transport_angles is None:
+                                raise RuntimeError(
+                                    "Transport gripper posture is not configured."
+                                )
+                            angles = transport_angles
+                        else:
+                            angles = (
                                 gripper.closed_left_angle_deg,
                                 gripper.closed_right_angle_deg,
                             )
-                        )
                         controller.set_gripper_angles(*angles)
                         last_posture = decision.gripper_posture
                     controller.drive_wheel_limited(

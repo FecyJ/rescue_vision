@@ -73,76 +73,133 @@ motion:
     # 每组开/闭端点的左右角之和必须等于该值；示例值需按本车机械结构复核。
     angle_sum_deg: 190.0
   cluster_breakup:
-    # 仅用于有物理急停、人员全程监督的解团试验；不是完整比赛入口。
+    # 解团子流程：越障、搜索/居中、定距推散、张爪退出、闭爪退离和绿色扫描；
+    # 只用于有物理急停、人员全程监督的模拟赛前置试验，不是完整比赛入口。
     enabled: true
+    # 出发后原地搜索目标团的方向；left/right 只改变角速度符号。
     search_direction: right
-    # 从约定出发姿态直行越过减速带，编码器累计机器人中心路程。
+    # 从约定出发姿态直行越过减速带所需的机器人中心路程，单位 m；
+    # 由左右编码器累计路程计算，未达到前保持 LEAVE_START。
     departure_distance_m: 0.6
+    # LEAVE_START 阶段的直行速度，单位 m/s；必须不超过 motion 线速度上限。
     departure_speed_m_s: 0.15
-    # 左转为正；找到至少两个模型观测后切换为目标团居中。
+    # SEARCH_CLUSTER 阶段的原地搜索角速度，单位 rad/s；左转为正。
     search_angular_velocity_rad_s: 0.45
+    # SEARCH_CLUSTER 最长持续时间，单位 s；超时进入故障停车。
     search_timeout_s: 12.0
+    # 进入 CENTER_CLUSTER 所需的同帧目标观测数量下限；避免把单个目标当目标团。
     cluster_min_detections: 2
-    # 目标团包围框中心相对半幅图像的允许误差及连续确认帧数。
+    # 目标团联合框中心相对图像中心半幅的允许误差，无单位比例。
     center_tolerance_ratio: 0.08
+    # 联合框中心连续满足容差的帧数，满足后才进入 APPROACH_CLUSTER。
     center_confirm_frames: 3
+    # CENTER_CLUSTER 的横向误差比例控制增益，输出角速度单位 rad/s。
     center_kp_rad_s: 1.20
+    # CENTER_CLUSTER 角速度硬上限，单位 rad/s。
     center_max_angular_velocity_rad_s: 0.55
+    # APPROACH_CLUSTER 接近目标团的线速度，单位 m/s。
     approach_speed_m_s: 0.12
-    # 最近有效 K0 地面点进入该前向距离后，保持闭爪并开始定距冲散；
-    # 到达冲散距离后停车张爪，按 motion.gripper.full_travel_time_s 完全打开，
-    # 张爪退出一段距离，再停车合爪并进入闭爪 RETREAT。
+    # 最近有效 K0 地面点进入该前向距离后，保持闭爪并开始定距冲散，单位 mm；
+    # 这是接触目标团前的触发距离，不是最终推散路程。
     gripper_open_distance_mm: 200.0
+    # BREAKUP_PUSH 阶段的定距推散速度，单位 m/s。
     breakup_speed_m_s: 0.25
-    breakup_distance_m: 0.25
-    # 张爪退出距离与闭爪 RETREAT 距离分开配置。
+    # BREAKUP_PUSH 阶段的编码器中心前进距离，单位 m；到达后立即停车并张爪。
+    breakup_distance_m: 0.4
+    # BREAKUP_OPEN_RETREAT 阶段保持张爪倒退的距离，单位 m；
+    # 到达后先停车合爪并等待全行程，再进入闭爪 RETREAT。
     gripper_open_retreat_distance_m: 0.10
+    # BREAKUP_OPEN_RETREAT/RETREAT 两个倒退阶段的线速度，单位 m/s。
     retreat_speed_m_s: 0.10
-    retreat_distance_m: 0.25
+    # RETREAT 阶段合爪后继续倒退的编码器中心距离，单位 m。
+    retreat_distance_m: 0.3
+    # SCAN_GREEN 阶段的原地扫描角速度，单位 rad/s；左转为正。
     scan_green_angular_velocity_rad_s: 0.35
+    # 连续看到 green_supply 的帧数；满足后输出 GREEN_FOUND 并停车。
     green_confirm_frames: 2
+    # CENTER/APPROACH 等目标团阶段允许暂时丢失目标的时间，单位 ms；
+    # 超过后进入故障停车。
     target_loss_timeout_ms: 500.0
+    # 每个定距运动或夹爪动作阶段的最长时间，单位 s；用于防止编码器/执行器失效时无限运动。
     motion_phase_timeout_s: 10.0
 
 simulation_20_point:
-  # 初版四次单个绿色物资推送；真实运行仍受 STM32 看门狗/急停和现场确认门禁约束。
+  # 单车四次单个绿色普通物资推送的应用参数；分数固定为 4 × 5 = 20。
+  # 真实运行仍受 STM32 看门狗/急停、定位质量和现场规则确认门禁约束。
   enabled: true
+  # 本流程目标数固定为 4；代码拒绝其他数量，避免把展示分数改成另一套规则。
   target_delivery_count: 4
+  # 目标中心到机器人推头前缘的预推距离，单位 mm；包含车体/推头/目标尺寸裕量。
   prepush_offset_mm: 180.0
+  # 机器人轮轴中点的保守足迹半径，单位 mm；用于路径和目标走廊膨胀检查。
   robot_footprint_radius_mm: 160.0
+  # 普通物块足迹半尺寸，单位 mm；用于目标间净空和安全区内缩计算。
   target_half_extent_mm: 25.0
+  # 路径、目标间距和安全区判断的额外保守裕量，单位 mm。
   safety_margin_mm: 80.0
+  # 交付区域边界的额外内缩距离，单位 mm；目标中心必须远离边界达到该值加半尺寸。
   delivery_inset_mm: 35.0
+  # 允许进入导航/选择的最大机器人位置不确定度，单位 mm。
   max_position_uncertainty_mm: 120.0
+  # 允许进入导航/选择的最大航向不确定度，单位 rad。
   max_heading_uncertainty_rad: 0.20
+  # 目标最近一次有效观测的最大年龄，单位 ms；超过后不能接近、接触或交付。
   target_max_age_ms: 250.0
+  # 绿色目标正式筛选前必须覆盖的累计航向范围，单位 rad；默认约一整圈。
   scan_min_heading_span_rad: 6.283185307179586
+  # SCAN_GREEN 原地搜索角速度，单位 rad/s；方向沿 motion.cluster_breakup.search_direction。
   scan_angular_velocity_rad_s: 0.30
+  # NAVIGATE_PREPUSH 直线段速度，单位 m/s。
   navigation_speed_m_s: 0.12
+  # 导航航向误差比例增益，单位 rad/s per rad。
   navigation_angular_kp_rad_s: 1.0
+  # 导航阶段角速度上限，单位 rad/s。
   navigation_max_angular_velocity_rad_s: 0.45
+  # 到达预推点的距离容差，单位 mm。
   navigation_position_tolerance_mm: 40.0
+  # 导航和目标对准的航向误差容差，单位 rad。
   navigation_heading_tolerance_rad: 0.10
+  # APPROACH_GREEN 近场接近线速度，单位 m/s；目标到达接触距离前使用。
   approach_speed_m_s: 0.08
+  # ALIGN_GREEN/APPROACH_GREEN 横向角误差比例增益，单位 rad/s per rad。
   alignment_kp_rad_s: 1.2
+  # 局部视觉对准的角速度上限，单位 rad/s。
   alignment_max_angular_velocity_rad_s: 0.35
+  # 目标前向距离小于等于该值时进入 ENGAGE_GREEN，单位 mm。
   engage_distance_mm: 90.0
+  # 接触时允许的目标横向误差，单位 mm。
   engage_lateral_tolerance_mm: 35.0
+  # 检查第二目标是否进入推头接触走廊的前向长度，单位 mm。
   contact_corridor_length_mm: 140.0
+  # PUSH_TO_MATERIAL_ZONE 推送线速度，单位 m/s。
   push_speed_m_s: 0.07
+  # 推送期间根据目标局部横向误差修正角速度的比例增益，单位 rad/s per rad。
   push_angular_kp_rad_s: 0.8
+  # 推送期间角速度上限，单位 rad/s。
   push_max_angular_velocity_rad_s: 0.25
+  # 交付确认后 DISENGAGE_AND_RETREAT 的倒退速度，单位 m/s。
   retreat_speed_m_s: 0.08
+  # 交付证据成立后倒退的最小编码器路程，单位 m。
   retreat_distance_m: 0.20
+  # 退离时目标中心必须重新出现在机器人前方的最小距离，单位 mm。
   retreat_clear_distance_mm: 180.0
+  # 目标完全进入己方物资区的连续确认帧数；不足时不生成交付证据。
   delivery_confirm_frames: 3
+  # 退离后目标仍安全存在且已脱离接触的连续确认帧数。
   disengage_confirm_frames: 3
+  # 每次交付循环允许的重复解团次数，不含首次解团。
   max_breakup_attempts_per_delivery: 2
+  # 整轮允许的解团总次数上限，防止无限重复冲散。
   max_breakup_attempts_total: 8
+  # 解团碰撞后允许重建轨迹前需要的新鲜稳定帧数。
   breakup_settle_confirm_frames: 3
+  # 相邻重复解团之间要求的最大净空改善下限，单位 mm；不足则停止盲撞。
   min_breakup_progress_mm: 20.0
+  # 绿色目标与其他目标之间要求的最小可搬运净空，单位 mm。
   min_green_clearance_mm: 80.0
+  # 路径/推送走廊离散采样间隔，单位 mm；越小越保守但计算量越大。
   corridor_sample_step_mm: 40.0
+  # 已交付目标场地点排除半径，单位 mm；防止 tracker 重置后重复选择同一物块。
   completed_target_exclusion_mm: 120.0
 
 remote:
@@ -160,18 +217,29 @@ remote:
   max_payload_bytes: 2097152
 
 tracking:
+  # 同一目标需要连续命中多少帧才从 tentative 变为 confirmed。
   confirmation_hits: 2
+  # 有 GroundPoint 时允许的目标关联最大距离，单位 mm。
   max_association_ground_mm: 250.0
+  # 没有 GroundPoint 时使用的最小框 IoU 关联阈值。
   min_association_iou: 0.10
+  # 目标暂时遮挡后允许保留 coasting 轨迹的时间，单位 ms。
   max_coast_ms: 600.0
+  # 轨迹置信度每秒衰减量；用于过期目标删除和候选过滤。
   confidence_decay_per_second: 0.8
+  # 低于该置信度的轨迹会被删除，不进入世界模型决策。
   min_confidence: 0.15
 
 world:
+  # 世界模型允许使用的最大视觉年龄，单位 ms；过期会产生 STALE_VISION。
   max_visual_age_ms: 250.0
+  # 对手占据观测允许保留的最大年龄，单位 ms。
   opponent_max_age_ms: 500.0
+  # blue_danger 概率达到该值且轨迹确认后判为 CONFIRMED，单位无量纲。
   danger_confirm_threshold: 0.60
+  # blue_danger 概率达到该值后判为 SUSPECTED，单位无量纲。
   danger_suspect_threshold: 0.15
+  # unknown 概率达到该值后判为 SUSPECTED，单位无量纲。
   unknown_suspect_threshold: 0.50
   # 抽签后设为 red 或 blue；unknown 时只生成 field 语义，不把固定红蓝区
   # 猜成己方/对方区域。

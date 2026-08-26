@@ -14,9 +14,9 @@
 | --- | --- | --- |
 | `rescue-vision-manual-capture` | `runtime.yaml`、车端输出根目录和显式监督确认 | 完整装配 TCP/UART/相机/运动/夹爪/记录；推荐生产入口 |
 | `rescue-vision-cluster-breakup` | `runtime.yaml` 和显式监督确认 | 定距越障、目标团搜索/居中、闭爪定距冲散、原地全开、张爪退出、停车合爪、闭爪退离并扫描绿色；找到绿色后停车 |
-| `rescue-vision-simulation-20-point` | `runtime.simulation-20min.yaml` 和显式监督确认 | 复用现有解团，跟踪/世界模型/规则门禁、受限预推导航、单绿色推送、交付验证、退离、四次完成停车，并向 observe_only 观察端发布最新 `map/state` 位姿 |
+| `rescue-vision-simulation-20-point` | `runtime.simulation-20min.yaml` 和显式监督确认 | 复用现有解团，跟踪/世界模型/规则门禁、受限预推导航、单绿色推送、接近时 transport 局部打开、接触确认后闭合、交付验证、退离、四次完成停车，并向 observe_only 观察端发布最新 `map/state` 位姿 |
 | `ClusterBreakupSequence(...).step()` | `ClusterBreakupRuntimeConfig`、`motion.gripper.full_travel_time_s`、同一单调时间轴、编码器累计路程和最新 `PerceptionSnapshot` | 纯逻辑流程决策；不创建相机、Hailo、UART 或电机；冲散后全开、张爪退出、停车合爪，再进入闭爪退离 |
-| `EncoderTravelTracker.submit()` | 带有效双编码器的 `OdometryImu` | 使用运行配置机械标定产生机器人中心累计有符号路程 |
+| `EncoderTravelTracker.submit()` | 带有效双编码器的 `OdometryImu`；默认允许单次 `sample_overrun` | 使用运行配置机械标定产生机器人中心累计有符号路程；连续异常超出配置预算时抛错 |
 | `OdometryImuFusion.submit_odometry()` | 同一 UART 消费链路中的 `OdometryImu` | 解团临时配置只输出编码器+IMU 连续 `FieldPose2D`；不调用 `submit_visual()` |
 | `OdometryFusionPump` | `OdometryImu` 有界队列和 `OdometryImuFusion` | 顺序处理融合，不阻塞运动刷新线程；队列满或 worker 异常进入停车路径 |
 | `CameraPerceptionPump` | `FrameSource`、去畸变函数和目标感知旁路 | 在独立线程完成取帧/去畸变/推理提交，不占用运动刷新线程 |
@@ -90,8 +90,31 @@ decision = flow.step(
 
 返回的 `SimulationDecision.linear_velocity_m_s`、
 `angular_velocity_rad_s` 是机器人轮轴中点参考的差速 twist，角速度左转为正；
-夹爪姿态只允许 `open/closed` 两个已标定端点。调用方把它交给同一
-`MotionController`，不能在 `TERMINAL_STOP` 或 `FINISH_STOP` 覆盖为非零速度：
+夹爪姿态为 `open/transport/closed`。20 分流程在 `APPROACH_GREEN` 和尚未确认的
+`ENGAGE_GREEN` 使用 `transport` 局部打开姿态，成功确认接触后切换为 `closed`。
+调用方把它交给同一 `MotionController`，不能在 `TERMINAL_STOP` 或 `FINISH_STOP`
+覆盖为非零速度。真实控制循环只在姿态变化时下发角度：
+
+```python
+from rescue_vision.app import GripperPosture
+
+gripper = config.motion.gripper.build_calibration()
+if gripper is None or gripper.transport_angles_deg is None:
+    raise RuntimeError("20-point simulation requires transport gripper angles.")
+
+# `last_posture` 由控制循环跨周期保存；`decision` 来自前一个 step() 示例。
+if decision.gripper_posture is not last_posture:
+    if decision.gripper_posture is GripperPosture.OPEN:
+        angles = (gripper.open_left_angle_deg, gripper.open_right_angle_deg)
+    elif decision.gripper_posture is GripperPosture.TRANSPORT:
+        angles = gripper.transport_angles_deg
+    else:
+        angles = (gripper.closed_left_angle_deg, gripper.closed_right_angle_deg)
+    motion_controller.set_gripper_angles(*angles)
+    last_posture = decision.gripper_posture
+```
+
+随后按状态发送底盘意图；不能在 `TERMINAL_STOP` 或 `FINISH_STOP` 覆盖为非零速度：
 
 ```python
 if decision.state in {
@@ -109,14 +132,15 @@ else:
 流程的顺序是：现有解团 → 轨迹重置/稳定确认 → 最小航向扫描 → 易搬运绿色筛选 →
 预推点和保守走廊 → 对准/几何单目标接触 → 单目标推送 → 己方物资区内缩区域的
 连续完全进入证据 → 退离确认。完成四个不同的有效 `delivery_id` 后进入
-`FINISH_STOP`，`valid_green_deliveries=4`、`score_points=20`。目标丢失、危险/未知
-目标、第二目标进入接触走廊、定位/视觉过期、证据不足和旁路故障分别进入安全保持
-或终止停车；安全保持不会自动恢复，必须由外部新鲜证据调用
+`FINISH_STOP`，`valid_green_deliveries=4`、`score_points=20`。目标丢失、第二目标
+进入接触走廊、定位/视觉过期、证据不足和旁路故障分别进入安全保持或终止停车；
+接近中的目标若变为危险会取消当前方案，远场危险目标和解团时的短暂接触不触发安全保持。
+安全保持不会自动恢复，必须由外部新鲜证据调用
 `resume_after_safety_hold()`。
 
-如果最新视野只包含 `unknown`/`blue_danger`，且没有正在转运的物块，流程会清除
-未完成的目标锁定并原地搜索，直到出现其他目标后重新评估；正在转运时仍保持零速，
-不会为了搜索而旋转丢失接触物块。
+蓝色或 `unknown` 不会成为绿色候选。常规导航只在它们实际阻挡预推、接近或推动
+走廊时取消当前绿色方案并重新评估；已经建立单目标持续推动后若走廊被阻挡则保持
+零速，不带着物块自动绕行。解团阶段沿用固定直线动作，不为蓝色物块规划替代方向。
 
 真实车入口负责资源生命周期：UART 通道打开后，相机/Hailo 预热在独立启动线程中
 与运动同步并行；预热等待期间主线程持续排空 UART，感知旁路就绪后才进入相机门禁。
@@ -257,14 +281,15 @@ rescue-vision-cluster-breakup \
 保留目标 perception 所需的 Hailo 和地面映射，关闭 `localization.enabled` 及
 `perception.field_features.enabled`，但开启 `localization.fusion.enabled`。
 解团入口把每条有效 `OdometryImu` 同时送入固定距离里程计和
-`OdometryImuFusion`，当前只消费编码器+IMU预测；初始场地位姿来自配置的
+`OdometryImuFusion`，当前只消费编码器+IMU预测；单次双编码器有效的
+`sample_overrun` 会等待下一帧并做短时 IMU 插值，连续异常仍触发保守降级；初始场地位姿来自配置的
 `localization.fusion.initial_pose`，连续估计会在 `progress` 中打印。尚未接入
 中心十字、安全区或其他视觉位姿纠偏；后续只需在独立视觉旁路中调用
 `fusion.submit_visual()`。
 
 取帧和全尺寸去畸变在独立输入旁路运行，Hailo 推理再使用单槽最新帧后台旁路；
 运动循环只刷新轮速、排空 UART 并消费最新结构化观测。观测过期、
-目标团丢失、编码器无效/跳变、阶段超时、相机/Hailo/UART 异常以及退出都会走停车
+目标团丢失、编码器无效/跳变、连续里程计异常、阶段超时、相机/Hailo/UART 异常以及退出都会走停车
 路径。所有距离、速度、角度、确认帧数和超时均来自
 `motion.cluster_breakup`，不能在入口中另写一套参数。
 入口每秒输出机器人中心/左右轮累计路程、原始编码器计数及目标/已下发轮速。

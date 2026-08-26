@@ -56,7 +56,6 @@ from rescue_vision.world import (
     WorldModel,
     WorldSnapshot,
     WorldTarget,
-    WorldUncertainty,
 )
 
 
@@ -68,7 +67,6 @@ class Simulation20PointState(str, Enum):
     LEAVE_START = "leave_start"
     SEARCH_CLUSTER = "search_cluster"
     CENTER_CLUSTER = "center_cluster"
-    BREAKUP_SAFETY_CHECK = "breakup_safety_check"
     APPROACH_CLUSTER = "approach_cluster"
     BREAKUP_PUSH = "breakup_push"
     BREAKUP_RELEASE = "breakup_release"
@@ -570,7 +568,6 @@ class Simulation20PointSequence:
             Simulation20PointState.LEAVE_START,
             Simulation20PointState.SEARCH_CLUSTER,
             Simulation20PointState.CENTER_CLUSTER,
-            Simulation20PointState.BREAKUP_SAFETY_CHECK,
             Simulation20PointState.APPROACH_CLUSTER,
             Simulation20PointState.BREAKUP_PUSH,
             Simulation20PointState.RETREAT_FROM_CLUSTER,
@@ -587,8 +584,6 @@ class Simulation20PointSequence:
 
         if self.state is Simulation20PointState.RESET_TARGET_TRACKS:
             return self._step_reset_tracks(timestamp_ns, perception, pose, snapshot)
-        if self._hazard_only_view(perception):
-            return self._handle_hazard_only_view(timestamp_ns, snapshot)
         if self.state is Simulation20PointState.SAFETY_HOLD:
             return self._decision(
                 timestamp_ns,
@@ -752,59 +747,6 @@ class Simulation20PointSequence:
         self._world_snapshot = snapshot
         return snapshot
 
-    @staticmethod
-    def _hazard_only_view(perception: PerceptionSnapshot | None) -> bool:
-        if (
-            perception is None
-            or perception.dropped_stale_age_ms is not None
-            or not perception.observations
-        ):
-            return False
-        hazard_classes = {TargetClass.UNKNOWN, TargetClass.BLUE_DANGER}
-        return all(
-            observation.target_class in hazard_classes
-            for observation in perception.observations
-        )
-
-    def _handle_hazard_only_view(
-        self,
-        timestamp_ns: int,
-        snapshot: WorldSnapshot,
-    ) -> SimulationDecision:
-        if self._transport.engaged_track_ids:
-            return self._hold(timestamp_ns, "hazard_only_during_transport")
-        if self._breakup is None:
-            self._selected_track_id = None
-            self._selected_plan = None
-            self._hold_resume_state = None
-            self._safety_hold_reason = None
-            self.state = Simulation20PointState.SCAN_GREEN
-            self._scan_start_heading = None
-            self._scan_last_heading = None
-            self._scan_heading_span = 0.0
-        elif self.state is Simulation20PointState.SAFETY_HOLD:
-            self.state = (
-                self._hold_resume_state
-                or Simulation20PointState.BREAKUP_SAFETY_CHECK
-            )
-            self._hold_resume_state = None
-            self._safety_hold_reason = None
-        posture = GripperPosture.CLOSED
-        breakup_state = getattr(self._breakup, "state", None)
-        if breakup_state in {
-            BreakupState.BREAKUP_RELEASE,
-            BreakupState.BREAKUP_OPEN_RETREAT,
-        }:
-            posture = GripperPosture.OPEN
-        return self._decision(
-            timestamp_ns,
-            0.0,
-            self._scan_velocity(),
-            "hazard_only_view_search",
-            posture=posture,
-            world_snapshot=snapshot,
-        )
-
     def _step_breakup(
         self,
         timestamp_ns: int,
@@ -851,40 +793,13 @@ class Simulation20PointSequence:
                     posture=breakup_decision.gripper_posture,
                     world_snapshot=snapshot,
                 )
-        elif breakup_decision.state is BreakupState.APPROACH_CLUSTER:
-            if self.state is not Simulation20PointState.BREAKUP_SAFETY_CHECK:
-                self.state = Simulation20PointState.BREAKUP_SAFETY_CHECK
-                return self._decision(
-                    timestamp_ns,
-                    0.0,
-                    0.0,
-                    "breakup_safety_check",
-                    posture=breakup_decision.gripper_posture,
-                    world_snapshot=snapshot,
-                )
-            safe, hard_block, reason = self._breakup_safety_status(snapshot)
-            if not safe:
-                if hard_block:
-                    return self._hold(
-                        timestamp_ns,
-                        f"breakup_safety_evidence_missing:{reason}",
-                    )
-                self.state = Simulation20PointState.BREAKUP_SAFETY_CHECK
-                return self._decision(
-                    timestamp_ns,
-                    0.0,
-                    0.0,
-                    f"breakup_safety_wait:{reason}",
-                    posture=breakup_decision.gripper_posture,
-                    world_snapshot=snapshot,
-                )
-            self.state = Simulation20PointState.APPROACH_CLUSTER
         else:
             self.state = {
                 BreakupState.WAIT_ODOMETRY: Simulation20PointState.LEAVE_START,
                 BreakupState.LEAVE_START: Simulation20PointState.LEAVE_START,
                 BreakupState.SEARCH_CLUSTER: Simulation20PointState.SEARCH_CLUSTER,
                 BreakupState.CENTER_CLUSTER: Simulation20PointState.CENTER_CLUSTER,
+                BreakupState.APPROACH_CLUSTER: Simulation20PointState.APPROACH_CLUSTER,
                 BreakupState.BREAKUP_PUSH: Simulation20PointState.BREAKUP_PUSH,
                 BreakupState.BREAKUP_RELEASE: Simulation20PointState.BREAKUP_RELEASE,
                 BreakupState.BREAKUP_OPEN_RETREAT: (
@@ -910,41 +825,6 @@ class Simulation20PointSequence:
             posture=breakup_decision.gripper_posture,
             world_snapshot=snapshot,
         )
-
-    def _breakup_safety_clear(self, snapshot: WorldSnapshot) -> bool:
-        return self._breakup_safety_status(snapshot)[0]
-
-    @staticmethod
-    def _breakup_safety_status(
-        snapshot: WorldSnapshot,
-    ) -> tuple[bool, bool, str]:
-        """Return ``(safe, hard_block, reason)`` for the pre-push gate.
-
-        A missing/stale or not-yet-confirmed target is a zero-motion wait. An
-        explicit unknown/danger observation is a safety hold and requires
-        external recovery evidence.
-        """
-
-        if WorldUncertainty.STALE_VISION in snapshot.uncertainties:
-            return False, False, "stale_vision_wait_new_frame"
-        if not snapshot.targets:
-            return False, False, "no_targets_wait_new_frame"
-        for target in snapshot.targets:
-            if target.target_class in {
-                TargetClass.UNKNOWN,
-                TargetClass.BLUE_DANGER,
-            }:
-                return False, True, f"explicit_{target.target_class.value}"
-            if target.hazard_state is HazardState.CONFIRMED:
-                return False, True, f"confirmed_hazard_track_{target.track_id}"
-            if (
-                target.hazard_state is HazardState.SUSPECTED
-                and target.track_status is TrackStatus.CONFIRMED
-            ):
-                return False, True, f"suspected_hazard_track_{target.track_id}"
-            if target.track_status is not TrackStatus.CONFIRMED:
-                return False, False, "targets_not_confirmed_wait_new_frame"
-        return True, False, "clear"
 
     def _begin_reset_tracks(self, perception: PerceptionSnapshot | None) -> None:
         self._ignore_frames_through = self._last_tracker_frame_sequence
@@ -1147,11 +1027,29 @@ class Simulation20PointSequence:
         snapshot: WorldSnapshot,
         mission_decision: MissionDecision | None,
     ) -> SimulationDecision:
-        if self._selected_track_id is None or not self._pose_usable(pose):
+        if self._selected_track_id is None:
+            self._cancel_selected_green()
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "navigate_target_missing_reselect_green",
+                mission_decision=mission_decision,
+                world_snapshot=snapshot,
+            )
+        if not self._pose_usable(pose):
             return self._hold(timestamp_ns, "navigate_pose_uncertain")
         plan = self._find_plan(snapshot, pose.pose, self._selected_track_id)
         if plan is None:
-            return self._hold(timestamp_ns, "navigate_corridor_blocked")
+            self._cancel_selected_green()
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "navigate_corridor_blocked_reselect_green",
+                mission_decision=mission_decision,
+                world_snapshot=snapshot,
+            )
         self._selected_plan = plan
         current = pose.pose.position
         distance = _distance(current, plan.prepush_field)
@@ -1204,10 +1102,31 @@ class Simulation20PointSequence:
         mission_decision: MissionDecision | None,
     ) -> SimulationDecision:
         target = self._selected_target(snapshot)
-        if target is None or target.ground_point is None:
+        if target is None:
+            self._cancel_selected_green()
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "align_target_missing_reselect_green",
+                mission_decision=mission_decision,
+                world_snapshot=snapshot,
+            )
+        if target.ground_point is None:
             return self._hold(timestamp_ns, "align_target_missing")
-        if target.hazard_state is not HazardState.CLEAR:
-            return self._hold(timestamp_ns, "align_target_not_clear")
+        if (
+            target.target_class is not TargetClass.GREEN_SUPPLY
+            or target.hazard_state is not HazardState.CLEAR
+        ):
+            self._cancel_selected_green()
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "align_target_became_hazard_reselect_green",
+                mission_decision=mission_decision,
+                world_snapshot=snapshot,
+            )
         if not self._target_is_fresh(target, timestamp_ns):
             return self._hold(timestamp_ns, "align_target_stale")
         angle = math.atan2(target.ground_point.y, target.ground_point.x)
@@ -1218,6 +1137,7 @@ class Simulation20PointSequence:
                 0.0,
                 0.0,
                 "green_centerline_aligned",
+                posture=GripperPosture.TRANSPORT,
                 mission_decision=mission_decision,
                 world_snapshot=snapshot,
             )
@@ -1243,15 +1163,44 @@ class Simulation20PointSequence:
     ) -> SimulationDecision:
         del pose
         target = self._selected_target(snapshot)
-        if target is None or target.ground_point is None:
+        if target is None:
+            self._cancel_selected_green()
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "approach_target_missing_reselect_green",
+                mission_decision=mission_decision,
+                world_snapshot=snapshot,
+            )
+        if target.ground_point is None:
             return self._hold(timestamp_ns, "approach_target_missing")
-        if target.hazard_state is not HazardState.CLEAR:
-            return self._hold(timestamp_ns, "approach_target_not_clear")
+        if (
+            target.target_class is not TargetClass.GREEN_SUPPLY
+            or target.hazard_state is not HazardState.CLEAR
+        ):
+            self._cancel_selected_green()
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "approach_target_became_hazard_reselect_green",
+                mission_decision=mission_decision,
+                world_snapshot=snapshot,
+            )
         if not self._target_is_fresh(target, timestamp_ns):
             return self._hold(timestamp_ns, "approach_target_stale")
         conflict = self._contact_conflict(snapshot, target)
         if conflict:
-            return self._hold(timestamp_ns, "second_target_in_contact_corridor")
+            self._cancel_selected_green()
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "approach_corridor_blocked_reselect_green",
+                mission_decision=mission_decision,
+                world_snapshot=snapshot,
+            )
         ground = target.ground_point
         angle = math.atan2(ground.y, ground.x)
         if ground.x <= self.config.engage_distance_mm:
@@ -1261,6 +1210,7 @@ class Simulation20PointSequence:
                 0.0,
                 0.0,
                 "green_contact_distance_reached",
+                posture=GripperPosture.TRANSPORT,
                 mission_decision=mission_decision,
                 world_snapshot=snapshot,
             )
@@ -1273,6 +1223,7 @@ class Simulation20PointSequence:
                 self.config.alignment_max_angular_velocity_rad_s,
             ),
             "approach_selected_green",
+            posture=GripperPosture.TRANSPORT,
             mission_decision=mission_decision,
             world_snapshot=snapshot,
         )
@@ -1287,13 +1238,47 @@ class Simulation20PointSequence:
     ) -> SimulationDecision:
         del pose
         target = self._selected_target(snapshot)
-        if target is None or target.ground_point is None:
+        if target is None:
+            self._cancel_selected_green()
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "engage_target_missing_no_transport",
+                world_snapshot=snapshot,
+            )
+        if target.ground_point is None:
             return self._hold(timestamp_ns, "engage_target_missing")
+        if (
+            target.target_class is not TargetClass.GREEN_SUPPLY
+            or target.hazard_state is not HazardState.CLEAR
+        ):
+            self._cancel_selected_green()
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "engage_target_became_hazard_no_transport",
+                world_snapshot=snapshot,
+            )
         if self._contact_conflict(snapshot, target):
-            return self._hold(timestamp_ns, "engage_contact_count_uncertain")
+            self._cancel_selected_green()
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "engage_corridor_blocked_no_transport",
+                world_snapshot=snapshot,
+            )
         if not self._geometric_contact_is_valid(target):
             self.state = Simulation20PointState.APPROACH_GREEN
-            return self._decision(timestamp_ns, 0.0, 0.0, "engage_evidence_not_ready")
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "engage_evidence_not_ready",
+                posture=GripperPosture.TRANSPORT,
+            )
         assert self._selected_track_id is not None
         self._transport = TransportStatus(
             engaged_track_ids=(self._selected_track_id,),
@@ -1319,6 +1304,7 @@ class Simulation20PointSequence:
             0.0,
             0.0,
             "single_green_contact_engaged",
+            posture=GripperPosture.CLOSED,
             mission_decision=mission_decision,
             world_snapshot=snapshot,
         )
@@ -1333,7 +1319,10 @@ class Simulation20PointSequence:
         target = self._selected_target(snapshot)
         if target is None or target.ground_point is None:
             return self._hold(timestamp_ns, "pushing_target_missing")
-        if target.hazard_state is not HazardState.CLEAR:
+        if (
+            target.target_class is not TargetClass.GREEN_SUPPLY
+            or target.hazard_state is not HazardState.CLEAR
+        ):
             return self._hold(timestamp_ns, "pushing_target_not_clear")
         if self._contact_conflict(snapshot, target):
             return self._hold(timestamp_ns, "second_target_during_push")
@@ -1584,12 +1573,6 @@ class Simulation20PointSequence:
         ]
         if len(points) < 2:
             return False
-        if any(
-            target.target_class is TargetClass.UNKNOWN
-            or target.hazard_state is not HazardState.CLEAR
-            for target in points
-        ):
-            return False
         contact_distance = (
             2.0 * self.config.target_half_extent_mm
             + self.config.min_green_clearance_mm
@@ -1829,6 +1812,13 @@ class Simulation20PointSequence:
             return None
         return snapshot.target(self._selected_track_id)
 
+    def _cancel_selected_green(self) -> None:
+        """Drop a pre-contact green plan so the next frame can re-evaluate candidates."""
+
+        self._selected_track_id = None
+        self._selected_plan = None
+        self.state = Simulation20PointState.EVALUATE_EASY_GREEN
+
     def _pose_usable(self, estimate: FusedPoseEstimate | None) -> bool:
         if estimate is None or estimate.pose is None:
             return False
@@ -1865,6 +1855,7 @@ class Simulation20PointSequence:
             return False
         return (
             target.track_status is TrackStatus.CONFIRMED
+            and target.target_class is TargetClass.GREEN_SUPPLY
             and target.hazard_state is HazardState.CLEAR
             and 0.0 < target.ground_point.x <= self.config.engage_distance_mm
             and abs(target.ground_point.y) <= self.config.engage_lateral_tolerance_mm
@@ -2036,6 +2027,13 @@ def _run_hardware(
     assert channel is not None
     controller = config.motion.build_controller(channel)
     assert controller is not None
+    gripper = config.motion.gripper.build_calibration()
+    if gripper is None:
+        raise RuntimeError("20-point simulation requires gripper calibration.")
+    if gripper.transport_angles_deg is None:
+        raise RuntimeError(
+            "20-point simulation requires transport gripper angles."
+        )
 
     class _MotionChannelContext:
         """Ensure the soft brake is sent before UART shutdown on every exit."""
@@ -2057,6 +2055,9 @@ def _run_hardware(
     encoder_tracker = EncoderTravelTracker(
         odometry_calibration,
         max_wheel_velocity_m_s=config.motion.max_wheel_velocity_m_s,
+        max_interpolated_overrun_samples=(
+            config.localization.fusion.max_interpolated_overrun_samples
+        ),
     )
     fusion = config.build_odometry_imu_fusion()
     if fusion is None:
@@ -2220,18 +2221,24 @@ def _run_hardware(
                         rendered=renderer.latest(),
                     )
                 if decision.gripper_posture is not last_posture:
-                    gripper = config.motion.gripper.build_calibration()
-                    assert gripper is not None
                     if decision.gripper_posture is GripperPosture.OPEN:
-                        controller.set_gripper_angles(
+                        angles = (
                             gripper.open_left_angle_deg,
                             gripper.open_right_angle_deg,
                         )
+                    elif decision.gripper_posture is GripperPosture.TRANSPORT:
+                        transport_angles = gripper.transport_angles_deg
+                        if transport_angles is None:
+                            raise RuntimeError(
+                                "Transport gripper posture is not configured."
+                            )
+                        angles = transport_angles
                     else:
-                        controller.set_gripper_angles(
+                        angles = (
                             gripper.closed_left_angle_deg,
                             gripper.closed_right_angle_deg,
                         )
+                    controller.set_gripper_angles(*angles)
                     last_posture = decision.gripper_posture
                 motion_requested = (
                     decision.linear_velocity_m_s != 0.0
