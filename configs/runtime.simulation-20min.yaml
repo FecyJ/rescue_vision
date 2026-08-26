@@ -55,13 +55,10 @@ motion:
     left_wheel_radius_mm: 33
     # 右轮有效滚动半径，单位 mm；与左轮独立反标，允许左右不同。
     right_wheel_radius_mm: 33
-    # 静止时 STM32 原始 gyro_z 角速度平均零偏，单位 rad/s；水平静止、电机停止、
-    # IMU 预热后采集至少 30 s，剔除搬动/碰撞段取均值。
-    gyro_z_bias_rad_s: 0.0
-    # 将 STM32 上报的 gyro_z 及上述原始零偏乘以此符号，转换为定位规范的
-    # “左转为正、右转为负”。本车实测左转为负、右转为正，因此填写 -1。
+    # 将 IMU 标定并旋转到机器人系后的 gyro_z 乘以此符号，转换为定位规范的
+    # “左转为正、右转为负”。2026-08-26 新安装位置低速正反旋转实测已符合该极性。
     # 只允许 -1 或 1，无单位。
-    gyro_z_sign: -1
+    gyro_z_sign: 1
   gripper:
     # 未完成本车机械端点与全行程时间验证前保持禁用。
     enabled: true
@@ -426,6 +423,27 @@ localization:
       heading_uncertainty_deg: 10.0
       # 起始位姿可信度，无单位，范围 [0, 1]；不替代上述协方差。
       confidence: 0.5
+    # STM32 按 IMU 传感器坐标系发送 raw 物理量；先做温度零偏与交叉轴/比例
+    # 校正，再做安装旋转。2026-08-26 新安装位置的静止重力临时标定已写入旋转矩阵；
+    # 动态陀螺量程/比例仍未通过真车验收。
+    imu_calibration:
+      reference_temperature_c: 25.0
+      gyro_bias_rad_s: [0.0, 0.0, 0.0]
+      gyro_bias_temperature_coefficient_rad_s_per_c: [0.0, 0.0, 0.0]
+      gyro_cross_axis_scale:
+        - [1.0, 0.0, 0.0]
+        - [0.0, 1.0, 0.0]
+        - [0.0, 0.0, 1.0]
+      accel_bias_mm_s2: [0.0, 0.0, 0.0]
+      accel_bias_temperature_coefficient_mm_s2_per_c: [0.0, 0.0, 0.0]
+      accel_cross_axis_scale:
+        - [1.0, 0.0, 0.0]
+        - [0.0, 1.0, 0.0]
+        - [0.0, 0.0, 1.0]
+      sensor_to_robot_rotation:
+      - [0.999625377, -0.000086667, -0.027369660]
+      - [-0.000086667, 0.999979950, -0.006331787]
+      - [0.027369660, 0.006331787, 0.999605327]
     # 编码器单步平移的相对 1σ 噪声，无单位；0.02 表示本步距离的 2%。
     encoder_distance_noise_fraction: 0.02
     # 单个遥测周期内编码器差速转角的 1σ 噪声，单位 degree/sample。
@@ -444,6 +462,9 @@ localization:
     wheel_only_covariance_scale: 4.0
     # 遥测正向丢帧但累计计数仍合法时的协方差乘数，无单位，必须 >= 1。
     dropped_sample_covariance_scale: 3.0
+    # 单次 sample_overrun 暂存，待下一帧正常遥测后用前后有效 IMU 线性插值；
+    # 连续第二帧异常仍触发保守连续性降级。
+    max_interpolated_overrun_samples: 1
     # 相邻 STM32 实际采样时间最大间隔，单位 ms；超出即中断连续定位。
     max_sample_interval_ms: 50.0
     # 融合状态最大允许年龄，单位 ms；超时后地图清除机器人位姿。

@@ -118,6 +118,30 @@ def format_status(status: CarSystemStatus | None) -> str:
     )
 
 
+def require_motion_status_healthy(status: CarSystemStatus) -> None:
+    """拒绝不能靠运动序号重同步恢复的固件链路状态。"""
+
+    unhealthy = []
+    if not status.protocol_ready:
+        unhealthy.append("protocol_ready=False")
+    if status.reply_queue_full:
+        unhealthy.append("reply_queue_full=True")
+    if status.tx_degraded:
+        unhealthy.append("tx_degraded=True")
+    if status.rx_degraded:
+        unhealthy.append("rx_degraded=True")
+    if not unhealthy:
+        return
+
+    raise RuntimeError(
+        "STM32 UART health is unsafe for motion: "
+        f"{','.join(unhealthy)}. "
+        "SOFT_BRAKE resynchronization cannot clear the sticky degraded flags; "
+        "check UART wiring, baud rate, frame validity, and exclusive serial access, "
+        "then reset or power-cycle the STM32 before retrying."
+    )
+
+
 def _positive_float(value: str) -> float:
     parsed = float(value)
     if not math.isfinite(parsed) or parsed <= 0.0:
@@ -205,12 +229,20 @@ def main() -> int:
     try:
         with channel:
             try:
-                controller.synchronize()
+                def observe_sync_message(message: object) -> None:
+                    stats.observe(message)
+                    if isinstance(message, CarSystemStatus):
+                        require_motion_status_healthy(message)
+
+                controller.synchronize(on_message=observe_sync_message)
                 print("SOFT_BRAKE_SYNC=accepted", flush=True)
                 stats = OverrunProbeStats(started_timestamp_ns=time.monotonic_ns())
 
                 def observe_resync_message(message: object) -> None:
-                    if stats.observe(message):
+                    sample_overrun = stats.observe(message)
+                    if isinstance(message, CarSystemStatus):
+                        require_motion_status_healthy(message)
+                    if sample_overrun:
                         raise RuntimeError(
                             "SAMPLE_OVERRUN arrived during motion resynchronization."
                         )
@@ -240,7 +272,10 @@ def main() -> int:
                             raise RuntimeError(
                                 "STM32 emergency stop became latched during the test."
                             )
-                        if stats.observe(message):
+                        sample_overrun = stats.observe(message)
+                        if isinstance(message, CarSystemStatus):
+                            require_motion_status_healthy(message)
+                        if sample_overrun:
                             event = stats.first_sample_overrun
                             assert event is not None
                             print(
@@ -269,8 +304,8 @@ def main() -> int:
                         print("RESYNC_SYNC=accepted", flush=True)
                         if controller.link_degraded:
                             raise RuntimeError(
-                                "Motion controller link remained degraded after "
-                                "resynchronization."
+                                "STM32 reported a sticky degraded UART state; reset "
+                                "or power-cycle it before retrying."
                             )
                     time.sleep(min(_UPDATE_PERIOD_S, max(
                         0.0,

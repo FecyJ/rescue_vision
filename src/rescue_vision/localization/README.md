@@ -21,7 +21,7 @@
 | `CenterLineTerminalKind` | `red_safe_zone`、`blue_safe_zone`、`plain_boundary` 或 `unknown` |
 | `CenterCrossLocalizationQuality` | 缺失/部分十字、无地面坐标、过期、歧义或先验冲突 |
 | `OdometryImuFusion` | 累计编码器、陀螺仪和延迟视觉观测的线程安全误差状态 EKF |
-| `FusionConfig` / `OdometryCalibration` | 融合噪声/门限与本车计数、轮径、静态零偏 |
+| `FusionConfig` / `ImuFrameCalibration` / `OdometryCalibration` | 融合门限、完整三轴 IMU 校准与本车编码器机械量 |
 | `FusedPoseEstimate` | 可空全局位姿、估计时间、不确定度、绝对锚点来源和质量状态 |
 
 完整双轴十字产生四个相差 90° 的候选。定位器把观察到的终端类别与静态地图
@@ -112,6 +112,20 @@ for message in motion_controller.drain_messages():
         fusion.submit_odometry(message)
 ```
 
+`ODOMETRY_IMU` 的三轴陀螺和加速度字段处于 STM32 IMU 自身坐标系。融合器在消费
+每个有效帧前使用 `config.localization.fusion.imu_calibration`，分别执行：
+
+```text
+bias_at_temperature = bias + temperature_coefficient * (temperature - reference_temperature)
+sensor_corrected    = cross_axis_scale @ (sensor_raw - bias_at_temperature)
+robot_value         = sensor_to_robot_rotation @ sensor_corrected
+```
+
+陀螺单位为 rad/s，加速度单位为 mm/s²，温度单位为 °C。bias/温度系数为三向量，
+陀螺和加速度各自拥有可逆的 3×3 比例/交叉轴矩阵；安装旋转必须正交且行列式为
+`+1`。之后仅对机器人系 `gyro_z` 应用一次 `motion.odometry.gyro_z_sign`。调用方
+不得再次减零偏、旋转或翻转；模板零值和单位阵不能作为真车精度证据。
+
 这一步可以单独作为“编码器+IMU 航位推算”阶段运行，不要求启用
 `localization.enabled`、`perception.field_features` 或调用相机视觉定位。估计的
 绝对坐标起点来自 `localization.fusion.initial_pose`，因此它是带初始位姿假设和
@@ -151,14 +165,19 @@ else:
 
 ## 连续性与降级
 
-- 状态为场地 `x/y/heading` 与 `gyro_z` 零偏；编码器负责平移和差速转角，陀螺仪
+- 状态为场地 `x/y/heading` 与校准后机器人 `gyro_z` 的残余零偏；编码器负责平移和差速转角，陀螺仪
   负责短时航向。加速度只标记静止、倾斜、撞击或饱和，不二次积分平面位置。
-- `motion.odometry.gyro_z_sign` 在输入边界把线路读数及原始静态零偏转换为内部
-  左转为正；融合状态、`FieldPose2D.heading_rad` 和下游接口不随硬件极性改变。
+- `imu_calibration` 在输入边界依次执行温度零偏、比例/交叉轴和安装旋转；随后
+  `motion.odometry.gyro_z_sign` 把机器人系 `gyro_z` 转换为内部左转为正。融合状态、
+  `FieldPose2D.heading_rad` 和下游接口不随硬件极性改变。
 - 配置起点仅在进程启动后的首个有效编码器基线使用一次。控制器时间倒退、序号
   反向、超期、计数跳变或编码器失效会清除连续位姿；之后只能由可靠绝对视觉重建。
-- IMU 暂时无效可按配置退化为纯轮式预测并放大协方差；编码器无效时不会退化为
-  加速度积分。遥测超过 `max_telemetry_age_ms` 时返回显式不可用状态。
+- IMU 暂时无效或陀螺饱和时可按配置退化为纯轮式预测并放大协方差；无效 IMU
+  数值不会参与倾斜或冲击计算，饱和原因仍保留为质量状态。单次且双编码器有效的
+  `sample_overrun` 会暂存，下一帧正常遥测到达后用前后有效陀螺数据线性插值，并在
+  结果中保留 `interpolated_imu` 质量；连续异常、编码器无效或时间/计数不连续仍会
+  中断连续积分。允许次数由 `max_interpolated_overrun_samples` 控制，当前只能是 0 或 1。
+  编码器无效时不会退化为加速度积分。遥测超过 `max_telemetry_age_ms` 时返回显式不可用状态。
 - `sample_timestamp_us` 只用于控制器内部 `dt`。融合器以受限最小接收偏移映射到
   树莓派单调时钟供相机对齐，不直接相减两台设备的原始时钟。
 - 延迟视觉只在有限历史和时间对齐门限内更新，并经过马氏距离门控；可靠红/蓝或

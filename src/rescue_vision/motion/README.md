@@ -6,7 +6,7 @@
 串口、TCP 服务、定位器或规划器。
 
 树莓派与 STM32 接口以
-[`docs/树莓派与单片机通信协议v2.md`](../../../docs/树莓派与单片机通信协议v2.md)
+[`docs/树莓派与单片机通信协议v3.md`](../../../docs/树莓派与单片机通信协议v3.md)
 为唯一权威。树莓派端已经使用 COBS、CRC16 和固定长度二进制消息统一运动、
 夹爪、固件看门狗及编码器/IMU 遥测，并删除旧文本协议兼容层；当前控制器还会
 在打开 UART、重连或链路异常后等待 `SOFT_BRAKE accepted` 完成序号安全同步。
@@ -242,7 +242,7 @@ if isinstance(message, OdometryImu):
         message.gyro_z_rad_s,
     )
 elif isinstance(message, CarSystemStatus):
-    # v2 没有 watchdog_armed wire bit；last_motion_command_age_ms 非空表示
+    # 当前线路协议没有 watchdog_armed 位；last_motion_command_age_ms 非空表示
     # 固件已经收到过运动命令，链路健康位仍需单独检查。
     print(
         message.watchdog_timeout_ms,

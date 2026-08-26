@@ -1,7 +1,18 @@
 from __future__ import annotations
 
-from manual_tests.motion_sample_overrun import OverrunProbeStats
-from rescue_vision.motion import OdometryImu, SensorFlags
+import pytest
+
+from manual_tests.motion_sample_overrun import (
+    OverrunProbeStats,
+    require_motion_status_healthy,
+)
+from rescue_vision.motion import (
+    CarStopReason,
+    CarSystemStatus,
+    OdometryImu,
+    SensorFlags,
+    SystemFlags,
+)
 
 
 def odometry(*, sequence: int, flags: SensorFlags) -> OdometryImu:
@@ -20,6 +31,21 @@ def odometry(*, sequence: int, flags: SensorFlags) -> OdometryImu:
         accel_z_mm_s2=9807,
         imu_temperature_cdeg=2500,
         sensor_flags=flags,
+    )
+
+
+def system_status(*, flags: SystemFlags) -> CarSystemStatus:
+    return CarSystemStatus(
+        uart_sequence=1,
+        received_timestamp_ns=1_000_000,
+        status_sequence=1,
+        controller_timestamp_us=1_000,
+        watchdog_timeout_ms=300,
+        last_motion_command_age_ms=10,
+        system_flags=flags,
+        stop_reason=CarStopReason.RUNNING,
+        servo_left_target_cdeg=9000,
+        servo_right_target_cdeg=9000,
     )
 
 
@@ -44,3 +70,37 @@ def test_overrun_probe_records_first_sample_overrun() -> None:
     assert stats.first_sample_overrun is not None
     assert stats.first_sample_overrun.telemetry_sequence == 2
     assert "sample_overrun=2" in stats.summary(duration_s=0.1)
+
+
+def test_overrun_probe_accepts_healthy_motion_status() -> None:
+    require_motion_status_healthy(
+        system_status(flags=SystemFlags.PROTOCOL_READY)
+    )
+
+
+@pytest.mark.parametrize(
+    "unhealthy_flag,expected",
+    [
+        (SystemFlags.REPLY_QUEUE_FULL, "reply_queue_full=True"),
+        (SystemFlags.TX_DEGRADED, "tx_degraded=True"),
+        (SystemFlags.RX_DEGRADED, "rx_degraded=True"),
+    ],
+)
+def test_overrun_probe_rejects_sticky_uart_health_flags(
+    unhealthy_flag: SystemFlags,
+    expected: str,
+) -> None:
+    status = system_status(
+        flags=SystemFlags.PROTOCOL_READY | unhealthy_flag
+    )
+
+    with pytest.raises(RuntimeError, match=expected) as caught:
+        require_motion_status_healthy(status)
+
+    assert "cannot clear the sticky degraded flags" in str(caught.value)
+    assert "reset or power-cycle the STM32" in str(caught.value)
+
+
+def test_overrun_probe_rejects_protocol_not_ready() -> None:
+    with pytest.raises(RuntimeError, match="protocol_ready=False"):
+        require_motion_status_healthy(system_status(flags=SystemFlags(0)))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 
 import pytest
@@ -12,6 +13,7 @@ from rescue_vision.localization import (
     FieldPose2D,
     FusionConfig,
     FusionQuality,
+    ImuFrameCalibration,
     OdometryCalibration,
     OdometryImuFusion,
 )
@@ -57,9 +59,19 @@ def config(**changes: object) -> FusionConfig:
 def fusion(**changes: object) -> OdometryImuFusion:
     return OdometryImuFusion(
         config(**changes),
-        OdometryCalibration(1000, 100.0 / (2.0 * math.pi), 100.0 / (2.0 * math.pi), 0.0),
+        OdometryCalibration(
+            1000,
+            100.0 / (2.0 * math.pi),
+            100.0 / (2.0 * math.pi),
+        ),
         wheel_track_m=0.2,
     )
+
+
+@pytest.mark.parametrize("value", [-1, 2, True])
+def test_interpolated_overrun_budget_is_limited_to_one_sample(value: object) -> None:
+    with pytest.raises(ValueError, match="max_interpolated_overrun_samples"):
+        fusion(max_interpolated_overrun_samples=value)
 
 
 def odom(
@@ -68,7 +80,12 @@ def odom(
     left: int,
     right: int,
     *,
+    gyro_x_rad_s: float = 0.0,
+    gyro_y_rad_s: float = 0.0,
     gyro_z_rad_s: float = 0.0,
+    accel_x_mm_s2: int = 0,
+    accel_y_mm_s2: int = 0,
+    accel_z_mm_s2: int = 9807,
     flags: SensorFlags = FLAGS,
     received_offset_ns: int = 1_000_000_000,
 ) -> OdometryImu:
@@ -79,12 +96,12 @@ def odom(
         sample_timestamp_us=timestamp_us,
         left_encoder_count=left,
         right_encoder_count=right,
-        gyro_x_urad_s=0,
-        gyro_y_urad_s=0,
+        gyro_x_urad_s=round(gyro_x_rad_s * 1_000_000),
+        gyro_y_urad_s=round(gyro_y_rad_s * 1_000_000),
         gyro_z_urad_s=round(gyro_z_rad_s * 1_000_000),
-        accel_x_mm_s2=0,
-        accel_y_mm_s2=0,
-        accel_z_mm_s2=9807,
+        accel_x_mm_s2=accel_x_mm_s2,
+        accel_y_mm_s2=accel_y_mm_s2,
+        accel_z_mm_s2=accel_z_mm_s2,
         imu_temperature_cdeg=2500,
         sensor_flags=flags,
     )
@@ -161,12 +178,16 @@ def test_arc_motion_and_heading_wrap_follow_field_axes() -> None:
 
 def test_wheel_radius_difference_and_gyro_bias_are_applied() -> None:
     estimator = OdometryImuFusion(
-        config(initial_pose=FieldPose2D(FieldPoint(0.0, 0.0), 0.0)),
+        config(
+            initial_pose=FieldPose2D(FieldPoint(0.0, 0.0), 0.0),
+            imu_frame_calibration=ImuFrameCalibration(
+                gyro_bias_rad_s=(0.0, 0.0, 0.1)
+            ),
+        ),
         OdometryCalibration(
             1000,
             100.0 / (2.0 * math.pi),
             110.0 / (2.0 * math.pi),
-            0.1,
         ),
         wheel_track_m=0.2,
     )
@@ -185,12 +206,16 @@ def test_wheel_radius_difference_and_gyro_bias_are_applied() -> None:
 
 def test_negative_raw_left_turn_is_converted_to_positive_canonical_yaw() -> None:
     estimator = OdometryImuFusion(
-        config(initial_pose=FieldPose2D(FieldPoint(0.0, 0.0), 0.0)),
+        config(
+            initial_pose=FieldPose2D(FieldPoint(0.0, 0.0), 0.0),
+            imu_frame_calibration=ImuFrameCalibration(
+                gyro_bias_rad_s=(0.0, 0.0, 0.1)
+            ),
+        ),
         OdometryCalibration(
             1000,
             100.0 / (2.0 * math.pi),
             100.0 / (2.0 * math.pi),
-            0.1,
             -1,
         ),
         wheel_track_m=0.2,
@@ -202,6 +227,96 @@ def test_negative_raw_left_turn_is_converted_to_positive_canonical_yaw() -> None
 
     assert result.pose is not None
     assert result.pose.heading_rad > 0.0
+
+
+def test_sensor_frame_rotation_is_applied_before_heading_and_tilt_checks() -> None:
+    rotation = ImuFrameCalibration(
+        sensor_to_robot_rotation=(
+            (0.0, 0.0, -1.0),
+            (0.0, 1.0, 0.0),
+            (1.0, 0.0, 0.0),
+        )
+    )
+    estimator = fusion(
+        imu_frame_calibration=rotation,
+        max_tilt_deg=5.0,
+    )
+    estimator.submit_odometry(
+        odom(
+            0,
+            10_000,
+            0,
+            0,
+            gyro_x_rad_s=1.0,
+            accel_x_mm_s2=9807,
+            accel_z_mm_s2=0,
+        )
+    )
+    result = estimator.submit_odometry(
+        odom(
+            1,
+            20_000,
+            0,
+            0,
+            gyro_x_rad_s=1.0,
+            accel_x_mm_s2=9807,
+            accel_z_mm_s2=0,
+        )
+    )
+
+    assert result.pose is not None
+    assert result.pose.heading_rad > 0.0
+    assert FusionQuality.TILT_DETECTED not in result.quality
+    assert FusionQuality.IMPACT_DETECTED not in result.quality
+
+
+def test_temperature_bias_and_cross_axis_scale_are_applied_before_rotation() -> None:
+    calibration = ImuFrameCalibration(
+        reference_temperature_c=25.0,
+        gyro_bias_rad_s=(1.0, 0.0, 0.0),
+        gyro_bias_temperature_coefficient_rad_s_per_c=(0.1, 0.0, 0.0),
+        gyro_cross_axis_scale=(
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.5, 0.25, 1.0),
+        ),
+        accel_bias_mm_s2=(100.0, 0.0, 0.0),
+        accel_bias_temperature_coefficient_mm_s2_per_c=(10.0, 0.0, 0.0),
+    )
+    estimator = fusion(
+        imu_frame_calibration=calibration,
+        max_tilt_deg=5.0,
+    )
+    first = odom(
+        0,
+        10_000,
+        0,
+        0,
+        gyro_x_rad_s=3.0,
+        gyro_y_rad_s=2.0,
+        accel_x_mm_s2=200,
+        accel_z_mm_s2=9807,
+    )
+    second = odom(
+        1,
+        20_000,
+        0,
+        0,
+        gyro_x_rad_s=3.0,
+        gyro_y_rad_s=2.0,
+        accel_x_mm_s2=200,
+        accel_z_mm_s2=9807,
+    )
+    first = replace(first, imu_temperature_cdeg=3500)
+    second = replace(second, imu_temperature_cdeg=3500)
+
+    estimator.submit_odometry(first)
+    result = estimator.submit_odometry(second)
+
+    assert result.pose is not None
+    assert result.pose.heading_rad > 0.0
+    assert FusionQuality.TILT_DETECTED not in result.quality
+    assert FusionQuality.IMPACT_DETECTED not in result.quality
 
 
 def test_forward_drop_is_accepted_but_reverse_sequence_clears_pose() -> None:
@@ -223,13 +338,74 @@ def test_forward_drop_is_accepted_but_reverse_sequence_clears_pose() -> None:
         odom(2, 300_000, 2, 2),
         odom(2, 20_000, 100_000, 100_000),
         odom(2, 20_000, 2, 2, flags=FLAGS & ~SensorFlags.LEFT_ENCODER_VALID),
-        odom(2, 20_000, 2, 2, flags=FLAGS | SensorFlags.SAMPLE_OVERRUN),
     ],
 )
 def test_invalid_continuity_clears_global_pose(message: OdometryImu) -> None:
     estimator = fusion()
     estimator.submit_odometry(odom(1, 10_000, 0, 0))
     result = estimator.submit_odometry(message)
+    assert result.pose is None
+    assert FusionQuality.CONTINUITY_LOST in result.quality
+
+
+def test_single_sample_overrun_is_recovered_with_interpolated_imu() -> None:
+    estimator = fusion()
+    first = odom(0, 10_000, 0, 0, gyro_z_rad_s=0.0)
+    estimator.submit_odometry(first)
+
+    overrun = replace(
+        odom(
+            1,
+            10_000,
+            5,
+            5,
+            gyro_z_rad_s=50.0,
+            flags=FLAGS | SensorFlags.SAMPLE_OVERRUN,
+        ),
+        received_timestamp_ns=first.received_timestamp_ns + 10_000_000,
+    )
+    pending = estimator.submit_odometry(overrun)
+    assert pending.pose is not None
+    assert FusionQuality.INTERPOLATED_IMU not in pending.quality
+
+    recovered = estimator.submit_odometry(
+        odom(2, 30_000, 10, 10, gyro_z_rad_s=1.0)
+    )
+
+    assert recovered.pose is not None
+    assert recovered.pose.position.x == pytest.approx(101.0, abs=0.01)
+    assert recovered.pose.heading_rad > 0.0
+    assert FusionQuality.INTERPOLATED_IMU in recovered.quality
+
+
+def test_consecutive_overruns_clear_continuity_after_one_recovery_budget() -> None:
+    estimator = fusion()
+    first = odom(0, 10_000, 0, 0)
+    estimator.submit_odometry(first)
+    first_overrun = replace(
+        odom(
+            1,
+            10_000,
+            5,
+            5,
+            flags=FLAGS | SensorFlags.SAMPLE_OVERRUN,
+        ),
+        received_timestamp_ns=first.received_timestamp_ns + 10_000_000,
+    )
+    estimator.submit_odometry(first_overrun)
+    second_overrun = replace(
+        odom(
+            2,
+            10_000,
+            10,
+            10,
+            flags=FLAGS | SensorFlags.SAMPLE_OVERRUN,
+        ),
+        received_timestamp_ns=first_overrun.received_timestamp_ns + 10_000_000,
+    )
+
+    result = estimator.submit_odometry(second_overrun)
+
     assert result.pose is None
     assert FusionQuality.CONTINUITY_LOST in result.quality
 
@@ -314,6 +490,22 @@ def test_configuration_rejects_invalid_values() -> None:
     with pytest.raises(ValueError, match="history_duration"):
         config(history_duration_ms=10.0, max_visual_alignment_error_ms=20.0)
     with pytest.raises(ValueError, match="encoder_counts"):
-        OdometryCalibration(0, 10.0, 10.0, 0.0)
+        OdometryCalibration(0, 10.0, 10.0)
     with pytest.raises(ValueError, match="gyro_z_sign"):
-        OdometryCalibration(1000, 10.0, 10.0, 0.0, 0)
+        OdometryCalibration(1000, 10.0, 10.0, 0)
+    with pytest.raises(ValueError, match="orthonormal"):
+        ImuFrameCalibration(
+            sensor_to_robot_rotation=(
+                (1.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+                (0.0, 0.0, 2.0),
+            )
+        )
+    with pytest.raises(ValueError, match="invertible"):
+        ImuFrameCalibration(
+            gyro_cross_axis_scale=(
+                (1.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0, 1.0),
+            )
+        )

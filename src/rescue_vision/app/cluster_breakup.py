@@ -983,18 +983,30 @@ class EncoderTravelTracker:
         calibration: OdometryCalibration,
         *,
         max_wheel_velocity_m_s: float,
+        max_interpolated_overrun_samples: int = 1,
     ) -> None:
         if not isinstance(calibration, OdometryCalibration):
             raise TypeError("calibration must be an OdometryCalibration.")
         maximum = float(max_wheel_velocity_m_s)
         if not math.isfinite(maximum) or maximum <= 0.0:
             raise ValueError("max_wheel_velocity_m_s must be finite and positive.")
+        if (
+            isinstance(max_interpolated_overrun_samples, bool)
+            or not isinstance(max_interpolated_overrun_samples, int)
+            or not 0 <= max_interpolated_overrun_samples <= 1
+        ):
+            raise ValueError(
+                "max_interpolated_overrun_samples must be 0 or 1, got "
+                f"{max_interpolated_overrun_samples!r}."
+            )
         self._calibration = calibration
         self._maximum = maximum
+        self._max_interpolated_overrun_samples = max_interpolated_overrun_samples
         self._previous: OdometryImu | None = None
         self._distance_m = 0.0
         self._left_distance_m = 0.0
         self._right_distance_m = 0.0
+        self._consecutive_overrun_samples = 0
 
     @property
     def distance_m(self) -> float | None:
@@ -1017,6 +1029,10 @@ class EncoderTravelTracker:
             self._previous.right_encoder_count,
         )
 
+    @property
+    def consecutive_overrun_samples(self) -> int:
+        return self._consecutive_overrun_samples
+
     def forward_sign_mismatch(self, *, minimum_wheel_travel_m: float = 0.02) -> bool:
         minimum = float(minimum_wheel_travel_m)
         if not math.isfinite(minimum) or minimum <= 0.0:
@@ -1034,7 +1050,8 @@ class EncoderTravelTracker:
             f"center_distance_m={self._distance_m:.4f} "
             f"left_distance_m={self._left_distance_m:.4f} "
             f"right_distance_m={self._right_distance_m:.4f} "
-            f"encoder_counts={counts_text}"
+            f"encoder_counts={counts_text} "
+            f"consecutive_overrun_samples={self._consecutive_overrun_samples}"
         )
 
     def submit(self, message: OdometryImu) -> float:
@@ -1043,11 +1060,21 @@ class EncoderTravelTracker:
         required = SensorFlags.LEFT_ENCODER_VALID | SensorFlags.RIGHT_ENCODER_VALID
         if message.sensor_flags & required != required:
             raise RuntimeError("Both wheel encoders must be valid during breakup.")
-        if message.sensor_flags & SensorFlags.SAMPLE_OVERRUN:
-            raise RuntimeError("Odometry sample overrun during breakup.")
+        is_overrun = bool(message.sensor_flags & SensorFlags.SAMPLE_OVERRUN)
+        if (
+            is_overrun
+            and self._consecutive_overrun_samples
+            >= self._max_interpolated_overrun_samples
+        ):
+            raise RuntimeError(
+                "Consecutive odometry sample overruns exceed the configured "
+                f"limit ({self._max_interpolated_overrun_samples}); "
+                f"telemetry_sequence={message.telemetry_sequence}."
+            )
         previous = self._previous
-        self._previous = message
         if previous is None:
+            self._previous = message
+            self._consecutive_overrun_samples = 1 if is_overrun else 0
             return self._distance_m
         if message.received_timestamp_ns <= previous.received_timestamp_ns:
             raise RuntimeError("Odometry receive timestamps must increase.")
@@ -1064,6 +1091,10 @@ class EncoderTravelTracker:
         # 留出量化和接收抖动余量，但拒绝计数跳变驱动固定距离状态提前结束。
         if max(abs(left_m), abs(right_m)) > self._maximum * dt_s * 2.0 + 0.005:
             raise RuntimeError("Encoder delta exceeds the configured wheel speed bound.")
+        self._previous = message
+        self._consecutive_overrun_samples = (
+            self._consecutive_overrun_samples + 1 if is_overrun else 0
+        )
         self._distance_m += 0.5 * (left_m + right_m)
         self._left_distance_m += left_m
         self._right_distance_m += right_m
@@ -1703,6 +1734,9 @@ def _run_hardware(
     tracker = EncoderTravelTracker(
         calibration,
         max_wheel_velocity_m_s=config.motion.max_wheel_velocity_m_s,
+        max_interpolated_overrun_samples=(
+            config.localization.fusion.max_interpolated_overrun_samples
+        ),
     )
     odometry_fusion = config.build_odometry_imu_fusion()
     fusion_pump = (

@@ -258,7 +258,7 @@ with source, detector:
 | [`motion`](motion/README.md) | `MotionController`、`MotionLimits`、`GripperCalibration`、`RemoteMotionExecutor`、`RemoteGripperExecutor`、`run_remote_motion` | 差速运动、持续夹爪双舵机、Rescue Car 协议和远程调试执行 |
 | [`geometry`](geometry/README.md) | `CameraModel`、`GroundProjector`、显式坐标类型（含 `MapPixel`） | 去畸变及像素/地面/BEV 转换 |
 | [`perception`](perception/README.md) | `TargetPoseDetector`、`PerceptionFrameRenderer`、`PerceptionSnapshot`、`TargetGroundGeometryEstimator`、`FieldFeatureDetector`、`FieldBoundaryEstimator` | 任务目标、最新帧结构化/可视化旁路、地面几何、静态场地特征和局部场界三态掩膜 |
-| [`localization`](localization/README.md) | `CenterCrossLocalizer`、`OdometryImuFusion`、`FusedPoseEstimate` | 中心十字绝对位姿与编码器/IMU 连续融合、延迟视觉纠偏 |
+| [`localization`](localization/README.md) | `CenterCrossLocalizer`、`ImuFrameCalibration`、`OdometryImuFusion`、`FusedPoseEstimate` | 中心十字绝对位姿与编码器/IMU 连续融合、延迟视觉纠偏 |
 | [`tracking`](tracking/README.md) | `MultiTargetTracker`、`TrackedTarget`、`TrackStatus` | 时间关联、遮挡和轨迹生命周期 |
 | [`world`](world/README.md) | `StaticFieldMap`、`WorldModel`、`WorldSnapshot`、`HazardState` | 固定物理地图、任务区域派生、动态目标、对手占据和不确定性 |
 | [`mission`](mission/README.md) | `MissionStateMachine`、`replay_mission()`、`MissionDecision` | 规则、安全降级和抽象动作 |

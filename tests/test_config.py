@@ -434,6 +434,12 @@ localization:
   enabled: true
   fusion:
     enabled: true
+    imu_calibration:
+      gyro_bias_rad_s: [0.001, -0.002, 0.01]
+      sensor_to_robot_rotation:
+        - [0.0, 0.0, -1.0]
+        - [0.0, 1.0, 0.0]
+        - [1.0, 0.0, 0.0]
     initial_pose:
       x_mm: 10.0
       y_mm: -20.0
@@ -459,7 +465,6 @@ localization:
     encoder_counts_per_revolution: 4096
     left_wheel_radius_mm: 32.0
     right_wheel_radius_mm: 31.8
-    gyro_z_bias_rad_s: 0.01
     gyro_z_sign: -1""",
     )
     path = tmp_path / "runtime.yaml"
@@ -471,6 +476,16 @@ localization:
     assert estimator is not None
     assert estimator.calibration.encoder_counts_per_revolution == 4096
     assert estimator.calibration.gyro_z_sign == -1
+    assert estimator.config.imu_frame_calibration.gyro_bias_rad_s == (
+        0.001,
+        -0.002,
+        0.01,
+    )
+    assert estimator.config.imu_frame_calibration.sensor_to_robot_rotation == (
+        (0.0, 0.0, -1.0),
+        (0.0, 1.0, 0.0),
+        (1.0, 0.0, 0.0),
+    )
     assert estimator.config.initial_pose.position == FieldPoint(10.0, -20.0)
     assert estimator.config.initial_pose.heading_rad == pytest.approx(np.pi / 2)
 
@@ -504,7 +519,6 @@ localization:
     encoder_counts_per_revolution: 4096
     left_wheel_radius_mm: 32.0
     right_wheel_radius_mm: 31.8
-    gyro_z_bias_rad_s: 0.01
     gyro_z_sign: -1""",
     )
     path = tmp_path / "runtime-wheel-imu.yaml"

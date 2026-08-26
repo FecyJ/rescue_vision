@@ -18,6 +18,7 @@ from rescue_vision.localization import (
     CenterCrossLocalizerConfig,
     FieldPose2D,
     FusionConfig,
+    ImuFrameCalibration,
     OdometryCalibration,
 )
 from rescue_vision.mission import MissionConfig
@@ -159,6 +160,27 @@ def _hsv_triplet(value: object, location: str) -> tuple[int, int, int]:
     ):
         raise ValueError(f"{location} must be an integer [H, S, V] list.")
     return (value[0], value[1], value[2])
+
+
+def _float_vector3(value: object, location: str) -> tuple[float, float, float]:
+    if not isinstance(value, list) or len(value) != 3:
+        raise ValueError(f"{location} must be a list of three finite numbers.")
+    return tuple(
+        _finite_float(item, f"{location}[{index}]", minimum=-float("inf"))
+        for index, item in enumerate(value)
+    )  # type: ignore[return-value]
+
+
+def _float_matrix3(
+    value: object, location: str
+) -> tuple[tuple[float, float, float], ...]:
+    if not isinstance(value, list) or len(value) != 3:
+        raise ValueError(f"{location} must be a 3x3 list of finite numbers.")
+    rows = tuple(
+        _float_vector3(row, f"{location}[{index}]")
+        for index, row in enumerate(value)
+    )
+    return rows
 
 
 def _hsv_ranges(value: object, location: str) -> tuple[HsvRange, ...]:
@@ -427,6 +449,32 @@ def _localization_defaults() -> dict[str, Any]:
                 "heading_uncertainty_deg": 10.0,
                 "confidence": 0.5,
             },
+            "imu_calibration": {
+                "reference_temperature_c": 25.0,
+                "gyro_bias_rad_s": [0.0, 0.0, 0.0],
+                "gyro_bias_temperature_coefficient_rad_s_per_c": [0.0, 0.0, 0.0],
+                "gyro_cross_axis_scale": [
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                "accel_bias_mm_s2": [0.0, 0.0, 0.0],
+                "accel_bias_temperature_coefficient_mm_s2_per_c": [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                "accel_cross_axis_scale": [
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                "sensor_to_robot_rotation": [
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                ],
+            },
             "encoder_distance_noise_fraction": 0.02,
             "encoder_heading_noise_std_deg": 1.0,
             "gyro_noise_std_rad_s": 0.03,
@@ -436,6 +484,7 @@ def _localization_defaults() -> dict[str, Any]:
             "allow_wheel_only": True,
             "wheel_only_covariance_scale": 4.0,
             "dropped_sample_covariance_scale": 3.0,
+            "max_interpolated_overrun_samples": 1,
             "max_sample_interval_ms": 50.0,
             "max_telemetry_age_ms": 100.0,
             "max_encoder_speed_mm_s": 1000.0,
@@ -614,7 +663,6 @@ class OdometryRuntimeConfig:
     encoder_counts_per_revolution: int | None
     left_wheel_radius_mm: float | None
     right_wheel_radius_mm: float | None
-    gyro_z_bias_rad_s: float | None
     gyro_z_sign: int
 
     def build_calibration(self) -> OdometryCalibration | None:
@@ -623,12 +671,10 @@ class OdometryRuntimeConfig:
         assert self.encoder_counts_per_revolution is not None
         assert self.left_wheel_radius_mm is not None
         assert self.right_wheel_radius_mm is not None
-        assert self.gyro_z_bias_rad_s is not None
         return OdometryCalibration(
             self.encoder_counts_per_revolution,
             self.left_wheel_radius_mm,
             self.right_wheel_radius_mm,
-            self.gyro_z_bias_rad_s,
             self.gyro_z_sign,
         )
 
@@ -1581,7 +1627,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "encoder_counts_per_revolution",
             "left_wheel_radius_mm",
             "right_wheel_radius_mm",
-            "gyro_z_bias_rad_s",
             "gyro_z_sign",
         },
         "motion.odometry",
@@ -1602,7 +1647,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     for name, minimum in (
         ("left_wheel_radius_mm", 0.001),
         ("right_wheel_radius_mm", 0.001),
-        ("gyro_z_bias_rad_s", -float("inf")),
     ):
         raw_value = odometry_raw.get(name)
         odometry_floats[name] = (
@@ -1634,7 +1678,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         encoder_counts_per_revolution=encoder_counts,
         left_wheel_radius_mm=odometry_floats["left_wheel_radius_mm"],
         right_wheel_radius_mm=odometry_floats["right_wheel_radius_mm"],
-        gyro_z_bias_rad_s=odometry_floats["gyro_z_bias_rad_s"],
         gyro_z_sign=gyro_z_sign,
     )
     if odometry.enabled:
@@ -3213,6 +3256,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         {
             "enabled",
             "initial_pose",
+            "imu_calibration",
             "encoder_distance_noise_fraction",
             "encoder_heading_noise_std_deg",
             "gyro_noise_std_rad_s",
@@ -3222,6 +3266,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "allow_wheel_only",
             "wheel_only_covariance_scale",
             "dropped_sample_covariance_scale",
+            "max_interpolated_overrun_samples",
             "max_sample_interval_ms",
             "max_telemetry_age_ms",
             "max_encoder_speed_mm_s",
@@ -3269,6 +3314,73 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         raise ValueError(
             "localization.fusion.initial_pose.confidence must be <= 1."
         )
+    imu_raw = _mapping(
+        _required(fusion_raw, "imu_calibration", "localization.fusion"),
+        "localization.fusion.imu_calibration",
+    )
+    _reject_unknown(
+        imu_raw,
+        {
+            "reference_temperature_c",
+            "gyro_bias_rad_s",
+            "gyro_bias_temperature_coefficient_rad_s_per_c",
+            "gyro_cross_axis_scale",
+            "accel_bias_mm_s2",
+            "accel_bias_temperature_coefficient_mm_s2_per_c",
+            "accel_cross_axis_scale",
+            "sensor_to_robot_rotation",
+        },
+        "localization.fusion.imu_calibration",
+    )
+    imu_location = "localization.fusion.imu_calibration"
+    try:
+        imu_frame_calibration = ImuFrameCalibration(
+            reference_temperature_c=_finite_float(
+                _required(imu_raw, "reference_temperature_c", imu_location),
+                f"{imu_location}.reference_temperature_c",
+                minimum=-float("inf"),
+            ),
+            gyro_bias_rad_s=_float_vector3(
+                _required(imu_raw, "gyro_bias_rad_s", imu_location),
+                f"{imu_location}.gyro_bias_rad_s",
+            ),
+            gyro_bias_temperature_coefficient_rad_s_per_c=_float_vector3(
+                _required(
+                    imu_raw,
+                    "gyro_bias_temperature_coefficient_rad_s_per_c",
+                    imu_location,
+                ),
+                f"{imu_location}.gyro_bias_temperature_coefficient_rad_s_per_c",
+            ),
+            gyro_cross_axis_scale=_float_matrix3(
+                _required(imu_raw, "gyro_cross_axis_scale", imu_location),
+                f"{imu_location}.gyro_cross_axis_scale",
+            ),
+            accel_bias_mm_s2=_float_vector3(
+                _required(imu_raw, "accel_bias_mm_s2", imu_location),
+                f"{imu_location}.accel_bias_mm_s2",
+            ),
+            accel_bias_temperature_coefficient_mm_s2_per_c=_float_vector3(
+                _required(
+                    imu_raw,
+                    "accel_bias_temperature_coefficient_mm_s2_per_c",
+                    imu_location,
+                ),
+                f"{imu_location}.accel_bias_temperature_coefficient_mm_s2_per_c",
+            ),
+            accel_cross_axis_scale=_float_matrix3(
+                _required(imu_raw, "accel_cross_axis_scale", imu_location),
+                f"{imu_location}.accel_cross_axis_scale",
+            ),
+            sensor_to_robot_rotation=_float_matrix3(
+                _required(imu_raw, "sensor_to_robot_rotation", imu_location),
+                f"{imu_location}.sensor_to_robot_rotation",
+            ),
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"{imu_location} is invalid: {exc}"
+        ) from exc
     fusion = FusionConfig(
         enabled=fusion_enabled,
         initial_pose=FieldPose2D(
@@ -3317,6 +3429,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             )
         ),
         initial_confidence=initial_confidence,
+        imu_frame_calibration=imu_frame_calibration,
         encoder_distance_noise_fraction=_finite_float(
             fusion_raw["encoder_distance_noise_fraction"],
             "localization.fusion.encoder_distance_noise_fraction",
@@ -3358,6 +3471,10 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             fusion_raw["dropped_sample_covariance_scale"],
             "localization.fusion.dropped_sample_covariance_scale",
             minimum=1.0,
+        ),
+        max_interpolated_overrun_samples=_nonnegative_int(
+            fusion_raw["max_interpolated_overrun_samples"],
+            "localization.fusion.max_interpolated_overrun_samples",
         ),
         max_sample_interval_ms=_finite_float(
             fusion_raw["max_sample_interval_ms"],

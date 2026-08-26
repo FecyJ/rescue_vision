@@ -311,7 +311,12 @@ def test_breakup_sequence_reaches_scan_green_then_stops_on_green() -> None:
     assert found.linear_velocity_m_s == 0.0
 
 
-def odometry(timestamp_ns: int, count: int) -> OdometryImu:
+def odometry(
+    timestamp_ns: int,
+    count: int,
+    *,
+    sensor_flags: SensorFlags | None = None,
+) -> OdometryImu:
     return OdometryImu(
         uart_sequence=count,
         received_timestamp_ns=timestamp_ns,
@@ -327,7 +332,9 @@ def odometry(timestamp_ns: int, count: int) -> OdometryImu:
         accel_z_mm_s2=9800,
         imu_temperature_cdeg=2500,
         sensor_flags=(
-            SensorFlags.LEFT_ENCODER_VALID | SensorFlags.RIGHT_ENCODER_VALID
+            sensor_flags
+            if sensor_flags is not None
+            else SensorFlags.LEFT_ENCODER_VALID | SensorFlags.RIGHT_ENCODER_VALID
         ),
     )
 
@@ -335,7 +342,7 @@ def odometry(timestamp_ns: int, count: int) -> OdometryImu:
 def test_encoder_travel_tracker_uses_effective_wheel_calibration() -> None:
     radius_mm = 1000.0 / (2.0 * np.pi)
     tracker = EncoderTravelTracker(
-        OdometryCalibration(1000, radius_mm, radius_mm, 0.0),
+        OdometryCalibration(1000, radius_mm, radius_mm),
         max_wheel_velocity_m_s=0.3,
     )
     assert tracker.submit(odometry(1_000_000_000, 0)) == 0.0
@@ -346,10 +353,57 @@ def test_encoder_travel_tracker_uses_effective_wheel_calibration() -> None:
     assert "encoder_counts=(100,100)" in tracker.diagnostic()
 
 
+def test_encoder_travel_tracker_accepts_one_overrun_and_rebases_after_clean_sample() -> None:
+    radius_mm = 1000.0 / (2.0 * np.pi)
+    tracker = EncoderTravelTracker(
+        OdometryCalibration(1000, radius_mm, radius_mm),
+        max_wheel_velocity_m_s=0.3,
+    )
+    valid = SensorFlags.LEFT_ENCODER_VALID | SensorFlags.RIGHT_ENCODER_VALID
+    tracker.submit(odometry(1_000_000_000, 0, sensor_flags=valid))
+    overrun = odometry(
+        1_010_000_000,
+        5,
+        sensor_flags=valid | SensorFlags.SAMPLE_OVERRUN,
+    )
+    clean = odometry(1_020_000_000, 10, sensor_flags=valid)
+
+    assert tracker.submit(overrun) == pytest.approx(0.005)
+    assert tracker.consecutive_overrun_samples == 1
+    assert tracker.submit(clean) == pytest.approx(0.01)
+    assert tracker.consecutive_overrun_samples == 0
+
+
+def test_encoder_travel_tracker_rejects_a_second_consecutive_overrun() -> None:
+    radius_mm = 1000.0 / (2.0 * np.pi)
+    tracker = EncoderTravelTracker(
+        OdometryCalibration(1000, radius_mm, radius_mm),
+        max_wheel_velocity_m_s=0.3,
+    )
+    valid = SensorFlags.LEFT_ENCODER_VALID | SensorFlags.RIGHT_ENCODER_VALID
+    tracker.submit(odometry(1_000_000_000, 0, sensor_flags=valid))
+    tracker.submit(
+        odometry(
+            1_010_000_000,
+            5,
+            sensor_flags=valid | SensorFlags.SAMPLE_OVERRUN,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="Consecutive odometry sample overruns"):
+        tracker.submit(
+            odometry(
+                1_020_000_000,
+                10,
+                sensor_flags=valid | SensorFlags.SAMPLE_OVERRUN,
+            )
+        )
+
+
 def test_encoder_travel_tracker_detects_opposed_forward_signs() -> None:
     radius_mm = 1000.0 / (2.0 * np.pi)
     tracker = EncoderTravelTracker(
-        OdometryCalibration(1000, radius_mm, radius_mm, 0.0),
+        OdometryCalibration(1000, radius_mm, radius_mm),
         max_wheel_velocity_m_s=0.3,
     )
     tracker.submit(odometry(1_000_000_000, 0))
@@ -386,7 +440,7 @@ def test_breakup_odometry_is_dispatched_to_distance_and_pose_consumers() -> None
 
     radius_mm = 1000.0 / (2.0 * np.pi)
     tracker = EncoderTravelTracker(
-        OdometryCalibration(1000, radius_mm, radius_mm, 0.0),
+        OdometryCalibration(1000, radius_mm, radius_mm),
         max_wheel_velocity_m_s=0.3,
     )
     fusion = _RecordingFusion()

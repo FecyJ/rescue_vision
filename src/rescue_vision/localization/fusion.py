@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import math
 import threading
@@ -30,6 +30,126 @@ class FusionQuality(str, Enum):
     VISUAL_REJECTED = "visual_rejected"
     CONTINUITY_LOST = "continuity_lost"
     STALE = "stale"
+    INTERPOLATED_IMU = "interpolated_imu"
+
+
+def _finite_vector3(value: object, name: str) -> tuple[float, float, float]:
+    try:
+        vector = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite three-element vector.") from exc
+    if vector.shape != (3,) or not np.all(np.isfinite(vector)):
+        raise ValueError(f"{name} must be a finite three-element vector.")
+    return tuple(float(item) for item in vector)  # type: ignore[return-value]
+
+
+def _finite_matrix3(value: object, name: str) -> np.ndarray:
+    try:
+        matrix = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite 3x3 matrix.") from exc
+    if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+        raise ValueError(f"{name} must be a finite 3x3 matrix.")
+    return matrix
+
+
+def _invertible_matrix3(
+    value: object, name: str
+) -> tuple[tuple[float, float, float], ...]:
+    matrix = _finite_matrix3(value, name)
+    if math.isclose(float(np.linalg.det(matrix)), 0.0, abs_tol=1e-12):
+        raise ValueError(f"{name} must be invertible.")
+    return tuple(tuple(float(item) for item in row) for row in matrix)
+
+
+@dataclass(frozen=True, slots=True)
+class ImuFrameCalibration:
+    """Complete sensor-frame IMU calibration applied once on the Pi."""
+
+    reference_temperature_c: float = 25.0
+    gyro_bias_rad_s: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    gyro_bias_temperature_coefficient_rad_s_per_c: tuple[float, float, float] = (
+        0.0,
+        0.0,
+        0.0,
+    )
+    gyro_cross_axis_scale: tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ] = (
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+    accel_bias_mm_s2: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    accel_bias_temperature_coefficient_mm_s2_per_c: tuple[
+        float, float, float
+    ] = (0.0, 0.0, 0.0)
+    accel_cross_axis_scale: tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ] = (
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+
+    sensor_to_robot_rotation: tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ] = (
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+
+    def __post_init__(self) -> None:
+        reference_temperature_c = float(self.reference_temperature_c)
+        if not math.isfinite(reference_temperature_c):
+            raise ValueError("reference_temperature_c must be finite.")
+        object.__setattr__(self, "reference_temperature_c", reference_temperature_c)
+        for name in (
+            "gyro_bias_rad_s",
+            "gyro_bias_temperature_coefficient_rad_s_per_c",
+            "accel_bias_mm_s2",
+            "accel_bias_temperature_coefficient_mm_s2_per_c",
+        ):
+            object.__setattr__(self, name, _finite_vector3(getattr(self, name), name))
+
+        gyro_scale = _invertible_matrix3(
+            self.gyro_cross_axis_scale, "gyro_cross_axis_scale"
+        )
+        accel_scale = _invertible_matrix3(
+            self.accel_cross_axis_scale, "accel_cross_axis_scale"
+        )
+        matrix = _finite_matrix3(
+            self.sensor_to_robot_rotation, "sensor_to_robot_rotation"
+        )
+        if not np.allclose(
+            matrix @ matrix.T,
+            np.eye(3, dtype=np.float64),
+            atol=1e-6,
+            rtol=1e-6,
+        ):
+            raise ValueError(
+                "sensor_to_robot_rotation must be orthonormal."
+            )
+        determinant = float(np.linalg.det(matrix))
+        if not math.isclose(determinant, 1.0, abs_tol=1e-6):
+            raise ValueError(
+                "sensor_to_robot_rotation must have determinant +1, "
+                f"got {determinant!r}."
+            )
+        object.__setattr__(
+            self,
+            "sensor_to_robot_rotation",
+            tuple(tuple(float(value) for value in row) for row in matrix),
+        )
+        object.__setattr__(self, "gyro_cross_axis_scale", gyro_scale)
+        object.__setattr__(self, "accel_cross_axis_scale", accel_scale)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,7 +157,6 @@ class OdometryCalibration:
     encoder_counts_per_revolution: int
     left_wheel_radius_mm: float
     right_wheel_radius_mm: float
-    gyro_z_bias_rad_s: float
     gyro_z_sign: int = 1
 
     def __post_init__(self) -> None:
@@ -51,8 +170,6 @@ class OdometryCalibration:
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive.")
-        if not math.isfinite(float(self.gyro_z_bias_rad_s)):
-            raise ValueError("gyro_z_bias_rad_s must be finite.")
         if (
             isinstance(self.gyro_z_sign, bool)
             or not isinstance(self.gyro_z_sign, int)
@@ -85,6 +202,10 @@ class FusionConfig:
     history_duration_ms: float
     max_tilt_deg: float
     impact_accel_threshold_mm_s2: float
+    imu_frame_calibration: ImuFrameCalibration = field(
+        default_factory=ImuFrameCalibration
+    )
+    max_interpolated_overrun_samples: int = 1
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool) or not isinstance(
@@ -93,6 +214,10 @@ class FusionConfig:
             raise ValueError("enabled and allow_wheel_only must be booleans.")
         if not isinstance(self.initial_pose, FieldPose2D):
             raise ValueError("initial_pose must be a FieldPose2D.")
+        if not isinstance(self.imu_frame_calibration, ImuFrameCalibration):
+            raise ValueError(
+                "imu_frame_calibration must be an ImuFrameCalibration."
+            )
         positive = (
             "initial_position_uncertainty_mm",
             "initial_heading_uncertainty_rad",
@@ -129,6 +254,15 @@ class FusionConfig:
         if self.history_duration_ms < self.max_visual_alignment_error_ms:
             raise ValueError(
                 "history_duration_ms must be at least max_visual_alignment_error_ms."
+            )
+        if (
+            isinstance(self.max_interpolated_overrun_samples, bool)
+            or not isinstance(self.max_interpolated_overrun_samples, int)
+            or not 0 <= self.max_interpolated_overrun_samples <= 1
+        ):
+            raise ValueError(
+                "max_interpolated_overrun_samples must be 0 or 1, got "
+                f"{self.max_interpolated_overrun_samples!r}."
             )
         if self.max_tilt_deg >= 180.0:
             raise ValueError("max_tilt_deg must be less than 180 degrees.")
@@ -194,9 +328,38 @@ class OdometryImuFusion:
         self.config = config
         self.calibration = calibration
         self._track_mm = track_mm
+        self._imu_rotation = np.asarray(
+            config.imu_frame_calibration.sensor_to_robot_rotation,
+            dtype=np.float64,
+        )
+        self._gyro_cross_axis_scale = np.asarray(
+            config.imu_frame_calibration.gyro_cross_axis_scale,
+            dtype=np.float64,
+        )
+        self._accel_cross_axis_scale = np.asarray(
+            config.imu_frame_calibration.accel_cross_axis_scale,
+            dtype=np.float64,
+        )
+        self._gyro_bias = np.asarray(
+            config.imu_frame_calibration.gyro_bias_rad_s,
+            dtype=np.float64,
+        )
+        self._gyro_bias_temperature_coefficient = np.asarray(
+            config.imu_frame_calibration.gyro_bias_temperature_coefficient_rad_s_per_c,
+            dtype=np.float64,
+        )
+        self._accel_bias = np.asarray(
+            config.imu_frame_calibration.accel_bias_mm_s2,
+            dtype=np.float64,
+        )
+        self._accel_bias_temperature_coefficient = np.asarray(
+            config.imu_frame_calibration.accel_bias_temperature_coefficient_mm_s2_per_c,
+            dtype=np.float64,
+        )
         self._lock = threading.RLock()
         self._history: deque[_HistoryEntry] = deque()
         self._last_sample: OdometryImu | None = None
+        self._pending_overrun: OdometryImu | None = None
         self._last_host_timestamp_ns: int | None = None
         self._clock_offsets_ns: deque[int] = deque(maxlen=128)
         self._initial_pose_available = True
@@ -214,17 +377,26 @@ class OdometryImuFusion:
         if not isinstance(message, OdometryImu):
             raise TypeError("message must be an OdometryImu.")
         with self._lock:
+            if message.sensor_flags & SensorFlags.SAMPLE_OVERRUN:
+                return self._submit_overrun(message)
             host_timestamp_ns = self._map_controller_time(message)
             previous = self._last_sample
+            if self._pending_overrun is not None:
+                if previous is None:
+                    self._lose_continuity()
+                    return self._estimate(message.received_timestamp_ns)
+                return self._recover_overrun(
+                    previous,
+                    self._pending_overrun,
+                    message,
+                    host_timestamp_ns,
+                )
             if previous is None:
                 required = (
                     SensorFlags.LEFT_ENCODER_VALID
                     | SensorFlags.RIGHT_ENCODER_VALID
                 )
-                if (
-                    message.sensor_flags & required != required
-                    or message.sensor_flags & SensorFlags.SAMPLE_OVERRUN
-                ):
+                if message.sensor_flags & required != required:
                     self._clock_offsets_ns.clear()
                     self._last_host_timestamp_ns = None
                     return self._estimate(message.received_timestamp_ns)
@@ -288,7 +460,17 @@ class OdometryImuFusion:
                     return self._estimate(message.received_timestamp_ns)
                 covariance_scale *= self.config.wheel_only_covariance_scale
                 qualities.add(FusionQuality.WHEEL_ONLY)
-            qualities.update(self._acceleration_quality(message))
+            gyro_robot: np.ndarray | None = None
+            if flags & SensorFlags.IMU_VALID:
+                gyro_robot, accel_robot = self._calibrated_imu_vectors(message)
+                qualities.update(
+                    self._acceleration_quality(
+                        accel_robot,
+                        saturated=bool(flags & SensorFlags.ACCEL_SATURATED),
+                    )
+                )
+            elif flags & SensorFlags.ACCEL_SATURATED:
+                qualities.add(FusionQuality.IMPACT_DETECTED)
             if (
                 FusionQuality.TILT_DETECTED in qualities
                 or FusionQuality.IMPACT_DETECTED in qualities
@@ -299,8 +481,8 @@ class OdometryImuFusion:
                 distance_mm=(left_mm + right_mm) / 2.0,
                 encoder_heading_rad=(right_mm - left_mm) / self._track_mm,
                 gyro_z_rad_s=(
-                    self.calibration.gyro_z_sign * message.gyro_z_rad_s
-                    if imu_usable
+                    float(gyro_robot[2])
+                    if imu_usable and gyro_robot is not None
                     else None
                 ),
                 dt_s=dt_s,
@@ -313,23 +495,202 @@ class OdometryImuFusion:
             )
             current = self._state_entry()
             if current is not None:
-                state, covariance = self._predict(
-                    current.state, current.covariance, prediction
-                )
-                self._history.append(
-                    _HistoryEntry(
-                        host_timestamp_ns,
-                        state,
-                        covariance,
-                        prediction,
-                        prediction.qualities or frozenset({FusionQuality.FUSED}),
-                    )
-                )
-                self._trim_history(host_timestamp_ns)
+                self._append_prediction(host_timestamp_ns, prediction)
                 self._status = self._history[-1].qualities
             self._last_sample = message
             self._last_host_timestamp_ns = host_timestamp_ns
             return self._estimate(message.received_timestamp_ns)
+
+    def _submit_overrun(self, message: OdometryImu) -> FusedPoseEstimate:
+        """Buffer one bad IMU period until the following valid sample arrives."""
+
+        required = SensorFlags.LEFT_ENCODER_VALID | SensorFlags.RIGHT_ENCODER_VALID
+        previous = self._last_sample
+        if (
+            self.config.max_interpolated_overrun_samples == 0
+            or message.sensor_flags & required != required
+            or self._pending_overrun is not None
+        ):
+            self._lose_continuity()
+            return self._estimate(message.received_timestamp_ns)
+        if previous is None:
+            # There is no valid IMU endpoint from which to interpolate.  Keep the
+            # configured initial pose available and use the next clean sample as
+            # the first baseline.
+            self._clock_offsets_ns.clear()
+            self._last_host_timestamp_ns = None
+            return self._estimate(message.received_timestamp_ns)
+        sequence_delta = (
+            message.telemetry_sequence - previous.telemetry_sequence
+        ) & 0xFFFF
+        if (
+            sequence_delta != 1
+            or message.received_timestamp_ns <= previous.received_timestamp_ns
+        ):
+            self._lose_continuity()
+            return self._estimate(message.received_timestamp_ns)
+        dt_s = (
+            message.received_timestamp_ns - previous.received_timestamp_ns
+        ) / 1_000_000_000.0
+        left_mm = self._count_distance(
+            message.left_encoder_count - previous.left_encoder_count,
+            left=True,
+        )
+        right_mm = self._count_distance(
+            message.right_encoder_count - previous.right_encoder_count,
+            left=False,
+        )
+        if (
+            dt_s <= 0.0
+            or max(abs(left_mm), abs(right_mm)) / dt_s
+            > self.config.max_encoder_speed_mm_s
+        ):
+            self._lose_continuity()
+            return self._estimate(message.received_timestamp_ns)
+        self._pending_overrun = message
+        self._status = frozenset({FusionQuality.INTERPOLATED_IMU})
+        return self._estimate(message.received_timestamp_ns)
+
+    def _recover_overrun(
+        self,
+        previous: OdometryImu,
+        overrun: OdometryImu,
+        current: OdometryImu,
+        host_timestamp_ns: int,
+    ) -> FusedPoseEstimate:
+        """Replay the two half-periods around one overrun with linear IMU data."""
+
+        discontinuity = self._validate_continuity(previous, current)
+        if discontinuity is not None:
+            self._lose_continuity()
+            return self._estimate(current.received_timestamp_ns)
+        previous_to_overrun = (
+            overrun.telemetry_sequence - previous.telemetry_sequence
+        ) & 0xFFFF
+        overrun_to_current = (
+            current.telemetry_sequence - overrun.telemetry_sequence
+        ) & 0xFFFF
+        if previous_to_overrun != 1 or overrun_to_current != 1:
+            self._lose_continuity()
+            return self._estimate(current.received_timestamp_ns)
+        if (
+            overrun.received_timestamp_ns <= previous.received_timestamp_ns
+            or current.received_timestamp_ns <= overrun.received_timestamp_ns
+        ):
+            self._lose_continuity()
+            return self._estimate(current.received_timestamp_ns)
+        previous_host_timestamp_ns = self._last_host_timestamp_ns
+        if (
+            previous_host_timestamp_ns is None
+            or host_timestamp_ns <= previous_host_timestamp_ns
+        ):
+            self._lose_continuity()
+            return self._estimate(current.received_timestamp_ns)
+
+        total_dt_s = (
+            current.sample_timestamp_us - previous.sample_timestamp_us
+        ) / 1_000_000.0
+        if total_dt_s <= 0.0:
+            self._lose_continuity()
+            return self._estimate(current.received_timestamp_ns)
+        segment_dt_s = total_dt_s / 2.0
+        first_left_mm = self._count_distance(
+            overrun.left_encoder_count - previous.left_encoder_count,
+            left=True,
+        )
+        first_right_mm = self._count_distance(
+            overrun.right_encoder_count - previous.right_encoder_count,
+            left=False,
+        )
+        second_left_mm = self._count_distance(
+            current.left_encoder_count - overrun.left_encoder_count,
+            left=True,
+        )
+        second_right_mm = self._count_distance(
+            current.right_encoder_count - overrun.right_encoder_count,
+            left=False,
+        )
+        if (
+            segment_dt_s <= 0.0
+            or max(abs(first_left_mm), abs(first_right_mm)) / segment_dt_s
+            > self.config.max_encoder_speed_mm_s
+            or max(abs(second_left_mm), abs(second_right_mm)) / segment_dt_s
+            > self.config.max_encoder_speed_mm_s
+        ):
+            self._lose_continuity()
+            return self._estimate(current.received_timestamp_ns)
+
+        previous_gyro = self._usable_gyro(previous)
+        current_gyro = self._usable_gyro(current)
+        qualities: set[FusionQuality] = {FusionQuality.INTERPOLATED_IMU}
+        if previous_gyro is None or current_gyro is None:
+            if not self.config.allow_wheel_only:
+                self._lose_continuity()
+                return self._estimate(current.received_timestamp_ns)
+            qualities.add(FusionQuality.WHEEL_ONLY)
+            first_gyro_z = None
+            second_gyro_z = None
+        else:
+            first_gyro = previous_gyro + (current_gyro - previous_gyro) * 0.25
+            second_gyro = previous_gyro + (current_gyro - previous_gyro) * 0.75
+            first_gyro_z = float(first_gyro[2])
+            second_gyro_z = float(second_gyro[2])
+
+        current_acceleration_quality: set[FusionQuality] = set()
+        if current.sensor_flags & SensorFlags.IMU_VALID:
+            _, current_accel = self._calibrated_imu_vectors(current)
+            current_acceleration_quality = self._acceleration_quality(
+                current_accel,
+                saturated=bool(current.sensor_flags & SensorFlags.ACCEL_SATURATED),
+            )
+        qualities.update(current_acceleration_quality)
+        covariance_scale = self.config.dropped_sample_covariance_scale
+        if FusionQuality.WHEEL_ONLY in qualities or {
+            FusionQuality.TILT_DETECTED,
+            FusionQuality.IMPACT_DETECTED,
+        } & qualities:
+            covariance_scale *= self.config.wheel_only_covariance_scale
+        first_qualities = frozenset(qualities - current_acceleration_quality)
+        second_qualities = frozenset(qualities)
+        first_prediction = _Prediction(
+            distance_mm=(first_left_mm + first_right_mm) / 2.0,
+            encoder_heading_rad=(first_right_mm - first_left_mm) / self._track_mm,
+            gyro_z_rad_s=first_gyro_z,
+            dt_s=segment_dt_s,
+            covariance_scale=covariance_scale,
+            qualities=first_qualities,
+            stationary=(
+                abs(overrun.left_encoder_count - previous.left_encoder_count)
+                <= self.config.stationary_encoder_delta_count
+                and abs(overrun.right_encoder_count - previous.right_encoder_count)
+                <= self.config.stationary_encoder_delta_count
+            ),
+        )
+        second_prediction = _Prediction(
+            distance_mm=(second_left_mm + second_right_mm) / 2.0,
+            encoder_heading_rad=(second_right_mm - second_left_mm) / self._track_mm,
+            gyro_z_rad_s=second_gyro_z,
+            dt_s=segment_dt_s,
+            covariance_scale=covariance_scale,
+            qualities=second_qualities,
+            stationary=(
+                abs(current.left_encoder_count - overrun.left_encoder_count)
+                <= self.config.stationary_encoder_delta_count
+                and abs(current.right_encoder_count - overrun.right_encoder_count)
+                <= self.config.stationary_encoder_delta_count
+            ),
+        )
+        midpoint_host_timestamp_ns = previous_host_timestamp_ns + round(
+            (host_timestamp_ns - previous_host_timestamp_ns) / 2.0
+        )
+        self._append_prediction(midpoint_host_timestamp_ns, first_prediction)
+        self._append_prediction(host_timestamp_ns, second_prediction)
+        if self._history:
+            self._status = self._history[-1].qualities
+        self._pending_overrun = None
+        self._last_sample = current
+        self._last_host_timestamp_ns = host_timestamp_ns
+        return self._estimate(current.received_timestamp_ns)
 
     def pose_at(self, timestamp_ns: int) -> FusedPoseEstimate:
         self._validate_timestamp(timestamp_ns)
@@ -553,26 +914,106 @@ class OdometryImuFusion:
             h = np.array([[0.0, 0.0, 0.0, 1.0]])
             residual = prediction.gyro_z_rad_s - float(next_state[3])
             r = self.config.stationary_gyro_noise_std_rad_s**2
-            innovation_variance = float(h @ next_covariance @ h.T) + r
+            innovation_variance = float((h @ next_covariance @ h.T)[0, 0]) + r
             gain = next_covariance @ h.T / innovation_variance
             next_state = next_state + gain[:, 0] * residual
             next_covariance = (np.eye(4) - gain @ h) @ next_covariance
         return next_state, (next_covariance + next_covariance.T) / 2.0
 
-    def _acceleration_quality(self, message: OdometryImu) -> set[FusionQuality]:
+    def _append_prediction(
+        self,
+        timestamp_ns: int,
+        prediction: _Prediction,
+    ) -> None:
+        current = self._state_entry()
+        if current is None:
+            return
+        state, covariance = self._predict(
+            current.state,
+            current.covariance,
+            prediction,
+        )
+        self._history.append(
+            _HistoryEntry(
+                timestamp_ns,
+                state,
+                covariance,
+                prediction,
+                prediction.qualities or frozenset({FusionQuality.FUSED}),
+            )
+        )
+        self._trim_history(timestamp_ns)
+
+    def _usable_gyro(self, message: OdometryImu) -> np.ndarray | None:
+        flags = message.sensor_flags
+        if not flags & SensorFlags.IMU_VALID:
+            return None
+        if flags & SensorFlags.GYRO_SATURATED:
+            return None
+        gyro, _ = self._calibrated_imu_vectors(message)
+        return gyro
+
+    def _calibrated_imu_vectors(
+        self, message: OdometryImu
+    ) -> tuple[np.ndarray, np.ndarray]:
+        gyro_sensor = np.array(
+            [
+                message.gyro_x_urad_s / 1_000_000.0,
+                message.gyro_y_urad_s / 1_000_000.0,
+                message.gyro_z_urad_s / 1_000_000.0,
+            ],
+            dtype=np.float64,
+        )
+        temperature_delta_c = (
+            message.imu_temperature_cdeg / 100.0
+            - self.config.imu_frame_calibration.reference_temperature_c
+        )
+        gyro_bias = (
+            self._gyro_bias
+            + self._gyro_bias_temperature_coefficient * temperature_delta_c
+        )
+        gyro_corrected = self._gyro_cross_axis_scale @ (gyro_sensor - gyro_bias)
+        gyro_robot = self._imu_rotation @ gyro_corrected
+        gyro_robot[2] *= self.calibration.gyro_z_sign
+
+        accel_sensor = np.array(
+            [
+                float(message.accel_x_mm_s2),
+                float(message.accel_y_mm_s2),
+                float(message.accel_z_mm_s2),
+            ],
+            dtype=np.float64,
+        )
+        accel_bias = (
+            self._accel_bias
+            + self._accel_bias_temperature_coefficient * temperature_delta_c
+        )
+        accel_corrected = self._accel_cross_axis_scale @ (accel_sensor - accel_bias)
+        accel_robot = self._imu_rotation @ accel_corrected
+        return gyro_robot, accel_robot
+
+    def _acceleration_quality(
+        self,
+        acceleration_robot_mm_s2: np.ndarray,
+        *,
+        saturated: bool,
+    ) -> set[FusionQuality]:
         qualities: set[FusionQuality] = set()
-        if message.sensor_flags & SensorFlags.ACCEL_SATURATED:
+        if saturated:
             qualities.add(FusionQuality.IMPACT_DETECTED)
             return qualities
         acceleration = math.sqrt(
-            message.accel_x_mm_s2**2
-            + message.accel_y_mm_s2**2
-            + message.accel_z_mm_s2**2
+            float(acceleration_robot_mm_s2[0]) ** 2
+            + float(acceleration_robot_mm_s2[1]) ** 2
+            + float(acceleration_robot_mm_s2[2]) ** 2
         )
         if abs(acceleration - 9807.0) > self.config.impact_accel_threshold_mm_s2:
             qualities.add(FusionQuality.IMPACT_DETECTED)
         if acceleration > 1e-9:
-            cosine = max(-1.0, min(1.0, message.accel_z_mm_s2 / acceleration))
+            cosine = max(
+                -1.0,
+                min(1.0, float(acceleration_robot_mm_s2[2]) / acceleration),
+            )
             if math.degrees(math.acos(cosine)) > self.config.max_tilt_deg:
                 qualities.add(FusionQuality.TILT_DETECTED)
         return qualities
@@ -591,10 +1032,7 @@ class OdometryImuFusion:
                 pose.position.x,
                 pose.position.y,
                 pose.heading_rad,
-                (
-                    self.calibration.gyro_z_sign
-                    * self.calibration.gyro_z_bias_rad_s
-                ),
+                0.0,
             ],
             dtype=np.float64,
         )
@@ -635,6 +1073,7 @@ class OdometryImuFusion:
         # A visual re-anchor is not guaranteed to coincide with the previous
         # controller sample.  Establish a fresh encoder baseline on the next
         # telemetry frame instead of replaying a delta that began before it.
+        self._pending_overrun = None
         self._last_sample = None
         self._last_host_timestamp_ns = None
         self._clock_offsets_ns.clear()
@@ -665,6 +1104,7 @@ class OdometryImuFusion:
 
     def _lose_continuity(self) -> None:
         self._history.clear()
+        self._pending_overrun = None
         self._last_sample = None
         self._last_host_timestamp_ns = None
         self._clock_offsets_ns.clear()

@@ -283,6 +283,7 @@ def test_simulation_config_is_explicit_and_strict(tmp_path: Path) -> None:
     assert config.simulation_20_point.enabled
     assert config.simulation_20_point.target_delivery_count == 4
     assert config.remote.access_mode.value == "observe_only"
+    assert config.localization.fusion.max_interpolated_overrun_samples == 1
     assert config.build_simulation_20_point_sequence().state is Simulation20PointState.BOOT
 
     raw = yaml.safe_load(

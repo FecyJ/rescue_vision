@@ -352,7 +352,7 @@ class CarSystemStatus:
     def watchdog_armed(self) -> bool:
         """Whether the controller has accepted a motion heartbeat.
 
-        v2 no longer allocates a ``watchdog_armed`` status bit.  The presence
+        The current protocol does not allocate a ``watchdog_armed`` status bit. The presence
         of a motion-command age is the only protocol-level indication that
         the communication watchdog has received a motion command.
         """
