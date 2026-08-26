@@ -104,8 +104,7 @@ motion:
     # 从约定出发姿态直行越过减速带，编码器累计机器人中心路程。
     departure_distance_m: 0.55
     departure_speed_m_s: 0.15
-    # 搜索方向显式选择 left/right；角速度始终填写正数。
-    search_direction: left
+    # 原地搜索角速度，单位 rad/s；左转为正、右转为负，符号即方向。
     search_angular_velocity_rad_s: 0.45
     search_timeout_s: 12.0
     cluster_min_detections: 2
@@ -125,6 +124,7 @@ motion:
     gripper_open_retreat_distance_m: 0.10
     retreat_speed_m_s: 0.10
     retreat_distance_m: 0.10
+    # SCAN_GREEN 原地扫描角速度，单位 rad/s；左转为正、右转为负。
     scan_green_angular_velocity_rad_s: 0.35
     green_confirm_frames: 2
     target_loss_timeout_ms: 500.0
@@ -143,6 +143,7 @@ simulation_20_point:
   max_heading_uncertainty_rad: 0.20
   target_max_age_ms: 250.0
   scan_min_heading_span_rad: 6.283185307179586
+  # SCAN_GREEN 原地搜索角速度，单位 rad/s；左转为正、右转为负。
   scan_angular_velocity_rad_s: 0.30
   navigation_speed_m_s: 0.12
   navigation_angular_kp_rad_s: 1.0

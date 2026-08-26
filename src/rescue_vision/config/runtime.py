@@ -109,6 +109,20 @@ def _nonnegative_int(value: object, location: str) -> int:
     return value
 
 
+def _signed_angular_velocity(value: object, location: str) -> float:
+    """带符号角速度：左转为正，右转为负，符号即方向。"""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{location} must be a number, got {value!r}.")
+    converted = float(value)
+    if not math.isfinite(converted) or abs(converted) < 0.001:
+        raise ValueError(
+            f"{location} must be a finite angular velocity with |value| >= "
+            f"0.001 rad/s (positive means left turn), got {value!r}."
+        )
+    return converted
+
+
 def _finite_float(value: object, location: str, *, minimum: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{location} must be a number, got {value!r}.")
@@ -688,7 +702,6 @@ class ClusterBreakupRuntimeConfig:
     enabled: bool
     departure_distance_m: float
     departure_speed_m_s: float
-    search_direction: str
     search_angular_velocity_rad_s: float
     search_timeout_s: float
     cluster_min_detections: int
@@ -711,12 +724,9 @@ class ClusterBreakupRuntimeConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
             raise ValueError("enabled must be a boolean.")
-        if self.search_direction not in {"left", "right"}:
-            raise ValueError("search_direction must be left or right.")
         for name in (
             "departure_distance_m",
             "departure_speed_m_s",
-            "search_angular_velocity_rad_s",
             "search_timeout_s",
             "center_tolerance_ratio",
             "center_kp_rad_s",
@@ -728,13 +738,23 @@ class ClusterBreakupRuntimeConfig:
             "gripper_open_retreat_distance_m",
             "retreat_speed_m_s",
             "retreat_distance_m",
-            "scan_green_angular_velocity_rad_s",
             "target_loss_timeout_ms",
             "motion_phase_timeout_s",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive.")
+        for name in (
+            "search_angular_velocity_rad_s",
+            "scan_green_angular_velocity_rad_s",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or abs(value) < 0.001:
+                raise ValueError(
+                    f"{name} must be a finite angular velocity with "
+                    f"|value| >= 0.001 rad/s (positive means left turn), "
+                    f"got {value!r}."
+                )
         if self.center_tolerance_ratio > 1.0:
             raise ValueError("center_tolerance_ratio must be <= 1.0.")
         for name in (
@@ -811,7 +831,6 @@ class Simulation20PointRuntimeConfig:
             "max_heading_uncertainty_rad",
             "target_max_age_ms",
             "scan_min_heading_span_rad",
-            "scan_angular_velocity_rad_s",
             "navigation_speed_m_s",
             "navigation_angular_kp_rad_s",
             "navigation_max_angular_velocity_rad_s",
@@ -837,6 +856,13 @@ class Simulation20PointRuntimeConfig:
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive.")
+        scan_velocity = float(self.scan_angular_velocity_rad_s)
+        if not math.isfinite(scan_velocity) or abs(scan_velocity) < 0.001:
+            raise ValueError(
+                "scan_angular_velocity_rad_s must be a finite angular velocity "
+                f"with |value| >= 0.001 rad/s (positive means left turn), "
+                f"got {self.scan_angular_velocity_rad_s!r}."
+            )
         for name in (
             "delivery_confirm_frames",
             "disengage_confirm_frames",
@@ -1703,7 +1729,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         "enabled",
         "departure_distance_m",
         "departure_speed_m_s",
-        "search_direction",
         "search_angular_velocity_rad_s",
         "search_timeout_s",
         "cluster_min_detections",
@@ -1735,6 +1760,12 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             minimum=0.001,
         )
 
+    def breakup_signed_angular(name: str, default: float) -> float:
+        return _signed_angular_velocity(
+            breakup_raw.get(name, default),
+            f"motion.cluster_breakup.{name}",
+        )
+
     center_tolerance_ratio = breakup_float("center_tolerance_ratio", 0.08)
     if center_tolerance_ratio > 1.0:
         raise ValueError(
@@ -1744,11 +1775,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         enabled=breakup_enabled,
         departure_distance_m=breakup_float("departure_distance_m", 0.55),
         departure_speed_m_s=breakup_float("departure_speed_m_s", 0.15),
-        search_direction=_string(
-            breakup_raw.get("search_direction", "left"),
-            "motion.cluster_breakup.search_direction",
-        ),
-        search_angular_velocity_rad_s=breakup_float(
+        search_angular_velocity_rad_s=breakup_signed_angular(
             "search_angular_velocity_rad_s", 0.45
         ),
         search_timeout_s=breakup_float("search_timeout_s", 12.0),
@@ -1776,7 +1803,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         ),
         retreat_speed_m_s=breakup_float("retreat_speed_m_s", 0.10),
         retreat_distance_m=breakup_float("retreat_distance_m", 0.10),
-        scan_green_angular_velocity_rad_s=breakup_float(
+        scan_green_angular_velocity_rad_s=breakup_signed_angular(
             "scan_green_angular_velocity_rad_s", 0.35
         ),
         green_confirm_frames=_positive_int(
@@ -1923,8 +1950,9 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         scan_min_heading_span_rad=simulation_float(
             "scan_min_heading_span_rad", 2.0 * math.pi
         ),
-        scan_angular_velocity_rad_s=simulation_float(
-            "scan_angular_velocity_rad_s", 0.30
+        scan_angular_velocity_rad_s=_signed_angular_velocity(
+            simulation_raw.get("scan_angular_velocity_rad_s", 0.30),
+            "simulation_20_point.scan_angular_velocity_rad_s",
         ),
         navigation_speed_m_s=simulation_float("navigation_speed_m_s", 0.12),
         navigation_angular_kp_rad_s=simulation_float(

@@ -1273,6 +1273,12 @@ def _submit_breakup_odometry(
     return fusion.submit_odometry(message)
 
 
+def _rotation_direction_name(angular_velocity_rad_s: float) -> str:
+    """按带符号角速度返回旋转方向名；左转为正。"""
+
+    return "left" if angular_velocity_rad_s > 0.0 else "right"
+
+
 class ClusterBreakupSequence:
     """从出发区到解团并找到第一枚绿色目标的确定性流程。"""
 
@@ -1307,9 +1313,10 @@ class ClusterBreakupSequence:
         self._green_frames = 0
 
     @property
-    def _search_angular_velocity_rad_s(self) -> float:
-        magnitude = self.config.search_angular_velocity_rad_s
-        return magnitude if self.config.search_direction == "left" else -magnitude
+    def _search_direction_name(self) -> str:
+        return _rotation_direction_name(
+            self.config.search_angular_velocity_rad_s
+        )
 
     def step(
         self,
@@ -1351,8 +1358,8 @@ class ClusterBreakupSequence:
                 return self._decision(
                     timestamp_ns,
                     0.0,
-                    self._search_angular_velocity_rad_s,
-                    f"departure_complete_search_{self.config.search_direction}",
+                    self.config.search_angular_velocity_rad_s,
+                    f"departure_complete_search_{self._search_direction_name}",
                 )
             return self._decision(
                 timestamp_ns,
@@ -1379,8 +1386,8 @@ class ClusterBreakupSequence:
             return self._decision(
                 timestamp_ns,
                 0.0,
-                self._search_angular_velocity_rad_s,
-                f"search_cluster_{self.config.search_direction}",
+                self.config.search_angular_velocity_rad_s,
+                f"search_cluster_{self._search_direction_name}",
             )
 
         if self.state in {BreakupState.CENTER_CLUSTER, BreakupState.APPROACH_CLUSTER}:
@@ -1562,7 +1569,7 @@ class ClusterBreakupSequence:
                 timestamp_ns,
                 0.0,
                 self.config.scan_green_angular_velocity_rad_s,
-                "scan_green_left",
+                f"scan_green_{_rotation_direction_name(self.config.scan_green_angular_velocity_rad_s)}",
             )
 
         return self._decision(timestamp_ns, 0.0, 0.0, self.state.value)

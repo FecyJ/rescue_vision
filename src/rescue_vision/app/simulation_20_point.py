@@ -384,7 +384,6 @@ class Simulation20PointSequence:
         mission: MissionStateMachine,
         breakup: _BreakupDriver,
         breakup_factory: Callable[[], _BreakupDriver] | None = None,
-        scan_direction: str = "left",
     ) -> None:
         if not isinstance(config, Simulation20PointRuntimeConfig):
             raise TypeError("config must be a Simulation20PointRuntimeConfig.")
@@ -400,15 +399,12 @@ class Simulation20PointSequence:
             raise TypeError("breakup must provide step().")
         if breakup_factory is not None and not callable(breakup_factory):
             raise TypeError("breakup_factory must be callable or None.")
-        if scan_direction not in {"left", "right"}:
-            raise ValueError("scan_direction must be left or right.")
         self.config = config
         self._tracker = tracker
         self._world_model = world_model
         self._mission = mission
         self._breakup: _BreakupDriver | None = breakup
         self._breakup_factory = breakup_factory
-        self._scan_direction = scan_direction
         self.state = Simulation20PointState.BOOT
         self._started = False
         self._start_timestamp_ns: int | None = None
@@ -464,7 +460,6 @@ class Simulation20PointSequence:
             mission=config.mission.build_state_machine(),
             breakup=make_breakup(),
             breakup_factory=make_breakup,
-            scan_direction=config.motion.cluster_breakup.search_direction,
         )
 
     @property
@@ -897,8 +892,8 @@ class Simulation20PointSequence:
         return self._scan_heading_span >= self.config.scan_min_heading_span_rad
 
     def _scan_velocity(self) -> float:
-        magnitude = self.config.scan_angular_velocity_rad_s
-        return magnitude if self._scan_direction == "left" else -magnitude
+        # 带符号角速度：左转为正，右转为负，符号由配置直接决定。
+        return self.config.scan_angular_velocity_rad_s
 
     def _step_scan(
         self,

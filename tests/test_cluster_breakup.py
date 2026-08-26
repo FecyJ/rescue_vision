@@ -53,7 +53,6 @@ def breakup_config(**changes: object) -> ClusterBreakupRuntimeConfig:
         "enabled": True,
         "departure_distance_m": 0.5,
         "departure_speed_m_s": 0.15,
-        "search_direction": "left",
         "search_angular_velocity_rad_s": 0.4,
         "search_timeout_s": 10.0,
         "cluster_min_detections": 2,
@@ -596,9 +595,9 @@ def test_odometry_fusion_startup_wait_services_callback() -> None:
         pump.stop()
 
 
-def test_breakup_search_direction_can_be_right() -> None:
+def test_breakup_search_accepts_negative_rightward_velocity() -> None:
     sequence = ClusterBreakupSequence(
-        breakup_config(search_direction="right"),
+        breakup_config(search_angular_velocity_rad_s=-0.4),
         gripper_full_travel_time_s=1.0,
     )
     sequence.step(timestamp_ns=0, cumulative_distance_m=0.0, perception=None)
@@ -608,8 +607,103 @@ def test_breakup_search_direction_can_be_right() -> None:
         perception=None,
     )
     assert decision.state is BreakupState.SEARCH_CLUSTER
-    assert decision.angular_velocity_rad_s < 0.0
+    assert decision.angular_velocity_rad_s == pytest.approx(-0.4)
     assert decision.reason == "departure_complete_search_right"
+
+
+def test_breakup_scan_green_follows_signed_velocity() -> None:
+    sequence = ClusterBreakupSequence(
+        breakup_config(
+            search_angular_velocity_rad_s=-0.4,
+            scan_green_angular_velocity_rad_s=-0.3,
+        ),
+        gripper_full_travel_time_s=1.0,
+    )
+    sequence.step(timestamp_ns=0, cumulative_distance_m=None, perception=None)
+    sequence.step(
+        timestamp_ns=10_000_000, cumulative_distance_m=0.0, perception=None
+    )
+    searching = sequence.step(
+        timestamp_ns=1_000_000_000,
+        cumulative_distance_m=0.5,
+        perception=None,
+    )
+    assert searching.state is BreakupState.SEARCH_CLUSTER
+    assert searching.angular_velocity_rad_s == pytest.approx(-0.4)
+    assert searching.reason == "departure_complete_search_right"
+
+    still_searching = sequence.step(
+        timestamp_ns=1_050_000_000,
+        cumulative_distance_m=0.5,
+        perception=None,
+    )
+    assert still_searching.reason == "search_cluster_right"
+
+    sequence.step(
+        timestamp_ns=1_100_000_000,
+        cumulative_distance_m=0.5,
+        perception=cluster_snapshot(11, distance_mm=500.0, offset=15.0),
+    )
+    sequence.step(
+        timestamp_ns=1_200_000_000,
+        cumulative_distance_m=0.5,
+        perception=cluster_snapshot(12, distance_mm=500.0),
+    )
+    sequence.step(
+        timestamp_ns=1_300_000_000,
+        cumulative_distance_m=0.5,
+        perception=cluster_snapshot(13, distance_mm=500.0),
+    )
+    sequence.step(
+        timestamp_ns=1_400_000_000,
+        cumulative_distance_m=0.55,
+        perception=cluster_snapshot(14, distance_mm=240.0),
+    )
+    sequence.step(
+        timestamp_ns=2_000_000_000, cumulative_distance_m=0.75, perception=None
+    )
+    sequence.step(
+        timestamp_ns=2_500_000_000, cumulative_distance_m=0.75, perception=None
+    )
+    sequence.step(
+        timestamp_ns=3_000_000_000, cumulative_distance_m=0.75, perception=None
+    )
+    sequence.step(
+        timestamp_ns=3_500_000_000, cumulative_distance_m=0.65, perception=None
+    )
+    sequence.step(
+        timestamp_ns=4_000_000_000, cumulative_distance_m=0.65, perception=None
+    )
+    sequence.step(
+        timestamp_ns=4_500_000_000, cumulative_distance_m=0.65, perception=None
+    )
+
+    scanning = sequence.step(
+        timestamp_ns=5_000_000_000,
+        cumulative_distance_m=0.55,
+        perception=None,
+    )
+    assert scanning.state is BreakupState.SCAN_GREEN
+    assert scanning.angular_velocity_rad_s == pytest.approx(-0.3)
+    assert scanning.reason == "retreat_complete_close_gripper_scan_green"
+
+    still_scanning = sequence.step(
+        timestamp_ns=5_050_000_000,
+        cumulative_distance_m=0.55,
+        perception=None,
+    )
+    assert still_scanning.state is BreakupState.SCAN_GREEN
+    assert still_scanning.angular_velocity_rad_s == pytest.approx(-0.3)
+    assert still_scanning.reason == "scan_green_right"
+
+
+def test_breakup_rejects_zero_or_tiny_scan_velocities() -> None:
+    with pytest.raises(ValueError, match="search_angular_velocity_rad_s"):
+        breakup_config(search_angular_velocity_rad_s=0.0)
+    with pytest.raises(ValueError, match="search_angular_velocity_rad_s"):
+        breakup_config(search_angular_velocity_rad_s=0.0005)
+    with pytest.raises(ValueError, match="scan_green_angular_velocity_rad_s"):
+        breakup_config(scan_green_angular_velocity_rad_s=0.0)
 
 
 class _OneFrameSource:

@@ -216,7 +216,6 @@ def make_sequence(
             )
         ),
         breakup=breakup or _ImmediateGreenBreakup(),
-        scan_direction="left",
     )
 
 
@@ -289,8 +288,20 @@ def test_simulation_config_is_explicit_and_strict(tmp_path: Path) -> None:
     assert config.simulation_20_point.target_delivery_count == 4
     assert config.remote.access_mode.value == "observe_only"
     assert config.localization.fusion.max_interpolated_overrun_samples == 1
-    # 试验配置关闭定距里程计的连续超期中止，只保留计数诊断。
-    assert config.motion.odometry.max_consecutive_overrun_samples is None
+    # 试验配置的定距里程计超期预算会被现场频繁调整；只验证可解析且语义合法。
+    overrun_budget = config.motion.odometry.max_consecutive_overrun_samples
+    assert overrun_budget is None or (
+        isinstance(overrun_budget, int) and overrun_budget >= 0
+    )
+    # 带符号角速度：右转搜索/扫描直接用负值表达，不再有方向关键字。
+    assert (
+        config.motion.cluster_breakup.search_angular_velocity_rad_s
+        == pytest.approx(-0.45)
+    )
+    assert (
+        config.simulation_20_point.scan_angular_velocity_rad_s
+        == pytest.approx(-0.30)
+    )
     assert config.build_simulation_20_point_sequence().state is Simulation20PointState.BOOT
 
     raw = yaml.safe_load(

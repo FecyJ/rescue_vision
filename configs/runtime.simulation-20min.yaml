@@ -79,15 +79,13 @@ motion:
     # 解团子流程：越障、搜索/居中、定距推散、张爪退出、闭爪退离和绿色扫描；
     # 只用于有物理急停、人员全程监督的模拟赛前置试验，不是完整比赛入口。
     enabled: true
-    # 出发后原地搜索目标团的方向；left/right 只改变角速度符号。
-    search_direction: right
     # 从约定出发姿态直行越过减速带所需的机器人中心路程，单位 m；
     # 由左右编码器累计路程计算，未达到前保持 LEAVE_START。
     departure_distance_m: 0.6
     # LEAVE_START 阶段的直行速度，单位 m/s；必须不超过 motion 线速度上限。
     departure_speed_m_s: 0.15
-    # SEARCH_CLUSTER 阶段的原地搜索角速度，单位 rad/s；左转为正。
-    search_angular_velocity_rad_s: 0.45
+    # SEARCH_CLUSTER 原地搜索角速度，单位 rad/s；左转为正、右转为负，符号即方向。
+    search_angular_velocity_rad_s: -0.45
     # SEARCH_CLUSTER 最长持续时间，单位 s；超时进入故障停车。
     search_timeout_s: 12.0
     # 进入 CENTER_CLUSTER 所需的同帧目标观测数量下限；避免把单个目标当目标团。
@@ -116,7 +114,7 @@ motion:
     retreat_speed_m_s: 0.10
     # RETREAT 阶段合爪后继续倒退的编码器中心距离，单位 m。
     retreat_distance_m: 0.3
-    # SCAN_GREEN 阶段的原地扫描角速度，单位 rad/s；左转为正。
+    # SCAN_GREEN 阶段的原地扫描角速度，单位 rad/s；左转为正、右转为负。
     scan_green_angular_velocity_rad_s: 0.35
     # 连续看到 green_supply 的帧数；满足后输出 GREEN_FOUND 并停车。
     green_confirm_frames: 2
@@ -150,8 +148,8 @@ simulation_20_point:
   target_max_age_ms: 250.0
   # 绿色目标正式筛选前必须覆盖的累计航向范围，单位 rad；默认约一整圈。
   scan_min_heading_span_rad: 6.283185307179586
-  # SCAN_GREEN 原地搜索角速度，单位 rad/s；方向沿 motion.cluster_breakup.search_direction。
-  scan_angular_velocity_rad_s: 0.30
+  # SCAN_GREEN 原地搜索角速度，单位 rad/s；左转为正、右转为负，符号即方向。
+  scan_angular_velocity_rad_s: -0.30
   # NAVIGATE_PREPUSH 直线段速度，单位 m/s。
   navigation_speed_m_s: 0.12
   # 导航航向误差比例增益，单位 rad/s per rad。

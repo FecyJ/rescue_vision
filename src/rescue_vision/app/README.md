@@ -264,17 +264,18 @@ rescue-vision-cluster-breakup \
 ```
 
 流程按配置执行：等待有效编码器 → 固定距离直行越过减速带 → 按
-`search_direction: left|right` 持续转向搜索至少
+`search_angular_velocity_rad_s` 的符号持续转向搜索至少
 `cluster_min_detections` 个模型观测 → 用观测框联合中心做比例居中 → 低速接近。
 最近有效 K0 地面点进入 `gripper_open_distance_mm` 后，夹爪保持闭合，车辆以
 `breakup_speed_m_s` 推进 `breakup_distance_m`；到达后原地停车并切到已标定张开端点，
 保持 `motion.gripper.full_travel_time_s` 完全打开，再以
 `retreat_speed_m_s` 张爪倒退 `gripper_open_retreat_distance_m`。到达后停车切回闭合
 端点，保持同一全行程时间，最后以 `retreat_speed_m_s` 闭爪倒退
-`retreat_distance_m`。最后进入 `SCAN_GREEN`，按配置的搜索方向原地
-扫描，连续看到配置帧数的 `green_supply` 后停车退出。当前不会继续接近或交付
-绿色目标；搜索方向始终由 `motion.cluster_breakup.search_direction` 决定，不在入口
-中固定为左转。解团阶段不额外插入 `BREAKUP_SAFETY_CHECK` 或危险/未知类别门禁；
+`retreat_distance_m`。最后进入 `SCAN_GREEN`，按
+`scan_green_angular_velocity_rad_s` 的符号原地扫描，连续看到配置帧数的
+`green_supply` 后停车退出。当前不会继续接近或交付绿色目标；
+搜索/扫描角速度均为带符号值（左转为正、右转为负），方向由符号唯一决定，
+不在入口中固定为左转。解团阶段不额外插入 `BREAKUP_SAFETY_CHECK` 或危险/未知类别门禁；
 在非转运阶段若视野只有 `unknown`/`blue_danger`，流程继续原地搜索，不直接锁定零速。
 
 `configs/runtime.simulation-20min.yaml` 是从当前车端 `runtime.yaml` 复制的临时配置：
