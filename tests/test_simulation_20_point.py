@@ -202,7 +202,6 @@ def make_sequence(
                 1000.0,
                 15.0,
                 10.0,
-                500.0,
                 (
                     TargetClass.ORANGE_INJURED,
                     TargetClass.BLACK_CORE,

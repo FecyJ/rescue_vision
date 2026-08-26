@@ -2245,7 +2245,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "match_duration_s",
             "no_motion_timeout_s",
             "opponent_contact_timeout_s",
-            "danger_avoid_distance_mm",
             "target_priority",
         },
         "mission",
@@ -2285,11 +2284,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         opponent_contact_timeout_s=_finite_float(
             mission_raw.get("opponent_contact_timeout_s", 10.0),
             "mission.opponent_contact_timeout_s",
-            minimum=0.001,
-        ),
-        danger_avoid_distance_mm=_finite_float(
-            mission_raw.get("danger_avoid_distance_mm", 500.0),
-            "mission.danger_avoid_distance_mm",
             minimum=0.001,
         ),
         target_priority=target_priority,

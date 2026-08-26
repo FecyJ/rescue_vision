@@ -270,7 +270,6 @@ mission:
   match_duration_s: 180.0
   no_motion_timeout_s: 15.0
   opponent_contact_timeout_s: 10.0
-  danger_avoid_distance_mm: 500.0
   target_priority: [orange_injured, black_core, green_supply]
 
 perception:

@@ -80,7 +80,6 @@ class MissionConfig:
     match_duration_s: float
     no_motion_timeout_s: float
     opponent_contact_timeout_s: float
-    danger_avoid_distance_mm: float
     target_priority: tuple[TargetClass, ...]
 
     def __post_init__(self) -> None:
@@ -88,7 +87,6 @@ class MissionConfig:
             "match_duration_s",
             "no_motion_timeout_s",
             "opponent_contact_timeout_s",
-            "danger_avoid_distance_mm",
         ):
             _positive_finite(getattr(self, name), name)
         allowed = {
@@ -468,11 +466,6 @@ class MissionStateMachine:
             )
         ):
             return self._avoid(timestamp_ns, "opponent_occupancy")
-        if snapshot.hazards_within_ground_distance(
-            self._config.danger_avoid_distance_mm
-        ):
-            return self._avoid(timestamp_ns, "hazard_nearby")
-
         if delivery is not None:
             if delivery_targets is None:
                 return self._hold(timestamp_ns, "delivery_target_missing")

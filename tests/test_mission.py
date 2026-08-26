@@ -37,7 +37,6 @@ def config(**overrides: object) -> MissionConfig:
         "match_duration_s": 180.0,
         "no_motion_timeout_s": 15.0,
         "opponent_contact_timeout_s": 10.0,
-        "danger_avoid_distance_mm": 400.0,
         "target_priority": (
             TargetClass.ORANGE_INJURED,
             TargetClass.BLACK_CORE,
@@ -369,9 +368,23 @@ def test_suspected_danger_is_never_selected_or_pushed() -> None:
     )
     nearby = step(machine, 1, (suspected,))
     engaged = step(machine, 2, (suspected,), transport_ids=(1,))
-    assert nearby.action is AbstractAction.AVOID
+    assert nearby.action is AbstractAction.SEARCH
+    assert nearby.activity is ActivityState.SEARCHING
     assert engaged.activity is ActivityState.SAFETY_HOLD
     assert engaged.action is AbstractAction.STOP
+
+
+def test_nearby_confirmed_danger_without_transport_is_not_global_avoidance() -> None:
+    machine = started_machine()
+    danger = target(
+        1,
+        TargetClass.BLUE_DANGER,
+        hazard_state=HazardState.CONFIRMED,
+        distance_mm=50.0,
+    )
+    decision = step(machine, 1, (danger,))
+    assert decision.activity is ActivityState.SEARCHING
+    assert decision.action is AbstractAction.SEARCH
 
 
 def test_candidate_in_known_safe_or_opponent_area_is_not_selected() -> None:

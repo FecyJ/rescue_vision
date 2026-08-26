@@ -338,6 +338,12 @@ class WorldSnapshot:
         self,
         distance_mm: float,
     ) -> tuple[WorldTarget, ...]:
+        """Return non-clear targets in a local diagnostic radius.
+
+        This query is not a mission-level avoidance rule; callers must use
+        their actual motion corridor before changing control behavior.
+        """
+
         if not math.isfinite(distance_mm) or distance_mm < 0.0:
             raise ValueError("distance_mm must be finite and non-negative.")
         return tuple(

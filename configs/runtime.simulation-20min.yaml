@@ -259,10 +259,13 @@ world:
           - [1200.0, -1200.0]
 
 mission:
+  # 本轮最大运行时间，单位 s；模拟赛豁免时也必须由现场约定显式修改。
   match_duration_s: 180.0
+  # 连续没有有效运动的规则终止时间，单位 s。
   no_motion_timeout_s: 15.0
+  # 与对手接触超过该时间后的规则处理时间，单位 s。
   opponent_contact_timeout_s: 10.0
-  danger_avoid_distance_mm: 500.0
+  # mission 目标优先级；20 分流程实际只选择 green_supply，但保留完整规则枚举。
   target_priority: [orange_injured, black_core, green_supply]
 
 perception:
