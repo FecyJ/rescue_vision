@@ -10,14 +10,15 @@ from __future__ import annotations
 
 import argparse
 import math
+import signal
+import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-import signal
-import time
 from threading import Thread
-from typing import Protocol
+from typing import Protocol, TextIO
 
 from rescue_vision.app.cluster_breakup import (
     BreakupDecision,
@@ -56,6 +57,7 @@ from rescue_vision.world import (
     WorldModel,
     WorldSnapshot,
     WorldTarget,
+    WorldUncertainty,
 )
 
 
@@ -88,9 +90,27 @@ class Simulation20PointState(str, Enum):
     UPDATE_PROGRESS = "update_progress"
     PLAN_REBREAKUP = "plan_rebreakup"
     CENTER_REBREAKUP_CLUSTER = "center_rebreakup_cluster"
-    SAFETY_HOLD = "safety_hold"
     TERMINAL_STOP = "terminal_stop"
     FINISH_STOP = "finish_stop"
+
+
+_FIXED_BREAKUP_STATES = frozenset(
+    {
+        Simulation20PointState.BREAKUP_PUSH,
+        Simulation20PointState.BREAKUP_RELEASE,
+        Simulation20PointState.BREAKUP_OPEN_RETREAT,
+        Simulation20PointState.BREAKUP_CLOSE,
+        Simulation20PointState.RETREAT_FROM_CLUSTER,
+    }
+)
+
+# Bounded retry window for transient startup evidence before preflight;
+# the emergency stop and observe_only gates are never retried.
+_PREFLIGHT_RETRY_WINDOW_NS = 5_000_000_000
+
+# Bounded restart backoff for a disconnected observe_only remote; observation
+# health never participates in motion gating.
+_REMOTE_RESTART_BACKOFF_NS = 2_000_000_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,18 +182,25 @@ class SimulationHealth:
 
     @property
     def hard_fault_reason(self) -> str | None:
-        if self.branch_error is not None:
-            return f"side_path_fault:{self.branch_error}"
-        if not self.control_ready:
-            return "motion_control_not_ready"
-        if not self.command_accepted:
-            return "motion_command_rejected"
-        if not self.watchdog_armed:
-            return "watchdog_not_armed"
+        # Only irrecoverable safety/rule gates terminate: a latched emergency
+        # stop and remote privilege loss. Side-path, synchronization and
+        # watchdog faults are transient and go through wait_reason instead.
         if not self.emergency_stop_clear:
             return "emergency_stop_latched"
         if not self.observe_only_remote:
             return "remote_is_not_observe_only"
+        return None
+
+    @property
+    def wait_reason(self) -> str | None:
+        if self.branch_error is not None:
+            return f"side_path_recovering:{self.branch_error}"
+        if not self.control_ready:
+            return "motion_control_recovering"
+        if not self.command_accepted:
+            return "motion_command_recovering"
+        if not self.watchdog_armed:
+            return "watchdog_rearming"
         return None
 
 
@@ -192,11 +219,15 @@ class _SimulationRemoteTransport(Protocol):
 def _publish_remote_simulation_state(
     remote_transport: _SimulationRemoteTransport | None,
     *,
-    pose: FusedPoseEstimate,
+    pose: FusedPoseEstimate | None,
     timestamp_ns: int,
     rendered: object | None,
 ) -> None:
-    """提交本周期最新定位和可选 perception 帧，不复制定位源。"""
+    """提交本周期最新定位和可选 perception 帧，不复制定位源。
+
+    定位旁路暂不可用时提交 ``None``，观察端按 ``robot_localized=false``
+    发布，不沿用过期坐标。
+    """
 
     if remote_transport is None:
         return
@@ -204,6 +235,68 @@ def _publish_remote_simulation_state(
     remote_transport.submit_localization(pose, timestamp_ns)
     if rendered is not None:
         remote_transport.submit(rendered)
+
+
+class _TeeStream:
+    """把标准流同时写到控制台和日志文件；flush 同步刷新两侧。"""
+
+    def __init__(self, primary: TextIO, secondary: TextIO) -> None:
+        self._primary = primary
+        self._secondary = secondary
+
+    def write(self, text: str) -> int:
+        primary_count = self._primary.write(text)
+        self._secondary.write(text)
+        return primary_count
+
+    def flush(self) -> None:
+        self._primary.flush()
+        self._secondary.flush()
+
+    def isatty(self) -> bool:
+        return self._primary.isatty()
+
+    def fileno(self) -> int:
+        return self._primary.fileno()
+
+
+def _begin_time_named_log(
+    log_dir: Path | None,
+) -> tuple[TextIO | None, TextIO, TextIO]:
+    """可选地把 stdout/stderr tee 到 ``log_dir/<YYYYmmdd_HHMM>.log``。
+
+    返回 ``(日志流, 原 stdout, 原 stderr)``；``log_dir`` 为 ``None`` 时不动
+    标准流并返回 ``(None, sys.stdout, sys.stderr)``。日志文件按行缓冲追加，
+    同分钟重跑会继续写入同一文件；进程异常退出时已写入内容仍在文件中。
+    """
+
+    if log_dir is None:
+        return None, sys.stdout, sys.stderr
+    if not isinstance(log_dir, Path):
+        raise TypeError("log_dir must be a Path or None.")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    path = log_dir / f"{time.strftime('%Y%m%d_%H%M')}.log"
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    stream = open(path, "a", encoding="utf-8", buffering=1)
+    sys.stdout = _TeeStream(original_stdout, stream)
+    sys.stderr = _TeeStream(original_stderr, stream)
+    print(f"logging to {path}", flush=True)
+    return stream, original_stdout, original_stderr
+
+
+def _end_time_named_log(
+    log_stream: TextIO | None,
+    original_stdout: TextIO,
+    original_stderr: TextIO,
+) -> None:
+    """恢复标准流并关闭按时间命名的日志文件。"""
+
+    if log_stream is None:
+        return
+    sys.stdout = original_stdout
+    sys.stderr = original_stderr
+    log_stream.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -424,16 +517,14 @@ class Simulation20PointSequence:
         self._completed_target_points: list[FieldPoint] = []
         self._current_breakup_attempts = 0
         self._total_breakup_attempts = 1
-        self._breakup_progress_reference_mm: float | None = None
         self._settle_confirm_count = 0
+        self._last_settle_frame_sequence: int | None = None
         self._scan_start_heading: float | None = None
         self._scan_last_heading: float | None = None
         self._scan_heading_span = 0.0
         self._nav_stage = "heading"
         self._retreat_base_distance_m: float | None = None
         self._rebreakup_mode = False
-        self._hold_resume_state: Simulation20PointState | None = None
-        self._safety_hold_reason: str | None = None
         self._cycle_mission_decision: MissionDecision | None = None
 
     @classmethod
@@ -558,17 +649,31 @@ class Simulation20PointSequence:
         hard_fault = health.hard_fault_reason
         if hard_fault is not None:
             return self._terminal(timestamp_ns, hard_fault)
-        if not health.camera_fresh and self.state is not Simulation20PointState.LEAVE_START:
-            return self._hold(timestamp_ns, "camera_observation_stale")
+        health_wait = health.wait_reason
+        if health_wait is not None:
+            return self._hold(timestamp_ns, health_wait)
+        vision_independent_action = self._vision_independent_action_active(
+            cumulative_distance_m
+        )
+        scan_recovery_state = self.state in {
+            Simulation20PointState.RESET_TARGET_TRACKS,
+            Simulation20PointState.SCAN_GREEN,
+        }
+        if (
+            not health.camera_fresh
+            and self.state is not Simulation20PointState.LEAVE_START
+            and not vision_independent_action
+        ):
+            return self._hold(timestamp_ns, "camera_observation_recovering")
         if not health.localization_fresh and self.state not in {
             Simulation20PointState.LEAVE_START,
             Simulation20PointState.SEARCH_CLUSTER,
             Simulation20PointState.CENTER_CLUSTER,
             Simulation20PointState.APPROACH_CLUSTER,
-            Simulation20PointState.BREAKUP_PUSH,
-            Simulation20PointState.RETREAT_FROM_CLUSTER,
-        }:
-            return self._hold(timestamp_ns, "localization_stale")
+            Simulation20PointState.RESET_TARGET_TRACKS,
+            Simulation20PointState.SCAN_GREEN,
+        } and not vision_independent_action:
+            return self._hold(timestamp_ns, "localization_recovering")
         direct_safety = self._direct_safety_reason(safety)
         if direct_safety is not None:
             return self._terminal(timestamp_ns, direct_safety)
@@ -576,8 +681,21 @@ class Simulation20PointSequence:
         try:
             snapshot = self._update_world(timestamp_ns, perception, pose)
         except (RuntimeError, ValueError) as exc:
-            return self._terminal(timestamp_ns, f"world_update_failed:{exc}")
+            # A single inconsistent snapshot (timestamp skew, malformed
+            # observation) must not latch a permanent stop: keep the current
+            # state at zero speed and retry the world update next cycle.
+            return self._hold(timestamp_ns, f"world_update_recovering:{exc}")
 
+        ignore_nonterminal_mission_hold = (
+            vision_independent_action
+            or scan_recovery_state
+            or self._breakup is not None
+            or self.state
+            in {
+                Simulation20PointState.RESET_TARGET_TRACKS,
+                Simulation20PointState.UPDATE_PROGRESS,
+            }
+        )
         mission_decision = self._evaluate_mission(snapshot, safety)
         if mission_decision.terminal:
             return self._terminal(
@@ -586,20 +704,18 @@ class Simulation20PointSequence:
                 mission_decision=mission_decision,
                 world_snapshot=snapshot,
             )
-        if self.state is Simulation20PointState.SAFETY_HOLD:
-            # A latched hold always blocks motion. _evaluate_mission only
-            # enters a hold from regular states; breakup/reset/update states
+        if (
+            mission_decision.activity
+            in {ActivityState.SAFETY_HOLD, ActivityState.AVOIDING}
+            and not ignore_nonterminal_mission_hold
+        ):
+            # Holds never latch a separate state: the current behaviour state
+            # is kept at zero speed and the next cycle re-evaluates mission
+            # and health, so recovery is automatic when evidence returns.
+            # Breakup actions and the minimum delivery-retreat distance
             # intentionally ignore non-terminal mission activity instead of
             # interrupting their fixed encoder-driven actions.
-            return self._decision(
-                timestamp_ns,
-                0.0,
-                0.0,
-                self._safety_hold_reason or "safety_hold",
-                mission_decision=mission_decision,
-                world_snapshot=snapshot,
-            )
-
+            return self._hold(timestamp_ns, mission_decision.reason)
         if self.state is Simulation20PointState.RESET_TARGET_TRACKS:
             return self._step_reset_tracks(timestamp_ns, perception, pose, snapshot)
         if self._breakup is not None:
@@ -660,34 +776,6 @@ class Simulation20PointSequence:
             mission_decision=mission_decision,
             world_snapshot=snapshot,
         )
-
-    def resume_after_safety_hold(
-        self,
-        timestamp_ns: int,
-        *,
-        fresh_perception: bool,
-        fresh_localization: bool,
-        hazards_clear: bool,
-        control_ready: bool,
-    ) -> SimulationDecision:
-        """在外部确认风险已经消失后恢复扫描；不会自动猜测风险消失。"""
-
-        self._validate_timestamp(timestamp_ns)
-        if self.state is not Simulation20PointState.SAFETY_HOLD:
-            raise RuntimeError("resume_after_safety_hold() requires SAFETY_HOLD.")
-        if not all(
-            (fresh_perception, fresh_localization, hazards_clear, control_ready)
-        ):
-            return self._decision(timestamp_ns, 0.0, 0.0, "resume_evidence_missing")
-        resume_state = self._hold_resume_state
-        self._hold_resume_state = None
-        self._safety_hold_reason = None
-        self.state = resume_state or Simulation20PointState.SCAN_GREEN
-        if self.state is Simulation20PointState.SCAN_GREEN:
-            self._scan_start_heading = None
-            self._scan_last_heading = None
-            self._scan_heading_span = 0.0
-        return self._decision(timestamp_ns, 0.0, 0.0, "safety_hold_released")
 
     def _update_world(
         self,
@@ -762,9 +850,18 @@ class Simulation20PointSequence:
         if not isinstance(breakup_decision, BreakupDecision):
             raise TypeError("breakup.step() must return a BreakupDecision.")
         if breakup_decision.state is BreakupState.FAULT:
-            return self._terminal(
+            # A transient breakup fault (lost cluster, odometry stall, phase
+            # timeout) aborts the current fixed action instead of ending the
+            # round: reset the pre-collision tracks and fall back to the
+            # canonical scan path, which re-plans a bounded rebreakup only
+            # when no easy green exists. Rule terminations still apply.
+            self._begin_reset_tracks(perception)
+            return self._decision(
                 timestamp_ns,
-                f"breakup_fault:{breakup_decision.reason}",
+                0.0,
+                0.0,
+                f"breakup_fault_reset_tracks:{breakup_decision.reason}",
+                posture=breakup_decision.gripper_posture,
                 world_snapshot=snapshot,
             )
         if breakup_decision.state is BreakupState.GREEN_FOUND:
@@ -779,6 +876,15 @@ class Simulation20PointSequence:
             )
         if breakup_decision.state is BreakupState.SCAN_GREEN:
             self.state = Simulation20PointState.SCAN_GREEN
+            if pose is None or pose.pose is None:
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    0.0,
+                    "scan_waiting_for_field_pose",
+                    posture=breakup_decision.gripper_posture,
+                    world_snapshot=snapshot,
+                )
             if self._scan_span_reached(pose):
                 self._begin_reset_tracks(perception)
                 return self._decision(
@@ -835,6 +941,7 @@ class Simulation20PointSequence:
         self._last_visual_timestamp_ns = 0
         self._world_snapshot = None
         self._settle_confirm_count = 0
+        self._last_settle_frame_sequence = None
         self._breakup = None
         self._rebreakup_mode = False
         self._selected_track_id = None
@@ -862,8 +969,10 @@ class Simulation20PointSequence:
                 self._ignore_frames_through is None
                 or perception.frame_sequence > self._ignore_frames_through
             )
+            and perception.frame_sequence != self._last_settle_frame_sequence
         ):
             self._settle_confirm_count += 1
+            self._last_settle_frame_sequence = perception.frame_sequence
         if self._settle_confirm_count < self.config.breakup_settle_confirm_frames:
             return self._decision(timestamp_ns, 0.0, 0.0, "settle_after_breakup")
         self.state = Simulation20PointState.SCAN_GREEN
@@ -871,7 +980,12 @@ class Simulation20PointSequence:
         self._scan_last_heading = None
         self._scan_heading_span = 0.0
         if pose is None or pose.pose is None:
-            return self._hold(timestamp_ns, "scan_requires_field_pose")
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "scan_waiting_for_field_pose",
+            )
         return self._decision(
             timestamp_ns,
             0.0,
@@ -902,8 +1016,24 @@ class Simulation20PointSequence:
         snapshot: WorldSnapshot,
         mission_decision: MissionDecision | None,
     ) -> SimulationDecision:
+        if WorldUncertainty.STALE_VISION in snapshot.uncertainties:
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "scan_waiting_for_fresh_vision",
+                mission_decision=mission_decision,
+                world_snapshot=snapshot,
+            )
         if pose is None or pose.pose is None:
-            return self._hold(timestamp_ns, "scan_requires_field_pose")
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "scan_waiting_for_field_pose",
+                mission_decision=mission_decision,
+                world_snapshot=snapshot,
+            )
         if self._scan_span_reached(pose):
             self.state = Simulation20PointState.EVALUATE_EASY_GREEN
             return self._decision(
@@ -930,8 +1060,24 @@ class Simulation20PointSequence:
         snapshot: WorldSnapshot,
         mission_decision: MissionDecision | None,
     ) -> SimulationDecision:
-        if not self._pose_usable(pose):
+        if pose is None or pose.pose is None:
             return self._hold(timestamp_ns, "candidate_selection_pose_uncertain")
+        if not self._pose_usable(pose):
+            # A pose that exists but exceeds the uncertainty gates can never
+            # verify an easy green, so holding in EVALUATE would deadlock a
+            # dead-reckoning-only run: treat it as "no easy green" and let
+            # PLAN_REBREAKUP decide under its own attempt/geometry/progress
+            # bounds. Candidate selection and navigation still require a
+            # qualified pose.
+            self.state = Simulation20PointState.PLAN_REBREAKUP
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "no_easy_green_pose_uncertain",
+                mission_decision=mission_decision,
+                world_snapshot=snapshot,
+            )
         plans = self._candidate_plans(snapshot, pose.pose)
         if plans:
             self._selected_plan = plans[0]
@@ -1515,7 +1661,6 @@ class Simulation20PointSequence:
                 world_snapshot=snapshot,
             )
         self._current_breakup_attempts = 0
-        self._breakup_progress_reference_mm = None
         self._selected_track_id = None
         self._selected_plan = None
         self._begin_reset_tracks(None)
@@ -1536,16 +1681,6 @@ class Simulation20PointSequence:
             return self._hold(timestamp_ns, "rebreakup_driver_unavailable")
         if not self._rebreakup_plan_is_safe(snapshot):
             return self._hold(timestamp_ns, "no_safe_rebreakup_plan")
-        progress = self._breakup_clearance_metric(snapshot)
-        if (
-            progress is not None
-            and self._breakup_progress_reference_mm is not None
-            and progress
-            < self._breakup_progress_reference_mm + self.config.min_breakup_progress_mm
-        ):
-            return self._hold(timestamp_ns, "breakup_no_clearance_progress")
-        if progress is not None:
-            self._breakup_progress_reference_mm = progress
         self._breakup = self._breakup_factory()
         self._rebreakup_mode = True
         self._current_breakup_attempts += 1
@@ -1570,26 +1705,6 @@ class Simulation20PointSequence:
             for index, first in enumerate(points)
             for second in points[index + 1 :]
         )
-
-    def _breakup_clearance_metric(self, snapshot: WorldSnapshot) -> float | None:
-        greens = tuple(
-            target
-            for target in snapshot.targets
-            if target.target_class is TargetClass.GREEN_SUPPLY
-            and target.field_point is not None
-        )
-        if not greens:
-            return None
-        values: list[float] = []
-        for target in greens:
-            distances = [
-                _distance(target.field_point, other.field_point)
-                - 2.0 * self.config.target_half_extent_mm
-                for other in greens
-                if other.track_id != target.track_id and other.field_point is not None
-            ]
-            values.append(min(distances) if distances else float("inf"))
-        return max(values)
 
     def _candidate_plans(
         self,
@@ -1857,10 +1972,11 @@ class Simulation20PointSequence:
         """Advance the rule state machine exactly once per control cycle.
 
         Terminal outcomes are enforced by ``step()`` for every state. A
-        non-terminal ``SAFETY_HOLD``/``AVOIDING`` activity only latches a hold
-        when it originates from a regular behaviour state; fixed encoder-driven
-        breakup/reset/update actions keep running so that brief vision gaps do
-        not interrupt them, while rule-level terminations still stop motion.
+        non-terminal ``SAFETY_HOLD``/``AVOIDING`` activity only produces a
+        zero-speed hold, never a latched state, when it originates from a
+        regular behaviour state; fixed encoder-driven breakup/reset/update
+        actions keep running so that brief vision gaps do not interrupt them,
+        while rule-level terminations still stop motion.
         """
 
         decision = self._mission.step(
@@ -1872,20 +1988,29 @@ class Simulation20PointSequence:
         self._cycle_mission_decision = decision
         if decision.terminal:
             return decision
-        if (
-            decision.activity in {ActivityState.SAFETY_HOLD, ActivityState.AVOIDING}
-            and self._breakup is None
-            and self.state
-            not in {
-                Simulation20PointState.RESET_TARGET_TRACKS,
-                Simulation20PointState.UPDATE_PROGRESS,
-            }
-            and self.state is not Simulation20PointState.SAFETY_HOLD
-        ):
-            self._hold_resume_state = self.state
-            self._safety_hold_reason = decision.reason
-            self.state = Simulation20PointState.SAFETY_HOLD
         return decision
+
+    def _vision_independent_action_active(
+        self,
+        cumulative_distance_m: float | None,
+    ) -> bool:
+        """固定动作未完成时允许短时缺少视觉/定位快照。
+
+        解团的固定动作由各自的编码器/定时阶段和超时约束。交付后退离只在最低
+        编码器距离尚未走完时属于固定动作；达到距离后必须恢复新鲜视觉与定位，
+        再确认目标已经脱离，不能靠旧目标位置完成交付收尾。
+        """
+
+        if self.state in _FIXED_BREAKUP_STATES:
+            return True
+        if self.state is not Simulation20PointState.DISENGAGE_AND_RETREAT:
+            return False
+        if cumulative_distance_m is None or self._retreat_base_distance_m is None:
+            return True
+        return (
+            abs(cumulative_distance_m - self._retreat_base_distance_m)
+            < self.config.retreat_distance_m
+        )
 
     @staticmethod
     def _direct_safety_reason(safety: SafetySignals) -> str | None:
@@ -1948,15 +2073,15 @@ class Simulation20PointSequence:
         )
 
     def _hold(self, timestamp_ns: int, reason: str) -> SimulationDecision:
-        if self.state is not Simulation20PointState.SAFETY_HOLD:
-            self._hold_resume_state = self.state
-            self._safety_hold_reason = reason
-        self.state = Simulation20PointState.SAFETY_HOLD
+        """保持当前流程状态并输出零速；证据恢复后下一周期自动继续。"""
+
         return self._decision(
             timestamp_ns,
             0.0,
             0.0,
-            self._safety_hold_reason or reason,
+            reason,
+            mission_decision=self._cycle_mission_decision,
+            world_snapshot=self._world_snapshot,
         )
 
     def _terminal(
@@ -1968,8 +2093,6 @@ class Simulation20PointSequence:
         world_snapshot: WorldSnapshot | None = None,
     ) -> SimulationDecision:
         self.state = Simulation20PointState.TERMINAL_STOP
-        self._hold_resume_state = None
-        self._safety_hold_reason = None
         self._transport = TransportStatus()
         return self._decision(
             timestamp_ns,
@@ -1987,8 +2110,13 @@ def _run_hardware(
     supervised_stop_ready: bool,
     jpeg_quality: int = 80,
     observer_image_interval_s: float = 1.0,
+    log_dir: Path | None = None,
 ) -> None:
     """装配真实旁路；不在模块导入阶段访问相机、Hailo 或串口。"""
+
+    # 传入 --log-dir 时把之后所有终端输出（含配置错误和旁路 worker 打印）
+    # tee 到按时间命名的日志文件；正常退出时在 finally 中恢复标准流。
+    log_stream, original_stdout, original_stderr = _begin_time_named_log(log_dir)
 
     from rescue_vision.app.cluster_breakup import (
         CameraPerceptionPump,
@@ -2008,6 +2136,7 @@ def _run_hardware(
         CarSystemStatus,
         CommandResult,
         MotionController,
+        MotionSynchronizationError,
         OdometryImu,
     )
     from rescue_vision.perception import PerceptionFrameRenderer
@@ -2096,6 +2225,9 @@ def _run_hardware(
     active_motion_since_ns: int | None = None
     last_reported_state: Simulation20PointState | None = None
     next_progress_ns = 0
+    next_resynchronization_attempt_ns = 0
+    remote_restart_thread: Thread | None = None
+    next_remote_restart_attempt_ns = 0
     previous_sigterm = signal.getsignal(signal.SIGTERM)
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -2130,7 +2262,26 @@ def _run_hardware(
             # Hailo/相机预热与运动通道同步并行；等待预热期间主线程仍排空
             # UART，避免 100 Hz 遥测在启动门禁处挤满接收队列。
             camera_start_thread = camera_pump.start_in_background()
-            controller.synchronize(on_message=consume)
+            # A transient UART blip must not abort startup: retry the initial
+            # SOFT_BRAKE synchronization within the bounded preflight window,
+            # aborting immediately on a latched emergency stop.
+            sync_deadline_ns = time.monotonic_ns() + _PREFLIGHT_RETRY_WINDOW_NS
+            while True:
+                try:
+                    controller.synchronize(on_message=consume)
+                    break
+                except MotionSynchronizationError:
+                    if (
+                        latest_status is not None
+                        and latest_status.emergency_stop_latched
+                    ):
+                        raise RuntimeError(
+                            "STM32 emergency stop is latched during camera "
+                            "startup."
+                        )
+                    if time.monotonic_ns() >= sync_deadline_ns:
+                        raise
+                    time.sleep(0.02)
             camera_pump.wait_until_started(
                 camera_start_thread,
                 on_wait=service_uart_during_camera_startup,
@@ -2149,9 +2300,9 @@ def _run_hardware(
                 time.sleep(0.005)
             if latest_snapshot is None:
                 raise RuntimeError("No fresh perception snapshot before start.")
-            preflight_decision = sequence.preflight(
-                time.monotonic_ns(),
-                SimulationPreflight(
+
+            def preflight_checks() -> SimulationPreflight:
+                return SimulationPreflight(
                     telemetry_fresh=encoder_tracker.distance_m is not None,
                     watchdog_armed=bool(
                         latest_status is not None and latest_status.watchdog_armed
@@ -2164,29 +2315,110 @@ def _run_hardware(
                     camera_observation_fresh=True,
                     observe_only_remote=not config.remote.enabled
                     or config.remote.access_mode is RemoteAccessMode.OBSERVE_ONLY,
-                ),
+                )
+
+            # Transient startup evidence (telemetry, watchdog report, zero
+            # speed synchronization) is retried within a bounded window while
+            # UART keeps draining; a latched emergency stop or a non
+            # observe_only remote gate is a safety/rule failure and is never
+            # retried.
+            checks = preflight_checks()
+            preflight_deadline_ns = (
+                time.monotonic_ns() + _PREFLIGHT_RETRY_WINDOW_NS
             )
+            while (
+                not checks.ready
+                and time.monotonic_ns() < preflight_deadline_ns
+                and checks.emergency_stop_clear
+                and checks.observe_only_remote
+            ):
+                controller.update(now_ns=time.monotonic_ns())
+                for message in controller.drain_messages():
+                    consume(message)
+                if controller.needs_synchronization:
+                    try:
+                        controller.synchronize(on_message=consume)
+                    except MotionSynchronizationError:
+                        # Bounded by the retry window above; SOFT_BRAKE has
+                        # already zeroed the controller state.
+                        pass
+                time.sleep(0.005)
+                checks = preflight_checks()
+            preflight_decision = sequence.preflight(time.monotonic_ns(), checks)
             if preflight_decision.state is Simulation20PointState.TERMINAL_STOP:
                 raise RuntimeError(preflight_decision.reason)
             sequence.start(time.monotonic_ns())
             last_posture: GripperPosture | None = None
             while not stop_requested:
-                now_ns = time.monotonic_ns()
-                controller.update(now_ns=now_ns)
-                for message in controller.drain_messages():
-                    if (
-                        isinstance(message, CarCommandReply)
-                        and message.result is not CommandResult.ACCEPTED
-                    ):
-                        raise RuntimeError(
-                            "STM32 rejected command: "
-                            f"{message.command_type.name.lower()}="
-                            f"{message.result.name.lower()}"
+                loop_start_ns = time.monotonic_ns()
+                if (
+                    controller.needs_synchronization
+                    and loop_start_ns >= next_resynchronization_attempt_ns
+                ):
+                    try:
+                        controller.synchronize(on_message=consume)
+                    except MotionSynchronizationError:
+                        # SOFT_BRAKE has already zeroed the controller state.
+                        # Keep the process alive and retry after a bounded
+                        # interval instead of converting a transient missing
+                        # reply into a permanent application stop.
+                        next_resynchronization_attempt_ns = (
+                            time.monotonic_ns() + 500_000_000
                         )
-                    consume(message)
-                camera_pump.check_health()
-                latest_snapshot = renderer.latest_snapshot() or latest_snapshot
-                pose = fusion_pump.latest_estimate(now_ns)
+                    else:
+                        next_resynchronization_attempt_ns = 0
+                now_ns = time.monotonic_ns()
+                branch_error: str | None = None
+                controller.update(now_ns=now_ns)
+                try:
+                    for message in controller.drain_messages():
+                        if (
+                            isinstance(message, CarCommandReply)
+                            and message.result is not CommandResult.ACCEPTED
+                        ):
+                            # The controller already handled the rejection
+                            # internally (old sequence or other -> request
+                            # synchronization, emergency stop -> latch). A
+                            # single rejected reply must not end the round;
+                            # the bounded resynchronization retry recovers.
+                            print(
+                                "STM32 rejected command: "
+                                f"{message.command_type.name.lower()}="
+                                f"{message.result.name.lower()}",
+                                flush=True,
+                            )
+                            continue
+                        try:
+                            consume(message)
+                        except Exception as exc:
+                            if branch_error is None:
+                                branch_error = f"odometry_submit:{exc}"
+                except MotionSynchronizationError as exc:
+                    # A rejected SOFT_BRAKE reply has already zeroed the
+                    # controller state; retry synchronization after the
+                    # bounded backoff instead of exiting the process.
+                    print(f"motion_synchronization_retry={exc}", flush=True)
+                    next_resynchronization_attempt_ns = (
+                        time.monotonic_ns() + 500_000_000
+                    )
+                try:
+                    camera_pump.check_health()
+                except Exception as exc:
+                    if branch_error is None:
+                        branch_error = f"camera_pump:{exc}"
+                try:
+                    fresh_snapshot = renderer.latest_snapshot()
+                except Exception as exc:
+                    if branch_error is None:
+                        branch_error = f"perception_renderer:{exc}"
+                    fresh_snapshot = None
+                latest_snapshot = fresh_snapshot or latest_snapshot
+                try:
+                    pose = fusion_pump.latest_estimate(now_ns)
+                except Exception as exc:
+                    if branch_error is None:
+                        branch_error = f"fusion_pump:{exc}"
+                    pose = None
                 decision = sequence.step(
                     now_ns,
                     perception=latest_snapshot,
@@ -2212,18 +2444,57 @@ def _run_hardware(
                             now_ns - latest_snapshot.capture_timestamp_ns
                         )
                         <= round(config.processing.max_observation_age_ms * 1_000_000),
-                        localization_fresh=pose.pose is not None,
+                        localization_fresh=pose is not None
+                        and pose.pose is not None,
                         observe_only_remote=not config.remote.enabled
                         or config.remote.access_mode is RemoteAccessMode.OBSERVE_ONLY,
+                        branch_error=branch_error,
                     ),
                 )
                 if remote_transport is not None:
-                    _publish_remote_simulation_state(
-                        remote_transport,
-                        pose=pose,
-                        timestamp_ns=now_ns,
-                        rendered=renderer.latest(),
-                    )
+                    # Observation is optional and must not stop motion: a
+                    # broken observer connection only logs and schedules a
+                    # bounded background restart so a new observer can
+                    # connect again.
+                    try:
+                        _publish_remote_simulation_state(
+                            remote_transport,
+                            pose=pose,
+                            timestamp_ns=now_ns,
+                            rendered=renderer.latest(),
+                        )
+                    except Exception as exc:
+                        print(f"remote_observation_error={exc}", flush=True)
+                        if (
+                            remote_restart_thread is None
+                            and now_ns >= next_remote_restart_attempt_ns
+                        ):
+                            next_remote_restart_attempt_ns = (
+                                now_ns + _REMOTE_RESTART_BACKOFF_NS
+                            )
+
+                            def restart_remote_observation() -> None:
+                                try:
+                                    remote_transport.stop()
+                                    remote_transport.start()
+                                except Exception as restart_exc:
+                                    print(
+                                        "remote_observation_restart_failed="
+                                        f"{restart_exc}",
+                                        flush=True,
+                                    )
+
+                            remote_restart_thread = Thread(
+                                target=restart_remote_observation,
+                                name="rescue-remote-observation-restart",
+                                daemon=True,
+                            )
+                            remote_restart_thread.start()
+                    if (
+                        remote_restart_thread is not None
+                        and not remote_restart_thread.is_alive()
+                    ):
+                        remote_restart_thread = None
                 if decision.gripper_posture is not last_posture:
                     if decision.gripper_posture is GripperPosture.OPEN:
                         angles = (
@@ -2253,6 +2524,7 @@ def _run_hardware(
                         active_motion_since_ns = now_ns
                 else:
                     active_motion_since_ns = None
+                motor_blocked_reason: str | None = None
                 if (
                     active_motion_since_ns is not None
                     and now_ns - active_motion_since_ns >= 750_000_000
@@ -2261,18 +2533,23 @@ def _run_hardware(
                     <= 500_000_000
                     and not latest_status.motor_output_enabled
                 ):
-                    raise RuntimeError(
-                        "STM32 motor output remained disabled after a motion "
-                        "request; "
+                    # Keep the command stream alive at zero speed and wait for
+                    # the STM32 to re-enable motor output instead of ending
+                    # the round on a single disabled state; the 15 s no-motion
+                    # rule still bounds an unrecovered failure.
+                    motor_blocked_reason = (
                         f"stop_reason={latest_status.stop_reason.name.lower()} "
                         f"watchdog_armed={latest_status.watchdog_armed} "
                         "last_motion_command_age_ms="
-                        f"{latest_status.last_motion_command_age_ms}."
+                        f"{latest_status.last_motion_command_age_ms}"
                     )
-                controller.drive_wheel_limited(
-                    decision.linear_velocity_m_s,
-                    decision.angular_velocity_rad_s,
-                )
+                if motor_blocked_reason is None:
+                    controller.drive_wheel_limited(
+                        decision.linear_velocity_m_s,
+                        decision.angular_velocity_rad_s,
+                    )
+                else:
+                    controller.drive_wheel_limited(0.0, 0.0)
                 if decision.state is not last_reported_state or now_ns >= next_progress_ns:
                     status_text = "status=none"
                     if latest_status is not None:
@@ -2283,6 +2560,42 @@ def _run_hardware(
                             f"stop_reason={latest_status.stop_reason.name.lower()},"
                             f"motion_age_ms={latest_status.last_motion_command_age_ms})"
                         )
+                    localization_quality = (
+                        ""
+                        if pose is None
+                        else ",".join(sorted(item.value for item in pose.quality))
+                    )
+                    position_sigma_text = (
+                        "none"
+                        if pose is None or pose.position_uncertainty_mm is None
+                        else f"{pose.position_uncertainty_mm:.1f}"
+                    )
+                    heading_sigma_text = (
+                        "none"
+                        if pose is None or pose.heading_uncertainty_rad is None
+                        else f"{pose.heading_uncertainty_rad:.3f}"
+                    )
+                    localization_text = (
+                        "localization=("
+                        f"pose={pose is not None and pose.pose is not None},"
+                        f"quality={localization_quality or 'unknown'},"
+                        f"position_sigma_mm={position_sigma_text},"
+                        f"heading_sigma_rad={heading_sigma_text},"
+                        "estimate_timestamp_ns="
+                        f"{pose.estimate_timestamp_ns if pose is not None else 'none'},"
+                        "continuity_loss_reason="
+                        f"{fusion_pump.continuity_loss_reason or 'none'})"
+                    )
+                    perception_text = "perception=none"
+                    if latest_snapshot is not None:
+                        perception_text = (
+                            "perception=("
+                            "age_ms="
+                            f"{(now_ns - latest_snapshot.capture_timestamp_ns) / 1_000_000.0:.1f},"
+                            "stale_dropped="
+                            f"{latest_snapshot.dropped_stale_age_ms is not None},"
+                            f"frame_sequence={latest_snapshot.frame_sequence})"
+                        )
                     print(
                         f"state={decision.state.value} reason={decision.reason} "
                         f"deliveries={decision.valid_green_deliveries} "
@@ -2290,7 +2603,9 @@ def _run_hardware(
                         f"{encoder_tracker.diagnostic()} "
                         f"target_wheel_m_s={controller.target_wheel_speeds_m_s} "
                         f"commanded_wheel_m_s={controller.commanded_wheel_speeds_m_s} "
-                        f"{status_text}",
+                        f"motor_blocked={motor_blocked_reason or 'none'} "
+                        f"{perception_text} "
+                        f"{status_text} {localization_text}",
                         flush=True,
                     )
                     last_reported_state = decision.state
@@ -2312,6 +2627,12 @@ def _run_hardware(
             except Exception:
                 pass
             try:
+                if remote_restart_thread is not None and (
+                    remote_restart_thread.is_alive()
+                ):
+                    # Wait for a pending observe-only restart so transport
+                    # shutdown does not race its stop()/start() pair.
+                    remote_restart_thread.join(timeout=2.0)
                 if remote_transport is not None:
                     remote_transport.stop()
             finally:
@@ -2320,6 +2641,11 @@ def _run_hardware(
                         fusion_pump.stop()
                 finally:
                     signal.signal(signal.SIGTERM, previous_sigterm)
+                    _end_time_named_log(
+                        log_stream,
+                        original_stdout,
+                        original_stderr,
+                    )
 
 
 def main() -> None:
@@ -2334,6 +2660,16 @@ def main() -> None:
     )
     parser.add_argument("--jpeg-quality", type=int, default=80)
     parser.add_argument("--observer-image-interval-seconds", type=float, default=1.0)
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional directory for a time-named log: stdout/stderr are also "
+            "written to <dir>/<YYYYmmdd_HHMM>.log (append on same-minute "
+            "restarts), e.g. --log-dir logs."
+        ),
+    )
     args = parser.parse_args()
     if not 1 <= args.jpeg_quality <= 100:
         parser.error("--jpeg-quality must be in [1, 100]")
@@ -2346,6 +2682,7 @@ def main() -> None:
         supervised_stop_ready=args.supervised_physical_stop_ready,
         jpeg_quality=args.jpeg_quality,
         observer_image_interval_s=args.observer_image_interval_seconds,
+        log_dir=args.log_dir,
     )
 
 

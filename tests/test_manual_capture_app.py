@@ -404,7 +404,7 @@ def test_session_uart_callback_fans_out_odometry_once() -> None:
     localization_messages: list[object] = []
     runtime.vehicle = SimpleNamespace(on_car_message=vehicle_messages.append)
     runtime.capture = SimpleNamespace(record_car_message=recorded_messages.append)
-    runtime.map_localization = SimpleNamespace(
+    runtime.odometry_imu_fusion = SimpleNamespace(
         submit_odometry=localization_messages.append
     )
 
@@ -955,11 +955,8 @@ def test_bev_renderer_keeps_latest_result_off_motion_loop() -> None:
         renderer.stop()
 
 
-def test_remote_bev_prefers_same_frame_localization_overlay() -> None:
+def test_remote_bev_uses_renderer_frame() -> None:
     plain = CameraFrame(7, 11, np.zeros((30, 40, 3), np.uint8))
-    annotated_image = np.zeros((30, 40, 3), np.uint8)
-    annotated_image[:, :] = (0, 0, 255)
-    annotated = CameraFrame(7, 11, annotated_image)
     projector = GroundProjector(
         np.eye(3),
         BevConfig(0.0, 300.0, 0.0, 400.0, 10.0),
@@ -967,9 +964,6 @@ def test_remote_bev_prefers_same_frame_localization_overlay() -> None:
     runtime = object.__new__(ManualCaptureRuntime)
     runtime.latest_frame = plain
     runtime.video_mode = VideoFrameMode.BEV
-    runtime.map_localization = SimpleNamespace(
-        latest_bev_frame=lambda: annotated,
-    )
     runtime.bev_renderer = SimpleNamespace(latest=lambda: plain)
     runtime.minimum_rendered_sequence = None
     runtime.last_sent_video_sequence = None
@@ -992,8 +986,7 @@ def test_remote_bev_prefers_same_frame_localization_overlay() -> None:
     )
     decoded = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
     assert decoded is not None
-    assert float(np.mean(decoded[:, :, 2])) > 240.0
-    assert float(np.mean(decoded[:, :, :2])) < 10.0
+    assert int(np.mean(decoded)) < 10.0
 
 
 def test_manual_session_publishes_bev_with_robot_ground_mapping(tmp_path) -> None:
@@ -1251,7 +1244,7 @@ def test_manual_cycle_services_motion_between_slow_image_operations(
         bev_renderer=None,
         map_state_available=False,
         map_team_color=None,
-        map_localization=None,
+        odometry_imu_fusion=None,
         stop_requested=lambda: False,
         safety_mode=VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP,
     )
@@ -1326,7 +1319,7 @@ def test_idle_manual_cycle_only_prepares_frames_at_video_rate(
         bev_renderer=None,
         map_state_available=False,
         map_team_color=None,
-        map_localization=None,
+        odometry_imu_fusion=None,
         stop_requested=lambda: False,
         safety_mode=VehicleSafetyMode.UNAVAILABLE,
     )

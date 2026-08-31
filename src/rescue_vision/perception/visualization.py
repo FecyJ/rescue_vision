@@ -25,6 +25,9 @@ _TARGET_COLORS: dict[TargetClass, tuple[int, int, int]] = {
 _K0_COLOR = (0, 0, 255)
 _STALE_COLOR = (0, 0, 255)
 
+# 推理旁路 worker 的耗时诊断打印间隔；只用于定位感知链路瓶颈。
+_TIMING_REPORT_INTERVAL_NS = 2_000_000_000
+
 
 @dataclass(frozen=True, slots=True)
 class PerceptionSnapshot:
@@ -325,6 +328,15 @@ class PerceptionFrameRenderer:
                     "Perception video mode detector was not initialized."
                 )
             return
+        frame_count = 0
+        detect_ms_total = 0.0
+        detect_ms_max = 0.0
+        render_ms_total = 0.0
+        render_ms_max = 0.0
+        age_ms_total = 0.0
+        age_ms_max = 0.0
+        stale_dropped_count = 0
+        next_report_ns = monotonic_ns() + _TIMING_REPORT_INTERVAL_NS
         try:
             while not self._stop_event.is_set():
                 self._condition.wait(timeout=0.05)
@@ -335,6 +347,7 @@ class PerceptionFrameRenderer:
                         self._pending_frame = None
                     if frame is None:
                         break
+                    detect_start_ns = monotonic_ns()
                     result = detector.detect_realtime(
                         frame,
                         frame.image_bgr,
@@ -343,6 +356,8 @@ class PerceptionFrameRenderer:
                             frame.timestamp_ns,
                         ),
                     )
+                    detect_ms = (monotonic_ns() - detect_start_ns) / 1_000_000.0
+                    render_start_ns = monotonic_ns()
                     rendered = CameraFrame(
                         sequence=frame.sequence,
                         timestamp_ns=frame.timestamp_ns,
@@ -355,6 +370,7 @@ class PerceptionFrameRenderer:
                             "perception_stale_dropped": result.stale_dropped,
                         },
                     )
+                    render_ms = (monotonic_ns() - render_start_ns) / 1_000_000.0
                     completed_ns = max(
                         (item.result_timestamp_ns for item in result.observations),
                         default=monotonic_ns(),
@@ -369,6 +385,40 @@ class PerceptionFrameRenderer:
                     with self._lock:
                         self._latest_frame = rendered
                         self._latest_snapshot = snapshot
+                    frame_count += 1
+                    detect_ms_total += detect_ms
+                    detect_ms_max = max(detect_ms_max, detect_ms)
+                    render_ms_total += render_ms
+                    render_ms_max = max(render_ms_max, render_ms)
+                    age_ms = (monotonic_ns() - frame.timestamp_ns) / 1_000_000.0
+                    age_ms_total += age_ms
+                    age_ms_max = max(age_ms_max, age_ms)
+                    if result.stale_dropped:
+                        stale_dropped_count += 1
+                    now_ns = monotonic_ns()
+                    if now_ns >= next_report_ns:
+                        if frame_count:
+                            print(
+                                "perception_timing=(frames="
+                                f"{frame_count},"
+                                f"detect_ms_avg={detect_ms_total / frame_count:.1f},"
+                                f"detect_ms_max={detect_ms_max:.1f},"
+                                f"render_ms_avg={render_ms_total / frame_count:.1f},"
+                                f"render_ms_max={render_ms_max:.1f},"
+                                f"age_ms_avg={age_ms_total / frame_count:.1f},"
+                                f"age_ms_max={age_ms_max:.1f},"
+                                f"stale_dropped={stale_dropped_count})",
+                                flush=True,
+                            )
+                        frame_count = 0
+                        detect_ms_total = 0.0
+                        detect_ms_max = 0.0
+                        render_ms_total = 0.0
+                        render_ms_max = 0.0
+                        age_ms_total = 0.0
+                        age_ms_max = 0.0
+                        stale_dropped_count = 0
+                        next_report_ns = now_ns + _TIMING_REPORT_INTERVAL_NS
         except BaseException as error:
             with self._lock:
                 self._worker_error = error

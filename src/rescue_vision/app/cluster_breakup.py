@@ -7,7 +7,7 @@ import math
 from queue import Empty, Full, Queue
 import signal
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -57,6 +57,9 @@ from rescue_vision.perception import (
 )
 
 _REMOTE_CONTROL_BATCH_LIMIT = 4
+
+# 旁路 worker 的耗时诊断打印间隔；只用于定位感知链路瓶颈。
+_TIMING_REPORT_INTERVAL_NS = 2_000_000_000
 
 
 class BreakupState(str, Enum):
@@ -242,13 +245,46 @@ class CameraPerceptionPump:
         self._raise_worker_error()
 
     def _worker_loop(self) -> None:
+        frame_count = 0
+        read_ms_total = 0.0
+        read_ms_max = 0.0
+        prepare_ms_total = 0.0
+        prepare_ms_max = 0.0
+        next_report_ns = time.monotonic_ns() + _TIMING_REPORT_INTERVAL_NS
         try:
             while not self._stop_event.is_set():
+                read_start_ns = time.monotonic_ns()
                 try:
                     frame = self._source.read(timeout=0.05)
                 except TimeoutError:
                     continue
+                read_ms = (time.monotonic_ns() - read_start_ns) / 1_000_000.0
+                prepare_start_ns = time.monotonic_ns()
                 self._perception.submit(self._prepare(frame))
+                prepare_ms = (time.monotonic_ns() - prepare_start_ns) / 1_000_000.0
+                frame_count += 1
+                read_ms_total += read_ms
+                read_ms_max = max(read_ms_max, read_ms)
+                prepare_ms_total += prepare_ms
+                prepare_ms_max = max(prepare_ms_max, prepare_ms)
+                now_ns = time.monotonic_ns()
+                if now_ns >= next_report_ns:
+                    if frame_count:
+                        print(
+                            "camera_pump_timing=(frames="
+                            f"{frame_count},"
+                            f"read_ms_avg={read_ms_total / frame_count:.1f},"
+                            f"read_ms_max={read_ms_max:.1f},"
+                            f"prepare_ms_avg={prepare_ms_total / frame_count:.1f},"
+                            f"prepare_ms_max={prepare_ms_max:.1f})",
+                            flush=True,
+                        )
+                    frame_count = 0
+                    read_ms_total = 0.0
+                    read_ms_max = 0.0
+                    prepare_ms_total = 0.0
+                    prepare_ms_max = 0.0
+                    next_report_ns = now_ns + _TIMING_REPORT_INTERVAL_NS
         except BaseException as exc:
             with self._error_lock:
                 self._worker_error = exc
@@ -1186,6 +1222,13 @@ class OdometryFusionPump:
         self._raise_worker_error()
         return self._fusion.latest_estimate(timestamp_ns)
 
+    @property
+    def continuity_loss_reason(self) -> str | None:
+        """返回融合器最近一次连续性清除原因；测试替身可以不提供该诊断。"""
+
+        value = getattr(self._fusion, "continuity_loss_reason", None)
+        return value if isinstance(value, str) and value else None
+
     def wait_until_ready(
         self,
         *,
@@ -1623,13 +1666,16 @@ class ClusterBreakupSequence:
         width = observations[0].image_size[0]
         if any(item.image_size[0] != width for item in observations):
             raise ValueError("Perception observations must share one image size.")
-        x_min = min(item.box.x_min for item in observations)
-        x_max = max(item.box.x_max for item in observations)
+        cluster = self._largest_observation_group(observations, width)
+        if len(cluster) < minimum_count:
+            return None
+        x_min = min(item.box.x_min for item in cluster)
+        x_max = max(item.box.x_max for item in cluster)
         center_u = 0.5 * (x_min + x_max)
         horizontal_error = (center_u - width * 0.5) / (width * 0.5)
         forward_distances = [
             item.ground_point.x
-            for item in observations
+            for item in cluster
             if item.ground_point is not None and item.ground_point.x > 0.0
         ]
         return _ClusterView(
@@ -1637,6 +1683,42 @@ class ClusterBreakupSequence:
             nearest_forward_distance_mm=(
                 min(forward_distances) if forward_distances else None
             ),
+        )
+
+    def _largest_observation_group(
+        self,
+        observations: Sequence[TargetObservation],
+        width: int,
+    ) -> tuple[TargetObservation, ...]:
+        """按水平间隙把观测框分成目标团，返回成员最多的团。
+
+        相邻框的水平间隙超过 ``cluster_group_gap_ratio * width`` 即分属不同团；
+        成员数相同时取水平跨度更大的团。散落在目标团外的单个目标不会被计入
+        联合框中心或最近前向距离。
+        """
+
+        gap_limit = self.config.cluster_group_gap_ratio * width
+        groups: list[list[TargetObservation]] = []
+        current: list[TargetObservation] = []
+        current_max_x = 0.0
+        for item in sorted(observations, key=lambda entry: entry.box.x_min):
+            if current and item.box.x_min - current_max_x > gap_limit:
+                groups.append(current)
+                current = []
+                current_max_x = 0.0
+            current.append(item)
+            current_max_x = max(current_max_x, item.box.x_max)
+        if current:
+            groups.append(current)
+        return tuple(
+            max(
+                groups,
+                key=lambda group: (
+                    len(group),
+                    max(entry.box.x_max for entry in group)
+                    - min(entry.box.x_min for entry in group),
+                ),
+            )
         )
 
     @staticmethod
@@ -1890,7 +1972,6 @@ def _run_hardware(
                                 not message.protocol_ready
                                 or message.reply_queue_full
                                 or message.tx_degraded
-                                or message.rx_degraded
                             ):
                                 raise RuntimeError(
                                     "STM32 UART health is degraded; "

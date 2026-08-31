@@ -61,6 +61,7 @@ from rescue_vision.geometry.camera_model import (
     CameraModel,
 )
 from rescue_vision.geometry.ground_projector import BevConfig, GroundProjector
+from rescue_vision.localization import FusedPoseEstimate, OdometryImuFusion
 from rescue_vision.motion import (
     CarStopReason,
     CarSystemStatus,
@@ -79,7 +80,6 @@ from rescue_vision.motion import (
     run_remote_motion,
 )
 from rescue_vision.perception import PerceptionFrameRenderer
-from rescue_vision.app.field_map import LatestCenterCrossLocalization
 SESSION_STATUS_PERIOD_MS = 1_000
 VEHICLE_STATUS_PERIOD_MS = 100
 CAMERA_ONLY_VEHICLE_STATUS_PERIOD_MS = 500
@@ -752,7 +752,7 @@ class ManualCaptureRuntime:
         bev_renderer: BevFrameRenderer | None,
         map_state_available: bool,
         map_team_color: RemoteTeamColor | None,
-        map_localization: LatestCenterCrossLocalization | None,
+        odometry_imu_fusion: OdometryImuFusion | None,
         stop_requested: Callable[[], bool],
         safety_mode: VehicleSafetyMode,
     ) -> None:
@@ -768,7 +768,7 @@ class ManualCaptureRuntime:
         self.bev_renderer = bev_renderer
         self.map_state_available = map_state_available
         self.map_team_color = map_team_color
-        self.map_localization = map_localization
+        self.odometry_imu_fusion = odometry_imu_fusion
         self.stop_requested = stop_requested
         if (executor is None) != (not session_status.motion_control_available):
             raise ValueError(
@@ -838,8 +838,8 @@ class ManualCaptureRuntime:
     def _on_car_message(self, message: ParsedCarMessage) -> None:
         self.vehicle.on_car_message(message)
         self.capture.record_car_message(message)
-        if self.map_localization is not None and isinstance(message, OdometryImu):
-            self.map_localization.submit_odometry(message)
+        if self.odometry_imu_fusion is not None and isinstance(message, OdometryImu):
+            self.odometry_imu_fusion.submit_odometry(message)
 
     def _on_motion(self, outcome: ExecutedRemoteMotion) -> None:
         self.vehicle.on_motion(outcome)
@@ -869,10 +869,6 @@ class ManualCaptureRuntime:
             self.latest_frame is None
             or self.capture.recording_active
             or now_before_prepare_ns >= self.next_video_ns
-            or (
-                self.map_localization is not None
-                and now_before_prepare_ns >= self.next_map_state_ns
-            )
         )
         frame = None
         if read_due:
@@ -905,8 +901,6 @@ class ManualCaptureRuntime:
             self._service_motion_safety()
             self.last_camera_frame_ns = time.monotonic_ns()
             self.capture.record(self.latest_frame)
-            if self.map_localization is not None:
-                self.map_localization.submit(self.latest_frame)
             if self.video_mode is VideoFrameMode.PERCEPTION:
                 if self.perception_renderer is None:
                     raise RuntimeError(
@@ -1018,11 +1012,6 @@ class ManualCaptureRuntime:
                 )
                 assert renderer is not None
                 renderer.clear_latest()
-                if (
-                    command.mode is VideoFrameMode.BEV
-                    and self.map_localization is not None
-                ):
-                    self.map_localization.clear_latest_bev()
                 self.minimum_rendered_sequence = (
                     None if self.latest_frame is None else self.latest_frame.sequence
                 )
@@ -1088,16 +1077,7 @@ class ManualCaptureRuntime:
         elif self.video_mode is VideoFrameMode.BEV:
             if self.bev_renderer is None:
                 raise RuntimeError("BEV video mode is not configured.")
-            annotated_frame = (
-                None
-                if self.map_localization is None
-                else self.map_localization.latest_bev_frame()
-            )
-            frame = (
-                annotated_frame
-                if annotated_frame is not None
-                else self.bev_renderer.latest()
-            )
+            frame = self.bev_renderer.latest()
             if frame is None:
                 return
             if self.minimum_rendered_sequence is None:
@@ -1126,30 +1106,38 @@ class ManualCaptureRuntime:
         if not self.map_state_available:
             return
         assert self.map_team_color is not None
-        robot = (
-            None
-            if self.map_localization is None
-            else self.map_localization.latest_robot_pose(timestamp_ns)
+        estimate: FusedPoseEstimate | None = None
+        if self.odometry_imu_fusion is not None:
+            estimate = self.odometry_imu_fusion.latest_estimate(timestamp_ns)
+        robot_pose = None if estimate is None else estimate.pose
+        robot_timestamp = (
+            None if estimate is None else estimate.estimate_timestamp_ns
+        )
+        position_uncertainty = (
+            None if estimate is None else estimate.position_uncertainty_mm
+        )
+        heading_uncertainty = (
+            None if estimate is None else estimate.heading_uncertainty_rad
         )
         state = MapStateObservation(
             state_sequence=self.map_state_sequence,
             timestamp_ns=timestamp_ns,
             team_color=self.map_team_color,
-            robot_localized=robot is not None,
-            robot_x_mm=None if robot is None else robot.pose.position.x,
-            robot_y_mm=None if robot is None else robot.pose.position.y,
-            robot_heading_rad=None if robot is None else robot.pose.heading_rad,
-            localization_timestamp_ns=(
-                None if robot is None else robot.capture_timestamp_ns
+            robot_localized=robot_pose is not None,
+            robot_x_mm=None if robot_pose is None else robot_pose.position.x,
+            robot_y_mm=None if robot_pose is None else robot_pose.position.y,
+            robot_heading_rad=(
+                None if robot_pose is None else robot_pose.heading_rad
             ),
-            localization_confidence=None if robot is None else robot.confidence,
-            localization_position_uncertainty_mm=(
-                None if robot is None else robot.position_uncertainty_mm
+            localization_timestamp_ns=robot_timestamp,
+            localization_confidence=None if estimate is None else estimate.confidence,
+            localization_position_uncertainty_mm=position_uncertainty,
+            localization_heading_uncertainty_rad=heading_uncertainty,
+            localization_source=(
+                None
+                if estimate is None or estimate.anchor_source is None
+                else f"fused_{estimate.anchor_source}"
             ),
-            localization_heading_uncertainty_rad=(
-                None if robot is None else robot.heading_uncertainty_rad
-            ),
-            localization_source=None if robot is None else robot.source,
             targets=(),
         )
         self.map_state_sequence += 1
@@ -1257,7 +1245,7 @@ def run_manual_capture_session(
     bev_renderer: BevFrameRenderer | None = None,
     map_state_available: bool = False,
     map_team_color: RemoteTeamColor | None = None,
-    map_localization: LatestCenterCrossLocalization | None = None,
+    odometry_imu_fusion: OdometryImuFusion | None = None,
     stop_requested: Callable[[], bool] = lambda: False,
     safety_mode: VehicleSafetyMode = VehicleSafetyMode.UNAVAILABLE,
 ) -> None:
@@ -1274,7 +1262,7 @@ def run_manual_capture_session(
         bev_renderer=bev_renderer,
         map_state_available=map_state_available,
         map_team_color=map_team_color,
-        map_localization=map_localization,
+        odometry_imu_fusion=odometry_imu_fusion,
         stop_requested=stop_requested,
         safety_mode=safety_mode,
     )
@@ -1463,7 +1451,7 @@ def main() -> None:
         "--enable-localization",
         action="store_true",
         help=(
-            "Enable the CPU-heavy field-feature/localization side path. "
+            "Enable the encoder+IMU localization fusion for map/state poses. "
             "Manual driving keeps it disabled unless requested; an enabled "
             "localization.fusion config also enables it."
         ),
@@ -1536,39 +1524,9 @@ def main() -> None:
         if map_state_available
         else None
     )
-    field_detector = (
-        config.perception.build_field_feature_detector(
-            static_map=config.world.static_map,
-            max_observation_age_ms=config.processing.max_observation_age_ms,
-            ground_projector=pipeline.ground_projector,
-        )
-        if enable_localization and pipeline.ground_projector is not None
-        else None
-    )
-    center_cross_localizer = (
-        config.build_center_cross_localizer(
-            ground_projector=pipeline.ground_projector,
-        )
-        if enable_localization
-        else None
-    )
     odometry_imu_fusion = (
         config.build_odometry_imu_fusion()
         if enable_localization and not args.camera_only
-        else None
-    )
-    map_localization = (
-        LatestCenterCrossLocalization(
-            field_detector,
-            center_cross_localizer,
-            valid_mask=pipeline.camera_model.valid_mask,
-            max_pose_age_ms=config.processing.max_observation_age_ms,
-            fusion=odometry_imu_fusion,
-            ground_projector=pipeline.ground_projector,
-        )
-        if field_detector is not None
-        and center_cross_localizer is not None
-        and pipeline.camera_model is not None
         else None
     )
     video_modes = (VideoFrameMode.RAW,) + (
@@ -1592,8 +1550,6 @@ def main() -> None:
                     perception_renderer.start()
                 if bev_renderer is not None:
                     bev_renderer.start()
-                if map_localization is not None:
-                    map_localization.start()
                 pipeline.source.start()
                 while not shutdown_requested.is_set():
                     connection = _accept_with_shutdown(
@@ -1603,9 +1559,9 @@ def main() -> None:
                         stop_requested=shutdown_requested.is_set,
                         on_car_message=(
                             None
-                            if map_localization is None
+                            if odometry_imu_fusion is None
                             else lambda message: (
-                                map_localization.submit_odometry(message)
+                                odometry_imu_fusion.submit_odometry(message)
                                 if isinstance(message, OdometryImu)
                                 else None
                             )
@@ -1643,7 +1599,7 @@ def main() -> None:
                                 bev_renderer=bev_renderer,
                                 map_state_available=map_state_available,
                                 map_team_color=map_team_color,
-                                map_localization=map_localization,
+                                odometry_imu_fusion=odometry_imu_fusion,
                                 stop_requested=shutdown_requested.is_set,
                                 safety_mode=(
                                     VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP
@@ -1673,12 +1629,8 @@ def main() -> None:
                             if perception_renderer is not None:
                                 perception_renderer.stop()
                         finally:
-                            try:
-                                if bev_renderer is not None:
-                                    bev_renderer.stop()
-                            finally:
-                                if map_localization is not None:
-                                    map_localization.stop()
+                            if bev_renderer is not None:
+                                bev_renderer.stop()
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
 

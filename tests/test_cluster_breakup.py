@@ -56,6 +56,7 @@ def breakup_config(**changes: object) -> ClusterBreakupRuntimeConfig:
         "search_angular_velocity_rad_s": 0.4,
         "search_timeout_s": 10.0,
         "cluster_min_detections": 2,
+        "cluster_group_gap_ratio": 0.10,
         "center_tolerance_ratio": 0.05,
         "center_confirm_frames": 2,
         "center_kp_rad_s": 1.0,
@@ -704,6 +705,120 @@ def test_breakup_rejects_zero_or_tiny_scan_velocities() -> None:
         breakup_config(search_angular_velocity_rad_s=0.0005)
     with pytest.raises(ValueError, match="scan_green_angular_velocity_rad_s"):
         breakup_config(scan_green_angular_velocity_rad_s=0.0)
+
+
+def _searching_sequence() -> ClusterBreakupSequence:
+    sequence = ClusterBreakupSequence(
+        breakup_config(),
+        gripper_full_travel_time_s=1.0,
+    )
+    sequence.step(timestamp_ns=0, cumulative_distance_m=None, perception=None)
+    sequence.step(timestamp_ns=10_000_000, cumulative_distance_m=0.0, perception=None)
+    sequence.step(timestamp_ns=1_000_000_000, cumulative_distance_m=0.5, perception=None)
+    return sequence
+
+
+def test_search_ignores_stray_target_for_cluster_center() -> None:
+    sequence = _searching_sequence()
+    decision = sequence.step(
+        timestamp_ns=2_000_000_000,
+        cumulative_distance_m=0.5,
+        perception=snapshot(
+            20,
+            observation(frame_sequence=20, x_min=35.0, x_max=48.0, distance_mm=500.0),
+            observation(frame_sequence=20, x_min=52.0, x_max=65.0, distance_mm=520.0),
+            observation(frame_sequence=20, x_min=85.0, x_max=95.0, distance_mm=600.0),
+        ),
+    )
+    assert decision.state is BreakupState.CENTER_CLUSTER
+    # 居中误差只来自相邻的两人目标团（联合框中心 50 恰在画面中心），
+    # 右侧散落目标（85..95）不会把中心拉偏。
+    assert decision.angular_velocity_rad_s == pytest.approx(0.0)
+
+
+def test_search_requires_minimum_detections_in_largest_group() -> None:
+    sequence = _searching_sequence()
+    decision = sequence.step(
+        timestamp_ns=2_000_000_000,
+        cumulative_distance_m=0.5,
+        perception=snapshot(
+            20,
+            observation(frame_sequence=20, x_min=35.0, x_max=45.0, distance_mm=500.0),
+            observation(frame_sequence=20, x_min=75.0, x_max=85.0, distance_mm=520.0),
+        ),
+    )
+    # 两个互相远离的单个目标分成两个团，最大团只有 1 个成员，
+    # 不满足 cluster_min_detections=2，继续搜索。
+    assert decision.state is BreakupState.SEARCH_CLUSTER
+
+
+def test_centering_uses_largest_group_center() -> None:
+    sequence = ClusterBreakupSequence(
+        breakup_config(center_kp_rad_s=0.5),
+        gripper_full_travel_time_s=1.0,
+    )
+    sequence.step(timestamp_ns=0, cumulative_distance_m=None, perception=None)
+    sequence.step(timestamp_ns=10_000_000, cumulative_distance_m=0.0, perception=None)
+    sequence.step(timestamp_ns=1_000_000_000, cumulative_distance_m=0.5, perception=None)
+    decision = sequence.step(
+        timestamp_ns=2_000_000_000,
+        cumulative_distance_m=0.5,
+        perception=snapshot(
+            20,
+            observation(frame_sequence=20, x_min=10.0, x_max=18.0, distance_mm=500.0),
+            observation(frame_sequence=20, x_min=20.0, x_max=28.0, distance_mm=520.0),
+            observation(frame_sequence=20, x_min=30.0, x_max=38.0, distance_mm=540.0),
+            observation(frame_sequence=20, x_min=80.0, x_max=88.0, distance_mm=600.0),
+            observation(frame_sequence=20, x_min=90.0, x_max=98.0, distance_mm=620.0),
+        ),
+    )
+    # 三人团（联合框中心 24，误差 -0.52）是最大团，
+    # 按 kp=0.5 得到左转角速度 +0.26；两人团在右侧不参与居中。
+    assert decision.state is BreakupState.CENTER_CLUSTER
+    assert decision.angular_velocity_rad_s == pytest.approx(0.26)
+
+
+def test_approach_nearest_distance_ignores_stray_target() -> None:
+    sequence = _searching_sequence()
+    sequence.step(
+        timestamp_ns=2_000_000_000,
+        cumulative_distance_m=0.5,
+        perception=cluster_snapshot(11, distance_mm=500.0),
+    )
+    centered = sequence.step(
+        timestamp_ns=3_000_000_000,
+        cumulative_distance_m=0.5,
+        perception=cluster_snapshot(12, distance_mm=500.0),
+    )
+    assert centered.state is BreakupState.CENTER_CLUSTER
+    approaching = sequence.step(
+        timestamp_ns=4_000_000_000,
+        cumulative_distance_m=0.5,
+        perception=cluster_snapshot(13, distance_mm=500.0),
+    )
+    assert approaching.state is BreakupState.APPROACH_CLUSTER
+    still_approaching = sequence.step(
+        timestamp_ns=5_000_000_000,
+        cumulative_distance_m=0.5,
+        perception=snapshot(
+            14,
+            observation(frame_sequence=14, x_min=35.0, x_max=48.0, distance_mm=500.0),
+            observation(frame_sequence=14, x_min=52.0, x_max=65.0, distance_mm=520.0),
+            observation(frame_sequence=14, x_min=85.0, x_max=95.0, distance_mm=150.0),
+        ),
+    )
+    # 散落目标虽然只有 150 mm，但属于独立团，不能提前触发 BREAKUP_PUSH。
+    assert still_approaching.state is BreakupState.APPROACH_CLUSTER
+    assert still_approaching.linear_velocity_m_s == pytest.approx(0.1)
+
+
+def test_breakup_validates_cluster_group_gap_ratio() -> None:
+    assert breakup_config(cluster_group_gap_ratio=0.0).cluster_group_gap_ratio == 0.0
+    assert breakup_config(cluster_group_gap_ratio=1.0).cluster_group_gap_ratio == 1.0
+    with pytest.raises(ValueError, match="cluster_group_gap_ratio"):
+        breakup_config(cluster_group_gap_ratio=-0.1)
+    with pytest.raises(ValueError, match="cluster_group_gap_ratio"):
+        breakup_config(cluster_group_gap_ratio=1.5)
 
 
 class _OneFrameSource:
