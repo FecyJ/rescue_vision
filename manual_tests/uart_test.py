@@ -8,7 +8,7 @@ import serial
 def main() -> None:
     parser = argparse.ArgumentParser(description="Print raw UART bytes for a manual check.")
     parser.add_argument("--device", default="/dev/ttyAMA10")
-    parser.add_argument("--baudrate", type=int, default=115200)
+    parser.add_argument("--baudrate", type=int, default=230400)
     parser.add_argument("--timeout", type=float, default=1.0)
     args = parser.parse_args()
 

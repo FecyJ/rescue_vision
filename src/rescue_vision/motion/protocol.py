@@ -12,7 +12,7 @@ from rescue_vision.communication import ReceivedUartFrame
 
 
 MAX_DECODED_FRAME_BYTES = 64
-STM32_UART_BAUDRATE = 115200
+STM32_UART_BAUDRATE = 230400
 _CRC_STRUCT = struct.Struct("<H")
 _WHEEL_COMMAND = struct.Struct("<Hhh")
 _SEQUENCE_COMMAND = struct.Struct("<H")

@@ -83,7 +83,6 @@ def test_overrun_probe_accepts_healthy_motion_status() -> None:
     [
         (SystemFlags.REPLY_QUEUE_FULL, "reply_queue_full=True"),
         (SystemFlags.TX_DEGRADED, "tx_degraded=True"),
-        (SystemFlags.RX_DEGRADED, "rx_degraded=True"),
     ],
 )
 def test_overrun_probe_rejects_sticky_uart_health_flags(
@@ -97,8 +96,16 @@ def test_overrun_probe_rejects_sticky_uart_health_flags(
     with pytest.raises(RuntimeError, match=expected) as caught:
         require_motion_status_healthy(status)
 
-    assert "cannot clear the sticky degraded flags" in str(caught.value)
+    assert "cannot clear the sticky queue/TX flags" in str(caught.value)
     assert "reset or power-cycle the STM32" in str(caught.value)
+
+
+def test_overrun_probe_does_not_gate_sticky_rx_health_flag() -> None:
+    require_motion_status_healthy(
+        system_status(
+            flags=SystemFlags.PROTOCOL_READY | SystemFlags.RX_DEGRADED
+        )
+    )
 
 
 def test_overrun_probe_rejects_protocol_not_ready() -> None:

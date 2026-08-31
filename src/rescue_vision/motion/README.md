@@ -22,14 +22,14 @@
 | `drive_wheel_limited()` | 分别合法的车体线速度和角速度 | 必要时同比缩放并返回实际 twist，使单轮不超限 |
 | `set_wheel_speeds()` | 左右轮速度 m/s | 绕过车体 twist 换算，仍执行轮速限幅校验 |
 | `update()` | 可选本机单调时间 ns | 按单轮最大加速度推进，并至少 20 Hz 刷新轮速；返回是否发送 |
-| `MotionControlTimingError` | 活动控制更新间隔超过 100 ms | 先发送柔和停车，再终止当前控制链路 |
+| `MotionControlTimingError` | 活动控制更新间隔超过 200 ms | 先发送柔和停车，再终止当前控制链路 |
 | `forward()` / `backward()` | 非负速度 m/s | 直行前进/后退 |
 | `turn_left()` / `turn_right()` | 非负角速度 rad/s | 原地左转/右转 |
 | `set_gripper_angles()` | 左右舵机角度 degree | 同时下发严格 `[0, 180]` 角度 |
 | `gripper_target_angles_deg` | 无 | 启动遥测或本进程最近下发的左右舵机目标；尚无时为 `None` |
 | `soft_brake()` / `emergency_stop()` | 无 | 固件斜坡制动/紧急停止 |
 | `synchronize()` | 等待秒数、可选回调 | 发送 `SOFT_BRAKE` 并等待同序号 `accepted`；等待期间转发遥测 |
-| `needs_synchronization` / `motion_synchronized` / `link_degraded` | 无 | 查询序号同步和 STM32 粘滞链路健康；告警后不再发送非零轮速 |
+| `needs_synchronization` / `motion_synchronized` / `link_degraded` | 无 | 查询序号同步和仍会阻止运动的 STM32 链路告警；`rx_degraded` 仅记录诊断，不单独阻止后续有效控制 |
 | `query_state()` | 无 | 请求固件立即返回状态 |
 | `receive_message()` | 可选等待秒数 | 丢弃损坏帧，返回编码器/IMU、系统状态或命令回复 |
 | `OdometryImu` | `ODOMETRY_IMU` | 同周期累计编码器、三轴 IMU、采样时间和质量位 |
@@ -128,7 +128,7 @@ controller.update()
 被拒绝。`run_remote_motion()` 已在每轮循环自动调用它，手动采集应用不需要
 另建定时器。其他直接调用方应以不超过 50 ms 的有界周期调用 `update()`；
 即使轮速没有变化，控制器也会至少 20 Hz 重发当前目标以刷新固件看门狗。
-若活动目标或实际下发值非零时两次更新相隔超过 100 ms，控制器不会把整段
+若活动目标或实际下发值非零时两次更新相隔超过 200 ms，控制器不会把整段
 停顿时间累计成一次大幅加速，也不会恢复停顿前目标；它先发送
 `SOFT_BRAKE`，清零本地目标并抛出 `MotionControlTimingError`，上层随后退出
 会话。静止时的长间隔只会刷新零轮速，不误报活动控制故障。
@@ -243,7 +243,7 @@ if isinstance(message, OdometryImu):
     )
 elif isinstance(message, CarSystemStatus):
     # 当前线路协议没有 watchdog_armed 位；last_motion_command_age_ms 非空表示
-    # 固件已经收到过运动命令，链路健康位仍需单独检查。
+    # 固件已经收到过运动命令；队列/TX 状态仍需检查，rx_degraded 仅作诊断记录。
     print(
         message.watchdog_timeout_ms,
         message.protocol_ready,

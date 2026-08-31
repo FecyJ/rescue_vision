@@ -74,7 +74,7 @@ def make_channel(
 ) -> UartFrameChannel:
     return UartFrameChannel(
         device="/dev/test-uart",
-        baudrate=115200,
+        baudrate=230400,
         read_timeout_s=0.05,
         write_timeout_s=0.05,
         receive_queue_capacity=receive_queue_capacity,
@@ -200,7 +200,7 @@ def test_real_serial_open_requests_exclusive_device(monkeypatch) -> None:
     )
     result = uart_module._open_pyserial(
         device="/dev/test-uart",
-        baudrate=115200,
+        baudrate=230400,
         read_timeout_s=0.05,
         write_timeout_s=0.05,
     )
@@ -208,7 +208,7 @@ def test_real_serial_open_requests_exclusive_device(monkeypatch) -> None:
     assert result is fake
     assert captured == {
         "port": "/dev/test-uart",
-        "baudrate": 115200,
+        "baudrate": 230400,
         "bytesize": 8,
         "parity": "N",
         "stopbits": 1,

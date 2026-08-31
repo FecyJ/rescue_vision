@@ -426,7 +426,7 @@ def test_active_control_loop_gap_soft_brakes_instead_of_resuming_target() -> Non
     clock.advance(0.05)
     assert controller.update()
 
-    clock.advance(0.101)
+    clock.advance(0.201)
     with pytest.raises(MotionControlTimingError, match="soft brake"):
         controller.update()
 
@@ -620,6 +620,30 @@ def test_motion_synchronization_waits_for_matching_soft_brake_reply() -> None:
     assert channel.sent == [encode_soft_brake_command(0)]
     assert isinstance(received[0], CarSystemStatus)
     assert isinstance(received[1], CarCommandReply)
+
+
+def test_sticky_rx_degraded_status_does_not_gate_wheel_motion() -> None:
+    clock = FakeClock()
+    channel = FakeCarChannel(
+        [
+            system_status_frame(
+                0,
+                1,
+                system_flags=SystemFlags.PROTOCOL_READY | SystemFlags.RX_DEGRADED,
+            )
+        ]
+    )
+    controller = MotionController(channel, limits(), monotonic_ns=clock)
+
+    message = controller.receive_message(timeout=0)
+    assert isinstance(message, CarSystemStatus)
+    assert message.rx_degraded
+    assert not controller.link_degraded
+
+    controller.forward(0.1)
+    clock.advance(0.04)
+    assert controller.update()
+    assert channel.sent == [encode_wheel_speed_command(0, 0.02, 0.02)]
 
 
 def test_sequence_old_requests_soft_brake_resynchronization() -> None:

@@ -119,7 +119,7 @@ def format_status(status: CarSystemStatus | None) -> str:
 
 
 def require_motion_status_healthy(status: CarSystemStatus) -> None:
-    """拒绝不能靠运动序号重同步恢复的固件链路状态。"""
+    """拒绝仍会影响运动的固件状态；记录但不门禁 ``rx_degraded``。"""
 
     unhealthy = []
     if not status.protocol_ready:
@@ -128,15 +128,13 @@ def require_motion_status_healthy(status: CarSystemStatus) -> None:
         unhealthy.append("reply_queue_full=True")
     if status.tx_degraded:
         unhealthy.append("tx_degraded=True")
-    if status.rx_degraded:
-        unhealthy.append("rx_degraded=True")
     if not unhealthy:
         return
 
     raise RuntimeError(
         "STM32 UART health is unsafe for motion: "
         f"{','.join(unhealthy)}. "
-        "SOFT_BRAKE resynchronization cannot clear the sticky degraded flags; "
+        "SOFT_BRAKE resynchronization cannot clear the sticky queue/TX flags; "
         "check UART wiring, baud rate, frame validity, and exclusive serial access, "
         "then reset or power-cycle the STM32 before retrying."
     )

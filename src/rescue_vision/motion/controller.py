@@ -25,7 +25,7 @@ from rescue_vision.motion.protocol import (
 
 
 _WHEEL_COMMAND_REFRESH_NS = 40_000_000
-_MAX_ACTIVE_UPDATE_GAP_NS = 100_000_000
+_MAX_ACTIVE_UPDATE_GAP_NS = 200_000_000
 _WHEEL_REPLY_TIMEOUT_NS = 100_000_000
 _MAX_PENDING_WHEEL_COMMANDS = 4
 
@@ -129,6 +129,7 @@ class MotionController:
         self._synchronization_acknowledged = False
         self._emergency_stop_latched = False
         self._link_degraded = False
+        self._latest_protocol_healthy = True
         self.invalid_received_frames = 0
 
     @property
@@ -184,7 +185,11 @@ class MotionController:
 
     @property
     def link_degraded(self) -> bool:
-        """返回是否观察到 STM32 本次启动期间的粘滞链路健康告警。"""
+        """返回是否观察到仍会阻止运动的 STM32 链路告警。
+
+        ``rx_degraded`` 是 STM32 本次启动期间的历史接收告警，只保留在
+        ``CarSystemStatus`` 中供记录和诊断，不单独阻止树莓派继续控制。
+        """
 
         return self._link_degraded
 
@@ -241,6 +246,8 @@ class MotionController:
             # SOFT_BRAKE is allowed to acknowledge while the emergency stop is
             # latched, but it must never make motion available again.
             return
+        if self._latest_protocol_healthy:
+            self._link_degraded = False
 
     def set_wheel_speeds(
         self,
@@ -299,7 +306,7 @@ class MotionController:
             gap_ms = elapsed_ns / 1_000_000.0
             self.soft_brake()
             raise MotionControlTimingError(
-                "Active motion update gap exceeded 100 ms; "
+                "Active motion update gap exceeded 200 ms; "
                 f"soft brake was sent after {gap_ms:.3f} ms."
             )
         maximum_delta = self.limits.max_wheel_acceleration_m_s2 * elapsed_s
@@ -578,22 +585,32 @@ class MotionController:
                         f"{message.result.name.lower()}."
                     )
         elif isinstance(message, CarSystemStatus):
+            # rx_degraded is a sticky STM32-side historical diagnostic.  It is
+            # intentionally observable through CarSystemStatus, but it is not
+            # a host-side motion gate: a transient bad RX frame must not make
+            # later valid ACKs and wheel commands unusable for this boot.
+            protocol_healthy = (
+                message.protocol_ready
+                and not message.reply_queue_full
+                and not message.tx_degraded
+            )
+            self._latest_protocol_healthy = protocol_healthy
             if message.emergency_stop_latched:
                 self._emergency_stop_latched = True
                 self._reset_acceleration_state()
             if (
                 message.reply_queue_full
                 or message.tx_degraded
-                or message.rx_degraded
             ):
                 self._link_degraded = True
             if (
                 not message.protocol_ready
                 or message.reply_queue_full
                 or message.tx_degraded
-                or message.rx_degraded
             ):
                 self._request_synchronization()
+            elif self.motion_synchronized:
+                self._link_degraded = False
 
     def _next_command_sequence(self) -> int:
         sequence = self._command_sequence

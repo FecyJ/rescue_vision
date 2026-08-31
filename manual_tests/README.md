@@ -12,8 +12,6 @@
 - `hailo_pose.py`：从实际 `runtime.yaml` 加载 YOLO Pose 部署包，检查单张去畸变图像的框、K0、HSV 类别和 ROI 分割摘要；启用 `target_ground_geometry` 时同时输出中心、足迹、朝向、拟合分数和降级原因。
 - `target_ground_geometry.py`：从实际相机逐帧运行 YOLO Pose、HSV 分割和 `TargetGroundGeometryEstimator`，在去畸变画面叠加地面中心、足迹和质量信息，并按 JSONL 周期输出机器人地面系毫米坐标；按 `Q/Esc` 退出。
 - `dataset_perception.py`：按数据清单批量运行 Hailo，覆盖式写出观测 JSONL，保留 Pose 类别、HSV 候选/覆盖率、UNKNOWN 和质量信息。
-- `field_features.py`：从图片或视频离线检测安全区、无编号出发区、中心十字和低精度边界候选，写出 JSONL 及可选叠加图；不访问相机或 Hailo。
-- `cross_localization.py`：从图片/视频或配置选择的最新帧相机运行中心十字绝对定位，输出四候选、同帧终端锚点、可选唯一位姿、JSONL 及去畸变/BEV 双实时界面；不访问串口或 Hailo。
 - `camera_undistort_perception.py`：按实际 `runtime.yaml` 连续执行相机、去畸变、Hailo Pose、ROI HSV 掩码和 K0/地面点叠加预览，按 `Q/Esc` 退出；偶发过期帧会标红并丢弃，不会终止预览。
 - `remote_link.py --config PATH`：在树莓派侧以 `remote.role: server` 监听电脑端客户端，连接后发送协议要求的最小会话状态，并持续打印收到的 control；该状态有意声明所有业务能力不可用，所以正式客户端应保持控制禁用。仅验证连接可使用 `observe_only`；用自制底层客户端检查 control 帧时使用 `debug_control`。
 - `remote_video.py --config PATH`：发送真实相机的最新 JPEG 帧和周期会话状态，接收电脑端的原图/perception 图像模式请求，但不接收或执行运动、夹爪和采集控制。
@@ -29,8 +27,9 @@
   编码器/IMU、系统状态、实际频率、序号丢帧和协议错误；可选只发送一次
   `QUERY_STATUS`，不发送运动或夹爪命令。
 
-手动驾驶默认关闭 CPU 较重的场地定位旁路；需要它时在命令中添加
-`--enable-localization`。这不会改变静态场地图发布，只控制实时场地特征线程。
+手动驾驶默认关闭编码器/IMU 融合；需要地图定位时在命令中添加
+`--enable-localization`。这不会改变静态场地图发布，只控制融合与 `map/state`
+位姿发布；当前没有场地特征模型推理后端，因此不启动视觉定位旁路。
 
 运行前先执行 `python -m pip install -e .`，并确保系统包和显示环境可用。
 
@@ -41,6 +40,7 @@
 ```bash
 python manual_tests/stm32_monitor.py \
   --config configs/runtime.yaml
+  --verbose
 ```
 
 默认每秒打印汇总和最新一帧定位/状态。只运行 10 秒：
@@ -133,8 +133,10 @@ PYTHONPATH=src .venv/bin/python \
 检测到异常时默认返回 0 但输出 `RESULT=sample_overrun_detected`，方便现场收集
 日志；需要让脚本以失败状态退出时增加 `--fail-on-overrun`。该脚本不会忽略或
 降级 `sample_overrun`，不能用来证明固件采样链路已经合格。若状态中的
-`reply_queue_full`、`tx_degraded` 或 `rx_degraded` 为真，脚本会立即停车并退出：
-这些是本次 STM32 启动期间的粘滞告警，`SOFT_BRAKE` 序号重同步不会清除。
+`reply_queue_full` 或 `tx_degraded` 为真，脚本会立即停车并退出；
+`rx_degraded` 仍会打印并记录，但不再作为树莓派后续有效运动控制的单独门禁，
+因为它是本次 STM32 启动期间的历史接收告警。`SOFT_BRAKE` 序号重同步不会清除
+这些 STM32 粘滞告警。
 排除串口接线、波特率、非法帧或多个进程同时读取串口后，必须复位或重新上电
 STM32，再重新运行检查。
 
@@ -161,96 +163,6 @@ PYTHONPATH=src .venv/bin/python \
 本次出现过 sample overrun 或连续 overrun 导致停止。`sample_dt_ms` 是 STM32 采样
 时间间隔，`host_dt_ms` 是树莓派接收时间间隔，不能用终端输出间隔代替。
 
-## 传统视觉场地特征离线检查
-
-输入已经按当前配置去畸变时：
-
-```bash
-python manual_tests/field_features.py recordings/field_sample.mp4 \
-  --config configs/runtime.yaml \
-  --already-undistorted \
-  --output-jsonl output/field_features.jsonl \
-  --overlay-dir output/field_feature_overlays
-```
-
-原始图片或视频应去掉 `--already-undistorted`，并启用有效内参。启用地面映射
-后才会进行 BEV 尺寸筛选并输出 `GroundPoint`；当前开发机检查不等于树莓派
-实时性能、围栏泛化或现场颜色精度验收。
-
-中心十字绝对位姿的远场验收当前为“未验证”。现有本机地面映射只覆盖前方
-约 500 mm，不能用它证明能从中心看到约 1.5 m 外的安全区或场界终端。后续
-取得全范围可用标定和真实场地录像后，应在同帧输出中核对：十字交点位置误差、
-航向误差、红/蓝锚点成功率、普通场界导致的 180° 歧义保留，以及遮挡、模糊和
-颜色偏差失败样例；不得用合成 BEV 关闭这些验收项。
-
-## 中心十字定位检查
-
-运行前必须在同一份配置中启用可用的远场地面映射、
-`perception.field_features.enabled` 和 `localization.enabled`，并完整定义
-`world.static_map`。处理原始相机录像：
-
-```bash
-python manual_tests/cross_localization.py recordings/field_sample.mp4 \
-  --config configs/runtime.yaml \
-  --output-jsonl output/cross_localization.jsonl \
-  --overlay-dir output/cross_localization_overlays \
-  --display
-```
-
-如果输入已经由当前 `CameraModel` 去畸变，额外传
-`--already-undistorted`。叠加目录每帧写出 `_undistorted.jpg` 和 `_bev.jpg`；
-JSONL 保留中心十字摘要、四个位姿候选、终端类别/距离、唯一位姿、选择来源和
-全部降级原因。按 `Q` 或 `Esc` 结束显示；无人值守抽查可使用
-`--max-frames 100`。
-
-固定机器人或已知单帧姿态时，可以注入场地先验：
-
-```bash
-python manual_tests/cross_localization.py recordings/stationary_cross.mp4 \
-  --config configs/runtime.yaml \
-  --output-jsonl output/cross_with_prior.jsonl \
-  --prior-field-pose 0 0 90
-```
-
-三个数依次是场地 `x_mm`、`y_mm` 和航向角 degree。该先验会原样用于每一帧，
-因此只适合静止录像或逐帧先验相同的受控检查；不得用于运动车辆视频冒充
-`OdometryImuFusion` 的真实连续推算结果。
-
-### 相机实时界面
-
-使用 `runtime.yaml` 的 `camera.backend`、分辨率、帧率和固定焦点打开真机：
-
-```bash
-python manual_tests/cross_localization.py \
-  --camera \
-  --config configs/runtime.yaml \
-  --output-jsonl output/cross_camera_live.jsonl \
-  --overlay-dir output/cross_camera_overlays \
-  --print-interval 0.5
-```
-
-`--camera` 会自动打开去畸变和 BEV 两个可缩放窗口，无需再传 `--display`；按
-`Q` 或 `Esc` 退出。相机源在后台持续排空输入，定位循环只读取最新完整帧，不会
-积累延迟。JSONL 每帧立即刷新；正常退出、相机异常、写盘失败或窗口退出都会关闭
-Picamera2/rpicam 源和窗口。偶发过期帧会在双窗口和 JSONL 中标记
-`STALE dropped` 后继续读取最新帧，不会把旧观测用于定位。需要在有限帧后
-自动结束时可加 `--max-frames 100`。
-
-实时相机模式显式跳过普通场界候选，只运行安全区、中心十字和方向锚定所需
-步骤，以满足定位时效预算；因此该模式 JSONL 的 `boundary_feature_count` 为 0。
-需要检查围栏基线/场角时改用 `field_features.py`，不要用本命令的空边界集合
-证明现场没有场界。
-
-BEV 窗口会半透明填充并标出 `CROSS`、`SAFE red`、`SAFE blue`；当同帧十字、
-地面投影和安全区/场界方向证据足够消除四向歧义时，终端按
-`--print-interval` 打印十字机器人地面坐标、终端证据和最终
-`FieldPoint(x, y, heading)` 计算结果。设为 `--print-interval 0` 可打印每个
-成功定位帧；没有唯一位姿时不会打印伪造结果，窗口仍显示候选和降级原因。
-
-实时相机输入一定是原始像素，脚本会使用当前 `CameraModel` 去畸变，因此
-`--camera` 不能与 `--already-undistorted` 同时使用。该脚本仍只检查视觉定位；
-完整编码器/IMU 融合由手动采集入口装配。
-
 ## 编码器/IMU 连续融合真车验收
 
 先用 `stm32_monitor.py` 确认 `ODOMETRY_IMU` 稳定达到 100 Hz、传感器原始轴方向和
@@ -266,8 +178,10 @@ BEV 窗口会半透明填充并标出 `CROSS`、`SAFE red`、`SAFE blue`；当�
 1. 静止至少 30 秒，记录零偏收敛和停车位置/航向漂移。
 2. 定距直线、原地正反各一整圈、正反弧线，分别重复至少 5 次。
 3. 在物理急停和全程监督下制造短时 IMU invalid、正向遥测丢帧和 STM32 重启；
-   核对轮式降级、协方差增长、地图清除以及可靠中心十字重新锚定。
-4. 驶过中心十字前后测量闭环位置与航向误差，并记录 P50/P95 定位年龄。
+   核对轮式降级、协方差增长和地图清除。视觉重锚定验收需等待场地特征模型
+   推理后端实现，不能在当前仓库用传统 OpenCV 结果替代。
+4. 真车往返后测量编码器+IMU 推算的闭环位置与航向误差，并记录 P50/P95
+   定位年龄；中心十字视觉纠偏的误差验收同样后置到模型后端落地之后。
 
 每项必须保存真实 `motion.jsonl`、相机 recording、测量基准和失败样例。当前只有
 合成轨迹 pytest，真车误差、长期温漂、UART 延迟分布和树莓派性能均为“未验证”。

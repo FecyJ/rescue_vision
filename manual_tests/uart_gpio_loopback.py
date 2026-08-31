@@ -2,7 +2,7 @@ import time
 import serial
 
 PORT = "/dev/ttyAMA10"
-BAUDRATE = 115200
+BAUDRATE = 230400
 TEST_COUNT = 1000
 
 success = 0
