@@ -205,6 +205,19 @@ world:
         negative_x: plain_boundary
         positive_y: red_safe_zone
         negative_y: blue_safe_zone
+    # v3 安全区地标。以下坐标仅由命题示意图启动，尚未实测，因此必须保持
+    # measured/usable=false；定位装配不会把它们作为绝对视觉证据。
+    safe_zone_landmarks:
+      - color: red
+        ground_anchor_field_mm: [0.0, 1200.0]
+        near_field_corners_mm: [[-300.0, 1200.0], [300.0, 1200.0]]
+        measured: false
+        usable: false
+      - color: blue
+        ground_anchor_field_mm: [0.0, -1200.0]
+        near_field_corners_mm: [[-300.0, -1200.0], [300.0, -1200.0]]
+        measured: false
+        usable: false
     # 以下 3000 mm 场界、600×300 mm 安全区和 300 mm 出发区来自命题示意图，
     # 是启动地图而非现场测量真值；现场尺寸或布置变化时只改这里。
     # 安全区多边形描述彩色有效区域，不包含外侧 660 mm 围栏厚度。
@@ -284,6 +297,22 @@ perception:
   # 模型负责检测框和 K0；最终任务类别由框内 HSV 颜色证据决定。
   detection_threshold: 0.25
   k0_threshold: 0.50
+  center_cross_refinement:
+    enabled: true
+    canny_low: 50
+    canny_high: 150
+    hough_threshold: 16
+    min_line_length_px: 18.0
+    max_line_gap_px: 12.0
+    max_intersection_distance_px: 18.0
+    min_axis_angle_deg: 65.0
+  safe_zone_color:
+    # 尚无现场色卡数据，保持关闭；启用时红蓝范围都必须非空。
+    enabled: false
+    red_hsv_ranges: []
+    blue_hsv_ranges: []
+    min_fraction: 0.08
+    min_margin: 0.03
   color_classifier:
     # OpenCV HSV：H=0..179，S/V=0..255。初值来自命题文件示意图，
     # 不是官方色卡；必须按现场实物、光照和相机参数重新校准。
@@ -477,7 +506,12 @@ hailo:
   hef_path: null
   postprocess_onnx_path: null
   output_mapping_path: null
-  raw_classes: []
-  class_mapping: {}
+  raw_classes:
+    - green_supply
+    - black_core
+    - orange_injured
+    - blue_danger
+    - center_cross
+    - safe_zone
   backend_score_threshold: 0.01
   max_detections: 100

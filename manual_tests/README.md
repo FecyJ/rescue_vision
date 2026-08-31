@@ -9,8 +9,8 @@
 - `camera_undistort.py --intrinsics PATH`：加载指定内参实时预览去畸变结果。
 - `picamera_minimal.py`：直接使用 Picamera2 的最小检查。
 - `geometry_projection.py`：使用本地测试图片人工检查 BEV 和点投影。
-- `hailo_pose.py`：从实际 `runtime.yaml` 加载 YOLO Pose 部署包，检查单张去畸变图像的框、K0、HSV 类别和 ROI 分割摘要；启用 `target_ground_geometry` 时同时输出中心、足迹、朝向、拟合分数和降级原因。
-- `target_ground_geometry.py`：从实际相机逐帧运行 YOLO Pose、HSV 分割和 `TargetGroundGeometryEstimator`，在去畸变画面叠加地面中心、足迹和质量信息，并按 JSONL 周期输出机器人地面系毫米坐标；按 `Q/Esc` 退出。
+- `hailo_pose.py`：从实际 `runtime.yaml` 加载 YOLO Pose v3 部署包，检查单张去畸变图像的六类框、K0/K1/K2、目标 HSV 类别、场地特征和 ROI 分割摘要。
+- `target_ground_geometry.py`：旧接触锚点实验工具，不兼容 v3 K0 底面中心语义；仅用于复现旧结果，不作为新版模型验收入口。
 - `dataset_perception.py`：按数据清单批量运行 Hailo，覆盖式写出观测 JSONL，保留 Pose 类别、HSV 候选/覆盖率、UNKNOWN 和质量信息。
 - `camera_undistort_perception.py`：按实际 `runtime.yaml` 连续执行相机、去畸变、Hailo Pose、ROI HSV 掩码和 K0/地面点叠加预览，按 `Q/Esc` 退出；偶发过期帧会标红并丢弃，不会终止预览。
 - `remote_link.py --config PATH`：在树莓派侧以 `remote.role: server` 监听电脑端客户端，连接后发送协议要求的最小会话状态，并持续打印收到的 control；该状态有意声明所有业务能力不可用，所以正式客户端应保持控制禁用。仅验证连接可使用 `observe_only`；用自制底层客户端检查 control 帧时使用 `debug_control`。
@@ -29,7 +29,7 @@
 
 手动驾驶默认关闭编码器/IMU 融合；需要地图定位时在命令中添加
 `--enable-localization`。这不会改变静态场地图发布，只控制融合与 `map/state`
-位姿发布；当前没有场地特征模型推理后端，因此不启动视觉定位旁路。
+位姿发布；v3 场地结果会在实测地标和定位门禁满足时提交视觉纠偏。
 
 运行前先执行 `python -m pip install -e .`，并确保系统包和显示环境可用。
 
@@ -178,10 +178,10 @@ PYTHONPATH=src .venv/bin/python \
 1. 静止至少 30 秒，记录零偏收敛和停车位置/航向漂移。
 2. 定距直线、原地正反各一整圈、正反弧线，分别重复至少 5 次。
 3. 在物理急停和全程监督下制造短时 IMU invalid、正向遥测丢帧和 STM32 重启；
-   核对轮式降级、协方差增长和地图清除。视觉重锚定验收需等待场地特征模型
-   推理后端实现，不能在当前仓库用传统 OpenCV 结果替代。
+   核对轮式降级、协方差增长和地图清除。视觉重锚定必须使用正式 v3 模型、
+   实测安全区地标和远场标定，不能用局部精修或合成结果替代。
 4. 真车往返后测量编码器+IMU 推算的闭环位置与航向误差，并记录 P50/P95
-   定位年龄；中心十字视觉纠偏的误差验收同样后置到模型后端落地之后。
+   定位年龄，并单列中心十字与安全区视觉纠偏误差。
 
 每项必须保存真实 `motion.jsonl`、相机 recording、测量基准和失败样例。当前只有
 合成轨迹 pytest，真车误差、长期温漂、UART 延迟分布和树莓派性能均为“未验证”。

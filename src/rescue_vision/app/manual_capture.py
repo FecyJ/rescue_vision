@@ -61,7 +61,11 @@ from rescue_vision.geometry.camera_model import (
     CameraModel,
 )
 from rescue_vision.geometry.ground_projector import BevConfig, GroundProjector
-from rescue_vision.localization import FusedPoseEstimate, OdometryImuFusion
+from rescue_vision.localization import (
+    FusedPoseEstimate,
+    OdometryImuFusion,
+    VisualLocalizationPipeline,
+)
 from rescue_vision.motion import (
     CarStopReason,
     CarSystemStatus,
@@ -753,6 +757,7 @@ class ManualCaptureRuntime:
         map_state_available: bool,
         map_team_color: RemoteTeamColor | None,
         odometry_imu_fusion: OdometryImuFusion | None,
+        visual_localization: VisualLocalizationPipeline | None = None,
         stop_requested: Callable[[], bool],
         safety_mode: VehicleSafetyMode,
     ) -> None:
@@ -769,6 +774,7 @@ class ManualCaptureRuntime:
         self.map_state_available = map_state_available
         self.map_team_color = map_team_color
         self.odometry_imu_fusion = odometry_imu_fusion
+        self.visual_localization = visual_localization
         self.stop_requested = stop_requested
         if (executor is None) != (not session_status.motion_control_available):
             raise ValueError(
@@ -901,7 +907,10 @@ class ManualCaptureRuntime:
             self._service_motion_safety()
             self.last_camera_frame_ns = time.monotonic_ns()
             self.capture.record(self.latest_frame)
-            if self.video_mode is VideoFrameMode.PERCEPTION:
+            if (
+                self.video_mode is VideoFrameMode.PERCEPTION
+                or self.visual_localization is not None
+            ):
                 if self.perception_renderer is None:
                     raise RuntimeError(
                         "Perception video mode is not available in this session."
@@ -913,6 +922,10 @@ class ManualCaptureRuntime:
                 self.bev_renderer.submit(self.latest_frame)
             self._service_motion_safety()
         now_ns = time.monotonic_ns()
+        if self.visual_localization is not None and self.perception_renderer is not None:
+            snapshot = self.perception_renderer.latest_snapshot()
+            if snapshot is not None and snapshot.field_features is not None:
+                self.visual_localization.submit(snapshot.field_features)
         if self.latest_frame is not None and now_ns >= self.next_video_ns:
             self._service_motion_safety()
             self._send_current_video()
@@ -1246,6 +1259,7 @@ def run_manual_capture_session(
     map_state_available: bool = False,
     map_team_color: RemoteTeamColor | None = None,
     odometry_imu_fusion: OdometryImuFusion | None = None,
+    visual_localization: VisualLocalizationPipeline | None = None,
     stop_requested: Callable[[], bool] = lambda: False,
     safety_mode: VehicleSafetyMode = VehicleSafetyMode.UNAVAILABLE,
 ) -> None:
@@ -1263,6 +1277,7 @@ def run_manual_capture_session(
         map_state_available=map_state_available,
         map_team_color=map_team_color,
         odometry_imu_fusion=odometry_imu_fusion,
+        visual_localization=visual_localization,
         stop_requested=stop_requested,
         safety_mode=safety_mode,
     )
@@ -1529,6 +1544,10 @@ def main() -> None:
         if enable_localization and not args.camera_only
         else None
     )
+    visual_localization = config.build_visual_localization_pipeline(
+        ground_projector=pipeline.ground_projector,
+        fusion=odometry_imu_fusion,
+    )
     video_modes = (VideoFrameMode.RAW,) + (
         (VideoFrameMode.PERCEPTION,) if perception_renderer is not None else ()
     ) + ((VideoFrameMode.BEV,) if bev_renderer is not None else ())
@@ -1600,6 +1619,7 @@ def main() -> None:
                                 map_state_available=map_state_available,
                                 map_team_color=map_team_color,
                                 odometry_imu_fusion=odometry_imu_fusion,
+                                visual_localization=visual_localization,
                                 stop_requested=shutdown_requested.is_set,
                                 safety_mode=(
                                     VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP

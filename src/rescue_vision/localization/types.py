@@ -139,6 +139,36 @@ class FieldPose2D:
 
 
 @dataclass(frozen=True, slots=True)
+class FieldPositionObservation:
+    """已知场地单点在新鲜航向先验下形成的位置观测，不含航向测量。"""
+
+    frame_sequence: int
+    capture_timestamp_ns: int
+    result_timestamp_ns: int
+    position: FieldPoint
+    position_uncertainty_mm: float
+    confidence: float
+    source: str
+
+    def __post_init__(self) -> None:
+        for name in ("frame_sequence", "capture_timestamp_ns", "result_timestamp_ns"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer.")
+        if self.result_timestamp_ns < self.capture_timestamp_ns:
+            raise ValueError("result timestamp must not precede capture timestamp.")
+        if not isinstance(self.position, FieldPoint):
+            raise ValueError("position must be a FieldPoint.")
+        _finite(self.position.x, "position.x")
+        _finite(self.position.y, "position.y")
+        if _finite(self.position_uncertainty_mm, "position_uncertainty_mm") <= 0.0:
+            raise ValueError("position_uncertainty_mm must be positive.")
+        _probability(self.confidence, "confidence")
+        if not isinstance(self.source, str) or not self.source.strip():
+            raise ValueError("source must be a non-empty string.")
+
+
+@dataclass(frozen=True, slots=True)
 class CenterLineTerminalObservation:
     direction_forward: float
     direction_left: float

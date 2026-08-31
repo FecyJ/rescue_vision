@@ -2197,6 +2197,10 @@ def _run_hardware(
         raise RuntimeError("20-point simulation requires odometry/IMU fusion.")
     fusion_pump = OdometryFusionPump(fusion)
     pipeline = build_camera_pipeline(config)
+    visual_localization = config.build_visual_localization_pipeline(
+        ground_projector=pipeline.ground_projector,
+        fusion=fusion,
+    )
     renderer = PerceptionFrameRenderer(
         lambda: config.build_target_pose_detector(
             ground_projector=pipeline.ground_projector
@@ -2297,6 +2301,12 @@ def _run_hardware(
                     consume(message)
                 camera_pump.check_health()
                 latest_snapshot = renderer.latest_snapshot()
+                if (
+                    latest_snapshot is not None
+                    and latest_snapshot.field_features is not None
+                    and visual_localization is not None
+                ):
+                    visual_localization.submit(latest_snapshot.field_features)
                 time.sleep(0.005)
             if latest_snapshot is None:
                 raise RuntimeError("No fresh perception snapshot before start.")
@@ -2413,6 +2423,12 @@ def _run_hardware(
                         branch_error = f"perception_renderer:{exc}"
                     fresh_snapshot = None
                 latest_snapshot = fresh_snapshot or latest_snapshot
+                if (
+                    fresh_snapshot is not None
+                    and fresh_snapshot.field_features is not None
+                    and visual_localization is not None
+                ):
+                    visual_localization.submit(fresh_snapshot.field_features)
                 try:
                     pose = fusion_pump.latest_estimate(now_ns)
                 except Exception as exc:

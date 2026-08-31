@@ -15,15 +15,15 @@ from rescue_vision.localization import (
     angular_distance,
 )
 from rescue_vision.perception import (
-    BoundaryFeatureKind,
-    BoundaryFeatureObservation,
     CenterCrossObservation,
     CenterCrossConfirmation,
     FieldFeatureDetectionResult,
     FieldFeatureQuality,
+    FieldPoseKeypoint,
     LineSegmentObservation,
     SafeZoneColor,
     SafeZoneObservation,
+    UndistortedBoundingBox,
 )
 from rescue_vision.world import (
     CenterCrossRay,
@@ -93,9 +93,13 @@ def cross(
         else UndistortedPixel(center.x + 2000.0, center.y + 2000.0)
     )
     return CenterCrossObservation(
+        box=UndistortedBoundingBox(100.0, 100.0, 300.0, 300.0),
+        intersection=FieldPoseKeypoint(
+            intersection_pixel,
+            center if ground and not partial else None,
+            0.8 if not partial else 0.0,
+        ),
         axes=axes,
-        intersection_undistorted=intersection_pixel,
-        intersection_ground=(center if ground and not partial else None),
         confidence=0.8 if not partial else 0.3,
         quality=(
             frozenset()
@@ -105,7 +109,6 @@ def cross(
         confirmation=CenterCrossConfirmation.TEMPORAL_CONFIRMED,
         axis_fit_residuals_px=((1.0,) if partial else (1.0, 1.0)),
         axis_angle_deg=(None if partial else 90.0),
-        intersection_extrapolated=False,
     )
 
 
@@ -116,51 +119,20 @@ def safe_zone(
     confidence: float = 0.9,
     partial: bool = False,
 ) -> SafeZoneObservation:
-    polygon_ground = (
-        GroundPoint(center.x - 100.0, center.y - 50.0),
-        GroundPoint(center.x + 100.0, center.y - 50.0),
-        GroundPoint(center.x + 100.0, center.y + 50.0),
-        GroundPoint(center.x - 100.0, center.y + 50.0),
-    )
-    polygon_pixels = tuple(
-        UndistortedPixel(point.x + 2000.0, point.y + 2000.0)
-        for point in polygon_ground
-    )
+    anchor_pixel = UndistortedPixel(center.x + 2000.0, center.y + 2000.0)
     return SafeZoneObservation(
+        box=UndistortedBoundingBox(100.0, 100.0, 300.0, 300.0),
+        ground_anchor=FieldPoseKeypoint(anchor_pixel, center, confidence),
+        image_left_landmark=FieldPoseKeypoint(UndistortedPixel(anchor_pixel.u - 100.0, anchor_pixel.v), GroundPoint(center.x - 100.0, center.y), confidence),
+        image_right_landmark=FieldPoseKeypoint(UndistortedPixel(anchor_pixel.u + 100.0, anchor_pixel.v), GroundPoint(center.x + 100.0, center.y), confidence),
         physical_color=color,
-        polygon_undistorted=polygon_pixels,
-        polygon_ground=polygon_ground,
-        entrance=None,
-        divider=None,
-        halves=(),
         confidence=confidence,
         quality=frozenset(
             {
-                FieldFeatureQuality.ENTRANCE_UNRESOLVED,
-                FieldFeatureQuality.DIVIDER_UNRESOLVED,
-                FieldFeatureQuality.SIDE_UNRESOLVED,
+                *( [FieldFeatureQuality.IDENTITY_UNRESOLVED] if color is SafeZoneColor.UNKNOWN else [] ),
             }
             | ({FieldFeatureQuality.PARTIAL} if partial else set())
         ),
-    )
-
-
-def boundary(
-    start: GroundPoint,
-    end: GroundPoint,
-    *,
-    confidence: float = 0.4,
-) -> BoundaryFeatureObservation:
-    return BoundaryFeatureObservation(
-        kind=BoundaryFeatureKind.FENCE_BASE_SEGMENT,
-        points_undistorted=(
-            UndistortedPixel(start.x + 2000.0, start.y + 2000.0),
-            UndistortedPixel(end.x + 2000.0, end.y + 2000.0),
-        ),
-        points_ground=(start, end),
-        capture_timestamp_ns=1_000_000,
-        confidence=confidence,
-        quality=frozenset({FieldFeatureQuality.LOW_CONFIDENCE_BOUNDARY}),
     )
 
 
@@ -168,7 +140,6 @@ def result(
     *,
     center_cross: CenterCrossObservation | None = None,
     safe_zones: tuple[SafeZoneObservation, ...] = (),
-    boundaries: tuple[BoundaryFeatureObservation, ...] = (),
 ) -> FieldFeatureDetectionResult:
     return FieldFeatureDetectionResult(
         frame_sequence=7,
@@ -176,9 +147,7 @@ def result(
         result_timestamp_ns=1_100_000,
         image_size=(400, 400),
         safe_zones=safe_zones,
-        start_zones=(),
         center_cross=cross() if center_cross is None else center_cross,
-        boundary_features=boundaries,
     )
 
 
@@ -344,26 +313,6 @@ def test_partial_blue_zone_still_requires_and_can_pass_ray_anchor_gate() -> None
     assert observation.selection_source is CenterCrossSelectionSource.BLUE_SAFE_ZONE
 
 
-def test_plain_boundary_does_not_resolve_180_degree_ambiguity() -> None:
-    observation = localizer().localize(
-        result(
-            boundaries=(
-                boundary(GroundPoint(1300.0, -500.0), GroundPoint(1300.0, 500.0)),
-            )
-        )
-    )
-
-    assert observation.selected_pose is None
-    assert any(
-        item.kind is CenterLineTerminalKind.PLAIN_BOUNDARY
-        for item in observation.terminals
-    )
-    assert (
-        CenterCrossLocalizationQuality.BOUNDARY_ONLY_AMBIGUITY
-        in observation.quality
-    )
-
-
 def test_off_axis_and_low_confidence_regions_do_not_anchor() -> None:
     observation = localizer().localize(
         result(
@@ -458,9 +407,7 @@ def test_missing_and_stale_center_observations_are_explicit() -> None:
         result_timestamp_ns=1_100_000,
         image_size=(400, 400),
         safe_zones=(),
-        start_zones=(),
         center_cross=None,
-        boundary_features=(),
     )
     missing_observation = localizer().localize(missing)
     assert (

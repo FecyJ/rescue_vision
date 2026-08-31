@@ -16,7 +16,13 @@ import numpy as np
 
 from rescue_vision.geometry.camera_model import IMAGE_BORDER_FILL_VALUE
 from rescue_vision.geometry.types import UndistortedPixel
-from rescue_vision.perception.types import ModelDetection, UndistortedBoundingBox
+from rescue_vision.perception.types import (
+    ModelDetection,
+    POSE_MODEL_CLASSES,
+    PoseKeypoint,
+    PoseModelClass,
+    UndistortedBoundingBox,
+)
 
 
 _ONNX_DUPLICATE_SCHEMA_PREFIX = (
@@ -254,11 +260,11 @@ def parse_yolo26_pose_output(
     score_threshold: float,
     max_detections: int,
 ) -> list[ModelDetection]:
-    """解析 end-to-end 输出；旧三点模型也只读取 K0。"""
+    """解析 YOLO Pose v3 end-to-end 输出的三个固定关键点。"""
 
-    if kpt_shape not in {(1, 3), (3, 3)}:
+    if kpt_shape != (3, 3):
         raise ValueError(
-            f"Pose kpt_shape must be [1, 3] or legacy [3, 3], got {kpt_shape!r}."
+            f"Pose v3 kpt_shape must be [3, 3], got {kpt_shape!r}."
         )
     detections = np.asarray(output)
     if detections.ndim == 3:
@@ -282,6 +288,8 @@ def parse_yolo26_pose_output(
         class_id = int(class_value)
         if not np.isfinite(class_value) or class_value != class_id or class_id < 0:
             raise ValueError(f"Invalid model class ID {class_value!r}.")
+        if class_id >= len(POSE_MODEL_CLASSES):
+            raise ValueError(f"Invalid YOLO Pose v3 class ID {class_id}.")
         try:
             box = transform.box_to_original(
                 *[float(value) for value in row[:4]]
@@ -290,21 +298,31 @@ def parse_yolo26_pose_output(
             # 填充区或垃圾输出裁剪后可能退化为零面积框；单条坏输出
             # 不应击穿整帧实时推理。
             continue
-        k0_confidence = (
-            float(row[8]) if np.isfinite(row[8]) else 0.0
-        )
-        k0 = (
-            transform.point_to_original(float(row[6]), float(row[7]))
-            if np.isfinite(row[6:9]).all()
-            else None
-        )
+        keypoints: list[PoseKeypoint] = []
+        for index in range(3):
+            offset = 6 + index * 3
+            values = row[offset : offset + 3]
+            confidence = float(values[2]) if np.isfinite(values[2]) else 0.0
+            point = (
+                transform.point_to_original(float(values[0]), float(values[1]))
+                if confidence > 0.0 and np.isfinite(values).all()
+                else None
+            )
+            keypoints.append(PoseKeypoint(point, confidence if point is not None else 0.0))
+        model_class = POSE_MODEL_CLASSES[class_id]
+        if (
+            model_class is PoseModelClass.SAFE_ZONE
+            and keypoints[1].point is not None
+            and keypoints[2].point is not None
+            and keypoints[1].point.u >= keypoints[2].point.u
+        ):
+            raise ValueError("safe_zone keypoints must satisfy u(K1) < u(K2).")
         parsed.append(
             ModelDetection(
                 model_class_id=class_id,
                 confidence=float(row[4]),
                 box=box,
-                k0=k0,
-                k0_confidence=k0_confidence,
+                keypoints=(keypoints[0], keypoints[1], keypoints[2]),
             )
         )
     return parsed
@@ -349,9 +367,12 @@ class HailoYolo26PoseBackend:
         if not isinstance(kpt_value, list) or len(kpt_value) != 2:
             raise ValueError("postprocess_params.kpt_shape must be [K, 3].")
         self._kpt_shape = (int(kpt_value[0]), int(kpt_value[1]))
-        if self._kpt_shape not in {(1, 3), (3, 3)}:
+        if self._kpt_shape != (3, 3):
+            raise ValueError("YOLO Pose v3 requires kpt_shape [3, 3].")
+        if class_count != len(POSE_MODEL_CLASSES):
             raise ValueError(
-                "Only [1, 3] or the legacy [3, 3] pose layout is supported."
+                f"YOLO Pose v3 requires {len(POSE_MODEL_CLASSES)} classes, "
+                f"got {class_count}."
             )
         tensor_mapping = config.get("output_tensor_mapping")
         if not isinstance(tensor_mapping, dict) or not tensor_mapping:

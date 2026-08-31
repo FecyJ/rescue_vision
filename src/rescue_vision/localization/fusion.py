@@ -15,6 +15,7 @@ from rescue_vision.localization.types import (
     CenterCrossPoseObservation,
     CenterCrossSelectionSource,
     FieldPose2D,
+    FieldPositionObservation,
     normalize_angle,
 )
 from rescue_vision.localization.static_landmarks import (
@@ -939,6 +940,66 @@ class OdometryImuFusion:
             self._history = deque(entries)
             self._anchor_source = source
             self._anchor_confidence = confidence
+            self._status = frozenset({FusionQuality.FUSED})
+            return VisualFusionResult(True, alignment_error_ns, mahalanobis)
+
+    def submit_position_landmark(
+        self,
+        observation: FieldPositionObservation,
+    ) -> VisualFusionResult:
+        """融合纯 x/y 地标测量；绝不初始化或修改航向测量模型。"""
+
+        if not isinstance(observation, FieldPositionObservation):
+            raise TypeError("observation must be a FieldPositionObservation.")
+        with self._lock:
+            entry, index = self._nearest_entry(observation.capture_timestamp_ns)
+            if entry is None or index is None:
+                return VisualFusionResult(False, None, None)
+            alignment_error_ns = abs(entry.timestamp_ns - observation.capture_timestamp_ns)
+            if alignment_error_ns > round(self.config.max_visual_alignment_error_ms * 1_000_000):
+                self._status = frozenset({FusionQuality.VISUAL_REJECTED})
+                return VisualFusionResult(False, alignment_error_ns, None)
+            measurement = np.asarray(
+                [observation.position.x, observation.position.y],
+                dtype=np.float64,
+            )
+            confidence_scale = 1.0 / max(observation.confidence, 0.05)
+            measurement_covariance = np.eye(2) * (
+                observation.position_uncertainty_mm**2 * confidence_scale
+            )
+            innovation = measurement - entry.state[:2]
+            h = np.zeros((2, 4), dtype=np.float64)
+            h[:, :2] = np.eye(2)
+            innovation_covariance = h @ entry.covariance @ h.T + measurement_covariance
+            mahalanobis = float(innovation.T @ np.linalg.solve(innovation_covariance, innovation))
+            if mahalanobis > self.config.visual_innovation_gate:
+                self._status = frozenset({FusionQuality.VISUAL_REJECTED})
+                return VisualFusionResult(False, alignment_error_ns, mahalanobis)
+            gain = entry.covariance @ h.T @ np.linalg.inv(innovation_covariance)
+            # 此观测没有航向或陀螺零偏证据；不利用历史交叉协方差间接改写它们。
+            gain[2:, :] = 0.0
+            corrected_state = entry.state + gain @ innovation
+            corrected_state[2] = normalize_angle(float(corrected_state[2]))
+            identity = np.eye(4)
+            residual = identity - gain @ h
+            corrected_covariance = residual @ entry.covariance @ residual.T + gain @ measurement_covariance @ gain.T
+            entries = list(self._history)
+            entries[index].state = corrected_state
+            entries[index].covariance = corrected_covariance
+            entries[index].qualities = frozenset({FusionQuality.FUSED})
+            for replay_index in range(index + 1, len(entries)):
+                prediction = entries[replay_index].prediction
+                assert prediction is not None
+                state, covariance = self._predict(
+                    entries[replay_index - 1].state,
+                    entries[replay_index - 1].covariance,
+                    prediction,
+                )
+                entries[replay_index].state = state
+                entries[replay_index].covariance = covariance
+            self._history = deque(entries)
+            self._anchor_source = observation.source
+            self._anchor_confidence = observation.confidence
             self._status = frozenset({FusionQuality.FUSED})
             return VisualFusionResult(True, alignment_error_ns, mahalanobis)
 

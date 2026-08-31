@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 import math
 from time import monotonic_ns
@@ -15,12 +14,25 @@ from rescue_vision.geometry.ground_projector import GroundProjector
 from rescue_vision.geometry.types import GroundPoint, UndistortedPixel
 from rescue_vision.perception.backend import InferenceBackend
 from rescue_vision.perception.color_segmentation import segment_roi_colors
+from rescue_vision.perception.field_feature_types import (
+    CenterCrossConfirmation,
+    CenterCrossObservation,
+    FieldFeatureDetectionResult,
+    FieldFeatureQuality,
+    FieldPoseKeypoint,
+    LineSegmentObservation,
+    SafeZoneColor,
+    SafeZoneObservation,
+)
 from rescue_vision.perception.types import (
+    COLOR_TARGET_CLASSES,
     ClassProbabilities,
     ColorSegmentationStatus,
     HsvColorClassifierConfig,
     ModelDetection,
     ObservationQuality,
+    POSE_MODEL_CLASSES,
+    PoseModelClass,
     RoiColorSegmentation,
     TargetClass,
     TargetObservation,
@@ -44,6 +56,7 @@ class RealtimeDetectionResult:
     """实时检测结果；过期观测只记录丢弃原因，不向下游泄漏。"""
 
     observations: tuple[TargetObservation, ...]
+    field_features: FieldFeatureDetectionResult | None
     dropped_stale_age_ms: float | None = None
 
     @property
@@ -63,39 +76,90 @@ class _ProcessedDetection:
     quality: frozenset[ObservationQuality]
 
 
+@dataclass(frozen=True, slots=True)
+class PoseDetectionResult:
+    """一次六类模型推理产生的同帧任务目标与场地地标。"""
+
+    observations: tuple[TargetObservation, ...]
+    field_features: FieldFeatureDetectionResult
+
+    def __iter__(self):
+        return iter(self.observations)
+
+    def __len__(self) -> int:
+        return len(self.observations)
+
+    def __getitem__(self, index: int) -> TargetObservation:
+        return self.observations[index]
+
+
+@dataclass(frozen=True, slots=True)
+class CenterCrossRefinementConfig:
+    enabled: bool = True
+    canny_low: int = 50
+    canny_high: int = 150
+    hough_threshold: int = 16
+    min_line_length_px: float = 18.0
+    max_line_gap_px: float = 12.0
+    max_intersection_distance_px: float = 18.0
+    min_axis_angle_deg: float = 65.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("enabled must be a boolean.")
+        if not 0 <= self.canny_low < self.canny_high <= 255:
+            raise ValueError("Canny thresholds must satisfy 0 <= low < high <= 255.")
+        if self.hough_threshold <= 0:
+            raise ValueError("hough_threshold must be positive.")
+        for name in (
+            "min_line_length_px", "max_intersection_distance_px", "min_axis_angle_deg"
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be positive and finite.")
+        if not math.isfinite(self.max_line_gap_px) or self.max_line_gap_px < 0.0:
+            raise ValueError("max_line_gap_px must be non-negative and finite.")
+        if self.min_axis_angle_deg > 90.0:
+            raise ValueError("min_axis_angle_deg must be <= 90.")
+
+
+@dataclass(frozen=True, slots=True)
+class SafeZoneColorConfig:
+    """安全区底色证据；阈值未标定时保持禁用并输出 unknown。"""
+
+    enabled: bool = False
+    red_hsv_ranges: tuple[tuple[tuple[int, int, int], tuple[int, int, int]], ...] = ()
+    blue_hsv_ranges: tuple[tuple[tuple[int, int, int], tuple[int, int, int]], ...] = ()
+    min_fraction: float = 0.08
+    min_margin: float = 0.03
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("enabled must be a boolean.")
+        if not 0.0 <= float(self.min_fraction) <= 1.0:
+            raise ValueError("min_fraction must be in [0, 1].")
+        if not 0.0 <= float(self.min_margin) <= 1.0:
+            raise ValueError("min_margin must be in [0, 1].")
+        if self.enabled and (not self.red_hsv_ranges or not self.blue_hsv_ranges):
+            raise ValueError("enabled safe-zone color classification requires both ranges.")
+
+
 class TargetPoseDetector:
     def __init__(
         self,
         backend: InferenceBackend,
         *,
-        class_mapping: Mapping[int, TargetClass],
         detection_threshold: float,
         k0_threshold: float,
         color_classifier: HsvColorClassifierConfig,
         max_observation_age_ms: float,
         ground_projector: GroundProjector | None = None,
+        center_cross_refinement: CenterCrossRefinementConfig | None = None,
+        safe_zone_color: SafeZoneColorConfig | None = None,
     ) -> None:
         self._backend = backend
         self._closed = False
         try:
-            if not isinstance(class_mapping, Mapping) or not class_mapping:
-                raise ValueError(
-                    "class_mapping must be a non-empty mapping; runtime "
-                    "callers should use config.hailo.model_class_mapping()."
-                )
-            if any(
-                isinstance(key, bool)
-                or not isinstance(key, int)
-                or key < 0
-                or not isinstance(value, TargetClass)
-                for key, value in class_mapping.items()
-            ):
-                raise ValueError(
-                    "class_mapping must map non-negative integer model IDs "
-                    "to TargetClass values; runtime callers should use "
-                    "config.hailo.model_class_mapping()."
-                )
-            self._class_mapping = dict(class_mapping)
             self._detection_threshold = self._threshold(
                 detection_threshold, "detection_threshold"
             )
@@ -117,6 +181,10 @@ class TargetPoseDetector:
                 )
             self._max_observation_age_ms = converted_max_age_ms
             self._ground_projector = ground_projector
+            self._center_cross_refinement = (
+                center_cross_refinement or CenterCrossRefinementConfig()
+            )
+            self._safe_zone_color = safe_zone_color or SafeZoneColorConfig()
         except BaseException:
             try:
                 self.close()
@@ -137,7 +205,7 @@ class TargetPoseDetector:
         undistorted_image_bgr: np.ndarray,
         *,
         result_timestamp_ns: int | None = None,
-    ) -> list[TargetObservation]:
+    ) -> PoseDetectionResult:
         if (
             undistorted_image_bgr.ndim != 3
             or undistorted_image_bgr.shape[2] != 3
@@ -165,22 +233,34 @@ class TargetPoseDetector:
             if detection.confidence < self._detection_threshold:
                 continue
             detection.box.validate_image_size(image_size)
-            if detection.model_class_id not in self._class_mapping:
-                raise ValueError(
-                    f"Model class ID {detection.model_class_id} has no configured mapping."
-                )
+            width, height = image_size
+            for index, keypoint in enumerate(detection.keypoints):
+                point = keypoint.point
+                if point is not None and not (
+                    0.0 <= point.u < width and 0.0 <= point.v < height
+                ):
+                    raise ValueError(
+                        f"Model K{index} {point!r} is outside image_size {image_size!r}."
+                    )
             candidate_detections.append(detection)
 
         image_hsv = (
             cv2.cvtColor(undistorted_image_bgr, cv2.COLOR_BGR2HSV)
-            if candidate_detections
+            if any(item.model_class in {
+                PoseModelClass.GREEN_SUPPLY,
+                PoseModelClass.BLACK_CORE,
+                PoseModelClass.ORANGE_INJURED,
+                PoseModelClass.BLUE_DANGER,
+            } for item in candidate_detections)
             else None
         )
         processed: list[_ProcessedDetection] = []
         for detection in candidate_detections:
+            if detection.model_class not in POSE_MODEL_CLASSES[:4]:
+                continue
             assert image_hsv is not None
             quality: set[ObservationQuality] = set()
-            model_target_class = self._class_mapping[detection.model_class_id]
+            model_target_class = COLOR_TARGET_CLASSES[detection.model_class_id]
             color_segmentation, probabilities = segment_roi_colors(
                 image_hsv,
                 detection.box,
@@ -200,8 +280,9 @@ class TargetPoseDetector:
                 ):
                     quality.add(ObservationQuality.POSE_COLOR_CONFLICT)
 
-            k0 = detection.k0
-            if k0 is None or detection.k0_confidence < self._k0_threshold:
+            k0_keypoint = detection.keypoints[0]
+            k0 = k0_keypoint.point
+            if k0 is None or k0_keypoint.confidence < self._k0_threshold:
                 k0 = None
                 ground_point = None
                 quality.add(ObservationQuality.K0_UNAVAILABLE)
@@ -244,7 +325,7 @@ class TargetPoseDetector:
                 self._max_observation_age_ms,
             )
 
-        return [
+        observations = tuple(
             TargetObservation(
                 frame_sequence=frame.sequence,
                 capture_timestamp_ns=frame.timestamp_ns,
@@ -257,12 +338,178 @@ class TargetPoseDetector:
                 box=item.detection.box,
                 color_segmentation=item.color_segmentation,
                 k0=item.k0,
-                k0_confidence=item.detection.k0_confidence,
+                k0_confidence=item.detection.keypoints[0].confidence,
                 ground_point=item.ground_point,
                 quality=item.quality,
             )
             for item in processed
+        )
+        field_features = self._build_field_features(
+            frame,
+            undistorted_image_bgr,
+            candidate_detections,
+            completed_timestamp_ns,
+        )
+        return PoseDetectionResult(observations, field_features)
+
+    def _field_keypoint(self, detection: ModelDetection, index: int) -> FieldPoseKeypoint:
+        keypoint = detection.keypoints[index]
+        if keypoint.point is None or keypoint.confidence < self._k0_threshold:
+            return FieldPoseKeypoint(None, None, 0.0)
+        ground = (
+            self._ground_projector.pixel_to_ground(keypoint.point)
+            if self._ground_projector is not None
+            else None
+        )
+        return FieldPoseKeypoint(keypoint.point, ground, keypoint.confidence)
+
+    @staticmethod
+    def _point_line_distance(point: UndistortedPixel, line: tuple[int, int, int, int]) -> float:
+        x1, y1, x2, y2 = line
+        denominator = math.hypot(x2 - x1, y2 - y1)
+        if denominator <= 1e-9:
+            return float("inf")
+        return abs((y2 - y1) * point.u - (x2 - x1) * point.v + x2 * y1 - y2 * x1) / denominator
+
+    def _refine_center_axes(
+        self,
+        image_bgr: np.ndarray,
+        detection: ModelDetection,
+        intersection: FieldPoseKeypoint,
+    ) -> tuple[tuple[LineSegmentObservation, ...], tuple[float, ...], float | None]:
+        config = self._center_cross_refinement
+        point = intersection.undistorted
+        if not config.enabled or point is None:
+            return (), (), None
+        box = detection.box
+        x0, y0 = math.floor(box.x_min), math.floor(box.y_min)
+        x1, y1 = math.ceil(box.x_max), math.ceil(box.y_max)
+        roi = image_bgr[y0:y1, x0:x1]
+        if roi.size == 0:
+            return (), (), None
+        edges = cv2.Canny(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), config.canny_low, config.canny_high)
+        raw = cv2.HoughLinesP(
+            edges,
+            1.0,
+            np.pi / 180.0,
+            config.hough_threshold,
+            minLineLength=config.min_line_length_px,
+            maxLineGap=config.max_line_gap_px,
+        )
+        if raw is None:
+            return (), (), None
+        candidates: list[tuple[float, tuple[int, int, int, int]]] = []
+        for values in raw[:, 0, :]:
+            line = (int(values[0] + x0), int(values[1] + y0), int(values[2] + x0), int(values[3] + y0))
+            if self._point_line_distance(point, line) <= config.max_intersection_distance_px:
+                angle = math.atan2(line[3] - line[1], line[2] - line[0]) % math.pi
+                candidates.append((angle, line))
+        if not candidates:
+            return (), (), None
+        first = max(candidates, key=lambda item: math.hypot(item[1][2] - item[1][0], item[1][3] - item[1][1]))
+        second_candidates = [
+            item for item in candidates
+            if math.degrees(min(abs(item[0] - first[0]), math.pi - abs(item[0] - first[0]))) >= config.min_axis_angle_deg
         ]
+        selected = [first]
+        if second_candidates:
+            selected.append(max(second_candidates, key=lambda item: math.hypot(item[1][2] - item[1][0], item[1][3] - item[1][1])))
+        axes: list[LineSegmentObservation] = []
+        residuals: list[float] = []
+        for _angle, line in selected:
+            start = UndistortedPixel(float(line[0]), float(line[1]))
+            end = UndistortedPixel(float(line[2]), float(line[3]))
+            start_ground = end_ground = None
+            if self._ground_projector is not None:
+                start_ground = self._ground_projector.pixel_to_ground(start)
+                end_ground = self._ground_projector.pixel_to_ground(end)
+            axes.append(LineSegmentObservation(start, end, start_ground, end_ground))
+            residuals.append(self._point_line_distance(point, line))
+        angle_deg = None
+        if len(selected) == 2:
+            raw_angle = abs(selected[0][0] - selected[1][0]) % math.pi
+            angle_deg = math.degrees(min(raw_angle, math.pi - raw_angle))
+        return tuple(axes), tuple(residuals), angle_deg
+
+    def _safe_zone_identity(self, image_bgr: np.ndarray, box) -> SafeZoneColor:
+        config = self._safe_zone_color
+        if not config.enabled:
+            return SafeZoneColor.UNKNOWN
+        x0, y0 = math.floor(box.x_min), math.floor(box.y_min)
+        x1, y1 = math.ceil(box.x_max), math.ceil(box.y_max)
+        hsv = cv2.cvtColor(image_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
+        if hsv.size == 0:
+            return SafeZoneColor.UNKNOWN
+        fractions: dict[SafeZoneColor, float] = {}
+        for color, ranges in ((SafeZoneColor.RED, config.red_hsv_ranges), (SafeZoneColor.BLUE, config.blue_hsv_ranges)):
+            mask = np.zeros(hsv.shape[:2], np.uint8)
+            for lower, upper in ranges:
+                mask |= cv2.inRange(hsv, np.asarray(lower, np.uint8), np.asarray(upper, np.uint8))
+            fractions[color] = float(np.count_nonzero(mask)) / mask.size
+        ranked = sorted(fractions.items(), key=lambda item: item[1], reverse=True)
+        winner, winner_fraction = ranked[0]
+        if (
+            winner_fraction < config.min_fraction
+            or winner_fraction - ranked[1][1] < config.min_margin
+        ):
+            return SafeZoneColor.UNKNOWN
+        return winner
+
+    def _build_field_features(
+        self,
+        frame: CameraFrame,
+        image_bgr: np.ndarray,
+        detections: list[ModelDetection],
+        result_timestamp_ns: int,
+    ) -> FieldFeatureDetectionResult:
+        cross: CenterCrossObservation | None = None
+        zones: list[SafeZoneObservation] = []
+        for detection in detections:
+            if detection.model_class is PoseModelClass.CENTER_CROSS:
+                intersection = self._field_keypoint(detection, 0)
+                axes, residuals, angle = self._refine_center_axes(image_bgr, detection, intersection)
+                quality = set()
+                if intersection.undistorted is None:
+                    quality.add(FieldFeatureQuality.KEYPOINT_UNAVAILABLE)
+                if len(axes) != 2:
+                    quality.add(FieldFeatureQuality.AXIS_REFINEMENT_UNAVAILABLE)
+                candidate = CenterCrossObservation(
+                    detection.box,
+                    intersection,
+                    axes,
+                    detection.confidence,
+                    frozenset(quality),
+                    CenterCrossConfirmation.CANDIDATE,
+                    residuals,
+                    angle,
+                )
+                if cross is None or candidate.confidence > cross.confidence:
+                    cross = candidate
+            elif detection.model_class is PoseModelClass.SAFE_ZONE:
+                identity = self._safe_zone_identity(image_bgr, detection.box)
+                quality = set()
+                keypoints = tuple(self._field_keypoint(detection, index) for index in range(3))
+                if any(item.undistorted is None for item in keypoints):
+                    quality.add(FieldFeatureQuality.KEYPOINT_UNAVAILABLE)
+                if identity is SafeZoneColor.UNKNOWN:
+                    quality.add(FieldFeatureQuality.IDENTITY_UNRESOLVED)
+                zones.append(SafeZoneObservation(
+                    detection.box,
+                    keypoints[0],
+                    keypoints[1],
+                    keypoints[2],
+                    identity,
+                    detection.confidence,
+                    frozenset(quality),
+                ))
+        return FieldFeatureDetectionResult(
+            frame.sequence,
+            frame.timestamp_ns,
+            result_timestamp_ns,
+            (image_bgr.shape[1], image_bgr.shape[0]),
+            tuple(zones),
+            cross,
+        )
 
     def detect_realtime(
         self,
@@ -278,7 +525,7 @@ class TargetPoseDetector:
         """
 
         try:
-            observations = self.detect(
+            detection_result = self.detect(
                 frame,
                 undistorted_image_bgr,
                 result_timestamp_ns=result_timestamp_ns,
@@ -286,9 +533,13 @@ class TargetPoseDetector:
         except StaleObservationError as exc:
             return RealtimeDetectionResult(
                 observations=(),
+                field_features=None,
                 dropped_stale_age_ms=exc.age_ms,
             )
-        return RealtimeDetectionResult(observations=tuple(observations))
+        return RealtimeDetectionResult(
+            observations=detection_result.observations,
+            field_features=detection_result.field_features,
+        )
 
     def close(self) -> None:
         if self._closed:

@@ -129,6 +129,7 @@ def snapshot(
         capture_timestamp_ns=timestamp_ns,
         result_timestamp_ns=timestamp_ns + 1,
         observations=tuple(observations),
+        field_features=None,
     )
 
 

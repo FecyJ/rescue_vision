@@ -14,11 +14,11 @@ from rescue_vision.localization.types import (
     CenterLineTerminalKind,
     CenterLineTerminalObservation,
     FieldPose2D,
+    FieldPositionObservation,
     angular_distance,
     normalize_angle,
 )
 from rescue_vision.perception.field_feature_types import (
-    BoundaryFeatureKind,
     FieldFeatureDetectionResult,
     SafeZoneColor,
     CenterCrossConfirmation,
@@ -61,33 +61,6 @@ def _ray_metrics(
     lateral = abs(dx * direction[1] - dy * direction[0])
     angle = math.atan2(lateral, max(forward, 1e-12))
     return forward, lateral, angle
-
-
-def _centroid(points: tuple[GroundPoint, ...]) -> GroundPoint:
-    return GroundPoint(
-        sum(point.x for point in points) / len(points),
-        sum(point.y for point in points) / len(points),
-    )
-
-
-def _segment_ray_distance(
-    origin: GroundPoint,
-    direction: tuple[float, float],
-    start: GroundPoint,
-    end: GroundPoint,
-) -> float | None:
-    sx = end.x - start.x
-    sy = end.y - start.y
-    denominator = direction[0] * sy - direction[1] * sx
-    if math.isclose(denominator, 0.0, abs_tol=1e-9):
-        return None
-    qx = start.x - origin.x
-    qy = start.y - origin.y
-    ray_distance = (qx * sy - qy * sx) / denominator
-    segment_fraction = (qx * direction[1] - qy * direction[0]) / denominator
-    if ray_distance < 0.0 or not 0.0 <= segment_fraction <= 1.0:
-        return None
-    return ray_distance
 
 
 class CenterCrossLocalizer:
@@ -139,14 +112,15 @@ class CenterCrossLocalizer:
         safe_matches: list[tuple[float, float, CenterLineTerminalKind]] = []
         for zone in result.safe_zones:
             if (
-                zone.polygon_ground is None
+                zone.ground_anchor.ground is None
+                or zone.physical_color is SafeZoneColor.UNKNOWN
                 or zone.confidence < self._config.min_anchor_confidence
             ):
                 continue
             accepted, distance = self._associated(
                 origin,
                 direction,
-                _centroid(zone.polygon_ground),
+                zone.ground_anchor.ground,
             )
             if accepted:
                 kind = (
@@ -171,44 +145,6 @@ class CenterCrossLocalizer:
                 0.0,
             )
 
-        boundary_matches: list[tuple[float, float]] = []
-        for feature in result.boundary_features:
-            if (
-                feature.points_ground is None
-                or feature.confidence < self._config.min_anchor_confidence
-            ):
-                continue
-            if feature.kind is BoundaryFeatureKind.FIELD_CORNER:
-                accepted, distance = self._associated(
-                    origin,
-                    direction,
-                    feature.points_ground[0],
-                )
-                if accepted:
-                    boundary_matches.append((feature.confidence, distance))
-                continue
-            distance = _segment_ray_distance(
-                origin,
-                direction,
-                feature.points_ground[0],
-                feature.points_ground[1],
-            )
-            if (
-                distance is not None
-                and self._config.ray_min_forward_distance_mm
-                <= distance
-                <= self._config.ray_max_forward_distance_mm
-            ):
-                boundary_matches.append((feature.confidence, distance))
-        if boundary_matches:
-            confidence, distance = max(boundary_matches)
-            return CenterLineTerminalObservation(
-                direction[0],
-                direction[1],
-                CenterLineTerminalKind.PLAIN_BOUNDARY,
-                distance,
-                confidence,
-            )
         return CenterLineTerminalObservation(
             direction[0],
             direction[1],
@@ -418,6 +354,41 @@ class CenterCrossLocalizer:
             selection_source=source,
             confidence=0.0 if selected is None else cross.confidence,
             quality=frozenset(quality),
+        )
+
+    def localize_position(
+        self,
+        result: FieldFeatureDetectionResult,
+        *,
+        prior_pose: FieldPose2D,
+        current_timestamp_ns: int | None = None,
+    ) -> FieldPositionObservation | None:
+        """用先验航向解释单个十字交点，只生成 x/y 测量。"""
+
+        now = result.result_timestamp_ns if current_timestamp_ns is None else current_timestamp_ns
+        if now < result.result_timestamp_ns:
+            raise ValueError("current_timestamp_ns must not precede result timestamp.")
+        if (now - result.capture_timestamp_ns) / 1_000_000.0 > self._max_observation_age_ms:
+            return None
+        cross = result.center_cross
+        if cross is None or cross.intersection_ground is None:
+            return None
+        center = cross.intersection_ground
+        cosine = math.cos(prior_pose.heading_rad)
+        sine = math.sin(prior_pose.heading_rad)
+        field_center = self._static_map.center_cross.intersection_field
+        position = FieldPoint(
+            field_center.x - (cosine * center.x - sine * center.y),
+            field_center.y - (sine * center.x + cosine * center.y),
+        )
+        return FieldPositionObservation(
+            result.frame_sequence,
+            result.capture_timestamp_ns,
+            result.result_timestamp_ns,
+            position,
+            self._config.position_uncertainty_floor_mm,
+            cross.confidence,
+            "center_cross_position",
         )
 
     @staticmethod

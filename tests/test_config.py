@@ -219,7 +219,6 @@ hailo:
   postprocess_onnx_path: null
   output_mapping_path: null
   raw_classes: []
-  class_mapping: {{}}
   backend_score_threshold: 0.01
   max_detections: 100
 {extra}"""
@@ -562,35 +561,30 @@ def test_unusable_intrinsics_fail_at_startup(tmp_path) -> None:
         load_runtime_config(path).build_geometry()
 
 
-def test_hailo_class_mapping_and_relative_paths(tmp_path) -> None:
+def test_hailo_v3_classes_and_relative_paths(tmp_path) -> None:
     text = config_text().replace(
         """  enabled: false
   hef_path: null
   postprocess_onnx_path: null
   output_mapping_path: null
-  raw_classes: []
-  class_mapping: {}""",
+  raw_classes: []""",
         """  enabled: true
   hef_path: bundle/model.hef
   postprocess_onnx_path: bundle/postprocess.onnx
   output_mapping_path: bundle/mapping.json
-  raw_classes: [raw_a, raw_b]
-  class_mapping:
-    raw_a: green_supply
-    raw_b: blue_danger""",
+  raw_classes: [green_supply, black_core, orange_injured, blue_danger, center_cross, safe_zone]""",
     )
     path = tmp_path / "runtime.yaml"
     path.write_text(text, encoding="utf-8")
     config = load_runtime_config(path)
     assert config.hailo.hef_path == (tmp_path / "bundle/model.hef").resolve()
-    assert config.hailo.model_class_mapping()[0].value == "green_supply"
-    assert config.hailo.model_class_mapping()[1].value == "blue_danger"
+    assert config.hailo.raw_classes[-2:] == ("center_cross", "safe_zone")
 
 
-def test_hailo_mapping_must_be_exhaustive(tmp_path) -> None:
+def test_hailo_classes_must_match_v3_order(tmp_path) -> None:
     text = config_text().replace(
-        "  raw_classes: []\n  class_mapping: {}",
-        "  raw_classes: [raw_a]\n  class_mapping: {}",
+        "  raw_classes: []",
+        "  raw_classes: [green_supply]",
     )
     path = tmp_path / "runtime.yaml"
     path.write_text(text, encoding="utf-8")

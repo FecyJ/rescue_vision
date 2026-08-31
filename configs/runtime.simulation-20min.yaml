@@ -266,6 +266,17 @@ world:
         negative_x: plain_boundary
         positive_y: red_safe_zone
         negative_y: blue_safe_zone
+    safe_zone_landmarks:
+      - color: red
+        ground_anchor_field_mm: [0.0, 1200.0]
+        near_field_corners_mm: [[-300.0, 1200.0], [300.0, 1200.0]]
+        measured: false
+        usable: false
+      - color: blue
+        ground_anchor_field_mm: [0.0, -1200.0]
+        near_field_corners_mm: [[-300.0, -1200.0], [300.0, -1200.0]]
+        measured: false
+        usable: false
     # 以下 3000 mm 场界、600×300 mm 安全区和 300 mm 出发区来自命题示意图，
     # 是启动地图而非现场测量真值；现场尺寸或布置变化时只改这里。
     # 安全区多边形描述彩色有效区域，不包含外侧 660 mm 围栏厚度。
@@ -348,6 +359,21 @@ mission:
 perception:
   detection_threshold: 0.25
   k0_threshold: 0.25
+  center_cross_refinement:
+    enabled: true
+    canny_low: 50
+    canny_high: 150
+    hough_threshold: 16
+    min_line_length_px: 18.0
+    max_line_gap_px: 12.0
+    max_intersection_distance_px: 18.0
+    min_axis_angle_deg: 65.0
+  safe_zone_color:
+    enabled: false
+    red_hsv_ranges: []
+    blue_hsv_ranges: []
+    min_fraction: 0.08
+    min_margin: 0.03
   color_classifier:
     # 仅按当前 Camera Module 3 NoIR Wide、固定焦点和本次现场视野实拍校准；
     # 更换材料、曝光、白平衡或照明后必须重新采样。
@@ -384,11 +410,8 @@ hailo:
     - black_core
     - orange_injured
     - blue_danger
-  class_mapping:
-    green_supply: green_supply
-    black_core: black_core
-    orange_injured: orange_injured
-    blue_danger: blue_danger
+    - center_cross
+    - safe_zone
   backend_score_threshold: 0.01
   max_detections: 100
 

@@ -7,6 +7,7 @@ from enum import Enum
 import math
 
 from rescue_vision.geometry.types import GroundPoint, UndistortedPixel
+from rescue_vision.perception.types import UndistortedBoundingBox
 
 
 class SafeZoneColor(str, Enum):
@@ -14,6 +15,7 @@ class SafeZoneColor(str, Enum):
 
     RED = "red"
     BLUE = "blue"
+    UNKNOWN = "unknown"
 
 
 class SafeZoneSide(str, Enum):
@@ -48,6 +50,9 @@ class FieldFeatureQuality(str, Enum):
     DIVIDER_UNRESOLVED = "divider_unresolved"
     SIDE_UNRESOLVED = "side_unresolved"
     LOW_CONFIDENCE_BOUNDARY = "low_confidence_boundary"
+    KEYPOINT_UNAVAILABLE = "keypoint_unavailable"
+    AXIS_REFINEMENT_UNAVAILABLE = "axis_refinement_unavailable"
+    IDENTITY_UNRESOLVED = "identity_unresolved"
 
 
 class CenterCrossConfirmation(str, Enum):
@@ -491,6 +496,113 @@ class BoundaryFeatureObservation:
 
 
 @dataclass(frozen=True, slots=True)
+class FieldPoseKeypoint:
+    """v3 场地关键点在去畸变像素与机器人地面系中的同帧观测。"""
+
+    undistorted: UndistortedPixel | None
+    ground: GroundPoint | None
+    confidence: float
+
+    def __post_init__(self) -> None:
+        _probability(self.confidence, "confidence")
+        if self.undistorted is None:
+            if self.ground is not None or self.confidence != 0.0:
+                raise ValueError("unavailable field keypoint requires no ground point and zero confidence.")
+            return
+        if not isinstance(self.undistorted, UndistortedPixel):
+            raise ValueError("undistorted must be an UndistortedPixel or None.")
+        _finite(self.undistorted.u, "undistorted.u")
+        _finite(self.undistorted.v, "undistorted.v")
+        if self.ground is not None:
+            if not isinstance(self.ground, GroundPoint):
+                raise ValueError("ground must be a GroundPoint or None.")
+            _finite(self.ground.x, "ground.x")
+            _finite(self.ground.y, "ground.y")
+
+
+@dataclass(frozen=True, slots=True)
+class SafeZonePoseObservation:
+    """v3 安全区实例；K1/K2 只有当前图像左右语义。"""
+
+    box: UndistortedBoundingBox
+    ground_anchor: FieldPoseKeypoint
+    image_left_landmark: FieldPoseKeypoint
+    image_right_landmark: FieldPoseKeypoint
+    physical_color: SafeZoneColor
+    confidence: float
+    quality: frozenset[FieldFeatureQuality]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.box, UndistortedBoundingBox):
+            raise ValueError("box must be an UndistortedBoundingBox.")
+        for name in ("ground_anchor", "image_left_landmark", "image_right_landmark"):
+            if not isinstance(getattr(self, name), FieldPoseKeypoint):
+                raise ValueError(f"{name} must be a FieldPoseKeypoint.")
+        if not isinstance(self.physical_color, SafeZoneColor):
+            raise ValueError("physical_color must be a SafeZoneColor.")
+        _probability(self.confidence, "confidence")
+        if not all(isinstance(item, FieldFeatureQuality) for item in self.quality):
+            raise ValueError("quality must contain FieldFeatureQuality values.")
+        left = self.image_left_landmark.undistorted
+        right = self.image_right_landmark.undistorted
+        if left is not None and right is not None and left.u >= right.u:
+            raise ValueError("safe-zone landmarks must satisfy u(K1) < u(K2).")
+        if (
+            self.physical_color is SafeZoneColor.UNKNOWN
+            and FieldFeatureQuality.IDENTITY_UNRESOLVED not in self.quality
+        ):
+            raise ValueError("unknown safe-zone identity must be marked unresolved.")
+
+
+@dataclass(frozen=True, slots=True)
+class CenterCrossPoseObservation:
+    """v3 中心十字实例；轴线是模型定位后的可选局部精修。"""
+
+    box: UndistortedBoundingBox
+    intersection: FieldPoseKeypoint
+    axes: tuple[LineSegmentObservation, ...]
+    confidence: float
+    quality: frozenset[FieldFeatureQuality]
+    confirmation: CenterCrossConfirmation = CenterCrossConfirmation.CANDIDATE
+    axis_fit_residuals_px: tuple[float, ...] = ()
+    axis_angle_deg: float | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.box, UndistortedBoundingBox):
+            raise ValueError("box must be an UndistortedBoundingBox.")
+        if not isinstance(self.intersection, FieldPoseKeypoint):
+            raise ValueError("intersection must be a FieldPoseKeypoint.")
+        if len(self.axes) not in {0, 1, 2} or not all(
+            isinstance(axis, LineSegmentObservation) for axis in self.axes
+        ):
+            raise ValueError("axes must contain zero, one, or two line segments.")
+        if len(self.axis_fit_residuals_px) != len(self.axes):
+            raise ValueError("axis_fit_residuals_px must match axes length.")
+        if len(self.axes) == 2:
+            angle = _finite(self.axis_angle_deg, "axis_angle_deg")
+            if not 0.0 < angle <= 90.0:
+                raise ValueError("axis_angle_deg must be in (0, 90].")
+        elif self.axis_angle_deg is not None:
+            raise ValueError("axis_angle_deg requires two refined axes.")
+        _probability(self.confidence, "confidence")
+        if not all(isinstance(item, FieldFeatureQuality) for item in self.quality):
+            raise ValueError("quality must contain FieldFeatureQuality values.")
+
+    @property
+    def intersection_undistorted(self) -> UndistortedPixel | None:
+        return self.intersection.undistorted
+
+    @property
+    def intersection_ground(self) -> GroundPoint | None:
+        return self.intersection.ground
+
+
+# 新版公共名称。旧 OpenCV 形状契约不再由 FieldFeatureDetectionResult 使用。
+SafeZoneObservation = SafeZonePoseObservation
+CenterCrossObservation = CenterCrossPoseObservation
+
+
+@dataclass(frozen=True, slots=True)
 class FieldFeatureDetectionResult:
     """一帧场地特征检测的完整输出。"""
 
@@ -499,9 +611,7 @@ class FieldFeatureDetectionResult:
     result_timestamp_ns: int
     image_size: tuple[int, int]
     safe_zones: tuple[SafeZoneObservation, ...]
-    start_zones: tuple[StartZoneObservation, ...]
     center_cross: CenterCrossObservation | None
-    boundary_features: tuple[BoundaryFeatureObservation, ...]
 
     def __post_init__(self) -> None:
         if (
@@ -531,29 +641,11 @@ class FieldFeatureDetectionResult:
             isinstance(item, SafeZoneObservation) for item in self.safe_zones
         ):
             raise ValueError("safe_zones must contain SafeZoneObservation values.")
-        if not all(
-            isinstance(item, StartZoneObservation) for item in self.start_zones
-        ):
-            raise ValueError("start_zones must contain StartZoneObservation values.")
         if self.center_cross is not None and not isinstance(
             self.center_cross,
             CenterCrossObservation,
         ):
             raise ValueError("center_cross must be a CenterCrossObservation or None.")
-        if not all(
-            isinstance(item, BoundaryFeatureObservation)
-            for item in self.boundary_features
-        ):
-            raise ValueError(
-                "boundary_features must contain BoundaryFeatureObservation values."
-            )
-        if any(
-            item.capture_timestamp_ns != self.capture_timestamp_ns
-            for item in self.boundary_features
-        ):
-            raise ValueError(
-                "boundary feature timestamps must match the containing frame."
-            )
 
 
 @dataclass(frozen=True, slots=True)

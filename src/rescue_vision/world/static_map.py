@@ -132,9 +132,47 @@ class StaticCenterCross:
 
 
 @dataclass(frozen=True, slots=True)
+class StaticSafeZoneLandmarks:
+    """一个安全区 v3 K0 与两个近场角点的场地坐标权威。"""
+
+    color: TeamColor
+    ground_anchor_field: FieldPoint
+    near_field_corner_a: FieldPoint
+    near_field_corner_b: FieldPoint
+    measured: bool
+    usable: bool
+
+    def __post_init__(self) -> None:
+        if self.color is TeamColor.UNKNOWN:
+            raise ValueError("safe-zone landmarks require red or blue color.")
+        for name in ("ground_anchor_field", "near_field_corner_a", "near_field_corner_b"):
+            point = getattr(self, name)
+            if not isinstance(point, FieldPoint):
+                raise ValueError(f"{name} must be a FieldPoint.")
+            _finite(point.x, f"{name}.x")
+            _finite(point.y, f"{name}.y")
+        if self.near_field_corner_a == self.near_field_corner_b:
+            raise ValueError("safe-zone near-field corners must be distinct.")
+        ax = self.ground_anchor_field.x - self.near_field_corner_a.x
+        ay = self.ground_anchor_field.y - self.near_field_corner_a.y
+        bx = self.near_field_corner_b.x - self.near_field_corner_a.x
+        by = self.near_field_corner_b.y - self.near_field_corner_a.y
+        if not math.isclose(ax * by - ay * bx, 0.0, abs_tol=1e-6):
+            raise ValueError("safe-zone K0 and near-field corners must be collinear.")
+        projection = (ax * bx + ay * by) / (bx * bx + by * by)
+        if not 0.0 <= projection <= 1.0:
+            raise ValueError("safe-zone K0 must lie between the near-field corners.")
+        if not isinstance(self.measured, bool) or not isinstance(self.usable, bool):
+            raise ValueError("measured and usable must be booleans.")
+        if self.usable and not self.measured:
+            raise ValueError("usable safe-zone landmarks must be measured.")
+
+
+@dataclass(frozen=True, slots=True)
 class StaticFieldMap:
     center_cross: StaticCenterCross
     regions: tuple[PhysicalStaticRegion, ...]
+    safe_zone_landmarks: tuple[StaticSafeZoneLandmarks, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.center_cross, StaticCenterCross):
@@ -149,6 +187,17 @@ class StaticFieldMap:
         )
         if field_count > 1:
             raise ValueError("static_map may contain at most one field region.")
+        if not all(
+            isinstance(item, StaticSafeZoneLandmarks)
+            for item in self.safe_zone_landmarks
+        ):
+            raise ValueError("safe_zone_landmarks must contain StaticSafeZoneLandmarks.")
+        colors = [item.color for item in self.safe_zone_landmarks]
+        if len(colors) != len(set(colors)):
+            raise ValueError("safe-zone landmark colors must be unique.")
+
+    def safe_zone_landmarks_for(self, color: TeamColor) -> StaticSafeZoneLandmarks | None:
+        return next((item for item in self.safe_zone_landmarks if item.color is color), None)
 
     @staticmethod
     def _bounds(

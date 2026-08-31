@@ -129,18 +129,13 @@ from rescue_vision.perception import TargetPoseDetector
 
 detector = TargetPoseDetector(
     backend,
-    class_mapping=config.hailo.model_class_mapping(),
     detection_threshold=config.perception.detection_threshold,
     k0_threshold=config.perception.k0_threshold,
     color_classifier=config.perception.color_classifier,
     max_observation_age_ms=config.processing.max_observation_age_ms,
     ground_projector=geometry.ground_projector,
-)
-ground_geometry_estimator = (
-    config.perception.build_target_ground_geometry_estimator(
-        max_observation_age_ms=config.processing.max_observation_age_ms,
-        ground_projector=geometry.ground_projector,
-    )
+    center_cross_refinement=config.perception.center_cross_refinement,
+    safe_zone_color=config.perception.safe_zone_color,
 )
 tracker = config.tracking.build_tracker()
 world_model = config.world.build_model()
@@ -172,13 +167,6 @@ with source, detector:
             raw_frame,
             undistorted_bgr,
         )
-        ground_geometry_result = (
-            ground_geometry_estimator.estimate_realtime(
-                detection_result.observations
-            )
-            if ground_geometry_estimator is not None
-            else None
-        )
         tracks = tracker.update(
             raw_frame.timestamp_ns,
             detection_result.observations,
@@ -188,11 +176,9 @@ with source, detector:
             visual_timestamp_ns=raw_frame.timestamp_ns,
             tracks=tracks,
             robot_field_point=None,
-            # 传统 OpenCV 场地特征检测已删除；场地特征模型推理后端尚未实现，
-            # 因此当前没有 FieldFeatureDetectionResult 或 FieldPoint 输入。
+            # v3 场地结果由同一感知快照产生；定位门禁满足时可提供 FieldPoint。
             # 中心十字没有唯一解时传 None，世界模型保留明确不确定性。
-            # ground_geometry_result 当前提供机器人系中心/足迹；后续规划
-            # 接口接入前不在这里伪造全局目标坐标。
+            # v3 目标 ground_point 是机器人系底面中心；不在这里伪造全局坐标。
         )
 
         # 20 分初版由 Simulation20PointSequence 统一生成
@@ -212,7 +198,7 @@ with source, detector:
 | [`communication`](communication/README.md) | `UartFrameChannel`、`RemoteMessageConnection`、`VideoModeCommand`、`VideoFrameAttributes`、`MapStateObservation`、`RemoteSessionStatus` | COBS UART、直接 TCP 远程消息、可选择 raw/perception/BEV 图传（可声明 perception-only）及轻量 FieldPoint 动态状态 schema |
 | [`motion`](motion/README.md) | `MotionController`、`MotionLimits`、`GripperCalibration`、`RemoteMotionExecutor`、`RemoteGripperExecutor`、`run_remote_motion` | 差速运动、持续夹爪双舵机、Rescue Car 协议和远程调试执行 |
 | [`geometry`](geometry/README.md) | `CameraModel`、`GroundProjector`、显式坐标类型（含 `MapPixel`） | 去畸变及像素/地面/BEV 转换 |
-| [`perception`](perception/README.md) | `TargetPoseDetector`、`PerceptionFrameRenderer`、`PerceptionSnapshot`、`TargetGroundGeometryEstimator`、`FieldFeatureDetectionResult` 等场地特征观测契约 | 任务目标、最新帧结构化/可视化旁路和目标地面几何；OpenCV 场地检测与局部场界已删除，模型推理后端尚未实现 |
+| [`perception`](perception/README.md) | `TargetPoseDetector`、`PerceptionFrameRenderer`、`PerceptionSnapshot`、`FieldFeatureDetectionResult` | v3 六类同帧分流、任务目标和中心十字/安全区结构化与可视化旁路 |
 | [`localization`](localization/README.md) | `CenterCrossLocalizer`、`StaticFieldLandmarkTracker`、`SafeZoneCornerLocalizer`、`ImuFrameCalibration`、`OdometryImuFusion` | 中心十字/安全区角点绝对位姿与地图软门控的纯几何消费层，以及编码器/IMU 连续融合 |
 | [`tracking`](tracking/README.md) | `MultiTargetTracker`、`TrackedTarget`、`TrackStatus` | 时间关联、遮挡和轨迹生命周期 |
 | [`world`](world/README.md) | `StaticFieldMap`、`WorldModel`、`WorldSnapshot`、`HazardState` | 固定物理地图、任务区域派生、动态目标、对手占据和不确定性 |

@@ -11,6 +11,7 @@ from rescue_vision.localization import (
     CenterCrossPoseObservation,
     CenterCrossSelectionSource,
     FieldPose2D,
+    FieldPositionObservation,
     FusionConfig,
     FusionQuality,
     ImuFrameCalibration,
@@ -569,6 +570,30 @@ def test_delayed_visual_update_replays_later_motion() -> None:
     assert latest.pose is not None
     assert latest.pose.position.x > 120.0
     assert latest.anchor_source == "red_safe_zone"
+
+
+def test_position_landmark_updates_xy_without_measuring_heading() -> None:
+    estimator = fusion(visual_innovation_gate=10_000.0)
+    estimator.submit_odometry(odom(0, 10_000, 0, 0))
+    before = estimator.pose_at(1_010_000_000)
+    assert before.pose is not None
+    result = estimator.submit_position_landmark(
+        FieldPositionObservation(
+            1,
+            1_010_000_000,
+            1_011_000_000,
+            FieldPoint(130.0, 240.0),
+            10.0,
+            0.9,
+            "center_cross_position",
+        )
+    )
+    after = estimator.pose_at(1_010_000_000)
+    assert result.accepted
+    assert after.pose is not None
+    assert after.pose.position.x > before.pose.position.x
+    assert after.pose.position.y > before.pose.position.y
+    assert after.pose.heading_rad == pytest.approx(before.pose.heading_rad)
 
 
 def test_visual_outlier_rejected_and_visual_can_reinitialize_after_reset() -> None:

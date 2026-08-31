@@ -19,8 +19,10 @@ from rescue_vision.perception import (
     HsvRange,
     ModelDetection,
     ObservationQuality,
+    PoseKeypoint,
     PerceptionFrameRenderer,
     RoiColorSegmentation,
+    SafeZoneColorConfig,
     StaleObservationError,
     TargetClass,
     TargetObservation,
@@ -61,13 +63,18 @@ def detection(
     k0: UndistortedPixel | None = UndistortedPixel(5.0, 6.0),
     k0_confidence: float = 0.9,
     box: UndistortedBoundingBox | None = None,
+    k1: UndistortedPixel | None = None,
+    k2: UndistortedPixel | None = None,
 ) -> ModelDetection:
     return ModelDetection(
         model_class_id=class_id,
         confidence=confidence,
         box=box or UndistortedBoundingBox(2.0, 3.0, 8.0, 9.0),
-        k0=k0,
-        k0_confidence=k0_confidence,
+        keypoints=(
+            PoseKeypoint(k0, k0_confidence if k0 is not None else 0.0),
+            PoseKeypoint(k1, 0.8 if k1 is not None else 0.0),
+            PoseKeypoint(k2, 0.8 if k2 is not None else 0.0),
+        ),
     )
 
 
@@ -92,18 +99,16 @@ def detector(
     *,
     projector: GroundProjector | None = None,
     classifier: HsvColorClassifierConfig | None = None,
+    safe_zone_color: SafeZoneColorConfig | None = None,
 ) -> TargetPoseDetector:
     return TargetPoseDetector(
         FakeInferenceBackend(batches),
-        class_mapping={
-            0: TargetClass.GREEN_SUPPLY,
-            1: TargetClass.BLUE_DANGER,
-        },
         detection_threshold=0.25,
         k0_threshold=0.5,
         color_classifier=classifier or color_config(),
         max_observation_age_ms=150.0,
         ground_projector=projector,
+        safe_zone_color=safe_zone_color,
     )
 
 
@@ -119,13 +124,17 @@ def test_target_classes_follow_pose_convention() -> None:
         TargetClass("hazard")
 
 
+def test_v3_task_class_rejects_unused_k1_k2_slots() -> None:
+    with pytest.raises(ValueError, match="must not expose K1/K2"):
+        detection(class_id=0, k1=UndistortedPixel(3.0, 4.0))
+
+
 def test_detector_closes_backend_when_constructor_validation_fails() -> None:
     backend = FakeInferenceBackend([])
-    with pytest.raises(ValueError, match="model_class_mapping"):
+    with pytest.raises(ValueError, match="detection_threshold"):
         TargetPoseDetector(
             backend,
-            class_mapping=(TargetClass.GREEN_SUPPLY,),  # type: ignore[arg-type]
-            detection_threshold=0.25,
+            detection_threshold=2.0,
             k0_threshold=0.5,
             color_classifier=color_config(),
             max_observation_age_ms=150.0,
@@ -202,7 +211,7 @@ def test_hsv_overrides_pose_class_and_records_conflict() -> None:
     assert blue.quality == frozenset({ObservationQuality.POSE_COLOR_CONFLICT})
 
     green_image = image_with_regions((box, (60, 255, 200)))
-    green = detector([[detection(class_id=1)]]).detect(
+    green = detector([[detection(class_id=3)]]).detect(
         frame(green_image),
         green_image,
         result_timestamp_ns=1_010_000_000,
@@ -306,10 +315,10 @@ def test_detector_filters_low_detection_and_supports_empty() -> None:
         image,
         result_timestamp_ns=1_010_000_000,
     )
-    assert result == []
+    assert len(result) == 0
 
 
-def test_detector_rejects_stale_or_unmapped_results() -> None:
+def test_detector_rejects_stale_and_dispatches_field_classes() -> None:
     image = image_with_regions()
     with pytest.raises(StaleObservationError, match="exceeds") as raised:
         detector([[detection()]]).detect(
@@ -319,12 +328,55 @@ def test_detector_rejects_stale_or_unmapped_results() -> None:
         )
     assert raised.value.age_ms == pytest.approx(151.0)
     assert raised.value.max_age_ms == pytest.approx(150.0)
-    with pytest.raises(ValueError, match="no configured mapping"):
-        detector([[detection(class_id=4)]]).detect(
-            frame(image),
-            image,
-            result_timestamp_ns=1_010_000_000,
-        )
+    field_result = detector([[detection(class_id=4)]]).detect(
+        frame(image), image, result_timestamp_ns=1_010_000_000
+    )
+    assert field_result.observations == ()
+    assert field_result.field_features.center_cross is not None
+
+
+def test_safe_zone_three_keypoints_share_frame_and_project_to_ground() -> None:
+    image = image_with_regions()
+    projector = GroundProjector(np.eye(3))
+    output = detector(
+        [[detection(
+            class_id=5,
+            k0=UndistortedPixel(5.0, 6.0),
+            k1=UndistortedPixel(3.0, 7.0),
+            k2=UndistortedPixel(7.0, 7.0),
+        )]],
+        projector=projector,
+    ).detect(frame(image), image, result_timestamp_ns=1_010_000_000)
+
+    assert output.observations == ()
+    assert output.field_features.frame_sequence == 7
+    zone = output.field_features.safe_zones[0]
+    assert zone.ground_anchor.ground == GroundPoint(5.0, 6.0)
+    assert zone.image_left_landmark.undistorted.u < zone.image_right_landmark.undistorted.u
+    assert zone.physical_color.value == "unknown"
+
+
+def test_safe_zone_color_evidence_is_separate_from_target_hsv_classification() -> None:
+    box = UndistortedBoundingBox(2.0, 3.0, 8.0, 9.0)
+    image = image_with_regions((box, (0, 255, 200)))
+    safe_color = SafeZoneColorConfig(
+        enabled=True,
+        red_hsv_ranges=(((0, 100, 100), (10, 255, 255)),),
+        blue_hsv_ranges=(((90, 100, 100), (110, 255, 255)),),
+        min_fraction=0.5,
+        min_margin=0.1,
+    )
+    output = detector(
+        [[detection(
+            class_id=5,
+            box=box,
+            k1=UndistortedPixel(3.0, 7.0),
+            k2=UndistortedPixel(7.0, 7.0),
+        )]],
+        safe_zone_color=safe_color,
+    ).detect(frame(image), image, result_timestamp_ns=1_010_000_000)
+
+    assert output.field_features.safe_zones[0].physical_color.value == "red"
 
 
 def test_realtime_detector_drops_only_stale_observations() -> None:
@@ -355,10 +407,10 @@ def test_realtime_detector_returns_current_observations() -> None:
 
 def test_realtime_detector_preserves_non_stale_errors() -> None:
     image = image_with_regions()
-    with pytest.raises(ValueError, match="no configured mapping"):
-        detector([[detection(class_id=4)]]).detect_realtime(
+    with pytest.raises(ValueError, match="uint8"):
+        detector([[]]).detect_realtime(
             frame(image),
-            image,
+            image.astype(np.float32),
             result_timestamp_ns=1_010_000_000,
         )
 
@@ -470,7 +522,7 @@ def test_observations_to_evaluation_records_full_chain() -> None:
     observations = detector(
         [
             [
-                detection(class_id=1, box=blue_box),
+                detection(class_id=3, box=blue_box),
                 detection(class_id=0, box=green_box),
             ]
         ]

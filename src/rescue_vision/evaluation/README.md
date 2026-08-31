@@ -105,9 +105,7 @@ evaluation_records = observations_to_evaluation_records(
 - `ground_truth_class: null` 表示误检。
 - `predicted_class: null` 表示漏检。
 - 二者不能同时为 `null`。
-- 真值和预测地面点同时存在时才统计毫米误差；当前字段是 K0 接触锚点，
-  不是 `TargetGroundGeometry.center_ground`。中心/足迹评测尚待单独
-  定义字段，不能用现有地面误差冒充。
+- 真值和预测地面点同时存在时才统计毫米误差；当前字段是 v3 K0 底面几何中心。
 - 捕获时间和结果时间必须同时存在或同时缺失；只有一个时间戳属于
   schema 错误。两者存在时按 sample 统计端到端时延。
 - 同一 `(sample_id, object_id)` 不能重复。

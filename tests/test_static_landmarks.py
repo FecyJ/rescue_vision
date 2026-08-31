@@ -23,16 +23,20 @@ from rescue_vision.perception import (
     CenterCrossObservation,
     FieldFeatureDetectionResult,
     FieldFeatureSearchHint,
+    FieldFeatureQuality,
+    FieldPoseKeypoint,
     LineSegmentObservation,
     SafeZoneColor,
-    SafeZoneCornerObservation,
     SafeZoneCornerRole,
     SafeZoneObservation,
+    UndistortedBoundingBox,
 )
 from rescue_vision.world import (
     PhysicalRegionKind,
     PhysicalStaticRegion,
     StaticFieldMap,
+    StaticSafeZoneLandmarks,
+    TeamColor,
     default_static_field_map,
 )
 
@@ -65,7 +69,46 @@ def static_map() -> StaticFieldMap:
             region("blue-injured", PhysicalRegionKind.BLUE_INJURED, -300, 0, -1500, -1200),
             region("blue-material", PhysicalRegionKind.BLUE_MATERIAL, 0, 300, -1500, -1200),
         ),
+        (
+            StaticSafeZoneLandmarks(
+                TeamColor.RED,
+                FieldPoint(0.0, 1200.0),
+                FieldPoint(-300.0, 1200.0),
+                FieldPoint(300.0, 1200.0),
+                True,
+                True,
+            ),
+            StaticSafeZoneLandmarks(
+                TeamColor.BLUE,
+                FieldPoint(0.0, -1200.0),
+                FieldPoint(-300.0, -1200.0),
+                FieldPoint(300.0, -1200.0),
+                True,
+                True,
+            ),
+        ),
     )
+
+
+def test_safe_zone_landmarks_require_measurement_and_common_baseline() -> None:
+    with pytest.raises(ValueError, match="must be measured"):
+        StaticSafeZoneLandmarks(
+            TeamColor.RED,
+            FieldPoint(0.0, 1200.0),
+            FieldPoint(-300.0, 1200.0),
+            FieldPoint(300.0, 1200.0),
+            False,
+            True,
+        )
+    with pytest.raises(ValueError, match="collinear"):
+        StaticSafeZoneLandmarks(
+            TeamColor.RED,
+            FieldPoint(0.0, 1250.0),
+            FieldPoint(-300.0, 1200.0),
+            FieldPoint(300.0, 1200.0),
+            True,
+            True,
+        )
 
 
 def empty_result(timestamp_ns: int) -> FieldFeatureDetectionResult:
@@ -75,9 +118,7 @@ def empty_result(timestamp_ns: int) -> FieldFeatureDetectionResult:
         result_timestamp_ns=timestamp_ns,
         image_size=(640, 480),
         safe_zones=(),
-        start_zones=(),
         center_cross=None,
-        boundary_features=(),
     )
 
 
@@ -115,19 +156,20 @@ def cross_result(
         result_timestamp_ns=timestamp_ns,
         image_size=(640, 480),
         safe_zones=(),
-        start_zones=(),
         center_cross=CenterCrossObservation(
+            box=UndistortedBoundingBox(0.0, 0.0, 639.0, 479.0),
+            intersection=FieldPoseKeypoint(
+                UndistortedPixel(center.x, center.y),
+                center,
+                confidence,
+            ),
             axes=tuple(axes),
-            intersection_undistorted=UndistortedPixel(center.x, center.y),
-            intersection_ground=center,
             confidence=confidence,
             quality=frozenset(),
             confirmation=confirmation,
             axis_fit_residuals_px=(0.5, 0.5),
             axis_angle_deg=90.0,
-            intersection_extrapolated=False,
         ),
-        boundary_features=(),
     )
 
 
@@ -173,48 +215,38 @@ def test_tracker_disables_hint_for_uncertain_prior() -> None:
     ) is None
 
 
-def test_safe_zone_corner_pair_recovers_unique_pose() -> None:
-    pose = FieldPose2D(FieldPoint(120.0, -240.0), math.radians(23.0))
-    field_by_role = {
-        SafeZoneCornerRole.ENTRANCE_LEFT: FieldPoint(-300.0, 1200.0),
-        SafeZoneCornerRole.ENTRANCE_RIGHT: FieldPoint(300.0, 1200.0),
-        SafeZoneCornerRole.BACK_LEFT: FieldPoint(-300.0, 1500.0),
-        SafeZoneCornerRole.BACK_RIGHT: FieldPoint(300.0, 1500.0),
-    }
-    corners = tuple(
-        SafeZoneCornerObservation(
-            role,
-            UndistortedPixel(float(index), float(index + 1)),
-            field_to_ground(pose, point),
-            0.95,
-        )
-        for index, (role, point) in enumerate(field_by_role.items())
-    )
-    polygon_ground = tuple(corner.ground for corner in corners)
-    assert all(point is not None for point in polygon_ground)
-    zone = SafeZoneObservation(
-        SafeZoneColor.RED,
-        tuple(corner.undistorted for corner in corners),
-        tuple(point for point in polygon_ground if point is not None),
-        None,
-        None,
-        (),
+def _safe_zone_from_pose(
+    pose: FieldPose2D,
+    *,
+    color: SafeZoneColor = SafeZoneColor.RED,
+    swap_image_order: bool = False,
+) -> SafeZoneObservation:
+    anchor_field = FieldPoint(0.0, 1200.0 if color is SafeZoneColor.RED else -1200.0)
+    first_field = FieldPoint(-300.0, anchor_field.y)
+    second_field = FieldPoint(300.0, anchor_field.y)
+    first_ground = field_to_ground(pose, first_field)
+    second_ground = field_to_ground(pose, second_field)
+    if swap_image_order:
+        first_ground, second_ground = second_ground, first_ground
+    return SafeZoneObservation(
+        UndistortedBoundingBox(0.0, 0.0, 100.0, 100.0),
+        FieldPoseKeypoint(UndistortedPixel(50.0, 70.0), field_to_ground(pose, anchor_field), 0.95),
+        FieldPoseKeypoint(UndistortedPixel(20.0, 70.0), first_ground, 0.95),
+        FieldPoseKeypoint(UndistortedPixel(80.0, 70.0), second_ground, 0.95),
+        color,
         0.9,
         frozenset(),
-        corners,
-    )
-    result = FieldFeatureDetectionResult(
-        1,
-        1_000_000,
-        1_100_000,
-        (640, 480),
-        (zone,),
-        (),
-        None,
-        (),
     )
 
-    observation = SafeZoneCornerLocalizer(static_map()).localize(result)
+
+def test_safe_zone_corner_pair_recovers_unique_pose() -> None:
+    pose = FieldPose2D(FieldPoint(120.0, -240.0), math.radians(23.0))
+    zone = _safe_zone_from_pose(pose)
+    result = FieldFeatureDetectionResult(
+        1, 1_000_000, 1_100_000, (640, 480), (zone,), None
+    )
+
+    observation = SafeZoneCornerLocalizer(static_map()).localize(result, prior_pose=pose)
 
     assert observation is not None
     assert observation.pose.position.x == pytest.approx(pose.position.x, abs=1e-6)
@@ -225,80 +257,33 @@ def test_safe_zone_corner_pair_recovers_unique_pose() -> None:
 
 
 def test_safe_zone_single_corner_cannot_create_pose() -> None:
-    corner = SafeZoneCornerObservation(
-        SafeZoneCornerRole.ENTRANCE_LEFT,
-        UndistortedPixel(10.0, 20.0),
-        GroundPoint(100.0, 200.0),
-        0.9,
-    )
     zone = SafeZoneObservation(
+        UndistortedBoundingBox(0.0, 0.0, 100.0, 100.0),
+        FieldPoseKeypoint(None, None, 0.0),
+        FieldPoseKeypoint(UndistortedPixel(10.0, 20.0), GroundPoint(100.0, 200.0), 0.9),
+        FieldPoseKeypoint(None, None, 0.0),
         SafeZoneColor.BLUE,
-        (
-            UndistortedPixel(0.0, 0.0),
-            UndistortedPixel(1.0, 0.0),
-            UndistortedPixel(1.0, 1.0),
-        ),
-        None,
-        None,
-        None,
-        (),
         0.8,
-        frozenset(),
-        (corner,),
+        frozenset({FieldFeatureQuality.KEYPOINT_UNAVAILABLE}),
     )
     result = FieldFeatureDetectionResult(
-        2,
-        2_000_000,
-        2_100_000,
-        (640, 480),
-        (zone,),
-        (),
-        None,
-        (),
+        2, 2_000_000, 2_100_000, (640, 480), (zone,), None
     )
-    assert SafeZoneCornerLocalizer(static_map()).localize(result) is None
+    assert SafeZoneCornerLocalizer(static_map()).localize(
+        result, prior_pose=FieldPose2D(FieldPoint(0.0, 0.0), 0.0)
+    ) is None
 
 
-def test_safe_zone_corner_localizer_rejects_one_outlier_corner() -> None:
+def test_safe_zone_image_order_hypotheses_use_prior() -> None:
     pose = FieldPose2D(FieldPoint(-80.0, 140.0), -0.3)
-    field_by_role = {
-        SafeZoneCornerRole.ENTRANCE_LEFT: FieldPoint(-300.0, 1200.0),
-        SafeZoneCornerRole.ENTRANCE_RIGHT: FieldPoint(300.0, 1200.0),
-        SafeZoneCornerRole.BACK_LEFT: FieldPoint(-300.0, 1500.0),
-        SafeZoneCornerRole.BACK_RIGHT: FieldPoint(300.0, 1500.0),
-    }
-    corners = []
-    for index, (role, point) in enumerate(field_by_role.items()):
-        ground = field_to_ground(pose, point)
-        if role is SafeZoneCornerRole.BACK_RIGHT:
-            ground = GroundPoint(ground.x + 500.0, ground.y - 400.0)
-        corners.append(
-            SafeZoneCornerObservation(
-                role,
-                UndistortedPixel(float(index), float(index)),
-                ground,
-                0.9,
-            )
-        )
-    zone = SafeZoneObservation(
-        SafeZoneColor.RED,
-        tuple(corner.undistorted for corner in corners),
-        tuple(corner.ground for corner in corners if corner.ground is not None),
-        None,
-        None,
-        (),
-        0.9,
-        frozenset(),
-        tuple(corners),
-    )
+    zone = _safe_zone_from_pose(pose, swap_image_order=True)
     result = FieldFeatureDetectionResult(
-        3, 3_000_000, 3_100_000, (640, 480), (zone,), (), None, ()
+        3, 3_000_000, 3_100_000, (640, 480), (zone,), None
     )
 
-    observation = SafeZoneCornerLocalizer(static_map()).localize(result)
+    observation = SafeZoneCornerLocalizer(static_map()).localize(result, prior_pose=pose)
 
     assert observation is not None
-    assert SafeZoneCornerRole.BACK_RIGHT not in observation.used_roles
     assert observation.pose.position.x == pytest.approx(pose.position.x, abs=1e-6)
     assert observation.pose.position.y == pytest.approx(pose.position.y, abs=1e-6)
 

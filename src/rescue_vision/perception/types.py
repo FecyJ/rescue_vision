@@ -22,6 +22,20 @@ class TargetClass(str, Enum):
     UNKNOWN = "unknown"
 
 
+class PoseModelClass(str, Enum):
+    """YOLO Pose v3 固定训练类别；顺序也是模型 class ID。"""
+
+    GREEN_SUPPLY = "green_supply"
+    BLACK_CORE = "black_core"
+    ORANGE_INJURED = "orange_injured"
+    BLUE_DANGER = "blue_danger"
+    CENTER_CROSS = "center_cross"
+    SAFE_ZONE = "safe_zone"
+
+
+POSE_MODEL_CLASSES = tuple(PoseModelClass)
+
+
 class ObservationQuality(str, Enum):
     """不会被静默丢弃的观测质量信息。"""
 
@@ -345,14 +359,32 @@ class RoiColorSegmentation:
 
 
 @dataclass(frozen=True, slots=True)
+class PoseKeypoint:
+    """单个 v3 Pose 槽位；低置信度点仍保留原始分数供领域层门控。"""
+
+    point: UndistortedPixel | None
+    confidence: float
+
+    def __post_init__(self) -> None:
+        _probability(self.confidence, "confidence")
+        if self.point is not None and (
+            not isinstance(self.point, UndistortedPixel)
+            or not math.isfinite(self.point.u)
+            or not math.isfinite(self.point.v)
+        ):
+            raise ValueError(f"point must be a finite UndistortedPixel, got {self.point!r}.")
+        if self.point is None and self.confidence != 0.0:
+            raise ValueError("an unavailable keypoint must have zero confidence.")
+
+
+@dataclass(frozen=True, slots=True)
 class ModelDetection:
     """推理后端输出；坐标已经反映射到去畸变输入图像。"""
 
     model_class_id: int
     confidence: float
     box: UndistortedBoundingBox
-    k0: UndistortedPixel | None
-    k0_confidence: float
+    keypoints: tuple[PoseKeypoint, PoseKeypoint, PoseKeypoint]
 
     def __post_init__(self) -> None:
         if (
@@ -365,11 +397,35 @@ class ModelDetection:
                 f"{self.model_class_id!r}."
             )
         _probability(self.confidence, "confidence")
-        _probability(self.k0_confidence, "k0_confidence")
-        if self.k0 is not None and (
-            not math.isfinite(self.k0.u) or not math.isfinite(self.k0.v)
+        if self.model_class_id >= len(POSE_MODEL_CLASSES):
+            raise ValueError(
+                f"model_class_id must be in [0, {len(POSE_MODEL_CLASSES) - 1}], "
+                f"got {self.model_class_id}."
+            )
+        if (
+            not isinstance(self.keypoints, tuple)
+            or len(self.keypoints) != 3
+            or not all(isinstance(item, PoseKeypoint) for item in self.keypoints)
         ):
-            raise ValueError(f"k0 must be finite, got {self.k0!r}.")
+            raise ValueError("keypoints must contain exactly three PoseKeypoint values.")
+        model_class = POSE_MODEL_CLASSES[self.model_class_id]
+        if model_class is not PoseModelClass.SAFE_ZONE and any(
+            item.point is not None for item in self.keypoints[1:]
+        ):
+            raise ValueError(
+                f"{model_class.value} must not expose K1/K2 in YOLO Pose v3."
+            )
+        if (
+            model_class is PoseModelClass.SAFE_ZONE
+            and self.keypoints[1].point is not None
+            and self.keypoints[2].point is not None
+            and self.keypoints[1].point.u >= self.keypoints[2].point.u
+        ):
+            raise ValueError("safe_zone keypoints must satisfy u(K1) < u(K2).")
+
+    @property
+    def model_class(self) -> PoseModelClass:
+        return POSE_MODEL_CLASSES[self.model_class_id]
 
 
 @dataclass(frozen=True, slots=True)

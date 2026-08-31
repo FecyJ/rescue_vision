@@ -21,7 +21,8 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `AppConfig.build_camera_model()` | 按内参开关创建 `CameraModel` | 内参关闭时返回 `None` |
 | `AppConfig.build_geometry()` | 创建相机模型和可选地面映射 | 内参关闭时返回 `None`；只有内参时 projector 为 `None` |
 | `AppConfig.build_target_pose_detector()` | 按当前 Hailo、类别和 HSV 配置创建任务目标检测器 | Hailo 关闭时返回 `None`；返回对象接管 backend 生命周期 |
-| `AppConfig.build_center_cross_localizer()` | 创建中心十字绝对位姿观测器 | 定位关闭或地面映射不可用时返回 `None`；当前仓库没有场地特征模型生产者 |
+| `AppConfig.build_center_cross_localizer()` | 创建中心十字绝对位姿观测器 | 定位关闭或地面映射不可用时返回 `None` |
+| `AppConfig.build_visual_localization_pipeline()` | 装配 v3 地标到融合器的同帧消费链 | 自动执行门禁和帧序去重 |
 | `AppConfig.build_static_field_landmark_tracker()` | 创建静态地图搜索提示和短时地标追踪器 | 不打开相机或传感器 |
 | `AppConfig.build_safe_zone_corner_localizer()` | 创建安全区角点绝对位姿拟合器 | 使用同一 `world.static_map` |
 | `AppConfig.build_odometry_imu_fusion()` | 创建连续二维编码器/IMU航位推算器 | 融合关闭时返回 `None`；启用时要求 motion、UART 和里程计机械标定，不强制启用视觉场地特征 |
@@ -33,7 +34,7 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `MotionRuntimeConfig.build_remote_executor()` | 创建远程调试运动执行器 | 复用同一个运动控制器和限速 |
 | `MotionRuntimeConfig.build_remote_gripper_executor()` | 创建远程夹爪执行器 | 夹爪禁用时返回 `None`；否则复用控制器、有效期与机械标定 |
 | `HailoConfig.build_backend()` | 校验模型资产并创建 Hailo 后端 | Hailo 关闭时返回 `None` |
-| `HailoConfig.model_class_mapping()` | 把模型 class ID 映射为 `TargetClass` | 直接传给 `TargetPoseDetector` |
+| `HailoConfig.raw_classes` | v3 固定六类顺序 | 缺失、重排或额外类别均拒绝加载 |
 | `PerceptionConfig.build_target_ground_geometry_estimator()` | 创建目标地面中心估计器 | 禁用时返回 `None`；启用时要求完整地面外参 |
 | `TrackingConfig.build_tracker()` | 创建一轮使用的多目标跟踪器 | 初始无轨迹 |
 | `WorldRuntimeConfig.build_model()` | 按 `team_color` 把物理静态地图派生为任务区域 | 队伍颜色未知时只派生场界 |
@@ -177,7 +178,6 @@ backend = config.hailo.build_backend()
 if backend is None:
     raise RuntimeError("当前功能需要在 runtime.yaml 中启用 Hailo")
 
-class_mapping = config.hailo.model_class_mapping()
 color_classifier = config.perception.color_classifier
 ```
 
@@ -216,8 +216,7 @@ mission = config.mission.build_state_machine()
 配置对象和已构建对象应在进程生命周期内复用，不能在逐帧循环中重新读取
 YAML、重新生成去畸变映射或重复创建 Hailo 设备。
 
-中心十字绝对位姿的纯几何消费方仍可单独装配；当前仓库没有场地特征模型
-推理生产者，因此运行时不能形成从图像到该定位器的完整链路：
+中心十字、安全区和连续融合可由统一 v3 管线装配：
 
 ```python
 center_cross_localizer = config.build_center_cross_localizer(
@@ -225,13 +224,17 @@ center_cross_localizer = config.build_center_cross_localizer(
 )
 static_landmark_tracker = config.build_static_field_landmark_tracker()
 safe_zone_corner_localizer = config.build_safe_zone_corner_localizer()
+visual_localization = config.build_visual_localization_pipeline(
+    ground_projector=ground_projector,
+    fusion=fusion,
+)
 ```
 
 `build_center_cross_localizer()` 要求 `localization.enabled=true` 和可用地面
 映射，任一条件缺失时返回 `None`。定位器从 `config.world.static_map` 读取
 中心十字交点和终端方向，不创建另一套地图、标定或 BEV。其输入
-`FieldFeatureDetectionResult` 必须由未来的场地特征模型后端产生；在该后端
-实现前，不要把合成观测当作现场检测结果。
+`FieldFeatureDetectionResult` 来自同一个六类模型快照。安全区地标未实测或
+`usable=false` 时只保留观测和假设诊断，不参与绝对安全区定位。
 
 ## 6. 几何开关组合
 
@@ -265,8 +268,8 @@ geometry:
 
 `hailo.backend_score_threshold` 是后端粗筛，必须小于等于
 `perception.detection_threshold`；后者决定模型框是否进入统一观测。
-`perception.k0_threshold` 独立控制接触点是否可用。最终任务类别不再由
-模型分类分数决定，而由 `perception.color_classifier` 对检测框 ROI 进行
+`perception.k0_threshold` 控制三个槽位进入领域观测的最低置信度。最终任务类别不再由
+模型分类分数决定，而由 `perception.color_classifier` 对四类目标检测框 ROI 进行
 HSV 分类；颜色覆盖不足或多色歧义时输出 `unknown`。
 
 ## 8. ROI HSV 配置

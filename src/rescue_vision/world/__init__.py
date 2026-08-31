@@ -19,6 +19,7 @@ from rescue_vision.world.static_map import (
     PhysicalStaticRegion,
     StaticCenterCross,
     StaticFieldMap,
+    StaticSafeZoneLandmarks,
     TeamColor,
     default_static_field_map,
 )
@@ -35,6 +36,7 @@ __all__ = [
     "PhysicalStaticRegion",
     "StaticCenterCross",
     "StaticFieldMap",
+    "StaticSafeZoneLandmarks",
     "TeamColor",
     "default_static_field_map",
     "WorldModel",

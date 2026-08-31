@@ -17,7 +17,8 @@
 | `rescue-vision-simulation-20-point` | `runtime.simulation-20min.yaml` 和显式监督确认；可选 `--log-dir logs` 把终端输出按时间命名写入日志文件 | 复用现有解团，跟踪/世界模型/规则门禁、受限预推导航、单绿色推送、接近时 transport 局部打开、接触确认后闭合、交付验证、退离、四次完成停车，并向 observe_only 观察端发布最新 `map/state` 位姿 |
 | `ClusterBreakupSequence(...).step()` | `ClusterBreakupRuntimeConfig`、`motion.gripper.full_travel_time_s`、同一单调时间轴、编码器累计路程和最新 `PerceptionSnapshot` | 纯逻辑流程决策；不创建相机、Hailo、UART 或电机；冲散后全开、张爪退出、停车合爪，再进入闭爪退离 |
 | `EncoderTravelTracker.submit()` | 带有效双编码器的 `OdometryImu`；连续 `sample_overrun` 预算来自 `motion.odometry.max_consecutive_overrun_samples`，`null` 关闭中止仅保留计数 | 使用运行配置机械标定产生机器人中心累计有符号路程；连续异常超出配置预算时抛错 |
-| `OdometryImuFusion.submit_odometry()` | 同一 UART 消费链路中的 `OdometryImu` | 解团临时配置只输出编码器+IMU 连续 `FieldPose2D`；不调用 `submit_visual()` |
+| `VisualLocalizationPipeline.submit()` | v3 同帧中心十字/安全区结果 | 每帧最多提交一次全位姿或位置纠偏 |
+| `OdometryImuFusion.submit_odometry()` | 同一 UART 消费链路中的 `OdometryImu` | 持续输出并接受时间对齐视觉纠偏 |
 | `OdometryFusionPump` | `OdometryImu` 有界队列和 `OdometryImuFusion` | 顺序处理融合，不阻塞运动刷新线程；队列满或 worker 异常进入停车路径 |
 | `CameraPerceptionPump` | `FrameSource`、去畸变函数和目标感知旁路 | 在独立线程完成取帧/去畸变/推理提交，不占用运动刷新线程 |
 | `RemotePerceptionPublisher` / `RemoteLocalizationPublisher` / `RemotePerceptionTransport` | `observe_only` TCP 连接、已渲染 perception 帧和编码器+IMU估计 | 异步接受一个观察端；独立旁路发送 perception JPEG 与 `map/state` 位姿 JSON，不发送原图/BEV |
@@ -199,7 +200,7 @@ rescue-vision-manual-capture \
 最新帧旁路生成。两者只发布带实际模式和坐标元数据的 JPEG，不阻塞运动安全循环。
 启用 `--enable-localization` 或 `localization.fusion.enabled` 时，唯一 UART
 消费回调把 100 Hz `OdometryImu` 送入 `OdometryImuFusion`，地图状态发布融合器
-的最新编码器+IMU 位姿；不再启动传统场地特征/中心十字视觉旁路，BEV 图传只
+的最新融合位姿；启用定位且门禁满足时复用统一 v3 感知旁路提交场地纠偏，BEV 图传只
 使用纯 BEV 渲染器。该融合位姿的绝对起点来自
 `localization.fusion.initial_pose`，不是现场视觉定位证据。
 相机去畸变、录像提交、JPEG 和动态状态发布之间都会再次检查远程命令期限并刷新
@@ -214,7 +215,7 @@ rescue-vision-manual-capture \
 `observation/map/state` JSON；静态底图、区域和 FieldPoint 到显示像素的映射
 由电脑端固化。完整车辆配置启用 `localization.fusion` 时，唯一 UART 消费回调把
 100 Hz `OdometryImu` 同时送给车辆状态、运动日志和融合器；该路径只做编码器+IMU
-连续推算，不再包含中心十字或安全区视觉纠偏。遥测超期或连续性中断时地图立即
+连续推算；新鲜 v3 中心十字或安全区观测可进行视觉纠偏。遥测超期或连续性中断时地图立即
 清除机器人位置。仅相机模式不创建融合器，也不会用配置起点冒充连续定位。
 手动会话的 `motion.jsonl` 逐条
 保存运动/夹爪执行结果、编码器/IMU、系统状态、命令回复和停车原因；

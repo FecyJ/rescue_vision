@@ -31,44 +31,70 @@ def test_letterbox_and_coordinate_round_trip() -> None:
     assert point.v == pytest.approx(25)
 
 
-@pytest.mark.parametrize(("kpt_shape", "width"), [((1, 3), 9), ((3, 3), 15)])
-def test_pose_parser_uses_class_id_and_only_k0(kpt_shape, width) -> None:
+def test_pose_parser_uses_v3_class_id_and_three_keypoints() -> None:
     image = np.zeros((100, 200, 3), dtype=np.uint8)
     _, transform = letterbox_bgr_to_rgb(image, (640, 640))
-    output = np.zeros((1, 2, width), dtype=np.float32)
-    output[0, 0, :9] = [32, 192, 320, 352, 0.9, 3, 160, 320, 0.8]
-    if width == 15:
-        output[0, 0, 9:] = [999, 999, 1, -999, -999, 1]
+    output = np.zeros((1, 2, 15), dtype=np.float32)
+    output[0, 0] = [32, 192, 320, 352, 0.9, 5, 160, 320, 0.8, 120, 300, 0.7, 200, 300, 0.6]
     parsed = parse_yolo26_pose_output(
         output,
-        kpt_shape=kpt_shape,
+        kpt_shape=(3, 3),
         transform=transform,
         score_threshold=0.25,
         max_detections=10,
     )
     assert len(parsed) == 1
-    assert parsed[0].model_class_id == 3
-    assert parsed[0].k0.u == pytest.approx(50)
-    assert parsed[0].k0.v == pytest.approx(50)
+    assert parsed[0].model_class_id == 5
+    assert parsed[0].keypoints[0].point.u == pytest.approx(50)
+    assert parsed[0].keypoints[0].point.v == pytest.approx(50)
+    assert all(item.point is not None for item in parsed[0].keypoints)
+
+
+def test_pose_parser_rejects_old_single_keypoint_layout() -> None:
+    image = np.zeros((100, 200, 3), dtype=np.uint8)
+    _, transform = letterbox_bgr_to_rgb(image, (640, 640))
+    with pytest.raises(ValueError, match=r"\[3, 3\]"):
+        parse_yolo26_pose_output(
+            np.zeros((1, 1, 9), dtype=np.float32),
+            kpt_shape=(1, 3),
+            transform=transform,
+            score_threshold=0.25,
+            max_detections=10,
+        )
+
+
+def test_pose_parser_rejects_reversed_safe_zone_image_landmarks() -> None:
+    image = np.zeros((100, 200, 3), dtype=np.uint8)
+    _, transform = letterbox_bgr_to_rgb(image, (640, 640))
+    output = np.zeros((1, 1, 15), dtype=np.float32)
+    output[0, 0] = [32, 192, 320, 352, 0.9, 5, 160, 320, 0.8, 220, 320, 0.8, 120, 320, 0.8]
+    with pytest.raises(ValueError, match=r"u\(K1\) < u\(K2\)"):
+        parse_yolo26_pose_output(
+            output,
+            kpt_shape=(3, 3),
+            transform=transform,
+            score_threshold=0.25,
+            max_detections=10,
+        )
 
 
 def test_pose_parser_skips_padding_boxes_and_sanitizes_nan_k0() -> None:
     image = np.zeros((100, 200, 3), dtype=np.uint8)
     _, transform = letterbox_bgr_to_rgb(image, (640, 640))
-    output = np.zeros((1, 2, 9), dtype=np.float32)
-    output[0, 0] = [10, 10, 20, 20, 0.9, 0, 15, 15, 0.8]
-    output[0, 1] = [32, 192, 320, 352, 0.8, 1, 160, 320, np.nan]
+    output = np.zeros((1, 2, 15), dtype=np.float32)
+    output[0, 0, :9] = [10, 10, 20, 20, 0.9, 0, 15, 15, 0.8]
+    output[0, 1, :9] = [32, 192, 320, 352, 0.8, 1, 160, 320, np.nan]
     parsed = parse_yolo26_pose_output(
         output,
-        kpt_shape=(1, 3),
+        kpt_shape=(3, 3),
         transform=transform,
         score_threshold=0.25,
         max_detections=10,
     )
     assert len(parsed) == 1
     assert parsed[0].model_class_id == 1
-    assert parsed[0].k0 is None
-    assert parsed[0].k0_confidence == 0.0
+    assert parsed[0].keypoints[0].point is None
+    assert parsed[0].keypoints[0].confidence == 0.0
 
 
 def test_backend_close_releases_resources_after_job_failure() -> None:
@@ -128,7 +154,7 @@ def test_backend_validates_mapping_before_hardware_import(tmp_path) -> None:
             hef_path=hef,
             postprocess_onnx_path=onnx,
             output_mapping_path=mapping,
-            class_count=4,
+            class_count=6,
             max_detections=10,
             score_threshold=0.25,
         )

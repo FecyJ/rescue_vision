@@ -12,6 +12,7 @@ import numpy as np
 
 from rescue_vision.camera.frame import CameraFrame
 from rescue_vision.perception.detector import TargetPoseDetector
+from rescue_vision.perception.field_feature_types import FieldFeatureDetectionResult, SafeZoneColor
 from rescue_vision.perception.types import TargetClass, TargetObservation
 
 
@@ -37,6 +38,7 @@ class PerceptionSnapshot:
     capture_timestamp_ns: int
     result_timestamp_ns: int
     observations: tuple[TargetObservation, ...]
+    field_features: FieldFeatureDetectionResult | None
     dropped_stale_age_ms: float | None = None
 
 
@@ -99,6 +101,7 @@ def render_target_observations(
     observations: Sequence[TargetObservation],
     *,
     dropped_stale_age_ms: float | None = None,
+    field_features: FieldFeatureDetectionResult | None = None,
 ) -> np.ndarray:
     """在图像副本上叠加检测框、颜色掩码、K0 和质量信息。
 
@@ -167,6 +170,61 @@ def render_target_observations(
             (max(0, start[0]), max(20, start[1] - 8)),
             color,
         )
+
+    if field_features is not None:
+        if field_features.image_size != image_size:
+            raise ValueError("field-feature image_size does not match image.")
+        cross = field_features.center_cross
+        if cross is not None:
+            box = cross.box
+            cv2.rectangle(
+                preview,
+                (round(box.x_min), round(box.y_min)),
+                (round(box.x_max), round(box.y_max)),
+                (0, 255, 255),
+                2,
+            )
+            if cross.intersection.undistorted is not None:
+                point = cross.intersection.undistorted
+                cv2.drawMarker(
+                    preview,
+                    (round(point.u), round(point.v)),
+                    (0, 255, 255),
+                    cv2.MARKER_CROSS,
+                    14,
+                    2,
+                )
+            for axis in cross.axes:
+                cv2.line(
+                    preview,
+                    (round(axis.start_undistorted.u), round(axis.start_undistorted.v)),
+                    (round(axis.end_undistorted.u), round(axis.end_undistorted.v)),
+                    (0, 180, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+        for zone in field_features.safe_zones:
+            color = (
+                (0, 0, 255)
+                if zone.physical_color is SafeZoneColor.RED
+                else (255, 0, 0)
+                if zone.physical_color is SafeZoneColor.BLUE
+                else (255, 0, 255)
+            )
+            box = zone.box
+            cv2.rectangle(
+                preview,
+                (round(box.x_min), round(box.y_min)),
+                (round(box.x_max), round(box.y_max)),
+                color,
+                2,
+            )
+            for index, keypoint in enumerate((zone.ground_anchor, zone.image_left_landmark, zone.image_right_landmark)):
+                if keypoint.undistorted is None:
+                    continue
+                point = keypoint.undistorted
+                cv2.circle(preview, (round(point.u), round(point.v)), 5, color, -1)
+                _draw_text(preview, f"K{index}", (round(point.u) + 5, round(point.v) - 5), color)
 
     if dropped_stale_age_ms is not None:
         cv2.rectangle(
@@ -365,6 +423,7 @@ class PerceptionFrameRenderer:
                             frame.image_bgr,
                             result.observations,
                             dropped_stale_age_ms=result.dropped_stale_age_ms,
+                            field_features=result.field_features,
                         ),
                         metadata={
                             "perception_stale_dropped": result.stale_dropped,
@@ -373,13 +432,18 @@ class PerceptionFrameRenderer:
                     render_ms = (monotonic_ns() - render_start_ns) / 1_000_000.0
                     completed_ns = max(
                         (item.result_timestamp_ns for item in result.observations),
-                        default=monotonic_ns(),
+                        default=(
+                            result.field_features.result_timestamp_ns
+                            if result.field_features is not None
+                            else monotonic_ns()
+                        ),
                     )
                     snapshot = PerceptionSnapshot(
                         frame_sequence=frame.sequence,
                         capture_timestamp_ns=frame.timestamp_ns,
                         result_timestamp_ns=completed_ns,
                         observations=result.observations,
+                        field_features=result.field_features,
                         dropped_stale_age_ms=result.dropped_stale_age_ms,
                     )
                     with self._lock:

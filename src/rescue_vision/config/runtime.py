@@ -28,7 +28,12 @@ from rescue_vision.perception.types import (
     COLOR_TARGET_CLASSES,
     HsvColorClassifierConfig,
     HsvRange,
+    POSE_MODEL_CLASSES,
     TargetClass,
+)
+from rescue_vision.perception.detector import (
+    CenterCrossRefinementConfig,
+    SafeZoneColorConfig,
 )
 from rescue_vision.perception.target_ground_geometry import (
     BoxTargetGeometry,
@@ -47,6 +52,7 @@ from rescue_vision.world import (
     RegionKind,
     StaticCenterCross,
     StaticFieldMap,
+    StaticSafeZoneLandmarks,
     StaticRegion,
     TeamColor,
     WorldModel,
@@ -293,6 +299,23 @@ def _perception_defaults() -> dict[str, Any]:
     return {
         "detection_threshold": 0.25,
         "k0_threshold": 0.50,
+        "center_cross_refinement": {
+            "enabled": True,
+            "canny_low": 50,
+            "canny_high": 150,
+            "hough_threshold": 16,
+            "min_line_length_px": 18.0,
+            "max_line_gap_px": 12.0,
+            "max_intersection_distance_px": 18.0,
+            "min_axis_angle_deg": 65.0,
+        },
+        "safe_zone_color": {
+            "enabled": False,
+            "red_hsv_ranges": [],
+            "blue_hsv_ranges": [],
+            "min_fraction": 0.08,
+            "min_margin": 0.03,
+        },
         "color_classifier": {
             "ranges": {
                 "green_supply": [
@@ -965,6 +988,8 @@ class PerceptionConfig:
     k0_threshold: float
     color_classifier: HsvColorClassifierConfig
     target_ground_geometry: TargetGroundGeometryConfig
+    center_cross_refinement: CenterCrossRefinementConfig
+    safe_zone_color: SafeZoneColorConfig
 
     def build_target_ground_geometry_estimator(
         self,
@@ -998,7 +1023,6 @@ class HailoConfig:
     postprocess_onnx_path: Path | None
     output_mapping_path: Path | None
     raw_classes: tuple[str, ...]
-    class_mapping: tuple[TargetClass, ...]
     backend_score_threshold: float
     max_detections: int
 
@@ -1020,10 +1044,6 @@ class HailoConfig:
             max_detections=self.max_detections,
             score_threshold=self.backend_score_threshold,
         )
-
-    def model_class_mapping(self) -> dict[int, TargetClass]:
-        return dict(enumerate(self.class_mapping))
-
 
 @dataclass(frozen=True, slots=True)
 class RuntimeGeometry:
@@ -1107,12 +1127,13 @@ class AppConfig:
 
         return TargetPoseDetector(
             backend,
-            class_mapping=self.hailo.model_class_mapping(),
             detection_threshold=self.perception.detection_threshold,
             k0_threshold=self.perception.k0_threshold,
             color_classifier=self.perception.color_classifier,
             max_observation_age_ms=self.processing.max_observation_age_ms,
             ground_projector=ground_projector,
+            center_cross_refinement=self.perception.center_cross_refinement,
+            safe_zone_color=self.perception.safe_zone_color,
         )
 
     def build_center_cross_localizer(
@@ -1176,6 +1197,28 @@ class AppConfig:
             self.localization.fusion,
             calibration,
             wheel_track_m=self.motion.wheel_track_m,
+        )
+
+    def build_visual_localization_pipeline(
+        self,
+        *,
+        ground_projector: GroundProjector | None,
+        fusion: OdometryImuFusion | None,
+    ):
+        """装配 v3 场地地标消费链；任一门禁关闭时返回 ``None``。"""
+
+        if fusion is None or not self.hailo.enabled:
+            return None
+        center = self.build_center_cross_localizer(ground_projector=ground_projector)
+        if center is None:
+            return None
+        from rescue_vision.localization import VisualLocalizationPipeline
+
+        return VisualLocalizationPipeline(
+            center_cross_localizer=center,
+            safe_zone_localizer=self.build_safe_zone_corner_localizer(),
+            landmark_tracker=self.build_static_field_landmark_tracker(),
+            fusion=fusion,
         )
 
     def build_simulation_20_point_sequence(self) -> Simulation20PointSequence:
@@ -2075,7 +2118,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     static_map_raw = _mapping(world_raw.get("static_map", {}), "world.static_map")
     _reject_unknown(
         static_map_raw,
-        {"center_cross", "regions"},
+        {"center_cross", "safe_zone_landmarks", "regions"},
         "world.static_map",
     )
     default_map = default_static_field_map()
@@ -2137,6 +2180,47 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         intersection_field=intersection_field,
         terminals=tuple(terminals),
     )
+
+    safe_landmarks_value = static_map_raw.get("safe_zone_landmarks", [])
+    if not isinstance(safe_landmarks_value, list):
+        raise ValueError("world.static_map.safe_zone_landmarks must be a list.")
+    safe_zone_landmarks: list[StaticSafeZoneLandmarks] = []
+
+    def parse_field_point(value: object, location: str) -> FieldPoint:
+        if not isinstance(value, list) or len(value) != 2:
+            raise ValueError(f"{location} must be [x_mm, y_mm].")
+        return FieldPoint(
+            _finite_float(value[0], f"{location}[0]", minimum=-float("inf")),
+            _finite_float(value[1], f"{location}[1]", minimum=-float("inf")),
+        )
+
+    for index, value in enumerate(safe_landmarks_value):
+        location = f"world.static_map.safe_zone_landmarks[{index}]"
+        item = _mapping(value, location)
+        _reject_unknown(
+            item,
+            {"color", "ground_anchor_field_mm", "near_field_corners_mm", "measured", "usable"},
+            location,
+        )
+        try:
+            color = TeamColor(_string(_required(item, "color", location), f"{location}.color"))
+        except ValueError as exc:
+            raise ValueError(f"{location}.color must be red or blue.") from exc
+        corners = _required(item, "near_field_corners_mm", location)
+        if not isinstance(corners, list) or len(corners) != 2:
+            raise ValueError(f"{location}.near_field_corners_mm must contain two points.")
+        measured = _required(item, "measured", location)
+        usable = _required(item, "usable", location)
+        if not isinstance(measured, bool) or not isinstance(usable, bool):
+            raise ValueError(f"{location}.measured and usable must be booleans.")
+        safe_zone_landmarks.append(StaticSafeZoneLandmarks(
+            color,
+            parse_field_point(_required(item, "ground_anchor_field_mm", location), f"{location}.ground_anchor_field_mm"),
+            parse_field_point(corners[0], f"{location}.near_field_corners_mm[0]"),
+            parse_field_point(corners[1], f"{location}.near_field_corners_mm[1]"),
+            measured,
+            usable,
+        ))
 
     regions_value = static_map_raw.get("regions", [])
     if not isinstance(regions_value, list):
@@ -2203,7 +2287,11 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     world = WorldRuntimeConfig(
         world_model,
         team_color,
-        StaticFieldMap(center_cross_map, tuple(physical_regions)),
+        StaticFieldMap(
+            center_cross_map,
+            tuple(physical_regions),
+            tuple(safe_zone_landmarks),
+        ),
     )
 
     mission_raw = _mapping(
@@ -2273,6 +2361,8 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         {
             "detection_threshold",
             "k0_threshold",
+            "center_cross_refinement",
+            "safe_zone_color",
             "color_classifier",
             "target_ground_geometry",
         },
@@ -2296,6 +2386,72 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     ):
         if value > 1.0:
             raise ValueError(f"{location} must be <= 1.0.")
+
+    cross_refinement_raw = _mapping(
+        perception_raw["center_cross_refinement"],
+        "perception.center_cross_refinement",
+    )
+    _reject_unknown(
+        cross_refinement_raw,
+        {
+            "enabled", "canny_low", "canny_high", "hough_threshold",
+            "min_line_length_px", "max_line_gap_px",
+            "max_intersection_distance_px", "min_axis_angle_deg",
+        },
+        "perception.center_cross_refinement",
+    )
+    refinement_enabled = cross_refinement_raw["enabled"]
+    if not isinstance(refinement_enabled, bool):
+        raise ValueError("perception.center_cross_refinement.enabled must be a boolean.")
+    canny_low = _nonnegative_int(cross_refinement_raw["canny_low"], "perception.center_cross_refinement.canny_low")
+    canny_high = _positive_int(cross_refinement_raw["canny_high"], "perception.center_cross_refinement.canny_high")
+    if canny_low >= canny_high or canny_high > 255:
+        raise ValueError("center-cross Canny thresholds must satisfy 0 <= low < high <= 255.")
+    center_cross_refinement = CenterCrossRefinementConfig(
+        enabled=refinement_enabled,
+        canny_low=canny_low,
+        canny_high=canny_high,
+        hough_threshold=_positive_int(cross_refinement_raw["hough_threshold"], "perception.center_cross_refinement.hough_threshold"),
+        min_line_length_px=_finite_float(cross_refinement_raw["min_line_length_px"], "perception.center_cross_refinement.min_line_length_px", minimum=0.001),
+        max_line_gap_px=_finite_float(cross_refinement_raw["max_line_gap_px"], "perception.center_cross_refinement.max_line_gap_px", minimum=0.0),
+        max_intersection_distance_px=_finite_float(cross_refinement_raw["max_intersection_distance_px"], "perception.center_cross_refinement.max_intersection_distance_px", minimum=0.001),
+        min_axis_angle_deg=_finite_float(cross_refinement_raw["min_axis_angle_deg"], "perception.center_cross_refinement.min_axis_angle_deg", minimum=0.001),
+    )
+    if center_cross_refinement.min_axis_angle_deg > 90.0:
+        raise ValueError("perception.center_cross_refinement.min_axis_angle_deg must be <= 90.")
+
+    safe_color_raw = _mapping(perception_raw["safe_zone_color"], "perception.safe_zone_color")
+    _reject_unknown(safe_color_raw, {"enabled", "red_hsv_ranges", "blue_hsv_ranges", "min_fraction", "min_margin"}, "perception.safe_zone_color")
+    safe_color_enabled = safe_color_raw["enabled"]
+    if not isinstance(safe_color_enabled, bool):
+        raise ValueError("perception.safe_zone_color.enabled must be a boolean.")
+
+    def parse_safe_ranges(name: str) -> tuple[tuple[tuple[int, int, int], tuple[int, int, int]], ...]:
+        values = safe_color_raw[name]
+        if not isinstance(values, list):
+            raise ValueError(f"perception.safe_zone_color.{name} must be a list.")
+        parsed = []
+        for index, value in enumerate(values):
+            item = _mapping(value, f"perception.safe_zone_color.{name}[{index}]")
+            _reject_unknown(item, {"lower", "upper"}, f"perception.safe_zone_color.{name}[{index}]")
+            hsv_range = HsvRange(
+                _hsv_triplet(item.get("lower"), f"perception.safe_zone_color.{name}[{index}].lower"),
+                _hsv_triplet(item.get("upper"), f"perception.safe_zone_color.{name}[{index}].upper"),
+            )
+            parsed.append((hsv_range.lower, hsv_range.upper))
+        return tuple(parsed)
+
+    red_safe_ranges = parse_safe_ranges("red_hsv_ranges")
+    blue_safe_ranges = parse_safe_ranges("blue_hsv_ranges")
+    if safe_color_enabled and (not red_safe_ranges or not blue_safe_ranges):
+        raise ValueError("enabled safe-zone color classification requires red and blue HSV ranges.")
+    safe_zone_color = SafeZoneColorConfig(
+        enabled=safe_color_enabled,
+        red_hsv_ranges=red_safe_ranges,
+        blue_hsv_ranges=blue_safe_ranges,
+        min_fraction=_threshold(safe_color_raw["min_fraction"], "perception.safe_zone_color.min_fraction"),
+        min_margin=_threshold(safe_color_raw["min_margin"], "perception.safe_zone_color.min_margin"),
+    )
 
     color_raw = _mapping(
         _required(
@@ -2667,6 +2823,8 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         k0_threshold=k0_threshold,
         color_classifier=color_classifier,
         target_ground_geometry=target_ground_geometry,
+        center_cross_refinement=center_cross_refinement,
+        safe_zone_color=safe_zone_color,
     )
 
     localization_raw = _merge_defaults(
@@ -3174,7 +3332,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "postprocess_onnx_path",
             "output_mapping_path",
             "raw_classes",
-            "class_mapping",
             "backend_score_threshold",
             "max_detections",
         },
@@ -3205,23 +3362,12 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     )
     if len(set(raw_classes)) != len(raw_classes):
         raise ValueError("hailo.raw_classes must not contain duplicates.")
-
-    mapping_value = hailo_raw.get("class_mapping", {})
-    mapping_raw = _mapping(mapping_value, "hailo.class_mapping")
-    if set(mapping_raw) != set(raw_classes):
+    expected_pose_classes = tuple(item.value for item in POSE_MODEL_CLASSES)
+    if raw_classes and raw_classes != expected_pose_classes:
         raise ValueError(
-            "hailo.class_mapping keys must exactly match hailo.raw_classes."
+            "hailo.raw_classes must exactly match YOLO Pose v3 order "
+            f"{list(expected_pose_classes)!r}, got {list(raw_classes)!r}."
         )
-    try:
-        class_mapping = tuple(
-            TargetClass(_string(mapping_raw[name], f"hailo.class_mapping.{name}"))
-            for name in raw_classes
-        )
-    except ValueError as exc:
-        raise ValueError(
-            "hailo.class_mapping values must be green_supply, black_core, "
-            "orange_injured, blue_danger or unknown."
-        ) from exc
 
     backend_score_threshold = _threshold(
         hailo_raw.get("backend_score_threshold", 0.01),
@@ -3258,7 +3404,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         postprocess_onnx_path=postprocess_onnx_path,
         output_mapping_path=output_mapping_path,
         raw_classes=raw_classes,
-        class_mapping=class_mapping,
         backend_score_threshold=backend_score_threshold,
         max_detections=max_detections,
     )

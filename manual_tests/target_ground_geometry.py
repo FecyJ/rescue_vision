@@ -355,12 +355,13 @@ def main() -> None:
 
     detector = TargetPoseDetector(
         backend=backend,
-        class_mapping=config.hailo.model_class_mapping(),
         detection_threshold=config.perception.detection_threshold,
         k0_threshold=config.perception.k0_threshold,
         color_classifier=config.perception.color_classifier,
         max_observation_age_ms=config.processing.max_observation_age_ms,
         ground_projector=projector,
+        center_cross_refinement=config.perception.center_cross_refinement,
+        safe_zone_color=config.perception.safe_zone_color,
     )
 
     with (

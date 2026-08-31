@@ -225,6 +225,8 @@ class StaticFieldLandmarkTracker:
             )
             seen = True
         for zone in result.safe_zones:
+            if zone.physical_color is SafeZoneColor.UNKNOWN:
+                continue
             landmark_id = f"{zone.physical_color.value}_safe_zone"
             residual = None
             team_color = (
@@ -236,19 +238,14 @@ class StaticFieldLandmarkTracker:
             if (
                 pose is not None
                 and field_polygon is not None
-                and zone.polygon_ground is not None
+                and zone.ground_anchor.ground is not None
             ):
                 expected_field = FieldPoint(
                     sum(point.x for point in field_polygon) / len(field_polygon),
                     sum(point.y for point in field_polygon) / len(field_polygon),
                 )
                 expected = _field_to_ground(pose, expected_field)
-                observed = GroundPoint(
-                    sum(point.x for point in zone.polygon_ground)
-                    / len(zone.polygon_ground),
-                    sum(point.y for point in zone.polygon_ground)
-                    / len(zone.polygon_ground),
-                )
+                observed = zone.ground_anchor.ground
                 residual = math.hypot(
                     observed.x - expected.x,
                     observed.y - expected.y,
@@ -445,7 +442,7 @@ class SafeZoneCornerPoseObservation:
 
 
 class SafeZoneCornerLocalizer:
-    """Fit a unique field pose from fresh semantic safe-zone corners."""
+    """枚举 v3 安全区身份和图像左右角点对应，并用先验选择唯一位姿。"""
 
     def __init__(
         self,
@@ -457,45 +454,11 @@ class SafeZoneCornerLocalizer:
         self._static_map = static_map
         self.config = config or SafeZoneCornerLocalizerConfig()
 
-    def _field_corners(
-        self,
-        color: SafeZoneColor,
-    ) -> dict[SafeZoneCornerRole, FieldPoint]:
-        team_color = TeamColor.RED if color is SafeZoneColor.RED else TeamColor.BLUE
-        polygon = self._static_map.safe_zone_polygon_field(team_color)
-        if polygon is None:
-            return {}
-        center = np.mean([(point.x, point.y) for point in polygon], axis=0)
-        direction = center / max(float(np.linalg.norm(center)), 1e-9)
-        left = np.asarray((-direction[1], direction[0]))
-        ordered = sorted(
-            polygon,
-            key=lambda point: point.x * direction[0] + point.y * direction[1],
-        )
-        entrance = ordered[:2]
-        back = ordered[-2:]
-
-        def left_right(points: list[FieldPoint]) -> tuple[FieldPoint, FieldPoint]:
-            ranked = sorted(
-                points,
-                key=lambda point: point.x * left[0] + point.y * left[1],
-                reverse=True,
-            )
-            return ranked[0], ranked[1]
-
-        entrance_left, entrance_right = left_right(entrance)
-        back_left, back_right = left_right(back)
-        return {
-            SafeZoneCornerRole.ENTRANCE_LEFT: entrance_left,
-            SafeZoneCornerRole.ENTRANCE_RIGHT: entrance_right,
-            SafeZoneCornerRole.BACK_LEFT: back_left,
-            SafeZoneCornerRole.BACK_RIGHT: back_right,
-        }
-
     def localize(
         self,
         result: FieldFeatureDetectionResult,
         *,
+        prior_pose: FieldPose2D | None = None,
         current_timestamp_ns: int | None = None,
     ) -> SafeZoneCornerPoseObservation | None:
         now = result.result_timestamp_ns if current_timestamp_ns is None else current_timestamp_ns
@@ -506,99 +469,103 @@ class SafeZoneCornerLocalizer:
             > round(self.config.max_observation_age_ms * 1_000_000)
         ):
             return None
+        if prior_pose is None:
+            # K1/K2 是图像左右语义；对称近场线在无先验时至少保留 180° 歧义。
+            return None
         candidates: list[SafeZoneCornerPoseObservation] = []
         for zone in result.safe_zones:
-            field_by_role = self._field_corners(zone.physical_color)
-            pairs = [
-                (corner, field_by_role.get(corner.role))
-                for corner in zone.corners
-                if corner.ground is not None
-            ]
-            pairs = [(corner, point) for corner, point in pairs if point is not None]
-            if len(pairs) < 2:
+            left = zone.image_left_landmark
+            right = zone.image_right_landmark
+            if left.ground is None or right.ground is None:
                 continue
-            ground = np.asarray(
-                [(corner.ground.x, corner.ground.y) for corner, _ in pairs],
-                dtype=np.float64,
-            )
-            field = np.asarray(
-                [(point.x, point.y) for _, point in pairs],
-                dtype=np.float64,
-            )
-            if max(
-                float(np.linalg.norm(ground[i] - ground[j]))
-                for i in range(len(ground))
-                for j in range(i)
-            ) < self.config.min_baseline_mm:
+            if math.hypot(left.ground.x - right.ground.x, left.ground.y - right.ground.y) < self.config.min_baseline_mm:
                 continue
-            active = list(range(len(pairs)))
-            rotation: np.ndarray | None = None
-            translation: np.ndarray | None = None
-            residual = float("inf")
-            while len(active) >= 2:
-                selected_ground = ground[active]
-                selected_field = field[active]
-                ground_mean = np.mean(selected_ground, axis=0)
-                field_mean = np.mean(selected_field, axis=0)
-                u, _singular, vt = np.linalg.svd(
-                    (selected_ground - ground_mean).T
-                    @ (selected_field - field_mean)
-                )
-                rotation = vt.T @ u.T
-                if np.linalg.det(rotation) < 0.0:
-                    vt[-1, :] *= -1.0
+            colors = (
+                (zone.physical_color,)
+                if zone.physical_color is not SafeZoneColor.UNKNOWN
+                else (SafeZoneColor.RED, SafeZoneColor.BLUE)
+            )
+            for color in colors:
+                team_color = TeamColor.RED if color is SafeZoneColor.RED else TeamColor.BLUE
+                landmarks = self._static_map.safe_zone_landmarks_for(team_color)
+                if landmarks is None or not landmarks.measured or not landmarks.usable:
+                    continue
+                for swap in (False, True):
+                    world_left, world_right = (
+                        (landmarks.near_field_corner_b, landmarks.near_field_corner_a)
+                        if swap
+                        else (landmarks.near_field_corner_a, landmarks.near_field_corner_b)
+                    )
+                    ground_points = [left.ground, right.ground]
+                    field_points = [world_left, world_right]
+                    confidences = [left.confidence, right.confidence]
+                    used_roles = (
+                        (SafeZoneCornerRole.ENTRANCE_RIGHT, SafeZoneCornerRole.ENTRANCE_LEFT)
+                        if swap
+                        else (SafeZoneCornerRole.ENTRANCE_LEFT, SafeZoneCornerRole.ENTRANCE_RIGHT)
+                    )
+                    if zone.ground_anchor.ground is not None:
+                        ground_points.append(zone.ground_anchor.ground)
+                        field_points.append(landmarks.ground_anchor_field)
+                        confidences.append(zone.ground_anchor.confidence)
+                    ground = np.asarray([(point.x, point.y) for point in ground_points], dtype=np.float64)
+                    field = np.asarray([(point.x, point.y) for point in field_points], dtype=np.float64)
+                    active = list(range(len(ground_points)))
+                    selected_ground = ground[active]
+                    selected_field = field[active]
+                    ground_mean = np.mean(selected_ground, axis=0)
+                    field_mean = np.mean(selected_field, axis=0)
+                    u, _singular, vt = np.linalg.svd((selected_ground - ground_mean).T @ (selected_field - field_mean))
                     rotation = vt.T @ u.T
-                translation = field_mean - rotation @ ground_mean
-                predicted = (
-                    (rotation @ selected_ground.T).T + translation
+                    if np.linalg.det(rotation) < 0.0:
+                        vt[-1, :] *= -1.0
+                        rotation = vt.T @ u.T
+                    translation = field_mean - rotation @ ground_mean
+                    predicted = (rotation @ selected_ground.T).T + translation
+                    point_errors = np.linalg.norm(predicted - selected_field, axis=1)
+                    residual = float(np.sqrt(np.mean(point_errors**2)))
+                    if residual > self.config.max_fit_residual_mm:
+                        continue
+                    heading = normalize_angle(math.atan2(float(rotation[1, 0]), float(rotation[0, 0])))
+                    confidence = min(
+                        1.0,
+                        zone.confidence * float(np.mean(confidences))
+                        * max(0.1, 1.0 - residual / self.config.max_fit_residual_mm),
+                    )
+                    candidates.append(SafeZoneCornerPoseObservation(
+                        result.frame_sequence,
+                        result.capture_timestamp_ns,
+                        result.result_timestamp_ns,
+                        color,
+                        used_roles,
+                        FieldPose2D(FieldPoint(float(translation[0]), float(translation[1])), heading),
+                        max(self.config.position_uncertainty_floor_mm, residual),
+                        math.radians(self.config.heading_uncertainty_floor_deg),
+                        residual,
+                        max(0.01, confidence),
+                    ))
+        ranked = sorted(
+            [
+                (
+                    _innovation(
+                        item.pose,
+                        prior_pose,
+                        position_uncertainty_mm=item.position_uncertainty_mm,
+                        heading_uncertainty_rad=item.heading_uncertainty_rad,
+                    ),
+                    item,
                 )
-                point_errors = np.linalg.norm(
-                    predicted - selected_field,
-                    axis=1,
-                )
-                residual = float(np.sqrt(np.mean(point_errors**2)))
-                if residual <= self.config.max_fit_residual_mm:
-                    break
-                if len(active) == 2:
-                    active = []
-                    break
-                del active[int(np.argmax(point_errors))]
-            if not active or rotation is None or translation is None:
-                continue
-            used_pairs = [pairs[index] for index in active]
-            selected_ground = ground[active]
-            if max(
-                float(np.linalg.norm(selected_ground[i] - selected_ground[j]))
-                for i in range(len(selected_ground))
-                for j in range(i)
-            ) < self.config.min_baseline_mm:
-                continue
-            heading = normalize_angle(
-                math.atan2(float(rotation[1, 0]), float(rotation[0, 0]))
-            )
-            confidence = min(
-                1.0,
-                zone.confidence
-                * float(
-                    np.mean([corner.confidence for corner, _ in used_pairs])
-                )
-                * max(0.1, 1.0 - residual / self.config.max_fit_residual_mm),
-            )
-            candidates.append(
-                SafeZoneCornerPoseObservation(
-                    result.frame_sequence,
-                    result.capture_timestamp_ns,
-                    result.result_timestamp_ns,
-                    zone.physical_color,
-                    tuple(corner.role for corner, _ in used_pairs),
-                    FieldPose2D(FieldPoint(float(translation[0]), float(translation[1])), heading),
-                    max(self.config.position_uncertainty_floor_mm, residual),
-                    math.radians(self.config.heading_uncertainty_floor_deg),
-                    residual,
-                    max(0.01, confidence),
-                )
-            )
-        return max(candidates, key=lambda item: item.confidence, default=None)
+                for item in candidates
+            ],
+            key=lambda pair: pair[0],
+        )
+        if not ranked:
+            return None
+        if len(ranked) > 1 and math.isclose(
+            ranked[0][0], ranked[1][0], rel_tol=0.0, abs_tol=1e-6
+        ):
+            return None
+        return ranked[0][1]
 
 
 def _innovation(

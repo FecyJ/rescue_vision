@@ -1846,6 +1846,10 @@ def _run_hardware(
         gripper_full_travel_time_s=gripper.full_travel_time_s,
     )
     pipeline = build_camera_pipeline(config)
+    visual_localization = config.build_visual_localization_pipeline(
+        ground_projector=pipeline.ground_projector,
+        fusion=odometry_fusion,
+    )
     renderer = PerceptionFrameRenderer(
         lambda: config.build_target_pose_detector(
             ground_projector=pipeline.ground_projector
@@ -2012,6 +2016,11 @@ def _run_hardware(
                     candidate = renderer.latest_snapshot()
                     if candidate is not None:
                         latest_snapshot = candidate
+                        if (
+                            visual_localization is not None
+                            and candidate.field_features is not None
+                        ):
+                            visual_localization.submit(candidate.field_features)
                     if latest_snapshot is not None:
                         age_ms = (
                             now_ns - latest_snapshot.capture_timestamp_ns
