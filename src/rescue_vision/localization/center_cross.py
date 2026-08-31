@@ -21,6 +21,7 @@ from rescue_vision.perception.field_feature_types import (
     BoundaryFeatureKind,
     FieldFeatureDetectionResult,
     SafeZoneColor,
+    CenterCrossConfirmation,
 )
 from rescue_vision.world.static_map import StaticFieldMap
 
@@ -309,6 +310,9 @@ class CenterCrossLocalizer:
             return self._empty(result, quality)
         if len(cross.axes) != 2:
             quality.add(CenterCrossLocalizationQuality.PARTIAL_CENTER_CROSS)
+            return self._empty(result, quality)
+        if cross.confirmation is CenterCrossConfirmation.CANDIDATE:
+            quality.add(CenterCrossLocalizationQuality.UNCONFIRMED_CENTER_CROSS)
             return self._empty(result, quality)
         if (
             cross.intersection_ground is None

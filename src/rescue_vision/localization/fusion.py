@@ -17,7 +17,13 @@ from rescue_vision.localization.types import (
     FieldPose2D,
     normalize_angle,
 )
+from rescue_vision.localization.static_landmarks import (
+    SafeZoneCornerPoseObservation,
+)
 from rescue_vision.motion.protocol import OdometryImu, SensorFlags
+
+
+_ODOMETRY_RELEASE_PERIOD_US = 10_000
 
 
 class FusionQuality(str, Enum):
@@ -359,19 +365,29 @@ class OdometryImuFusion:
         self._lock = threading.RLock()
         self._history: deque[_HistoryEntry] = deque()
         self._last_sample: OdometryImu | None = None
+        self._last_effective_sample_timestamp_us: int | None = None
         self._pending_overrun: OdometryImu | None = None
+        self._consecutive_overrun_samples = 0
         self._last_host_timestamp_ns: int | None = None
         self._clock_offsets_ns: deque[int] = deque(maxlen=128)
         self._initial_pose_available = True
         self._anchor_source: str | None = None
         self._anchor_confidence = 0.0
+        self._continuity_loss_reason: str | None = None
         self._status = frozenset({FusionQuality.INITIALIZING})
+
+    @property
+    def continuity_loss_reason(self) -> str | None:
+        """最近一次连续性清除的精确原因；成功重新锚定后恢复为 ``None``。"""
+
+        with self._lock:
+            return self._continuity_loss_reason
 
     def reset(self, reason: str) -> None:
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("reason must be a non-empty string.")
         with self._lock:
-            self._lose_continuity()
+            self._lose_continuity(f"explicit_reset:{reason.strip()}")
 
     def submit_odometry(self, message: OdometryImu) -> FusedPoseEstimate:
         if not isinstance(message, OdometryImu):
@@ -383,7 +399,7 @@ class OdometryImuFusion:
             previous = self._last_sample
             if self._pending_overrun is not None:
                 if previous is None:
-                    self._lose_continuity()
+                    self._lose_continuity("pending_overrun_without_baseline")
                     return self._estimate(message.received_timestamp_ns)
                 return self._recover_overrun(
                     previous,
@@ -409,6 +425,10 @@ class OdometryImuFusion:
                     self._last_host_timestamp_ns = None
                     return self._estimate(message.received_timestamp_ns)
                 self._last_sample = message
+                self._last_effective_sample_timestamp_us = (
+                    message.sample_timestamp_us
+                )
+                self._consecutive_overrun_samples = 0
                 self._last_host_timestamp_ns = host_timestamp_ns
                 if self._initial_pose_available and self._state_entry() is None:
                     self._initialize(
@@ -426,18 +446,40 @@ class OdometryImuFusion:
 
             discontinuity = self._validate_continuity(previous, message)
             if discontinuity is not None:
-                self._lose_continuity()
+                self._lose_continuity(discontinuity)
                 self._last_sample = message
                 self._last_host_timestamp_ns = self._map_controller_time(message)
                 return self._estimate(message.received_timestamp_ns)
 
-            dt_s = (message.sample_timestamp_us - previous.sample_timestamp_us) / 1e6
+            previous_effective_timestamp_us = (
+                self._last_effective_sample_timestamp_us
+            )
+            if previous_effective_timestamp_us is None:
+                self._lose_continuity("effective_sample_time_missing")
+                return self._estimate(message.received_timestamp_ns)
+            effective_dt_us = (
+                message.sample_timestamp_us - previous_effective_timestamp_us
+            )
+            if effective_dt_us <= 0:
+                self._lose_continuity("effective_sample_time_did_not_advance")
+                return self._estimate(message.received_timestamp_ns)
+            if effective_dt_us > round(self.config.max_sample_interval_ms * 1000):
+                self._lose_continuity(
+                    "effective_sample_interval_exceeded_limit"
+                )
+                return self._estimate(message.received_timestamp_ns)
+            dt_s = effective_dt_us / 1e6
             left_delta = message.left_encoder_count - previous.left_encoder_count
             right_delta = message.right_encoder_count - previous.right_encoder_count
             left_mm = self._count_distance(left_delta, left=True)
             right_mm = self._count_distance(right_delta, left=False)
-            if max(abs(left_mm), abs(right_mm)) / dt_s > self.config.max_encoder_speed_mm_s:
-                self._lose_continuity()
+            encoder_speed_mm_s = max(abs(left_mm), abs(right_mm)) / dt_s
+            if encoder_speed_mm_s > self.config.max_encoder_speed_mm_s:
+                self._lose_continuity(
+                    "encoder_speed_exceeded:"
+                    f"{encoder_speed_mm_s:.3f}>"
+                    f"{self.config.max_encoder_speed_mm_s:.3f}mm_s"
+                )
                 self._last_sample = message
                 self._last_host_timestamp_ns = self._map_controller_time(message)
                 return self._estimate(message.received_timestamp_ns)
@@ -454,7 +496,7 @@ class OdometryImuFusion:
             )
             if not imu_usable:
                 if not self.config.allow_wheel_only:
-                    self._lose_continuity()
+                    self._lose_continuity("imu_unusable_and_wheel_only_disabled")
                     self._last_sample = message
                     self._last_host_timestamp_ns = host_timestamp_ns
                     return self._estimate(message.received_timestamp_ns)
@@ -499,6 +541,8 @@ class OdometryImuFusion:
                 self._status = self._history[-1].qualities
             self._last_sample = message
             self._last_host_timestamp_ns = host_timestamp_ns
+            self._last_effective_sample_timestamp_us = message.sample_timestamp_us
+            self._consecutive_overrun_samples = 0
             return self._estimate(message.received_timestamp_ns)
 
     def _submit_overrun(self, message: OdometryImu) -> FusedPoseEstimate:
@@ -506,13 +550,21 @@ class OdometryImuFusion:
 
         required = SensorFlags.LEFT_ENCODER_VALID | SensorFlags.RIGHT_ENCODER_VALID
         previous = self._last_sample
-        if (
-            self.config.max_interpolated_overrun_samples == 0
-            or message.sensor_flags & required != required
-            or self._pending_overrun is not None
-        ):
-            self._lose_continuity()
+        if self.config.max_interpolated_overrun_samples == 0:
+            self._lose_continuity("sample_overrun_not_tolerated")
             return self._estimate(message.received_timestamp_ns)
+        if message.sensor_flags & required != required:
+            self._lose_continuity("sample_overrun_encoder_invalid")
+            return self._estimate(message.received_timestamp_ns)
+        if self._consecutive_overrun_samples >= 2:
+            self._lose_continuity("consecutive_sample_overrun_limit_exceeded:3")
+            return self._estimate(message.received_timestamp_ns)
+        if self._pending_overrun is not None:
+            return self._recover_consecutive_overruns(
+                previous,
+                self._pending_overrun,
+                message,
+            )
         if previous is None:
             # There is no valid IMU endpoint from which to interpolate.  Keep the
             # configured initial pose available and use the next clean sample as
@@ -523,33 +575,124 @@ class OdometryImuFusion:
         sequence_delta = (
             message.telemetry_sequence - previous.telemetry_sequence
         ) & 0xFFFF
-        if (
-            sequence_delta != 1
-            or message.received_timestamp_ns <= previous.received_timestamp_ns
-        ):
-            self._lose_continuity()
+        if sequence_delta != 1:
+            self._lose_continuity(
+                f"sample_overrun_sequence_gap:{sequence_delta}"
+            )
             return self._estimate(message.received_timestamp_ns)
-        dt_s = (
-            message.received_timestamp_ns - previous.received_timestamp_ns
-        ) / 1_000_000_000.0
-        left_mm = self._count_distance(
-            message.left_encoder_count - previous.left_encoder_count,
-            left=True,
-        )
-        right_mm = self._count_distance(
-            message.right_encoder_count - previous.right_encoder_count,
-            left=False,
-        )
-        if (
-            dt_s <= 0.0
-            or max(abs(left_mm), abs(right_mm)) / dt_s
-            > self.config.max_encoder_speed_mm_s
-        ):
-            self._lose_continuity()
+        if message.received_timestamp_ns <= previous.received_timestamp_ns:
+            self._lose_continuity("sample_overrun_receive_time_not_increasing")
             return self._estimate(message.received_timestamp_ns)
+        # overrun帧的sample_timestamp_us按协议保留最近一次有效IMU提交时间，
+        # UART又可能成批交付，所以此处既不能使用IMU时间也不能使用接收间隔反算
+        # 编码器速度。先缓存，待正常帧恢复后用固定10 ms释放周期统一校验。
         self._pending_overrun = message
+        self._consecutive_overrun_samples = 1
         self._status = frozenset({FusionQuality.INTERPOLATED_IMU})
         return self._estimate(message.received_timestamp_ns)
+
+    def _recover_consecutive_overruns(
+        self,
+        previous: OdometryImu | None,
+        first_overrun: OdometryImu,
+        second_overrun: OdometryImu,
+    ) -> FusedPoseEstimate:
+        """双编码器有效时将连续两次 IMU overrun 保守降级为纯轮式预测。"""
+
+        if previous is None:
+            self._lose_continuity("consecutive_overrun_without_baseline")
+            return self._estimate(second_overrun.received_timestamp_ns)
+        if not self.config.allow_wheel_only:
+            self._lose_continuity(
+                "consecutive_overrun_and_wheel_only_disabled"
+            )
+            return self._estimate(second_overrun.received_timestamp_ns)
+        first_sequence_delta = (
+            first_overrun.telemetry_sequence - previous.telemetry_sequence
+        ) & 0xFFFF
+        second_sequence_delta = (
+            second_overrun.telemetry_sequence - first_overrun.telemetry_sequence
+        ) & 0xFFFF
+        if first_sequence_delta != 1 or second_sequence_delta != 1:
+            self._lose_continuity(
+                "consecutive_overrun_sequence_gap:"
+                f"{first_sequence_delta},{second_sequence_delta}"
+            )
+            return self._estimate(second_overrun.received_timestamp_ns)
+        if not (
+            previous.received_timestamp_ns < first_overrun.received_timestamp_ns
+            < second_overrun.received_timestamp_ns
+        ):
+            self._lose_continuity("consecutive_overrun_receive_time_not_increasing")
+            return self._estimate(second_overrun.received_timestamp_ns)
+
+        previous_effective_timestamp_us = self._last_effective_sample_timestamp_us
+        if previous_effective_timestamp_us is None:
+            self._lose_continuity("consecutive_overrun_effective_time_missing")
+            return self._estimate(second_overrun.received_timestamp_ns)
+        first_effective_timestamp_us = (
+            previous_effective_timestamp_us + _ODOMETRY_RELEASE_PERIOD_US
+        )
+        second_effective_timestamp_us = (
+            first_effective_timestamp_us + _ODOMETRY_RELEASE_PERIOD_US
+        )
+        pairs = (
+            (previous, first_overrun),
+            (first_overrun, second_overrun),
+        )
+        predictions: list[_Prediction] = []
+        for start, end in pairs:
+            dt_s = _ODOMETRY_RELEASE_PERIOD_US / 1e6
+            left_delta = end.left_encoder_count - start.left_encoder_count
+            right_delta = end.right_encoder_count - start.right_encoder_count
+            left_mm = self._count_distance(left_delta, left=True)
+            right_mm = self._count_distance(right_delta, left=False)
+            encoder_speed_mm_s = max(abs(left_mm), abs(right_mm)) / dt_s
+            if encoder_speed_mm_s > self.config.max_encoder_speed_mm_s:
+                self._lose_continuity(
+                    "consecutive_overrun_encoder_speed_exceeded:"
+                    f"{encoder_speed_mm_s:.3f}>"
+                    f"{self.config.max_encoder_speed_mm_s:.3f}mm_s"
+                )
+                return self._estimate(second_overrun.received_timestamp_ns)
+            predictions.append(
+                _Prediction(
+                    distance_mm=(left_mm + right_mm) / 2.0,
+                    encoder_heading_rad=(right_mm - left_mm) / self._track_mm,
+                    gyro_z_rad_s=None,
+                    dt_s=dt_s,
+                    covariance_scale=(
+                        self.config.dropped_sample_covariance_scale
+                        * self.config.wheel_only_covariance_scale
+                    ),
+                    qualities=frozenset({FusionQuality.WHEEL_ONLY}),
+                    stationary=(
+                        abs(left_delta)
+                        <= self.config.stationary_encoder_delta_count
+                        and abs(right_delta)
+                        <= self.config.stationary_encoder_delta_count
+                    ),
+                )
+            )
+
+        first_host_timestamp_ns = self._map_controller_time(
+            first_overrun,
+            controller_timestamp_us=first_effective_timestamp_us,
+        )
+        second_host_timestamp_ns = self._map_controller_time(
+            second_overrun,
+            controller_timestamp_us=second_effective_timestamp_us,
+        )
+        self._append_prediction(first_host_timestamp_ns, predictions[0])
+        self._append_prediction(second_host_timestamp_ns, predictions[1])
+        self._pending_overrun = None
+        self._last_sample = second_overrun
+        self._last_host_timestamp_ns = second_host_timestamp_ns
+        self._last_effective_sample_timestamp_us = second_effective_timestamp_us
+        self._consecutive_overrun_samples = 2
+        if self._history:
+            self._status = self._history[-1].qualities
+        return self._estimate(second_overrun.received_timestamp_ns)
 
     def _recover_overrun(
         self,
@@ -562,7 +705,7 @@ class OdometryImuFusion:
 
         discontinuity = self._validate_continuity(previous, current)
         if discontinuity is not None:
-            self._lose_continuity()
+            self._lose_continuity(f"overrun_recovery:{discontinuity}")
             return self._estimate(current.received_timestamp_ns)
         previous_to_overrun = (
             overrun.telemetry_sequence - previous.telemetry_sequence
@@ -571,27 +714,34 @@ class OdometryImuFusion:
             current.telemetry_sequence - overrun.telemetry_sequence
         ) & 0xFFFF
         if previous_to_overrun != 1 or overrun_to_current != 1:
-            self._lose_continuity()
+            self._lose_continuity(
+                "overrun_recovery_sequence_gap:"
+                f"{previous_to_overrun},{overrun_to_current}"
+            )
             return self._estimate(current.received_timestamp_ns)
         if (
             overrun.received_timestamp_ns <= previous.received_timestamp_ns
             or current.received_timestamp_ns <= overrun.received_timestamp_ns
         ):
-            self._lose_continuity()
+            self._lose_continuity("overrun_recovery_receive_time_not_increasing")
             return self._estimate(current.received_timestamp_ns)
         previous_host_timestamp_ns = self._last_host_timestamp_ns
         if (
             previous_host_timestamp_ns is None
             or host_timestamp_ns <= previous_host_timestamp_ns
         ):
-            self._lose_continuity()
+            self._lose_continuity("overrun_recovery_host_time_not_increasing")
             return self._estimate(current.received_timestamp_ns)
 
+        previous_effective_timestamp_us = self._last_effective_sample_timestamp_us
+        if previous_effective_timestamp_us is None:
+            self._lose_continuity("overrun_recovery_effective_time_missing")
+            return self._estimate(current.received_timestamp_ns)
         total_dt_s = (
-            current.sample_timestamp_us - previous.sample_timestamp_us
+            current.sample_timestamp_us - previous_effective_timestamp_us
         ) / 1_000_000.0
         if total_dt_s <= 0.0:
-            self._lose_continuity()
+            self._lose_continuity("overrun_recovery_nonpositive_sample_interval")
             return self._estimate(current.received_timestamp_ns)
         segment_dt_s = total_dt_s / 2.0
         first_left_mm = self._count_distance(
@@ -617,7 +767,7 @@ class OdometryImuFusion:
             or max(abs(second_left_mm), abs(second_right_mm)) / segment_dt_s
             > self.config.max_encoder_speed_mm_s
         ):
-            self._lose_continuity()
+            self._lose_continuity("overrun_recovery_encoder_speed_exceeded")
             return self._estimate(current.received_timestamp_ns)
 
         previous_gyro = self._usable_gyro(previous)
@@ -625,7 +775,9 @@ class OdometryImuFusion:
         qualities: set[FusionQuality] = {FusionQuality.INTERPOLATED_IMU}
         if previous_gyro is None or current_gyro is None:
             if not self.config.allow_wheel_only:
-                self._lose_continuity()
+                self._lose_continuity(
+                    "overrun_recovery_imu_unusable_and_wheel_only_disabled"
+                )
                 return self._estimate(current.received_timestamp_ns)
             qualities.add(FusionQuality.WHEEL_ONLY)
             first_gyro_z = None
@@ -690,6 +842,8 @@ class OdometryImuFusion:
         self._pending_overrun = None
         self._last_sample = current
         self._last_host_timestamp_ns = host_timestamp_ns
+        self._last_effective_sample_timestamp_us = current.sample_timestamp_us
+        self._consecutive_overrun_samples = 0
         return self._estimate(current.received_timestamp_ns)
 
     def pose_at(self, timestamp_ns: int) -> FusedPoseEstimate:
@@ -703,12 +857,12 @@ class OdometryImuFusion:
 
     def submit_visual(
         self,
-        observation: CenterCrossPoseObservation,
+        observation: CenterCrossPoseObservation | SafeZoneCornerPoseObservation,
     ) -> VisualFusionResult:
-        if not isinstance(observation, CenterCrossPoseObservation):
-            raise TypeError("observation must be a CenterCrossPoseObservation.")
-        if observation.selected_pose is None:
+        values = self._visual_values(observation)
+        if values is None:
             return VisualFusionResult(False, None, None)
+        pose, position_uncertainty_mm, heading_uncertainty_rad, source, confidence = values
         with self._lock:
             entry, index = self._nearest_entry(observation.capture_timestamp_ns)
             if entry is None or index is None:
@@ -727,35 +881,25 @@ class OdometryImuFusion:
                     and observation.capture_timestamp_ns - entry.timestamp_ns
                     > round(self.config.max_telemetry_age_ms * 1_000_000)
                 ):
-                    self._lose_continuity()
+                    self._lose_continuity("visual_reanchor_after_stale_history")
                     self._initialize_from_visual(observation)
                     return VisualFusionResult(True, alignment_error_ns, 0.0)
                 self._status = frozenset({FusionQuality.VISUAL_REJECTED})
                 return VisualFusionResult(False, alignment_error_ns, None)
-            candidate = min(
-                observation.candidates,
-                key=lambda item: (
-                    (item.pose.position.x - observation.selected_pose.position.x) ** 2
-                    + (item.pose.position.y - observation.selected_pose.position.y) ** 2
-                    + normalize_angle(
-                        item.pose.heading_rad - observation.selected_pose.heading_rad
-                    ) ** 2
-                ),
-            )
             measurement = np.array(
                 [
-                    observation.selected_pose.position.x,
-                    observation.selected_pose.position.y,
-                    observation.selected_pose.heading_rad,
+                    pose.position.x,
+                    pose.position.y,
+                    pose.heading_rad,
                 ],
                 dtype=np.float64,
             )
-            confidence_scale = 1.0 / max(observation.confidence, 0.05)
+            confidence_scale = 1.0 / max(confidence, 0.05)
             measurement_covariance = np.diag(
                 [
-                    candidate.position_uncertainty_mm**2 * confidence_scale,
-                    candidate.position_uncertainty_mm**2 * confidence_scale,
-                    candidate.heading_uncertainty_rad**2 * confidence_scale,
+                    position_uncertainty_mm**2 * confidence_scale,
+                    position_uncertainty_mm**2 * confidence_scale,
+                    heading_uncertainty_rad**2 * confidence_scale,
                 ]
             )
             innovation = measurement - entry.state[:3]
@@ -793,9 +937,8 @@ class OdometryImuFusion:
                 entries[replay_index].state = state
                 entries[replay_index].covariance = covariance
             self._history = deque(entries)
-            assert observation.selection_source is not None
-            self._anchor_source = observation.selection_source.value
-            self._anchor_confidence = observation.confidence
+            self._anchor_source = source
+            self._anchor_confidence = confidence
             self._status = frozenset({FusionQuality.FUSED})
             return VisualFusionResult(True, alignment_error_ns, mahalanobis)
 
@@ -822,8 +965,18 @@ class OdometryImuFusion:
             return "controller reported sample overrun"
         return None
 
-    def _map_controller_time(self, message: OdometryImu) -> int:
-        controller_ns = message.sample_timestamp_us * 1000
+    def _map_controller_time(
+        self,
+        message: OdometryImu,
+        *,
+        controller_timestamp_us: int | None = None,
+    ) -> int:
+        controller_us = (
+            message.sample_timestamp_us
+            if controller_timestamp_us is None
+            else controller_timestamp_us
+        )
+        controller_ns = controller_us * 1000
         observed_offset = message.received_timestamp_ns - controller_ns
         self._clock_offsets_ns.append(observed_offset)
         mapped = controller_ns + min(self._clock_offsets_ns)
@@ -946,6 +1099,8 @@ class OdometryImuFusion:
 
     def _usable_gyro(self, message: OdometryImu) -> np.ndarray | None:
         flags = message.sensor_flags
+        if flags & SensorFlags.SAMPLE_OVERRUN:
+            return None
         if not flags & SensorFlags.IMU_VALID:
             return None
         if flags & SensorFlags.GYRO_SATURATED:
@@ -1049,44 +1204,85 @@ class OdometryImuFusion:
         )
         self._anchor_source = source
         self._anchor_confidence = confidence
+        self._continuity_loss_reason = None
         self._status = frozenset({FusionQuality.FUSED})
 
-    def _initialize_from_visual(self, observation: CenterCrossPoseObservation) -> None:
-        assert observation.selected_pose is not None
-        assert observation.selection_source is not None
-        candidate = min(
-            observation.candidates,
-            key=lambda item: abs(
-                normalize_angle(
-                    item.pose.heading_rad - observation.selected_pose.heading_rad
-                )
-            ),
-        )
+    def _initialize_from_visual(
+        self,
+        observation: CenterCrossPoseObservation | SafeZoneCornerPoseObservation,
+    ) -> None:
+        values = self._visual_values(observation)
+        assert values is not None
+        pose, position_uncertainty_mm, heading_uncertainty_rad, source, confidence = values
         self._initialize(
-            observation.selected_pose,
+            pose,
             observation.capture_timestamp_ns,
-            candidate.position_uncertainty_mm,
-            candidate.heading_uncertainty_rad,
-            observation.selection_source.value,
-            observation.confidence,
+            position_uncertainty_mm,
+            heading_uncertainty_rad,
+            source,
+            confidence,
         )
         # A visual re-anchor is not guaranteed to coincide with the previous
         # controller sample.  Establish a fresh encoder baseline on the next
         # telemetry frame instead of replaying a delta that began before it.
         self._pending_overrun = None
         self._last_sample = None
+        self._last_effective_sample_timestamp_us = None
         self._last_host_timestamp_ns = None
         self._clock_offsets_ns.clear()
         self._initial_pose_available = False
 
     @staticmethod
-    def _is_absolute_visual(observation: CenterCrossPoseObservation) -> bool:
+    def _is_absolute_visual(
+        observation: CenterCrossPoseObservation | SafeZoneCornerPoseObservation,
+    ) -> bool:
+        if isinstance(observation, SafeZoneCornerPoseObservation):
+            return True
         return observation.selection_source in {
             CenterCrossSelectionSource.RED_SAFE_ZONE,
             CenterCrossSelectionSource.BLUE_SAFE_ZONE,
             CenterCrossSelectionSource.RED_BLUE_SAFE_ZONES,
             CenterCrossSelectionSource.STATIC_MAP_TERMINAL,
         }
+
+    @staticmethod
+    def _visual_values(
+        observation: CenterCrossPoseObservation | SafeZoneCornerPoseObservation,
+    ) -> tuple[FieldPose2D, float, float, str, float] | None:
+        if isinstance(observation, SafeZoneCornerPoseObservation):
+            return (
+                observation.pose,
+                observation.position_uncertainty_mm,
+                observation.heading_uncertainty_rad,
+                observation.source,
+                observation.confidence,
+            )
+        if not isinstance(observation, CenterCrossPoseObservation):
+            raise TypeError(
+                "observation must be a CenterCrossPoseObservation or "
+                "SafeZoneCornerPoseObservation."
+            )
+        if observation.selected_pose is None:
+            return None
+        assert observation.selection_source is not None
+        candidate = min(
+            observation.candidates,
+            key=lambda item: (
+                (item.pose.position.x - observation.selected_pose.position.x) ** 2
+                + (item.pose.position.y - observation.selected_pose.position.y) ** 2
+                + normalize_angle(
+                    item.pose.heading_rad - observation.selected_pose.heading_rad
+                )
+                ** 2
+            ),
+        )
+        return (
+            observation.selected_pose,
+            candidate.position_uncertainty_mm,
+            candidate.heading_uncertainty_rad,
+            observation.selection_source.value,
+            observation.confidence,
+        )
 
     def _append_baseline(self, timestamp_ns: int) -> None:
         current = self._state_entry()
@@ -1102,15 +1298,20 @@ class OdometryImuFusion:
                 )
             )
 
-    def _lose_continuity(self) -> None:
+    def _lose_continuity(self, reason: str) -> None:
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("continuity loss reason must be a non-empty string.")
         self._history.clear()
         self._pending_overrun = None
+        self._consecutive_overrun_samples = 0
         self._last_sample = None
+        self._last_effective_sample_timestamp_us = None
         self._last_host_timestamp_ns = None
         self._clock_offsets_ns.clear()
         self._initial_pose_available = False
         self._anchor_source = None
         self._anchor_confidence = 0.0
+        self._continuity_loss_reason = reason.strip()
         self._status = frozenset({FusionQuality.CONTINUITY_LOST})
 
     def _state_entry(self) -> _HistoryEntry | None:

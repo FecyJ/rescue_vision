@@ -213,56 +213,6 @@ perception:
       max_center_uncertainty_mm: 12.0
       min_fit_score: 0.60
       min_silhouette_iou: 0.45
-  field_features:
-    enabled: false
-    colors:
-      safe_red:
-        - lower: [0, 80, 80]
-          upper: [12, 255, 255]
-        - lower: [170, 80, 80]
-          upper: [179, 255, 255]
-      safe_blue:
-        - lower: [90, 60, 70]
-          upper: [110, 255, 255]
-      start_magenta:
-        - lower: [140, 80, 80]
-          upper: [165, 255, 255]
-      entrance_purple:
-        - lower: [130, 60, 50]
-          upper: [160, 255, 255]
-      dark_marking:
-        - lower: [0, 0, 0]
-          upper: [179, 255, 80]
-    morphology:
-      kernel_size: 5
-      open_iterations: 1
-      close_iterations: 2
-    region_filter:
-      min_area_fraction: 0.002
-      min_rectangularity: 0.55
-      dimension_tolerance_fraction: 0.40
-    safe_zone:
-      entrance_color_fraction: 0.10
-      divider_dark_fraction: 0.10
-    center_cross:
-      min_axis_span_fraction: 0.20
-      max_gap_fraction: 0.06
-      min_gap_count: 2
-      perpendicular_tolerance_deg: 15.0
-      local_window_fraction: 0.015
-      local_contrast_threshold: 10
-      max_saturation: 80
-      min_floor_value: 120
-      min_line_support_fraction: 0.10
-      min_white_surround_fraction: 0.60
-      min_axis_balance_fraction: 0.08
-      min_intersection_margin_fraction: 0.02
-    boundary:
-      canny_low_threshold: 50
-      canny_high_threshold: 150
-      min_line_length_fraction: 0.20
-      corner_tolerance_deg: 20.0
-      max_features: 8
 hailo:
   enabled: false
   hef_path: null
@@ -303,63 +253,7 @@ def test_strict_config_and_geometry_build(tmp_path) -> None:
     assert geometry.ground_projector is not None
 
 
-def test_field_boundary_builder_requires_features_and_bev(tmp_path) -> None:
-    path = tmp_path / "runtime.yaml"
-    path.write_text(config_text(), encoding="utf-8")
-    loaded = load_runtime_config(path)
-    enabled_boundary = replace(
-        loaded.perception.field_boundary,
-        enabled=True,
-    )
-    enabled_perception = replace(
-        loaded.perception,
-        field_boundary=enabled_boundary,
-        field_features=replace(loaded.perception.field_features, enabled=True),
-    )
-    projector = GroundProjector(
-        np.eye(3),
-        BevConfig(0.0, 100.0, -50.0, 50.0, 1.0),
-    )
-    field = PhysicalStaticRegion(
-        "field",
-        PhysicalRegionKind.FIELD,
-        (
-            FieldPoint(-1500.0, -1500.0),
-            FieldPoint(1500.0, -1500.0),
-            FieldPoint(1500.0, 1500.0),
-            FieldPoint(-1500.0, 1500.0),
-        ),
-    )
-    static_map = StaticFieldMap(
-        loaded.world.static_map.center_cross,
-        (field, *loaded.world.static_map.regions),
-    )
-
-    estimator = enabled_perception.build_field_boundary_estimator(
-        static_map=static_map,
-        ground_projector=projector,
-    )
-
-    assert estimator is not None
-    with pytest.raises(RuntimeError, match="BEV"):
-        enabled_perception.build_field_boundary_estimator(
-            static_map=static_map,
-            ground_projector=GroundProjector(np.eye(3)),
-        )
-    with pytest.raises(RuntimeError, match="field_features"):
-        replace(
-            enabled_perception,
-            field_features=replace(
-                enabled_perception.field_features,
-                enabled=False,
-            ),
-        ).build_field_boundary_estimator(
-            static_map=static_map,
-            ground_projector=projector,
-        )
-
-
-def test_center_cross_localizer_requires_enabled_feature_and_ground_mapping(
+def test_center_cross_localizer_requires_enabled_and_ground_mapping(
     tmp_path,
 ) -> None:
     calibration = write_intrinsics(tmp_path / "intrinsics.json")
@@ -388,10 +282,7 @@ localization:
   position_uncertainty_floor_mm: 20.0
   heading_uncertainty_floor_deg: 3.0
 """
-    enabled_text = config_text(extra=localization).replace(
-        "  field_features:\n    enabled: false",
-        "  field_features:\n    enabled: true",
-    )
+    enabled_text = config_text(extra=localization)
     path = tmp_path / "runtime.yaml"
     path.write_text(enabled_text, encoding="utf-8")
     loaded = load_runtime_config(path)
@@ -400,15 +291,25 @@ localization:
     assert loaded.build_center_cross_localizer(
         ground_projector=geometry.ground_projector
     ) is not None
+    tracker = loaded.build_static_field_landmark_tracker()
+    corner_localizer = loaded.build_safe_zone_corner_localizer()
+    assert tracker.config.confirmation_hits == 2
+    assert corner_localizer.config.min_baseline_mm == pytest.approx(150.0)
     assert loaded.build_center_cross_localizer(ground_projector=None) is None
 
-    disabled_feature_path = tmp_path / "disabled_feature.yaml"
-    disabled_feature_path.write_text(
-        config_text(extra=localization),
+    disabled_localization_path = tmp_path / "disabled_localization.yaml"
+    disabled_localization_path.write_text(
+        config_text(
+            extra=localization.replace(
+                "  enabled: true",
+                "  enabled: false",
+                1,
+            )
+        ),
         encoding="utf-8",
     )
-    disabled_feature = load_runtime_config(disabled_feature_path)
-    assert disabled_feature.build_center_cross_localizer(
+    disabled_localization = load_runtime_config(disabled_localization_path)
+    assert disabled_localization.build_center_cross_localizer(
         ground_projector=geometry.ground_projector
     ) is None
 
@@ -450,10 +351,6 @@ localization:
     )
     text = text.replace("uart:\n  enabled: false", "uart:\n  enabled: true")
     text = text.replace("  device: null", "  device: /dev/ttyAMA0", 1)
-    text = text.replace(
-        "  field_features:\n    enabled: false",
-        "  field_features:\n    enabled: true",
-    )
     text = text.replace(
         "motion:\n  enabled: false\n  wheel_track_m: null",
         """motion:
@@ -526,7 +423,6 @@ localization:
     loaded = load_runtime_config(path)
 
     assert not loaded.localization.center_cross.enabled
-    assert not loaded.perception.field_features.enabled
     assert loaded.build_odometry_imu_fusion() is not None
 
 
@@ -732,42 +628,12 @@ def test_color_classifier_config_is_loaded_from_perception(tmp_path) -> None:
     assert target_geometry.green_supply.length_mm == pytest.approx(40.0)
     assert target_geometry.black_core.edge_mm == pytest.approx(40.0)
     assert target_geometry.orange_injured.length_mm == pytest.approx(80.0)
-    field_features = config.perception.field_features
-    assert field_features.enabled is False
     assert config.world.static_map.safe_zone_dimensions_mm(
         TeamColor.RED
     ) == pytest.approx((200.0, 100.0))
     assert config.world.static_map.start_zone_dimensions_mm() == (
         (60.0, 60.0),
     )
-    assert field_features.safe_red[0].lower == (0, 80, 80)
-
-
-def test_field_feature_detector_is_built_only_when_enabled(tmp_path) -> None:
-    path = tmp_path / "runtime.yaml"
-    path.write_text(config_text(), encoding="utf-8")
-    disabled = load_runtime_config(path)
-    assert (
-        disabled.perception.build_field_feature_detector(
-            static_map=disabled.world.static_map,
-            max_observation_age_ms=150.0,
-        )
-        is None
-    )
-
-    path.write_text(
-        config_text().replace(
-            "  field_features:\n    enabled: false",
-            "  field_features:\n    enabled: true",
-        ),
-        encoding="utf-8",
-    )
-    enabled = load_runtime_config(path)
-    detector = enabled.perception.build_field_feature_detector(
-        static_map=enabled.world.static_map,
-        max_observation_age_ms=150.0,
-    )
-    assert detector is not None
 
 
 def test_target_ground_geometry_estimator_is_strictly_configured(
@@ -844,63 +710,6 @@ def test_target_ground_geometry_estimator_is_strictly_configured(
     ],
 )
 def test_target_ground_geometry_config_rejects_invalid_values(
-    tmp_path,
-    old,
-    new,
-    message,
-) -> None:
-    path = tmp_path / "runtime.yaml"
-    path.write_text(config_text().replace(old, new), encoding="utf-8")
-    with pytest.raises(ValueError, match=message):
-        load_runtime_config(path)
-
-
-@pytest.mark.parametrize(
-    ("old", "new", "message"),
-    [
-        (
-            "      dimension_tolerance_fraction: 0.40",
-            "      dimension_tolerance_fraction: 1.00",
-            "dimension_tolerance_fraction",
-        ),
-        (
-            "      kernel_size: 5",
-            "      kernel_size: 4",
-            "morphology_kernel_size",
-        ),
-        (
-            "      perpendicular_tolerance_deg: 15.0",
-            "      perpendicular_tolerance_deg: 45.0",
-            "perpendicular_tolerance_deg",
-        ),
-        (
-            "      max_saturation: 80",
-            "      max_saturation: 256",
-            "center_max_saturation",
-        ),
-        (
-            "      min_floor_value: 120",
-            "      min_floor_value: 256",
-            "center_min_floor_value",
-        ),
-        (
-            "      min_white_surround_fraction: 0.60",
-            "      min_white_surround_fraction: 0.00",
-            "center_min_white_surround_fraction",
-        ),
-        (
-            "      min_axis_balance_fraction: 0.08",
-            "      min_axis_balance_fraction: 0.50",
-            "center_min_axis_balance_fraction",
-        ),
-        (
-            "      canny_low_threshold: 50",
-            "      canny_low_threshold: 200",
-            "boundary_canny_low_threshold",
-        ),
-    ],
-)
-def test_field_feature_config_rejects_unsafe_values(
     tmp_path,
     old,
     new,
@@ -996,7 +805,7 @@ def test_optional_sections_use_safe_defaults(tmp_path) -> None:
     assert not config.motion.enabled
     assert not config.hailo.enabled
     assert not config.perception.target_ground_geometry.enabled
-    assert not config.perception.field_features.enabled
+    assert config.perception.detection_threshold == pytest.approx(0.25)
 
 
 def test_perception_supports_partial_nested_overrides(tmp_path) -> None:
@@ -1009,9 +818,8 @@ def test_perception_supports_partial_nested_overrides(tmp_path) -> None:
         "  lens_position: 1.0\n"
         "perception:\n"
         "  detection_threshold: 0.4\n"
-        "  field_features:\n"
-        "    boundary:\n"
-        "      max_features: 4\n",
+        "  color_classifier:\n"
+        "    min_color_fraction: 0.22\n",
         encoding="utf-8",
     )
 
@@ -1019,8 +827,8 @@ def test_perception_supports_partial_nested_overrides(tmp_path) -> None:
 
     assert config.perception.detection_threshold == pytest.approx(0.4)
     assert config.perception.k0_threshold == pytest.approx(0.5)
-    assert config.perception.field_features.boundary_max_features == 4
-    assert not config.perception.field_features.enabled
+    assert config.perception.color_classifier.min_color_fraction == pytest.approx(0.22)
+    assert config.perception.color_classifier.morphology_kernel_size == 3
 
 
 def test_uart_config_builds_channel_without_opening_device(tmp_path) -> None:
@@ -1039,7 +847,7 @@ def test_uart_config_builds_channel_without_opening_device(tmp_path) -> None:
 
     assert channel is not None
     assert channel.device == "/dev/serial0"
-    assert channel.baudrate == 115200
+    assert channel.baudrate == 230400
     assert channel.max_frame_bytes == 64
     assert not channel.started
 

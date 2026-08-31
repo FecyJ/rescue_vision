@@ -1,7 +1,6 @@
 """可运行应用装配入口。"""
 
 from rescue_vision.app.field_map import (
-    LatestCenterCrossLocalization,
     MapRobotPose,
 )
 from rescue_vision.app.cluster_breakup import (
@@ -27,7 +26,6 @@ from rescue_vision.app.simulation_20_point import (
 )
 
 __all__ = [
-    "LatestCenterCrossLocalization",
     "MapRobotPose",
     "BreakupDecision",
     "BreakupState",

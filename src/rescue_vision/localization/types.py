@@ -67,6 +67,7 @@ class CenterCrossLocalizationQuality(str, Enum):
     CONFLICTING_DIRECTION_ANCHORS = "conflicting_direction_anchors"
     PRIOR_INNOVATION_REJECTED = "prior_innovation_rejected"
     ANCHOR_PRIOR_CONFLICT = "anchor_prior_conflict"
+    UNCONFIRMED_CENTER_CROSS = "unconfirmed_center_cross"
 
 
 @dataclass(frozen=True, slots=True)

@@ -18,6 +18,7 @@ from rescue_vision.perception import (
     BoundaryFeatureKind,
     BoundaryFeatureObservation,
     CenterCrossObservation,
+    CenterCrossConfirmation,
     FieldFeatureDetectionResult,
     FieldFeatureQuality,
     LineSegmentObservation,
@@ -101,6 +102,10 @@ def cross(
             if not partial
             else frozenset({FieldFeatureQuality.PARTIAL})
         ),
+        confirmation=CenterCrossConfirmation.TEMPORAL_CONFIRMED,
+        axis_fit_residuals_px=((1.0,) if partial else (1.0, 1.0)),
+        axis_angle_deg=(None if partial else 90.0),
+        intersection_extrapolated=False,
     )
 
 

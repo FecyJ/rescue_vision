@@ -191,6 +191,36 @@ class StaticFieldMap:
         min_x, max_x, min_y, max_y = bounds
         return max_x - min_x, max_y - min_y
 
+    def safe_zone_polygon_field(
+        self,
+        color: TeamColor,
+    ) -> tuple[FieldPoint, ...] | None:
+        """Return the configured union rectangle for one physical safe zone."""
+
+        if color is TeamColor.UNKNOWN:
+            raise ValueError("safe-zone polygon requires red or blue color.")
+        kinds = (
+            {PhysicalRegionKind.RED_MATERIAL, PhysicalRegionKind.RED_INJURED}
+            if color is TeamColor.RED
+            else {
+                PhysicalRegionKind.BLUE_MATERIAL,
+                PhysicalRegionKind.BLUE_INJURED,
+            }
+        )
+        selected = tuple(region for region in self.regions if region.kind in kinds)
+        if len(selected) != 2 or {region.kind for region in selected} != kinds:
+            return None
+        bounds = self._bounds(selected)
+        if bounds is None:
+            return None
+        min_x, max_x, min_y, max_y = bounds
+        return (
+            FieldPoint(min_x, min_y),
+            FieldPoint(max_x, min_y),
+            FieldPoint(max_x, max_y),
+            FieldPoint(min_x, max_y),
+        )
+
     def start_zone_dimensions_mm(self) -> tuple[tuple[float, float], ...]:
         """Return bounding-box width/depth for every configured start zone."""
 

@@ -29,8 +29,6 @@ class ObservationQuality(str, Enum):
     COLOR_EVIDENCE_AMBIGUOUS = "color_evidence_ambiguous"
     POSE_COLOR_CONFLICT = "pose_color_conflict"
     K0_UNAVAILABLE = "k0_unavailable"
-    FIELD_BOUNDARY_UNCERTAIN = "field_boundary_uncertain"
-    OUTSIDE_FIELD_SUSPECTED = "outside_field_suspected"
 
 
 class ColorSegmentationStatus(str, Enum):

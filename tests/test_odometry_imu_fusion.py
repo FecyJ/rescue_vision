@@ -16,7 +16,9 @@ from rescue_vision.localization import (
     ImuFrameCalibration,
     OdometryCalibration,
     OdometryImuFusion,
+    SafeZoneCornerPoseObservation,
 )
+from rescue_vision.perception import SafeZoneColor, SafeZoneCornerRole
 from rescue_vision.motion import OdometryImu, SensorFlags
 
 
@@ -127,6 +129,24 @@ def visual(timestamp_ns: int, pose: FieldPose2D, confidence: float = 0.9):
         selection_source=CenterCrossSelectionSource.RED_SAFE_ZONE,
         confidence=confidence,
         quality=frozenset(),
+    )
+
+
+def corner_visual(timestamp_ns: int, pose: FieldPose2D):
+    return SafeZoneCornerPoseObservation(
+        frame_sequence=2,
+        capture_timestamp_ns=timestamp_ns,
+        result_timestamp_ns=timestamp_ns + 1,
+        physical_color=SafeZoneColor.BLUE,
+        used_roles=(
+            SafeZoneCornerRole.ENTRANCE_LEFT,
+            SafeZoneCornerRole.ENTRANCE_RIGHT,
+        ),
+        pose=pose,
+        position_uncertainty_mm=20.0,
+        heading_uncertainty_rad=0.05,
+        fit_residual_mm=2.0,
+        confidence=0.9,
     )
 
 
@@ -346,6 +366,19 @@ def test_invalid_continuity_clears_global_pose(message: OdometryImu) -> None:
     result = estimator.submit_odometry(message)
     assert result.pose is None
     assert FusionQuality.CONTINUITY_LOST in result.quality
+    assert estimator.continuity_loss_reason is not None
+
+
+def test_continuity_loss_reports_sample_interval_reason() -> None:
+    estimator = fusion(max_sample_interval_ms=50.0)
+    estimator.submit_odometry(odom(1, 10_000, 0, 0))
+
+    result = estimator.submit_odometry(odom(2, 300_000, 2, 2))
+
+    assert result.pose is None
+    assert estimator.continuity_loss_reason == (
+        "controller sample interval exceeded limit"
+    )
 
 
 def test_single_sample_overrun_is_recovered_with_interpolated_imu() -> None:
@@ -356,7 +389,7 @@ def test_single_sample_overrun_is_recovered_with_interpolated_imu() -> None:
     overrun = replace(
         odom(
             1,
-            10_000,
+            20_000,
             5,
             5,
             gyro_z_rad_s=50.0,
@@ -378,7 +411,31 @@ def test_single_sample_overrun_is_recovered_with_interpolated_imu() -> None:
     assert FusionQuality.INTERPOLATED_IMU in recovered.quality
 
 
-def test_consecutive_overruns_clear_continuity_after_one_recovery_budget() -> None:
+def test_single_overrun_ignores_bursty_uart_receive_interval() -> None:
+    estimator = fusion(max_encoder_speed_mm_s=1000.0)
+    first = odom(0, 10_000, 0, 0)
+    estimator.submit_odometry(first)
+    overrun = replace(
+        odom(
+            1,
+            10_000,
+            5,
+            5,
+            flags=FLAGS | SensorFlags.SAMPLE_OVERRUN,
+        ),
+        received_timestamp_ns=first.received_timestamp_ns + 100_000,
+    )
+
+    pending = estimator.submit_odometry(overrun)
+    recovered = estimator.submit_odometry(odom(2, 30_000, 10, 10))
+
+    assert pending.pose is not None
+    assert recovered.pose is not None
+    assert FusionQuality.INTERPOLATED_IMU in recovered.quality
+    assert estimator.continuity_loss_reason is None
+
+
+def test_two_consecutive_overruns_degrade_to_wheel_only() -> None:
     estimator = fusion()
     first = odom(0, 10_000, 0, 0)
     estimator.submit_odometry(first)
@@ -406,8 +463,94 @@ def test_consecutive_overruns_clear_continuity_after_one_recovery_budget() -> No
 
     result = estimator.submit_odometry(second_overrun)
 
+    assert result.pose is not None
+    assert result.pose.position.x == pytest.approx(101.0)
+    assert FusionQuality.WHEEL_ONLY in result.quality
+    assert estimator.continuity_loss_reason is None
+
+    normal = fusion()
+    normal.submit_odometry(first)
+    normal.submit_odometry(odom(1, 20_000, 5, 5))
+    normal_result = normal.submit_odometry(odom(2, 30_000, 10, 10))
+    assert result.position_uncertainty_mm is not None
+    assert normal_result.position_uncertainty_mm is not None
+    assert result.position_uncertainty_mm > normal_result.position_uncertainty_mm
+
+    recovered = estimator.submit_odometry(odom(3, 40_000, 15, 15))
+    assert recovered.pose is not None
+    assert recovered.pose.position.x == pytest.approx(101.5)
+    assert estimator.continuity_loss_reason is None
+
+
+def test_third_consecutive_overrun_clears_continuity() -> None:
+    estimator = fusion()
+    first = odom(0, 10_000, 0, 0)
+    estimator.submit_odometry(first)
+    previous = first
+    result = None
+    for sequence, count in ((1, 5), (2, 10), (3, 15)):
+        current = replace(
+            odom(
+                sequence,
+                10_000 + sequence * 10_000,
+                count,
+                count,
+                flags=FLAGS | SensorFlags.SAMPLE_OVERRUN,
+            ),
+            received_timestamp_ns=previous.received_timestamp_ns + 10_000_000,
+        )
+        result = estimator.submit_odometry(current)
+        previous = current
+
+    assert result is not None
     assert result.pose is None
     assert FusionQuality.CONTINUITY_LOST in result.quality
+    assert estimator.continuity_loss_reason == (
+        "consecutive_sample_overrun_limit_exceeded:3"
+    )
+
+
+def test_consecutive_overrun_with_invalid_encoder_still_clears_continuity() -> None:
+    estimator = fusion()
+    first = odom(0, 10_000, 0, 0)
+    estimator.submit_odometry(first)
+    estimator.submit_odometry(
+        odom(1, 20_000, 5, 5, flags=FLAGS | SensorFlags.SAMPLE_OVERRUN)
+    )
+
+    result = estimator.submit_odometry(
+        odom(
+            2,
+            30_000,
+            10,
+            10,
+            flags=(
+                FLAGS
+                | SensorFlags.SAMPLE_OVERRUN
+            )
+            & ~SensorFlags.RIGHT_ENCODER_VALID,
+        )
+    )
+
+    assert result.pose is None
+    assert estimator.continuity_loss_reason == "sample_overrun_encoder_invalid"
+
+
+def test_consecutive_overrun_requires_wheel_only_degradation_enabled() -> None:
+    estimator = fusion(allow_wheel_only=False)
+    estimator.submit_odometry(odom(0, 10_000, 0, 0))
+    estimator.submit_odometry(
+        odom(1, 20_000, 5, 5, flags=FLAGS | SensorFlags.SAMPLE_OVERRUN)
+    )
+
+    result = estimator.submit_odometry(
+        odom(2, 30_000, 10, 10, flags=FLAGS | SensorFlags.SAMPLE_OVERRUN)
+    )
+
+    assert result.pose is None
+    assert estimator.continuity_loss_reason == (
+        "consecutive_overrun_and_wheel_only_disabled"
+    )
 
 
 def test_delayed_visual_update_replays_later_motion() -> None:
@@ -444,6 +587,26 @@ def test_visual_outlier_rejected_and_visual_can_reinitialize_after_reset() -> No
     assert estimator.latest_estimate(1_020_000_000).pose == FieldPose2D(
         FieldPoint(10.0, 20.0), 0.3
     )
+
+
+def test_safe_zone_corner_visual_uses_shared_gate_and_can_reanchor() -> None:
+    estimator = fusion(visual_innovation_gate=1.0)
+    estimator.submit_odometry(odom(0, 10_000, 0, 0))
+    rejected = estimator.submit_visual(
+        corner_visual(
+            1_010_000_000,
+            FieldPose2D(FieldPoint(2000.0, 2000.0), 1.0),
+        )
+    )
+    assert not rejected.accepted
+
+    estimator.reset("controller restart")
+    pose = FieldPose2D(FieldPoint(40.0, -30.0), -0.2)
+    anchored = estimator.submit_visual(corner_visual(1_020_000_000, pose))
+    assert anchored.accepted
+    estimate = estimator.latest_estimate(1_020_000_000)
+    assert estimate.pose == pose
+    assert estimate.anchor_source == "blue_safe_zone_corners"
 
 
 def test_stale_estimate_is_cleared_and_absolute_visual_reinitializes() -> None:

@@ -27,7 +27,7 @@ uart:
   # 本地实际设备名写入不提交的 runtime.yaml；禁用时不会导入或打开串口。
   enabled: false
   device: null
-  # STM32 二进制协议在代码与专项文档中固定为 115200 8N1，不重复配置。
+  # STM32 二进制协议在代码与专项文档中固定为 230400 8N1，不重复配置。
   read_timeout_ms: 100.0
   write_timeout_ms: 100.0
   # UART 后台读取只写入有界队列；溢出视为通信故障，不静默丢报文。
@@ -108,6 +108,10 @@ motion:
     search_angular_velocity_rad_s: 0.45
     search_timeout_s: 12.0
     cluster_min_detections: 2
+    # 目标团分组的最大水平间隙（相对图像宽度，范围 [0, 1]）；相邻观测框间隙
+    # 超过该比例即分属不同目标团，居中与最近前向距离只使用成员最多的团。
+    # 0 表示只有相交/相接的框才同团；1 等价于把全部观测视为一个团。
+    cluster_group_gap_ratio: 0.10
     # 目标团包围框中心相对半幅图像的允许误差及连续确认帧数。
     center_tolerance_ratio: 0.08
     center_confirm_frames: 3
@@ -167,7 +171,6 @@ simulation_20_point:
   max_breakup_attempts_per_delivery: 2
   max_breakup_attempts_total: 8
   breakup_settle_confirm_frames: 3
-  min_breakup_progress_mm: 20.0
   min_green_clearance_mm: 80.0
   corridor_sample_step_mm: 40.0
   completed_target_exclusion_mm: 120.0
@@ -350,84 +353,6 @@ perception:
       max_center_uncertainty_mm: 12.0
       min_fit_score: 0.60
       min_silhouette_iou: 0.45
-  field_features:
-    # 当前环境没有现场场地样本，模板保持关闭；开启前必须启用并验证地面映射。
-    enabled: false
-    colors:
-      # 初值取自命题文件示意图而非官方色卡，只用于搭建和离线初调。
-      safe_red:
-        - lower: [0, 80, 80]
-          upper: [12, 255, 255]
-        - lower: [170, 80, 80]
-          upper: [179, 255, 255]
-      safe_blue:
-        - lower: [90, 60, 70]
-          upper: [110, 255, 255]
-      start_magenta:
-        - lower: [140, 80, 80]
-          upper: [165, 255, 255]
-      entrance_purple:
-        - lower: [130, 60, 50]
-          upper: [160, 255, 255]
-      dark_marking:
-        - lower: [0, 0, 0]
-          upper: [179, 255, 80]
-    morphology:
-      kernel_size: 5
-      open_iterations: 1
-      close_iterations: 2
-    region_filter:
-      min_area_fraction: 0.002
-      min_rectangularity: 0.55
-      # 同时容纳命题图内外尺寸和制造、标定误差；现场数据到位后收紧。
-      dimension_tolerance_fraction: 0.40
-    safe_zone:
-      entrance_color_fraction: 0.10
-      divider_dark_fraction: 0.10
-    center_cross:
-      min_axis_span_fraction: 0.20
-      max_gap_fraction: 0.06
-      min_gap_count: 2
-      perpendicular_tolerance_deg: 15.0
-      # 真实 BEV 中中心线常呈低对比灰色连续细线；局部暗线与点划线证据并用。
-      local_window_fraction: 0.015
-      local_contrast_threshold: 10
-      max_saturation: 80
-      # 十字参考线位于白色地板；V 下限排除黑色背景和暗色货架。
-      min_floor_value: 120
-      min_line_support_fraction: 0.10
-      # 在线两侧采样白地板，允许有色物块造成不超过约 40% 的局部遮挡。
-      min_white_surround_fraction: 0.60
-      min_axis_balance_fraction: 0.08
-      min_intersection_margin_fraction: 0.02
-    boundary:
-      canny_low_threshold: 50
-      canny_high_threshold: 150
-      min_line_length_fraction: 0.20
-      corner_tolerance_deg: 20.0
-      max_features: 8
-      min_vertical_support_count: 3
-      side_contrast_threshold: 15
-
-  # 局部场界只依赖机器人地面系 BEV，不依赖全局定位。默认只输出三态掩膜；
-  # 取得真实场边录像并验收危险类召回前，不启用推理前硬遮挡。
-  field_boundary:
-    enabled: false
-    hard_mask_enabled: false
-    min_candidate_confidence: 0.25
-    min_confirmations: 2
-    max_missed_frames: 1
-    line_angle_tolerance_deg: 12.0
-    line_distance_tolerance_mm: 120.0
-    ransac_inlier_distance_mm: 60.0
-    rectangle_tolerance_fraction: 0.20
-    boundary_band_mm: 120.0
-    segment_extension_mm: 150.0
-    min_filter_confidence: 0.55
-    max_mask_age_ms: 150.0
-    mask_blur_radius_px: 5
-    neutral_fill_bgr: [114, 114, 114]
-
 localization:
   # 总开关控制中心十字绝对观测；连续融合另由 fusion.enabled 控制。
   enabled: false
@@ -441,6 +366,22 @@ localization:
   # 无实场误差标定前只提供保守下限，不能当作已验证精度。
   position_uncertainty_floor_mm: 20.0
   heading_uncertainty_floor_deg: 3.0
+  static_landmarks:
+    max_track_age_ms: 250.0
+    max_prior_position_uncertainty_mm: 300.0
+    max_prior_heading_uncertainty_deg: 15.0
+    cross_base_radius_mm: 180.0
+    safe_zone_base_margin_mm: 120.0
+    confirmation_hits: 2
+    max_confirmation_age_ms: 150.0
+    confirmation_ground_tolerance_mm: 120.0
+    confirmation_axis_tolerance_deg: 20.0
+  safe_zone_corners:
+    max_observation_age_ms: 250.0
+    min_baseline_mm: 150.0
+    max_fit_residual_mm: 80.0
+    position_uncertainty_floor_mm: 30.0
+    heading_uncertainty_floor_deg: 3.0
   fusion:
     # 真实轮径、计数、轮距、零偏和噪声未标定前保持关闭。
     enabled: false
@@ -505,8 +446,9 @@ localization:
     wheel_only_covariance_scale: 4.0
     # 遥测序号正向跳过但累计计数仍合法时的协方差乘数，无单位，必须 >= 1。
     dropped_sample_covariance_scale: 3.0
-    # 允许缓存并插值补偿的连续采样超期帧数；当前实现只支持 0 或 1。
-    # 1 表示单次异常不退出，下一帧正常时用前后有效陀螺数据线性插值。
+    # 是否允许单帧采样超期缓存并插值补偿；当前实现只支持 0 或 1。
+    # 1 表示单次异常等待下一帧正常遥测并插值 IMU；连续第二帧且编码器
+    # 证据全部合法时改用纯轮式并放大协方差，连续第三帧仍清除连续位姿。
     max_interpolated_overrun_samples: 1
     # 相邻 STM32 实际采样时间允许的最大间隔，单位 ms；超出即中断连续定位。
     max_sample_interval_ms: 50.0

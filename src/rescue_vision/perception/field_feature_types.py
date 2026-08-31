@@ -1,4 +1,4 @@
-"""传统视觉场地特征的配置与逐帧观测契约。"""
+"""场地特征检测结果的逐帧观测契约。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ from enum import Enum
 import math
 
 from rescue_vision.geometry.types import GroundPoint, UndistortedPixel
-from rescue_vision.perception.types import HsvRange
 
 
 class SafeZoneColor(str, Enum):
@@ -24,6 +23,15 @@ class SafeZoneSide(str, Enum):
     APPROACH_RIGHT = "approach_right"
 
 
+class SafeZoneCornerRole(str, Enum):
+    """从场内面向安全区时，紫色围框四个地面角点的稳定语义。"""
+
+    ENTRANCE_LEFT = "entrance_left"
+    ENTRANCE_RIGHT = "entrance_right"
+    BACK_LEFT = "back_left"
+    BACK_RIGHT = "back_right"
+
+
 class BoundaryFeatureKind(str, Enum):
     """围栏样式不稳定时仍可输出的低精度边界特征。"""
 
@@ -32,7 +40,7 @@ class BoundaryFeatureKind(str, Enum):
 
 
 class FieldFeatureQuality(str, Enum):
-    """传统视觉观测的显式降级原因。"""
+    """场地特征观测的显式降级原因。"""
 
     NO_GROUND_PROJECTION = "no_ground_projection"
     PARTIAL = "partial"
@@ -40,6 +48,14 @@ class FieldFeatureQuality(str, Enum):
     DIVIDER_UNRESOLVED = "divider_unresolved"
     SIDE_UNRESOLVED = "side_unresolved"
     LOW_CONFIDENCE_BOUNDARY = "low_confidence_boundary"
+
+
+class CenterCrossConfirmation(str, Enum):
+    """中心十字候选是否已具备定位消费所需的确认来源。"""
+
+    CANDIDATE = "candidate"
+    PRIOR_GUIDED = "prior_guided"
+    TEMPORAL_CONFIRMED = "temporal_confirmed"
 
 
 def _finite(value: float, location: str) -> float:
@@ -109,171 +125,6 @@ def _validate_ground_polygon(
 
 
 @dataclass(frozen=True, slots=True)
-class FieldFeatureConfig:
-    """颜色、形态学和几何筛选的单一运行时权威。"""
-
-    enabled: bool
-    safe_red: tuple[HsvRange, ...]
-    safe_blue: tuple[HsvRange, ...]
-    start_magenta: tuple[HsvRange, ...]
-    entrance_purple: tuple[HsvRange, ...]
-    dark_marking: tuple[HsvRange, ...]
-    morphology_kernel_size: int
-    open_iterations: int
-    close_iterations: int
-    min_region_area_fraction: float
-    min_rectangularity: float
-    dimension_tolerance_fraction: float
-    entrance_color_fraction: float
-    divider_dark_fraction: float
-    center_min_axis_span_fraction: float
-    center_max_gap_fraction: float
-    center_min_gap_count: int
-    center_perpendicular_tolerance_deg: float
-    center_local_window_fraction: float
-    center_local_contrast_threshold: int
-    center_max_saturation: int
-    center_min_floor_value: int
-    center_min_line_support_fraction: float
-    center_min_white_surround_fraction: float
-    center_min_axis_balance_fraction: float
-    center_min_intersection_margin_fraction: float
-    boundary_canny_low_threshold: int
-    boundary_canny_high_threshold: int
-    boundary_min_line_length_fraction: float
-    boundary_corner_tolerance_deg: float
-    boundary_max_features: int
-    boundary_min_vertical_support_count: int
-    boundary_side_contrast_threshold: int
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.enabled, bool):
-            raise ValueError("enabled must be a boolean.")
-        for name in (
-            "safe_red",
-            "safe_blue",
-            "start_magenta",
-            "entrance_purple",
-            "dark_marking",
-        ):
-            ranges = getattr(self, name)
-            if (
-                not isinstance(ranges, tuple)
-                or not ranges
-                or not all(isinstance(item, HsvRange) for item in ranges)
-            ):
-                raise ValueError(f"{name} must contain at least one HsvRange.")
-        if (
-            isinstance(self.morphology_kernel_size, bool)
-            or not isinstance(self.morphology_kernel_size, int)
-            or self.morphology_kernel_size <= 0
-            or self.morphology_kernel_size % 2 == 0
-        ):
-            raise ValueError(
-                "morphology_kernel_size must be a positive odd integer."
-            )
-        for name in ("open_iterations", "close_iterations"):
-            value = getattr(self, name)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or value < 0
-            ):
-                raise ValueError(f"{name} must be a non-negative integer.")
-        if (
-            isinstance(self.center_min_gap_count, bool)
-            or not isinstance(self.center_min_gap_count, int)
-            or self.center_min_gap_count <= 0
-        ):
-            raise ValueError("center_min_gap_count must be a positive integer.")
-        for name in (
-            "center_local_contrast_threshold",
-            "center_max_saturation",
-            "center_min_floor_value",
-            "boundary_canny_low_threshold",
-            "boundary_canny_high_threshold",
-            "boundary_side_contrast_threshold",
-        ):
-            value = getattr(self, name)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or not 0 <= value <= 255
-            ):
-                raise ValueError(f"{name} must be an integer in [0, 255].")
-        if self.boundary_canny_low_threshold >= self.boundary_canny_high_threshold:
-            raise ValueError(
-                "boundary_canny_low_threshold must be less than "
-                "boundary_canny_high_threshold."
-            )
-        for name in (
-            "min_region_area_fraction",
-            "min_rectangularity",
-            "dimension_tolerance_fraction",
-            "entrance_color_fraction",
-            "divider_dark_fraction",
-            "center_min_axis_span_fraction",
-            "center_max_gap_fraction",
-            "center_local_window_fraction",
-            "center_min_line_support_fraction",
-            "center_min_white_surround_fraction",
-            "center_min_axis_balance_fraction",
-            "center_min_intersection_margin_fraction",
-            "boundary_min_line_length_fraction",
-        ):
-            _probability(getattr(self, name), name)
-        if self.center_local_window_fraction <= 0.0:
-            raise ValueError("center_local_window_fraction must be positive.")
-        if self.center_min_line_support_fraction <= 0.0:
-            raise ValueError(
-                "center_min_line_support_fraction must be positive."
-            )
-        if self.center_min_white_surround_fraction <= 0.0:
-            raise ValueError(
-                "center_min_white_surround_fraction must be positive."
-            )
-        if not 0.0 < self.center_min_axis_balance_fraction < 0.5:
-            raise ValueError(
-                "center_min_axis_balance_fraction must be in (0, 0.5)."
-            )
-        if self.center_min_intersection_margin_fraction <= 0.0:
-            raise ValueError(
-                "center_min_intersection_margin_fraction must be positive."
-            )
-        if self.dimension_tolerance_fraction >= 1.0:
-            raise ValueError("dimension_tolerance_fraction must be less than 1.")
-        for name in (
-            "center_perpendicular_tolerance_deg",
-            "boundary_corner_tolerance_deg",
-        ):
-            value = _positive(getattr(self, name), name)
-            if value >= 45.0:
-                raise ValueError(f"{name} must be less than 45 degrees.")
-        if (
-            isinstance(self.boundary_max_features, bool)
-            or not isinstance(self.boundary_max_features, int)
-            or self.boundary_max_features <= 0
-        ):
-            raise ValueError("boundary_max_features must be a positive integer.")
-        if (
-            isinstance(self.boundary_min_vertical_support_count, bool)
-            or not isinstance(self.boundary_min_vertical_support_count, int)
-            or self.boundary_min_vertical_support_count <= 0
-        ):
-            raise ValueError(
-                "boundary_min_vertical_support_count must be a positive integer."
-            )
-
-    def ranges_for_safe_color(
-        self,
-        color: SafeZoneColor,
-    ) -> tuple[HsvRange, ...]:
-        if not isinstance(color, SafeZoneColor):
-            raise ValueError("color must be a SafeZoneColor.")
-        return self.safe_red if color is SafeZoneColor.RED else self.safe_blue
-
-
-@dataclass(frozen=True, slots=True)
 class LineSegmentObservation:
     """同一条线段在去畸变像素和可选机器人地面坐标中的表示。"""
 
@@ -327,6 +178,122 @@ class SafeZoneHalfObservation:
 
 
 @dataclass(frozen=True, slots=True)
+class SafeZoneCornerObservation:
+    """安全区紫色围框的语义角点；地面坐标缺失时不能用于定位。"""
+
+    role: SafeZoneCornerRole
+    undistorted: UndistortedPixel
+    ground: GroundPoint | None
+    confidence: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.role, SafeZoneCornerRole):
+            raise ValueError("role must be a SafeZoneCornerRole.")
+        if not isinstance(self.undistorted, UndistortedPixel):
+            raise ValueError("undistorted must be an UndistortedPixel.")
+        _finite(self.undistorted.u, "undistorted.u")
+        _finite(self.undistorted.v, "undistorted.v")
+        if self.ground is not None:
+            if not isinstance(self.ground, GroundPoint):
+                raise ValueError("ground must be a GroundPoint or None.")
+            _finite(self.ground.x, "ground.x")
+            _finite(self.ground.y, "ground.y")
+        _probability(self.confidence, "confidence")
+
+
+@dataclass(frozen=True, slots=True)
+class SafeZoneSearchRegion:
+    """由定位先验投影到机器人地面系的安全区搜索范围。"""
+
+    physical_color: SafeZoneColor
+    polygon_ground: tuple[GroundPoint, ...]
+    margin_mm: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.physical_color, SafeZoneColor):
+            raise ValueError("physical_color must be a SafeZoneColor.")
+        _validate_ground_polygon(
+            self.polygon_ground,
+            len(self.polygon_ground),
+            "polygon_ground",
+        )
+        if len(self.polygon_ground) < 3:
+            raise ValueError("polygon_ground must contain at least three points.")
+        if _finite(self.margin_mm, "margin_mm") < 0.0:
+            raise ValueError("margin_mm must be non-negative.")
+
+
+@dataclass(frozen=True, slots=True)
+class FieldFeatureSearchHint:
+    """可丢弃的定位搜索提示；只约束本帧候选，不构成视觉观测。"""
+
+    cross_center_ground: GroundPoint
+    cross_radius_mm: float
+    cross_axis_directions_ground: tuple[tuple[float, float], ...]
+    cross_position_uncertainty_mm: float
+    cross_heading_uncertainty_rad: float
+    safe_zone_regions: tuple[SafeZoneSearchRegion, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.cross_center_ground, GroundPoint):
+            raise ValueError("cross_center_ground must be a GroundPoint.")
+        _finite(self.cross_center_ground.x, "cross_center_ground.x")
+        _finite(self.cross_center_ground.y, "cross_center_ground.y")
+        if _positive(self.cross_radius_mm, "cross_radius_mm") <= 0.0:
+            raise ValueError("cross_radius_mm must be positive.")
+        _positive(
+            self.cross_position_uncertainty_mm,
+            "cross_position_uncertainty_mm",
+        )
+        heading_uncertainty = _positive(
+            self.cross_heading_uncertainty_rad,
+            "cross_heading_uncertainty_rad",
+        )
+        if heading_uncertainty >= math.pi:
+            raise ValueError(
+                "cross_heading_uncertainty_rad must be less than pi radians."
+            )
+        if len(self.cross_axis_directions_ground) != 2:
+            raise ValueError(
+                "cross_axis_directions_ground must contain two directions."
+            )
+        for index, direction in enumerate(self.cross_axis_directions_ground):
+            if not isinstance(direction, tuple) or len(direction) != 2:
+                raise ValueError(
+                    f"cross_axis_directions_ground[{index}] must be a pair."
+                )
+            forward = _finite(
+                direction[0],
+                f"cross_axis_directions_ground[{index}][0]",
+            )
+            left = _finite(
+                direction[1],
+                f"cross_axis_directions_ground[{index}][1]",
+            )
+            if not math.isclose(math.hypot(forward, left), 1.0, abs_tol=1e-6):
+                raise ValueError("cross axis directions must be unit vectors.")
+        dot = sum(
+            first * second
+            for first, second in zip(
+                self.cross_axis_directions_ground[0],
+                self.cross_axis_directions_ground[1],
+            )
+        )
+        if not math.isclose(dot, 0.0, abs_tol=1e-6):
+            raise ValueError("cross axis directions must be perpendicular.")
+        if not all(
+            isinstance(item, SafeZoneSearchRegion)
+            for item in self.safe_zone_regions
+        ):
+            raise ValueError(
+                "safe_zone_regions must contain SafeZoneSearchRegion values."
+            )
+        colors = [item.physical_color for item in self.safe_zone_regions]
+        if len(colors) != len(set(colors)):
+            raise ValueError("safe-zone search colors must be unique.")
+
+
+@dataclass(frozen=True, slots=True)
 class SafeZoneObservation:
     physical_color: SafeZoneColor
     polygon_undistorted: tuple[UndistortedPixel, ...]
@@ -336,6 +303,7 @@ class SafeZoneObservation:
     halves: tuple[SafeZoneHalfObservation, ...]
     confidence: float
     quality: frozenset[FieldFeatureQuality]
+    corners: tuple[SafeZoneCornerObservation, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.physical_color, SafeZoneColor):
@@ -356,6 +324,11 @@ class SafeZoneObservation:
             item.side for item in self.halves
         } != set(SafeZoneSide):
             raise ValueError("halves must contain approach_left and approach_right.")
+        if not all(isinstance(item, SafeZoneCornerObservation) for item in self.corners):
+            raise ValueError("corners must contain SafeZoneCornerObservation values.")
+        roles = [item.role for item in self.corners]
+        if len(roles) != len(set(roles)):
+            raise ValueError("safe-zone corner roles must be unique.")
         _probability(self.confidence, "confidence")
         if not all(isinstance(item, FieldFeatureQuality) for item in self.quality):
             raise ValueError("quality must contain FieldFeatureQuality values.")
@@ -396,6 +369,10 @@ class CenterCrossObservation:
     intersection_ground: GroundPoint | None
     confidence: float
     quality: frozenset[FieldFeatureQuality]
+    confirmation: CenterCrossConfirmation
+    axis_fit_residuals_px: tuple[float, ...]
+    axis_angle_deg: float | None
+    intersection_extrapolated: bool
 
     def __post_init__(self) -> None:
         if len(self.axes) not in {1, 2}:
@@ -426,6 +403,25 @@ class CenterCrossObservation:
             raise ValueError("a complete center cross requires an intersection.")
         if len(self.axes) == 1 and FieldFeatureQuality.PARTIAL not in self.quality:
             raise ValueError("a single center axis must be marked partial.")
+        if not isinstance(self.confirmation, CenterCrossConfirmation):
+            raise ValueError("confirmation must be a CenterCrossConfirmation.")
+        if len(self.axis_fit_residuals_px) != len(self.axes):
+            raise ValueError("axis_fit_residuals_px must match axes length.")
+        for index, residual in enumerate(self.axis_fit_residuals_px):
+            if _finite(residual, f"axis_fit_residuals_px[{index}]") < 0.0:
+                raise ValueError("axis fit residuals must be non-negative.")
+        if len(self.axes) == 1 and self.axis_angle_deg is not None:
+            raise ValueError("a partial center cross cannot have an axis angle.")
+        if len(self.axes) == 2:
+            if self.axis_angle_deg is None:
+                raise ValueError("a complete center cross requires axis_angle_deg.")
+            angle = _finite(self.axis_angle_deg, "axis_angle_deg")
+            if not 0.0 < angle <= 90.0:
+                raise ValueError("axis_angle_deg must be in (0, 90].")
+        if not isinstance(self.intersection_extrapolated, bool):
+            raise ValueError("intersection_extrapolated must be a boolean.")
+        if len(self.axes) == 1 and self.intersection_extrapolated:
+            raise ValueError("a partial center cross cannot extrapolate an intersection.")
         _probability(self.confidence, "confidence")
         if not all(isinstance(item, FieldFeatureQuality) for item in self.quality):
             raise ValueError("quality must contain FieldFeatureQuality values.")
@@ -496,7 +492,7 @@ class BoundaryFeatureObservation:
 
 @dataclass(frozen=True, slots=True)
 class FieldFeatureDetectionResult:
-    """一帧传统视觉场地特征的完整输出。"""
+    """一帧场地特征检测的完整输出。"""
 
     frame_sequence: int
     capture_timestamp_ns: int

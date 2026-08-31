@@ -20,6 +20,8 @@ from rescue_vision.localization import (
     FusionConfig,
     ImuFrameCalibration,
     OdometryCalibration,
+    SafeZoneCornerLocalizerConfig,
+    StaticLandmarkTrackingConfig,
 )
 from rescue_vision.mission import MissionConfig
 from rescue_vision.perception.types import (
@@ -28,8 +30,6 @@ from rescue_vision.perception.types import (
     HsvRange,
     TargetClass,
 )
-from rescue_vision.perception.field_feature_types import FieldFeatureConfig
-from rescue_vision.perception.field_boundary import FieldBoundaryConfig
 from rescue_vision.perception.target_ground_geometry import (
     BoxTargetGeometry,
     RegularTetrahedronTargetGeometry,
@@ -288,7 +288,7 @@ def _merge_defaults(
 
 
 def _perception_defaults() -> dict[str, Any]:
-    """返回与示例配置一致且默认关闭几何/场地检测的感知参数。"""
+    """返回与示例配置一致且默认关闭目标地面几何的感知参数。"""
 
     return {
         "detection_threshold": 0.25,
@@ -364,81 +364,6 @@ def _perception_defaults() -> dict[str, Any]:
                 "min_silhouette_iou": 0.45,
             },
         },
-        "field_features": {
-            "enabled": False,
-            "colors": {
-                "safe_red": [
-                    {"lower": [0, 80, 80], "upper": [12, 255, 255]},
-                    {"lower": [170, 80, 80], "upper": [179, 255, 255]},
-                ],
-                "safe_blue": [
-                    {"lower": [90, 60, 70], "upper": [110, 255, 255]},
-                ],
-                "start_magenta": [
-                    {"lower": [140, 80, 80], "upper": [165, 255, 255]},
-                ],
-                "entrance_purple": [
-                    {"lower": [130, 60, 50], "upper": [160, 255, 255]},
-                ],
-                "dark_marking": [
-                    {"lower": [0, 0, 0], "upper": [179, 255, 80]},
-                ],
-            },
-            "morphology": {
-                "kernel_size": 5,
-                "open_iterations": 1,
-                "close_iterations": 2,
-            },
-            "region_filter": {
-                "min_area_fraction": 0.002,
-                "min_rectangularity": 0.55,
-                "dimension_tolerance_fraction": 0.40,
-            },
-            "safe_zone": {
-                "entrance_color_fraction": 0.10,
-                "divider_dark_fraction": 0.10,
-            },
-            "center_cross": {
-                "min_axis_span_fraction": 0.20,
-                "max_gap_fraction": 0.06,
-                "min_gap_count": 2,
-                "perpendicular_tolerance_deg": 15.0,
-                "local_window_fraction": 0.015,
-                "local_contrast_threshold": 10,
-                "max_saturation": 80,
-                "min_floor_value": 120,
-                "min_line_support_fraction": 0.10,
-                "min_white_surround_fraction": 0.60,
-                "min_axis_balance_fraction": 0.08,
-                "min_intersection_margin_fraction": 0.02,
-            },
-            "boundary": {
-                "canny_low_threshold": 50,
-                "canny_high_threshold": 150,
-                "min_line_length_fraction": 0.20,
-                "corner_tolerance_deg": 20.0,
-                "max_features": 8,
-                "min_vertical_support_count": 3,
-                "side_contrast_threshold": 15,
-            },
-        },
-        "field_boundary": {
-            "enabled": False,
-            "hard_mask_enabled": False,
-            "min_candidate_confidence": 0.25,
-            "min_confirmations": 2,
-            "max_missed_frames": 1,
-            "line_angle_tolerance_deg": 12.0,
-            "line_distance_tolerance_mm": 120.0,
-            "ransac_inlier_distance_mm": 60.0,
-            "rectangle_tolerance_fraction": 0.20,
-            "boundary_band_mm": 120.0,
-            "segment_extension_mm": 150.0,
-            "min_filter_confidence": 0.55,
-            "max_mask_age_ms": 150.0,
-            "mask_blur_radius_px": 5,
-            "neutral_fill_bgr": [114, 114, 114],
-        },
     }
 
 
@@ -453,6 +378,24 @@ def _localization_defaults() -> dict[str, Any]:
         "max_prior_heading_innovation_deg": 20.0,
         "position_uncertainty_floor_mm": 20.0,
         "heading_uncertainty_floor_deg": 3.0,
+        "static_landmarks": {
+            "max_track_age_ms": 250.0,
+            "max_prior_position_uncertainty_mm": 300.0,
+            "max_prior_heading_uncertainty_deg": 15.0,
+            "cross_base_radius_mm": 180.0,
+            "safe_zone_base_margin_mm": 120.0,
+            "confirmation_hits": 2,
+            "max_confirmation_age_ms": 150.0,
+            "confirmation_ground_tolerance_mm": 120.0,
+            "confirmation_axis_tolerance_deg": 20.0,
+        },
+        "safe_zone_corners": {
+            "max_observation_age_ms": 250.0,
+            "min_baseline_mm": 150.0,
+            "max_fit_residual_mm": 80.0,
+            "position_uncertainty_floor_mm": 30.0,
+            "heading_uncertainty_floor_deg": 3.0,
+        },
         "fusion": {
             "enabled": False,
             "initial_pose": {
@@ -705,6 +648,7 @@ class ClusterBreakupRuntimeConfig:
     search_angular_velocity_rad_s: float
     search_timeout_s: float
     cluster_min_detections: int
+    cluster_group_gap_ratio: float
     center_tolerance_ratio: float
     center_confirm_frames: int
     center_kp_rad_s: float
@@ -755,6 +699,12 @@ class ClusterBreakupRuntimeConfig:
                     f"|value| >= 0.001 rad/s (positive means left turn), "
                     f"got {value!r}."
                 )
+        gap_ratio = float(self.cluster_group_gap_ratio)
+        if not math.isfinite(gap_ratio) or not 0.0 <= gap_ratio <= 1.0:
+            raise ValueError(
+                "cluster_group_gap_ratio must be finite and within [0, 1], "
+                f"got {self.cluster_group_gap_ratio!r}."
+            )
         if self.center_tolerance_ratio > 1.0:
             raise ValueError("center_tolerance_ratio must be <= 1.0.")
         for name in (
@@ -805,7 +755,6 @@ class Simulation20PointRuntimeConfig:
     max_breakup_attempts_per_delivery: int
     max_breakup_attempts_total: int
     breakup_settle_confirm_frames: int
-    min_breakup_progress_mm: float
     min_green_clearance_mm: float
     corridor_sample_step_mm: float
     completed_target_exclusion_mm: float
@@ -848,7 +797,6 @@ class Simulation20PointRuntimeConfig:
             "retreat_speed_m_s",
             "retreat_distance_m",
             "retreat_clear_distance_mm",
-            "min_breakup_progress_mm",
             "min_green_clearance_mm",
             "corridor_sample_step_mm",
             "completed_target_exclusion_mm",
@@ -1017,8 +965,6 @@ class PerceptionConfig:
     k0_threshold: float
     color_classifier: HsvColorClassifierConfig
     target_ground_geometry: TargetGroundGeometryConfig
-    field_features: FieldFeatureConfig
-    field_boundary: FieldBoundaryConfig
 
     def build_target_ground_geometry_estimator(
         self,
@@ -1041,52 +987,6 @@ class PerceptionConfig:
         return TargetGroundGeometryEstimator(
             self.target_ground_geometry,
             max_observation_age_ms=max_observation_age_ms,
-            ground_projector=ground_projector,
-        )
-
-    def build_field_feature_detector(
-        self,
-        *,
-        static_map: StaticFieldMap,
-        max_observation_age_ms: float,
-        ground_projector: GroundProjector | None = None,
-    ):
-        """按配置创建传统视觉场地特征检测器；禁用时返回 ``None``。"""
-
-        if not self.field_features.enabled:
-            return None
-        from rescue_vision.perception.field_feature_detector import (
-            FieldFeatureDetector,
-        )
-
-        return FieldFeatureDetector(
-            self.field_features,
-            static_map=static_map,
-            max_observation_age_ms=max_observation_age_ms,
-            ground_projector=ground_projector,
-        )
-
-    def build_field_boundary_estimator(
-        self,
-        *,
-        static_map: StaticFieldMap,
-        ground_projector: GroundProjector | None,
-    ):
-        """按配置创建局部场界时序估计器；禁用时返回 ``None``。"""
-
-        if not self.field_boundary.enabled:
-            return None
-        if not self.field_features.enabled:
-            raise RuntimeError(
-                "Enabled field_boundary requires perception.field_features."
-            )
-        if ground_projector is None or ground_projector.bev_config is None:
-            raise RuntimeError("Enabled field_boundary requires BEV ground mapping.")
-        from rescue_vision.perception import FieldBoundaryEstimator
-
-        return FieldBoundaryEstimator(
-            self.field_boundary,
-            static_map=static_map,
             ground_projector=ground_projector,
         )
 
@@ -1134,6 +1034,8 @@ class RuntimeGeometry:
 @dataclass(frozen=True, slots=True)
 class LocalizationRuntimeConfig:
     center_cross: CenterCrossLocalizerConfig
+    static_landmarks: StaticLandmarkTrackingConfig
+    safe_zone_corners: SafeZoneCornerLocalizerConfig
     fusion: FusionConfig
 
 
@@ -1222,7 +1124,6 @@ class AppConfig:
 
         if (
             not self.localization.center_cross.enabled
-            or not self.perception.field_features.enabled
             or not self.geometry.ground_mapping_enabled
             or ground_projector is None
         ):
@@ -1233,6 +1134,28 @@ class AppConfig:
             self.localization.center_cross,
             static_map=self.world.static_map,
             max_observation_age_ms=self.processing.max_observation_age_ms,
+        )
+
+    def build_static_field_landmark_tracker(self):
+        """Build bounded map-prior tracking for the visual localization path."""
+
+        from rescue_vision.localization import StaticFieldLandmarkTracker
+
+        return StaticFieldLandmarkTracker(
+            self.world.static_map,
+            self.localization.static_landmarks,
+            max_linear_velocity_m_s=self.motion.max_linear_velocity_m_s,
+            max_angular_velocity_rad_s=self.motion.max_angular_velocity_rad_s,
+        )
+
+    def build_safe_zone_corner_localizer(self):
+        """Build safe-zone corner absolute-pose fitting from the static map."""
+
+        from rescue_vision.localization import SafeZoneCornerLocalizer
+
+        return SafeZoneCornerLocalizer(
+            self.world.static_map,
+            self.localization.safe_zone_corners,
         )
 
     def build_odometry_imu_fusion(self) -> OdometryImuFusion | None:
@@ -1732,6 +1655,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         "search_angular_velocity_rad_s",
         "search_timeout_s",
         "cluster_min_detections",
+        "cluster_group_gap_ratio",
         "center_tolerance_ratio",
         "center_confirm_frames",
         "center_kp_rad_s",
@@ -1771,6 +1695,15 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         raise ValueError(
             "motion.cluster_breakup.center_tolerance_ratio must be <= 1.0."
         )
+    cluster_group_gap_ratio = _finite_float(
+        breakup_raw.get("cluster_group_gap_ratio", 0.10),
+        "motion.cluster_breakup.cluster_group_gap_ratio",
+        minimum=0.0,
+    )
+    if cluster_group_gap_ratio > 1.0:
+        raise ValueError(
+            "motion.cluster_breakup.cluster_group_gap_ratio must be <= 1.0."
+        )
     cluster_breakup = ClusterBreakupRuntimeConfig(
         enabled=breakup_enabled,
         departure_distance_m=breakup_float("departure_distance_m", 0.55),
@@ -1783,6 +1716,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             breakup_raw.get("cluster_min_detections", 2),
             "motion.cluster_breakup.cluster_min_detections",
         ),
+        cluster_group_gap_ratio=cluster_group_gap_ratio,
         center_tolerance_ratio=center_tolerance_ratio,
         center_confirm_frames=_positive_int(
             breakup_raw.get("center_confirm_frames", 3),
@@ -1910,7 +1844,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         "max_breakup_attempts_per_delivery",
         "max_breakup_attempts_total",
         "breakup_settle_confirm_frames",
-        "min_breakup_progress_mm",
         "min_green_clearance_mm",
         "corridor_sample_step_mm",
         "completed_target_exclusion_mm",
@@ -2008,9 +1941,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         breakup_settle_confirm_frames=_positive_int(
             simulation_raw.get("breakup_settle_confirm_frames", 3),
             "simulation_20_point.breakup_settle_confirm_frames",
-        ),
-        min_breakup_progress_mm=simulation_float(
-            "min_breakup_progress_mm", 20.0
         ),
         min_green_clearance_mm=simulation_float(
             "min_green_clearance_mm", 80.0
@@ -2345,8 +2275,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "k0_threshold",
             "color_classifier",
             "target_ground_geometry",
-            "field_features",
-            "field_boundary",
         },
         "perception",
     )
@@ -2734,455 +2662,11 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "min_silhouette_iou",
         ),
     )
-    field_raw = _mapping(
-        _required(perception_raw, "field_features", "perception"),
-        "perception.field_features",
-    )
-    _reject_unknown(
-        field_raw,
-        {
-            "enabled",
-            "colors",
-            "morphology",
-            "region_filter",
-            "safe_zone",
-            "center_cross",
-            "boundary",
-        },
-        "perception.field_features",
-    )
-    field_enabled = _required(
-        field_raw,
-        "enabled",
-        "perception.field_features",
-    )
-    if not isinstance(field_enabled, bool):
-        raise ValueError("perception.field_features.enabled must be a boolean.")
-
-    field_colors_raw = _mapping(
-        _required(field_raw, "colors", "perception.field_features"),
-        "perception.field_features.colors",
-    )
-    field_color_names = {
-        "safe_red",
-        "safe_blue",
-        "start_magenta",
-        "entrance_purple",
-        "dark_marking",
-    }
-    if set(field_colors_raw) != field_color_names:
-        raise ValueError(
-            "perception.field_features.colors keys must exactly be "
-            f"{sorted(field_color_names)!r}."
-        )
-    field_ranges = {
-        name: _hsv_ranges(
-            field_colors_raw[name],
-            f"perception.field_features.colors.{name}",
-        )
-        for name in sorted(field_color_names)
-    }
-
-    morphology_raw = _mapping(
-        _required(field_raw, "morphology", "perception.field_features"),
-        "perception.field_features.morphology",
-    )
-    _reject_unknown(
-        morphology_raw,
-        {"kernel_size", "open_iterations", "close_iterations"},
-        "perception.field_features.morphology",
-    )
-    region_filter_raw = _mapping(
-        _required(field_raw, "region_filter", "perception.field_features"),
-        "perception.field_features.region_filter",
-    )
-    _reject_unknown(
-        region_filter_raw,
-        {
-            "min_area_fraction",
-            "min_rectangularity",
-            "dimension_tolerance_fraction",
-        },
-        "perception.field_features.region_filter",
-    )
-    safe_zone_raw = _mapping(
-        _required(field_raw, "safe_zone", "perception.field_features"),
-        "perception.field_features.safe_zone",
-    )
-    _reject_unknown(
-        safe_zone_raw,
-        {
-            "entrance_color_fraction",
-            "divider_dark_fraction",
-        },
-        "perception.field_features.safe_zone",
-    )
-    center_raw = _mapping(
-        _required(field_raw, "center_cross", "perception.field_features"),
-        "perception.field_features.center_cross",
-    )
-    _reject_unknown(
-        center_raw,
-        {
-            "min_axis_span_fraction",
-            "max_gap_fraction",
-            "min_gap_count",
-            "perpendicular_tolerance_deg",
-            "local_window_fraction",
-            "local_contrast_threshold",
-            "max_saturation",
-            "min_floor_value",
-            "min_line_support_fraction",
-            "min_white_surround_fraction",
-            "min_axis_balance_fraction",
-            "min_intersection_margin_fraction",
-        },
-        "perception.field_features.center_cross",
-    )
-    boundary_raw = _mapping(
-        _required(field_raw, "boundary", "perception.field_features"),
-        "perception.field_features.boundary",
-    )
-    _reject_unknown(
-        boundary_raw,
-        {
-            "canny_low_threshold",
-            "canny_high_threshold",
-            "min_line_length_fraction",
-            "corner_tolerance_deg",
-            "max_features",
-            "min_vertical_support_count",
-            "side_contrast_threshold",
-        },
-        "perception.field_features.boundary",
-    )
-    field_features = FieldFeatureConfig(
-        enabled=field_enabled,
-        safe_red=field_ranges["safe_red"],
-        safe_blue=field_ranges["safe_blue"],
-        start_magenta=field_ranges["start_magenta"],
-        entrance_purple=field_ranges["entrance_purple"],
-        dark_marking=field_ranges["dark_marking"],
-        morphology_kernel_size=_positive_int(
-            _required(
-                morphology_raw,
-                "kernel_size",
-                "perception.field_features.morphology",
-            ),
-            "perception.field_features.morphology.kernel_size",
-        ),
-        open_iterations=_nonnegative_int(
-            _required(
-                morphology_raw,
-                "open_iterations",
-                "perception.field_features.morphology",
-            ),
-            "perception.field_features.morphology.open_iterations",
-        ),
-        close_iterations=_nonnegative_int(
-            _required(
-                morphology_raw,
-                "close_iterations",
-                "perception.field_features.morphology",
-            ),
-            "perception.field_features.morphology.close_iterations",
-        ),
-        min_region_area_fraction=_threshold(
-            _required(
-                region_filter_raw,
-                "min_area_fraction",
-                "perception.field_features.region_filter",
-            ),
-            "perception.field_features.region_filter.min_area_fraction",
-        ),
-        min_rectangularity=_threshold(
-            _required(
-                region_filter_raw,
-                "min_rectangularity",
-                "perception.field_features.region_filter",
-            ),
-            "perception.field_features.region_filter.min_rectangularity",
-        ),
-        dimension_tolerance_fraction=_threshold(
-            _required(
-                region_filter_raw,
-                "dimension_tolerance_fraction",
-                "perception.field_features.region_filter",
-            ),
-            "perception.field_features.region_filter.dimension_tolerance_fraction",
-        ),
-        entrance_color_fraction=_threshold(
-            _required(
-                safe_zone_raw,
-                "entrance_color_fraction",
-                "perception.field_features.safe_zone",
-            ),
-            "perception.field_features.safe_zone.entrance_color_fraction",
-        ),
-        divider_dark_fraction=_threshold(
-            _required(
-                safe_zone_raw,
-                "divider_dark_fraction",
-                "perception.field_features.safe_zone",
-            ),
-            "perception.field_features.safe_zone.divider_dark_fraction",
-        ),
-        center_min_axis_span_fraction=_threshold(
-            _required(
-                center_raw,
-                "min_axis_span_fraction",
-                "perception.field_features.center_cross",
-            ),
-            "perception.field_features.center_cross.min_axis_span_fraction",
-        ),
-        center_max_gap_fraction=_threshold(
-            _required(
-                center_raw,
-                "max_gap_fraction",
-                "perception.field_features.center_cross",
-            ),
-            "perception.field_features.center_cross.max_gap_fraction",
-        ),
-        center_min_gap_count=_positive_int(
-            _required(
-                center_raw,
-                "min_gap_count",
-                "perception.field_features.center_cross",
-            ),
-            "perception.field_features.center_cross.min_gap_count",
-        ),
-        center_perpendicular_tolerance_deg=_finite_float(
-            _required(
-                center_raw,
-                "perpendicular_tolerance_deg",
-                "perception.field_features.center_cross",
-            ),
-            "perception.field_features.center_cross.perpendicular_tolerance_deg",
-            minimum=0.001,
-        ),
-        center_local_window_fraction=_threshold(
-            _required(
-                center_raw,
-                "local_window_fraction",
-                "perception.field_features.center_cross",
-            ),
-            "perception.field_features.center_cross.local_window_fraction",
-        ),
-        center_local_contrast_threshold=_positive_int(
-            _required(
-                center_raw,
-                "local_contrast_threshold",
-                "perception.field_features.center_cross",
-            ),
-            "perception.field_features.center_cross.local_contrast_threshold",
-        ),
-        center_max_saturation=_nonnegative_int(
-            _required(
-                center_raw,
-                "max_saturation",
-                "perception.field_features.center_cross",
-            ),
-            "perception.field_features.center_cross.max_saturation",
-        ),
-        center_min_floor_value=_nonnegative_int(
-            _required(
-                center_raw,
-                "min_floor_value",
-                "perception.field_features.center_cross",
-            ),
-            "perception.field_features.center_cross.min_floor_value",
-        ),
-        center_min_line_support_fraction=_threshold(
-            _required(
-                center_raw,
-                "min_line_support_fraction",
-                "perception.field_features.center_cross",
-            ),
-            "perception.field_features.center_cross.min_line_support_fraction",
-        ),
-        center_min_white_surround_fraction=_threshold(
-            _required(
-                center_raw,
-                "min_white_surround_fraction",
-                "perception.field_features.center_cross",
-            ),
-            "perception.field_features.center_cross.min_white_surround_fraction",
-        ),
-        center_min_axis_balance_fraction=_threshold(
-            _required(
-                center_raw,
-                "min_axis_balance_fraction",
-                "perception.field_features.center_cross",
-            ),
-            "perception.field_features.center_cross.min_axis_balance_fraction",
-        ),
-        center_min_intersection_margin_fraction=_threshold(
-            _required(
-                center_raw,
-                "min_intersection_margin_fraction",
-                "perception.field_features.center_cross",
-            ),
-            "perception.field_features.center_cross."
-            "min_intersection_margin_fraction",
-        ),
-        boundary_canny_low_threshold=_nonnegative_int(
-            _required(
-                boundary_raw,
-                "canny_low_threshold",
-                "perception.field_features.boundary",
-            ),
-            "perception.field_features.boundary.canny_low_threshold",
-        ),
-        boundary_canny_high_threshold=_positive_int(
-            _required(
-                boundary_raw,
-                "canny_high_threshold",
-                "perception.field_features.boundary",
-            ),
-            "perception.field_features.boundary.canny_high_threshold",
-        ),
-        boundary_min_line_length_fraction=_threshold(
-            _required(
-                boundary_raw,
-                "min_line_length_fraction",
-                "perception.field_features.boundary",
-            ),
-            "perception.field_features.boundary.min_line_length_fraction",
-        ),
-        boundary_corner_tolerance_deg=_finite_float(
-            _required(
-                boundary_raw,
-                "corner_tolerance_deg",
-                "perception.field_features.boundary",
-            ),
-            "perception.field_features.boundary.corner_tolerance_deg",
-            minimum=0.001,
-        ),
-        boundary_max_features=_positive_int(
-            _required(
-                boundary_raw,
-                "max_features",
-                "perception.field_features.boundary",
-            ),
-            "perception.field_features.boundary.max_features",
-        ),
-        boundary_min_vertical_support_count=_positive_int(
-            _required(
-                boundary_raw,
-                "min_vertical_support_count",
-                "perception.field_features.boundary",
-            ),
-            "perception.field_features.boundary.min_vertical_support_count",
-        ),
-        boundary_side_contrast_threshold=_positive_int(
-            _required(
-                boundary_raw,
-                "side_contrast_threshold",
-                "perception.field_features.boundary",
-            ),
-            "perception.field_features.boundary.side_contrast_threshold",
-        ),
-    )
-    field_boundary_raw = _mapping(
-        _required(perception_raw, "field_boundary", "perception"),
-        "perception.field_boundary",
-    )
-    field_boundary_names = {
-        "enabled",
-        "hard_mask_enabled",
-        "min_candidate_confidence",
-        "min_confirmations",
-        "max_missed_frames",
-        "line_angle_tolerance_deg",
-        "line_distance_tolerance_mm",
-        "ransac_inlier_distance_mm",
-        "rectangle_tolerance_fraction",
-        "boundary_band_mm",
-        "segment_extension_mm",
-        "min_filter_confidence",
-        "max_mask_age_ms",
-        "mask_blur_radius_px",
-        "neutral_fill_bgr",
-    }
-    _reject_unknown(
-        field_boundary_raw,
-        field_boundary_names,
-        "perception.field_boundary",
-    )
-    for flag in ("enabled", "hard_mask_enabled"):
-        if not isinstance(field_boundary_raw[flag], bool):
-            raise ValueError(f"perception.field_boundary.{flag} must be a boolean.")
-    neutral_fill_raw = field_boundary_raw["neutral_fill_bgr"]
-    if not isinstance(neutral_fill_raw, list) or len(neutral_fill_raw) != 3:
-        raise ValueError(
-            "perception.field_boundary.neutral_fill_bgr must be [b, g, r]."
-        )
-    field_boundary = FieldBoundaryConfig(
-        enabled=field_boundary_raw["enabled"],
-        hard_mask_enabled=field_boundary_raw["hard_mask_enabled"],
-        min_candidate_confidence=_threshold(
-            field_boundary_raw["min_candidate_confidence"],
-            "perception.field_boundary.min_candidate_confidence",
-        ),
-        min_confirmations=_positive_int(
-            field_boundary_raw["min_confirmations"],
-            "perception.field_boundary.min_confirmations",
-        ),
-        max_missed_frames=_nonnegative_int(
-            field_boundary_raw["max_missed_frames"],
-            "perception.field_boundary.max_missed_frames",
-        ),
-        line_angle_tolerance_deg=_finite_float(
-            field_boundary_raw["line_angle_tolerance_deg"],
-            "perception.field_boundary.line_angle_tolerance_deg",
-            minimum=0.001,
-        ),
-        line_distance_tolerance_mm=_finite_float(
-            field_boundary_raw["line_distance_tolerance_mm"],
-            "perception.field_boundary.line_distance_tolerance_mm",
-            minimum=0.001,
-        ),
-        ransac_inlier_distance_mm=_finite_float(
-            field_boundary_raw["ransac_inlier_distance_mm"],
-            "perception.field_boundary.ransac_inlier_distance_mm",
-            minimum=0.001,
-        ),
-        rectangle_tolerance_fraction=_threshold(
-            field_boundary_raw["rectangle_tolerance_fraction"],
-            "perception.field_boundary.rectangle_tolerance_fraction",
-        ),
-        boundary_band_mm=_finite_float(
-            field_boundary_raw["boundary_band_mm"],
-            "perception.field_boundary.boundary_band_mm",
-            minimum=0.001,
-        ),
-        segment_extension_mm=_finite_float(
-            field_boundary_raw["segment_extension_mm"],
-            "perception.field_boundary.segment_extension_mm",
-            minimum=0.001,
-        ),
-        min_filter_confidence=_threshold(
-            field_boundary_raw["min_filter_confidence"],
-            "perception.field_boundary.min_filter_confidence",
-        ),
-        max_mask_age_ms=_finite_float(
-            field_boundary_raw["max_mask_age_ms"],
-            "perception.field_boundary.max_mask_age_ms",
-            minimum=0.001,
-        ),
-        mask_blur_radius_px=_nonnegative_int(
-            field_boundary_raw["mask_blur_radius_px"],
-            "perception.field_boundary.mask_blur_radius_px",
-        ),
-        neutral_fill_bgr=tuple(neutral_fill_raw),
-    )
     perception = PerceptionConfig(
         detection_threshold=detection_threshold,
         k0_threshold=k0_threshold,
         color_classifier=color_classifier,
         target_ground_geometry=target_ground_geometry,
-        field_features=field_features,
-        field_boundary=field_boundary,
     )
 
     localization_raw = _merge_defaults(
@@ -3201,6 +2685,8 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "max_prior_heading_innovation_deg",
             "position_uncertainty_floor_mm",
             "heading_uncertainty_floor_deg",
+            "static_landmarks",
+            "safe_zone_corners",
             "fusion",
         },
         "localization",
@@ -3282,6 +2768,115 @@ def load_runtime_config(path: str | Path) -> AppConfig:
                 "localization",
             ),
             "localization.heading_uncertainty_floor_deg",
+            minimum=0.001,
+        ),
+    )
+    static_landmarks_raw = _mapping(
+        localization_raw["static_landmarks"],
+        "localization.static_landmarks",
+    )
+    static_landmark_names = {
+        "max_track_age_ms",
+        "max_prior_position_uncertainty_mm",
+        "max_prior_heading_uncertainty_deg",
+        "cross_base_radius_mm",
+        "safe_zone_base_margin_mm",
+        "confirmation_hits",
+        "max_confirmation_age_ms",
+        "confirmation_ground_tolerance_mm",
+        "confirmation_axis_tolerance_deg",
+    }
+    _reject_unknown(
+        static_landmarks_raw,
+        static_landmark_names,
+        "localization.static_landmarks",
+    )
+    static_landmarks = StaticLandmarkTrackingConfig(
+        max_track_age_ms=_finite_float(
+            static_landmarks_raw["max_track_age_ms"],
+            "localization.static_landmarks.max_track_age_ms",
+            minimum=0.001,
+        ),
+        max_prior_position_uncertainty_mm=_finite_float(
+            static_landmarks_raw["max_prior_position_uncertainty_mm"],
+            "localization.static_landmarks.max_prior_position_uncertainty_mm",
+            minimum=0.001,
+        ),
+        max_prior_heading_uncertainty_deg=_finite_float(
+            static_landmarks_raw["max_prior_heading_uncertainty_deg"],
+            "localization.static_landmarks.max_prior_heading_uncertainty_deg",
+            minimum=0.001,
+        ),
+        cross_base_radius_mm=_finite_float(
+            static_landmarks_raw["cross_base_radius_mm"],
+            "localization.static_landmarks.cross_base_radius_mm",
+            minimum=0.001,
+        ),
+        safe_zone_base_margin_mm=_finite_float(
+            static_landmarks_raw["safe_zone_base_margin_mm"],
+            "localization.static_landmarks.safe_zone_base_margin_mm",
+            minimum=0.001,
+        ),
+        confirmation_hits=_positive_int(
+            static_landmarks_raw["confirmation_hits"],
+            "localization.static_landmarks.confirmation_hits",
+        ),
+        max_confirmation_age_ms=_finite_float(
+            static_landmarks_raw["max_confirmation_age_ms"],
+            "localization.static_landmarks.max_confirmation_age_ms",
+            minimum=0.001,
+        ),
+        confirmation_ground_tolerance_mm=_finite_float(
+            static_landmarks_raw["confirmation_ground_tolerance_mm"],
+            "localization.static_landmarks.confirmation_ground_tolerance_mm",
+            minimum=0.001,
+        ),
+        confirmation_axis_tolerance_deg=_finite_float(
+            static_landmarks_raw["confirmation_axis_tolerance_deg"],
+            "localization.static_landmarks.confirmation_axis_tolerance_deg",
+            minimum=0.001,
+        ),
+    )
+    safe_zone_corners_raw = _mapping(
+        localization_raw["safe_zone_corners"],
+        "localization.safe_zone_corners",
+    )
+    safe_zone_corner_names = {
+        "max_observation_age_ms",
+        "min_baseline_mm",
+        "max_fit_residual_mm",
+        "position_uncertainty_floor_mm",
+        "heading_uncertainty_floor_deg",
+    }
+    _reject_unknown(
+        safe_zone_corners_raw,
+        safe_zone_corner_names,
+        "localization.safe_zone_corners",
+    )
+    safe_zone_corners = SafeZoneCornerLocalizerConfig(
+        max_observation_age_ms=_finite_float(
+            safe_zone_corners_raw["max_observation_age_ms"],
+            "localization.safe_zone_corners.max_observation_age_ms",
+            minimum=0.001,
+        ),
+        min_baseline_mm=_finite_float(
+            safe_zone_corners_raw["min_baseline_mm"],
+            "localization.safe_zone_corners.min_baseline_mm",
+            minimum=0.001,
+        ),
+        max_fit_residual_mm=_finite_float(
+            safe_zone_corners_raw["max_fit_residual_mm"],
+            "localization.safe_zone_corners.max_fit_residual_mm",
+            minimum=0.001,
+        ),
+        position_uncertainty_floor_mm=_finite_float(
+            safe_zone_corners_raw["position_uncertainty_floor_mm"],
+            "localization.safe_zone_corners.position_uncertainty_floor_mm",
+            minimum=0.001,
+        ),
+        heading_uncertainty_floor_deg=_finite_float(
+            safe_zone_corners_raw["heading_uncertainty_floor_deg"],
+            "localization.safe_zone_corners.heading_uncertainty_floor_deg",
             minimum=0.001,
         ),
     )
@@ -3563,7 +3158,12 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "UART and motion.odometry; visual field features and ground mapping "
             "are only required by the visual localization path."
         )
-    localization = LocalizationRuntimeConfig(center_cross_localization, fusion)
+    localization = LocalizationRuntimeConfig(
+        center_cross_localization,
+        static_landmarks,
+        safe_zone_corners,
+        fusion,
+    )
 
     hailo_raw = _mapping(root.get("hailo", {}), "hailo")
     _reject_unknown(
