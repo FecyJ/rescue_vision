@@ -3,13 +3,12 @@
 本包把全尺寸去畸变图上的 Pose 模型结果转换为稳定的
 `TargetObservation`：模型负责目标框和 K0，框内 HSV 证据负责最终任务
 类别并提供局部颜色分割掩码。`TargetGroundGeometryEstimator` 再利用该掩码、
-K0、完整相机外参和可配置三维形状估计目标地面中心、朝向与足迹。独立的
-`FieldFeatureDetector` 从同一去畸变帧检测安全区、出发区、中心十字和低精度
-边界候选；独立的 `FieldBoundaryEstimator` 在机器人地面系中做共线拟合、矩形
-软约束和连续帧确认，输出三态 BEV/图像掩膜；
-`localization.CenterCrossLocalizer` 再消费这些同帧观测，不回读
-图像或掩码。这些链路都不创建相机、不复制标定矩阵，也不修改跟踪、定位、
-世界模型或任务状态。
+K0、完整相机外参和可配置三维形状估计目标地面中心、朝向与足迹。场地特征
+（安全区、出发区、中心十字和边界）的 OpenCV 传统检测与局部场界估计已删除；
+仓库只保留 `field_feature_types` 中的逐帧观测契约和
+`localization.CenterCrossLocalizer` 等纯几何消费方，模型推理后端尚未实现，
+当前没有运行时场地特征生产者。这些链路都不创建相机、不复制标定矩阵，也不
+修改跟踪、定位、世界模型或任务状态。
 
 ## 常用类和函数
 
@@ -22,17 +21,14 @@ K0、完整相机外参和可配置三维形状估计目标地面中心、朝向
 | `TargetGroundGeometry` | 接触锚点、可选中心/足迹/朝向、误差和降级原因 |
 | `TargetGroundGeometryConfig` | 四类形状尺寸、搜索步长、拟合权重和接受门限 |
 | `BoxTargetGeometry` / `RegularTetrahedronTargetGeometry` | 盒体和正四面体尺寸 |
-| `FieldFeatureDetector` | 颜色、线段、角点和可选 BEV 的静态场地特征检测 |
 | `FieldFeatureDetectionResult` | 同帧安全区、出发区、中心十字和边界候选集合 |
 | `RealtimeFieldFeatureResult` | 实时场地结果或明确的过期丢弃原因 |
 | `SafeZoneObservation` | 红/蓝物理颜色、入口、隔板和入口视角左右半区 |
+| `SafeZoneCornerObservation` | 紫色围框四个语义角点、可选地面坐标与置信度 |
+| `FieldFeatureSearchHint` | 定位层产生的可丢弃中心十字/安全区地面搜索提示 |
 | `StartZoneObservation` | 无编号洋红出发区轮廓及可选地面角点 |
 | `CenterCrossObservation` | 无序的两条中心轴或单轴部分观测 |
 | `BoundaryFeatureObservation` | 显式低置信度的围栏基线或场地角点候选 |
-| `FieldFeatureConfig` | 场地颜色、形态学、公差、线段和角点阈值 |
-| `FieldBoundaryEstimator` | 把逐帧围栏候选合并为时序确认的机器人系开放场界 |
-| `FieldBoundaryMask` / `FieldMaskState` | 只读 `inside` / `uncertain` / `outside` 图像与 BEV 掩膜 |
-| `FieldBoundaryConfig` | 共线/RANSAC、矩形公差、时序、边界带和遮挡参数 |
 | `RealtimeDetectionResult` | 实时检测结果，并明确记录是否丢弃了过期帧 |
 | `render_target_observations()` | 在同坐标系图像副本上叠加框、颜色掩码、K0、置信度和质量 |
 | `PerceptionFrameRenderer` | 单槽最新帧后台推理与可视化旁路；`latest_snapshot()` 同步提供结构化观测；`clear_latest()` 丢弃旧结果 |
@@ -127,10 +123,6 @@ with source, detector:
 ```
 
 `detect()` 的两个输入必须属于同一采集帧：第一个参数提供原始 `sequence/timestamp_ns`，第二个参数是该帧经当前 `CameraModel` 产生的去畸变图。不能把缓存旧图、裁剪图或另一相机的图像配给当前帧。
-
-可选的 `field_mask` 必须由同一帧或仍在配置时效内的场界估计产生。掩膜过期
-时检测器自动使用原图；明确场外的普通目标按 K0 丢弃，危险类和 `unknown`
-只添加 `outside_field_suspected`，不会被单帧场界静默删除。
 
 实时调用统一使用 `detect_realtime()`：它只兜底
 `StaleObservationError`，返回空观测并通过 `stale_dropped` /
@@ -251,7 +243,7 @@ for observation in observations:
 不足或歧义成为 `unknown`，仍保留顶部颜色候选掩码。完全无颜色像素时候选为
 `unknown` 且掩码全零。
 
-## 7. 传统视觉目标几何与场地特征
+## 7. 目标几何与场地特征观测契约
 
 ### 7.1 估计任务目标地面中心
 
@@ -323,167 +315,23 @@ K0 不可用时可从检测框底部建立搜索种子，但会显式附加
 和降级契约可运行；真实单调时钟回归会检查默认 150 ms 时效预算。该回归不
 证明现场中心误差或树莓派端到端性能，目标硬件仍需按 P50/P95 观测年龄验收。
 
-### 7.2 静态场地特征
+### 7.2 场地特征观测契约
 
-以下片段承接第 1 节的 `config` 和 `geometry`。传统视觉不需要 Hailo；
-配置关闭时构造函数返回 `None`，不会静默运行另一套默认阈值：
+中心十字、安全区、出发区和低精度边界候选的 OpenCV 传统检测器以及基于其
+围栏候选的局部场界估计器已删除；`PerceptionConfig` 不再提供
+`build_field_feature_detector()` 或 `build_field_boundary_estimator()`。
 
-```python
-field_detector = config.perception.build_field_feature_detector(
-    static_map=config.world.static_map,
-    max_observation_age_ms=config.processing.max_observation_age_ms,
-    ground_projector=geometry.ground_projector,
-)
-if field_detector is None:
-    raise RuntimeError("需要启用 perception.field_features")
-```
+`field_feature_types.py` 继续保留与检测实现无关的观测契约，供后续模型推理
+后端填充：
 
-对已经由当前 `CameraModel` 去畸变的同一帧执行：
+- `FieldFeatureDetectionResult` 汇总同帧安全区、出发区、中心十字和边界候选；
+- 各观测都携带去畸变像素和可选的机器人地面坐标，并显式保留质量与置信度；
+- `localization.CenterCrossLocalizer`、`StaticFieldLandmarkTracker` 和
+  `SafeZoneCornerLocalizer` 只消费这些契约，不回读图像或掩码。
 
-```python
-realtime_field_result = field_detector.detect_realtime(
-    raw_frame,
-    undistorted_bgr,
-    valid_mask=geometry.camera_model.valid_mask,
-    # 绝对定位不使用普通场界消歧，省去两次昂贵 Hough；需要区域/场界输出的
-    # 通用感知调用方保持默认 True。
-    include_boundary_features=False,
-)
-if realtime_field_result.stale_dropped:
-    # 不向定位层传递过期地标。
-    field_result = None
-else:
-    field_result = realtime_field_result.result
-
-for safe_zone in field_result.safe_zones if field_result is not None else ():
-    print(safe_zone.physical_color, safe_zone.quality)
-    for half in safe_zone.halves:
-        # side 是从场内面向入口时的 approach_left / approach_right。
-        print(half.side, half.polygon_ground)
-```
-
-`valid_mask` 必须与去畸变图同尺寸，直接使用当前 `CameraModel.valid_mask`。
-检测器会在颜色、线段和 BEV 路径中排除无效填充区，防止去畸变填充边界被
-误报为围栏或场角。
-
-`detect()` / `detect_realtime()` 的 `include_boundary_features` 默认为 `True`，
-因此普通调用方仍得到边界候选。只消费中心十字和红蓝方向锚点的实时定位旁路可
-显式传 `False`；此时 `boundary_features=()`，不能同时把该帧当作场界观测。
-
-启用带 BEV 配置的 `GroundProjector` 时，检测器每帧只生成一次 BEV 并在颜色、
-线段和角点步骤中复用。输出仍保留 `UndistortedPixel`；只有地面上的区域角点、
-线段端点才附带机器人系 `GroundPoint`。围栏顶部等非地面特征不会被地面
-单应性强行投影。
-
-安全区首先输出 `red` / `blue` 物理颜色，不在检测器中解释己方/对方或
-物资/伤员用途。左右以“从场内面向入口”为准；只有入口紫色证据、黑色隔板和
-地面方向均成立时才生成两个 `halves`。证据不足时保留整区并标记
-`entrance_unresolved`、`divider_unresolved` 或 `side_unresolved`。
-
-完整彩色区域优先按静态地图尺寸和矩形度确认。紫色围栏有高度、遮挡导致完整
-尺寸不再可见时，检测器不会单纯放宽长宽比：同色可见区域必须落入同一个紫色
-围栏外接矩形、总颜色面积和可见矩形度仍达标，并满足双颜色分区、黑色中隔或
-BEV 围栏物理尺寸三项中的至少一项，才输出带
-`partial`、`entrance_unresolved`、`divider_unresolved` 和
-`side_unresolved` 的保守安全区。散落的同色任务物块没有共同紫色围栏，不会
-触发该降级路径。部分安全区只提供可见颜色范围的多边形，不补画被遮挡区域；
-定位层仍需另外通过中心十字射线、距离、横向偏差、置信度和时效门限后才能把它
-作为方向锚点。
-
-中心十字 Hough 候选去重优先保留局部线支撑和点划证据更强的轴，长度只作为
-次级排序，避免远场围栏或场边长线把较短但语义更明确的真实十字轴挤出候选集。
-安全区确认后会把其保守多边形加入十字排除掩膜，紫色围栏及内部隔板不会再次
-参与中心十字拟合。
-
-检测到可靠安全区围栏时，还会检查十字候选的四条轴向射线：至少一条严格对齐
-围栏质心并实际穿过围栏多边形边界，且交点距离超过最小轴长，才获得安全区锚点
-优先级。该证据只选择更可信的图像十字候选，不直接解释红蓝全局方向；最终消歧
-仍由定位层的射线角度、500–1800 mm 距离、横向误差、置信度和时效门限完成。
-
-出发区只输出洋红轮廓和角点，不做数字 OCR，也不包含 1–4 编号。中心十字先
-合并两类证据：HSV 深色点划线，以及比局部地面更暗、低饱和的连续细线；后者
-用于真实 BEV 中因材料、曝光和缩放而呈灰色实线的中心标记。Hough 重复线会按
-方向和偏移折叠，再要求两轴近似垂直、交点远离 BEV 无效边缘，并且交点位于
-每条轴的内部而非端点。只有一条有效轴时标记 `partial`；有效区边缘形成的 L 形
-交点不会作为中心十字。两条轴在地图匹配前仍保持无序。围栏基线和角点始终带
-`low_confidence_boundary`，单帧结果不能直接当作闭合场界。
-
-`center_cross.local_window_fraction` 控制局部背景尺度，
-`local_contrast_threshold` 与 `max_saturation` 控制灰色细线响应；
-`min_floor_value` 与 `min_white_surround_fraction` 要求候选轴两侧主要是低饱和
-高亮度白地板，允许有色物块造成局部遮挡，但排除货架、紫色围栏和场界外暗背景；
-`min_line_support_fraction`、`min_axis_balance_fraction` 和
-`min_intersection_margin_fraction` 分别限制沿轴支撑、交点两侧覆盖和距无效边缘
-的距离。完整十字置信度由垂直度、两侧平衡和局部线支撑共同计算，不再使用固定
-常数。上述值仍是基于当前真实 BEV 样例的启动参数，必须通过不同距离、曝光、
-遮挡和场地材料的录像分层校准。
-
-中心十字的四向对称、红蓝安全区终端关联、先验门控和 `FieldPose2D` 约定由
-[`localization` README](../localization/README.md) 统一定义；感知层不把
-`GroundPoint` 伪装成 `FieldPoint`。
-
-完整算法阈值位于 `configs/runtime.example.yaml` 的
-`perception.field_features`；安全区和出发区物理尺寸只从
-`world.static_map.regions` 推导。红、蓝、洋红和紫色初值来自命题示意图，
-不是官方色卡；尺寸公差也只是启动值。获得现场材料、固定曝光和实际地面映射后
-必须重新标定。
-
-### 7.3 时序局部场界和三态掩膜
-
-以下片段承接 7.2 的 `field_detector`、`geometry` 和同一帧变量。场界估计要求
-地面标定包含 BEV；它不需要 `FieldPose2D`，也不会产生或伪造全局坐标：
-
-```python
-field_boundary_estimator = config.perception.build_field_boundary_estimator(
-    static_map=config.world.static_map,
-    ground_projector=geometry.ground_projector,
-)
-```
-
-在每帧中先更新场界，再把结果交给目标检测器：
-
-```python
-field_mask = None
-if field_result is not None and field_boundary_estimator is not None:
-    field_mask = field_boundary_estimator.update(
-        field_result,
-        valid_mask=geometry.camera_model.valid_mask,
-    )
-
-detection_result = detector.detect_realtime(
-    raw_frame,
-    undistorted_bgr,
-    field_mask=field_mask,
-)
-```
-
-逐帧边界候选以长底边为主，并用与底边近似垂直的重复支撑线及线段两侧亮度
-变化提高置信度；这些证据不足时仍保留低置信度候选，不强判场界。
-`FieldBoundaryEstimator` 仅消费 `FENCE_BASE_SEGMENT` 地面线段，以确定性 RANSAC
-合并共线端点，使用场地图尺寸约束不合理平行边，并由机器人原点及同帧安全区、
-出发区、中心十字地面点确定场内法向。边界必须达到连续帧确认次数才参与分类；
-有限线段只在配置的端部扩展范围内生效，单边或双边不会被补成闭合矩形。
-
-掩膜编码固定为 `outside=0`、`uncertain=127`、`inside=255`。只有 `outside`
-会在推理副本中以配置的中性 BGR 渐变填充；原始录像、显示图和 HSV 复核仍使用
-未遮挡图像。`hard_mask_enabled` 默认关闭，必须用真实场边录像验收边界误差和
-危险类召回后才能开启。无候选、未确认、过期或低置信度时
-`filter_ready=false`、`hard_mask_ready=false`，检测前后都自动回退为不使用
-场界过滤。
-
-离线图片或视频检查：
-
-```bash
-python manual_tests/field_features.py recordings/field_sample.mp4 \
-  --config configs/runtime.yaml \
-  --already-undistorted \
-  --output-jsonl output/field_features.jsonl \
-  --overlay-dir output/field_feature_overlays
-```
-
-若输入是原始相机图像，去掉 `--already-undistorted`，脚本会使用配置中的
-`CameraModel` 去畸变。该工具不访问相机和 Hailo；合成图测试只证明逻辑和
-契约可运行，不能作为现场精度或树莓派性能证据。
+这些类型当前只用于纯逻辑测试和定位层接口。仓库还没有已实现的场地特征模型
+推理后端，也没有运行时装配入口；在模型后端产出同一契约前，不能把
+`FieldFeatureDetectionResult` 当作已经接入生产的检测输出。
 
 ## 8. Hailo 部署包和配置
 

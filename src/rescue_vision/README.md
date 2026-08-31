@@ -142,18 +142,6 @@ ground_geometry_estimator = (
         ground_projector=geometry.ground_projector,
     )
 )
-field_detector = config.perception.build_field_feature_detector(
-    static_map=config.world.static_map,
-    max_observation_age_ms=config.processing.max_observation_age_ms,
-    ground_projector=geometry.ground_projector,
-)
-field_boundary_estimator = config.perception.build_field_boundary_estimator(
-    static_map=config.world.static_map,
-    ground_projector=geometry.ground_projector,
-)
-center_cross_localizer = config.build_center_cross_localizer(
-    ground_projector=geometry.ground_projector,
-)
 tracker = config.tracking.build_tracker()
 world_model = config.world.build_model()
 mission = config.mission.build_state_machine()
@@ -180,49 +168,15 @@ with source, detector:
         undistorted_bgr = geometry.camera_model.undistort_image(
             raw_frame.image_bgr
         )
-        field_realtime_result = (
-            field_detector.detect_realtime(
-                raw_frame,
-                undistorted_bgr,
-                valid_mask=geometry.camera_model.valid_mask,
-            )
-            if field_detector is not None
-            else None
-        )
-        field_result = (
-            field_realtime_result.result
-            if field_realtime_result is not None
-            else None
-        )
-        field_mask = (
-            field_boundary_estimator.update(
-                field_result,
-                valid_mask=geometry.camera_model.valid_mask,
-            )
-            if field_boundary_estimator is not None and field_result is not None
-            else None
-        )
         detection_result = detector.detect_realtime(
             raw_frame,
             undistorted_bgr,
-            field_mask=field_mask,
         )
         ground_geometry_result = (
             ground_geometry_estimator.estimate_realtime(
                 detection_result.observations
             )
             if ground_geometry_estimator is not None
-            else None
-        )
-        center_pose_observation = (
-            center_cross_localizer.localize(field_result)
-            if center_cross_localizer is not None and field_result is not None
-            else None
-        )
-        robot_field_point = (
-            center_pose_observation.selected_pose.position
-            if center_pose_observation is not None
-            and center_pose_observation.selected_pose is not None
             else None
         )
         tracks = tracker.update(
@@ -233,9 +187,10 @@ with source, detector:
             timestamp_ns=monotonic_ns(),
             visual_timestamp_ns=raw_frame.timestamp_ns,
             tracks=tracks,
-            robot_field_point=robot_field_point,
+            robot_field_point=None,
+            # 传统 OpenCV 场地特征检测已删除；场地特征模型推理后端尚未实现，
+            # 因此当前没有 FieldFeatureDetectionResult 或 FieldPoint 输入。
             # 中心十字没有唯一解时传 None，世界模型保留明确不确定性。
-            # 完整车辆入口会从 OdometryImuFusion 查询该采集时刻的先验。
             # ground_geometry_result 当前提供机器人系中心/足迹；后续规划
             # 接口接入前不在这里伪造全局目标坐标。
         )
@@ -251,14 +206,14 @@ with source, detector:
 
 | 子包 | 常用入口 | 对接责任 |
 | --- | --- | --- |
-| [`app`](app/README.md) | `run_manual_capture_session()`、`ClusterBreakupSequence`、`Simulation20PointSequence`、`RemotePerceptionTransport`、`RemoteLocalizationPublisher`、`OdometryImuFusion`、`LatestCenterCrossLocalization`、三个 `rescue-vision-*` 入口 | 赛外受监督手动驾驶/采集、固定流程解团试验、受限四绿色物资 20 分流程、编码器+IMU航位推算、异步 observe_only perception/位姿图传和连续融合动态地图装配 |
+| [`app`](app/README.md) | `run_manual_capture_session()`、`ClusterBreakupSequence`、`Simulation20PointSequence`、`RemotePerceptionTransport`、`RemoteLocalizationPublisher`、`OdometryImuFusion`、三个 `rescue-vision-*` 入口 | 赛外受监督手动驾驶/采集、固定流程解团试验、受限四绿色物资 20 分流程、编码器+IMU航位推算和异步 observe_only perception/位姿图传 |
 | [`config`](config/README.md) | `load_runtime_config()`、`GripperRuntimeConfig`、`AppConfig.build_geometry()`、`HailoConfig.build_backend()` | 启动时严格加载、机械标定和装配 |
 | [`camera`](camera/README.md) | `FrameSource`、`CameraFrame`、`Picamera2Source`、`RecordingSource` | 产生带时间和序号的最新帧 |
 | [`communication`](communication/README.md) | `UartFrameChannel`、`RemoteMessageConnection`、`VideoModeCommand`、`VideoFrameAttributes`、`MapStateObservation`、`RemoteSessionStatus` | COBS UART、直接 TCP 远程消息、可选择 raw/perception/BEV 图传（可声明 perception-only）及轻量 FieldPoint 动态状态 schema |
 | [`motion`](motion/README.md) | `MotionController`、`MotionLimits`、`GripperCalibration`、`RemoteMotionExecutor`、`RemoteGripperExecutor`、`run_remote_motion` | 差速运动、持续夹爪双舵机、Rescue Car 协议和远程调试执行 |
 | [`geometry`](geometry/README.md) | `CameraModel`、`GroundProjector`、显式坐标类型（含 `MapPixel`） | 去畸变及像素/地面/BEV 转换 |
-| [`perception`](perception/README.md) | `TargetPoseDetector`、`PerceptionFrameRenderer`、`PerceptionSnapshot`、`TargetGroundGeometryEstimator`、`FieldFeatureDetector`、`FieldBoundaryEstimator` | 任务目标、最新帧结构化/可视化旁路、地面几何、静态场地特征和局部场界三态掩膜 |
-| [`localization`](localization/README.md) | `CenterCrossLocalizer`、`ImuFrameCalibration`、`OdometryImuFusion`、`FusedPoseEstimate` | 中心十字绝对位姿与编码器/IMU 连续融合、延迟视觉纠偏 |
+| [`perception`](perception/README.md) | `TargetPoseDetector`、`PerceptionFrameRenderer`、`PerceptionSnapshot`、`TargetGroundGeometryEstimator`、`FieldFeatureDetectionResult` 等场地特征观测契约 | 任务目标、最新帧结构化/可视化旁路和目标地面几何；OpenCV 场地检测与局部场界已删除，模型推理后端尚未实现 |
+| [`localization`](localization/README.md) | `CenterCrossLocalizer`、`StaticFieldLandmarkTracker`、`SafeZoneCornerLocalizer`、`ImuFrameCalibration`、`OdometryImuFusion` | 中心十字/安全区角点绝对位姿与地图软门控的纯几何消费层，以及编码器/IMU 连续融合 |
 | [`tracking`](tracking/README.md) | `MultiTargetTracker`、`TrackedTarget`、`TrackStatus` | 时间关联、遮挡和轨迹生命周期 |
 | [`world`](world/README.md) | `StaticFieldMap`、`WorldModel`、`WorldSnapshot`、`HazardState` | 固定物理地图、任务区域派生、动态目标、对手占据和不确定性 |
 | [`mission`](mission/README.md) | `MissionStateMachine`、`replay_mission()`、`MissionDecision` | 规则、安全降级和抽象动作 |
@@ -273,4 +228,4 @@ with source, detector:
 - 原始像素使用 `RawPixel`，去畸变像素使用 `UndistortedPixel`，只有后者能交给 `GroundProjector`。
 - 感知算法只产生 `TargetObservation`、`TargetGroundGeometry` 或 `FieldFeatureDetectionResult`，不持有跟踪、定位、世界模型或规则状态。
 - 实时循环只处理最新帧；录制、显示、日志和通信使用有界旁路。
-- 当前正式任务目标模型、连续定位融合、完整区域/对手感知、真实接触与交付证据、规划、正式任务动作到运动控制的适配和比赛应用入口尚未完成。传统视觉场地特征和中心十字定位目前只有合成测试基线；远程场地图只发布新鲜唯一的低频绝对位姿，不能把过期位置当作连续定位。`app` 的远程驾驶/图传只用于赛外受监督采集，不能替代固件失联看门狗。
+- 当前正式任务目标模型、场地特征模型推理、完整区域/对手感知、真实接触与交付证据、规划和正式比赛应用尚未完成。传统 OpenCV 场地特征检测与局部场界估计已删除，只保留模型无关的观测契约和定位消费层；旧实拍回归结果不再作为当前策略的证据。`app` 的远程驾驶/图传只用于赛外受监督采集，不能替代固件失联看门狗。

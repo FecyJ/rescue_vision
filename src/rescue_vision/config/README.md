@@ -21,7 +21,9 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `AppConfig.build_camera_model()` | 按内参开关创建 `CameraModel` | 内参关闭时返回 `None` |
 | `AppConfig.build_geometry()` | 创建相机模型和可选地面映射 | 内参关闭时返回 `None`；只有内参时 projector 为 `None` |
 | `AppConfig.build_target_pose_detector()` | 按当前 Hailo、类别和 HSV 配置创建任务目标检测器 | Hailo 关闭时返回 `None`；返回对象接管 backend 生命周期 |
-| `AppConfig.build_center_cross_localizer()` | 创建中心十字绝对位姿观测器 | 定位、场地特征或地面映射任一不可用时返回 `None` |
+| `AppConfig.build_center_cross_localizer()` | 创建中心十字绝对位姿观测器 | 定位关闭或地面映射不可用时返回 `None`；当前仓库没有场地特征模型生产者 |
+| `AppConfig.build_static_field_landmark_tracker()` | 创建静态地图搜索提示和短时地标追踪器 | 不打开相机或传感器 |
+| `AppConfig.build_safe_zone_corner_localizer()` | 创建安全区角点绝对位姿拟合器 | 使用同一 `world.static_map` |
 | `AppConfig.build_odometry_imu_fusion()` | 创建连续二维编码器/IMU航位推算器 | 融合关闭时返回 `None`；启用时要求 motion、UART 和里程计机械标定，不强制启用视觉场地特征 |
 | `AppConfig.build_simulation_20_point_sequence()` | 按 `simulation_20_point` 装配受限四绿色物资流程 | 未显式开启时拒绝；只创建纯逻辑对象，不打开硬件 |
 | `UartConfig.build_channel()` | 创建协议无关 UART 行通道 | UART 关闭时返回 `None`；创建时尚不打开设备 |
@@ -32,8 +34,6 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `MotionRuntimeConfig.build_remote_gripper_executor()` | 创建远程夹爪执行器 | 夹爪禁用时返回 `None`；否则复用控制器、有效期与机械标定 |
 | `HailoConfig.build_backend()` | 校验模型资产并创建 Hailo 后端 | Hailo 关闭时返回 `None` |
 | `HailoConfig.model_class_mapping()` | 把模型 class ID 映射为 `TargetClass` | 直接传给 `TargetPoseDetector` |
-| `PerceptionConfig.build_field_feature_detector()` | 创建传统视觉场地特征检测器 | `field_features.enabled=false` 时返回 `None` |
-| `PerceptionConfig.build_field_boundary_estimator()` | 创建机器人系时序局部场界估计器 | 禁用时返回 `None`；启用时要求场地特征和 BEV 地面映射 |
 | `PerceptionConfig.build_target_ground_geometry_estimator()` | 创建目标地面中心估计器 | 禁用时返回 `None`；启用时要求完整地面外参 |
 | `TrackingConfig.build_tracker()` | 创建一轮使用的多目标跟踪器 | 初始无轨迹 |
 | `WorldRuntimeConfig.build_model()` | 按 `team_color` 把物理静态地图派生为任务区域 | 队伍颜色未知时只派生场界 |
@@ -57,13 +57,12 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `TrackingConfig` | 关联、确认、滑行、衰减和删除阈值 |
 | `WorldRuntimeConfig` | 世界阈值、`TeamColor`、`StaticFieldMap` 及任务区域派生 |
 | `MissionConfig` | 比赛计时、安全超时和目标优先级；路径避障由应用规划器按实际走廊负责 |
-| `PerceptionConfig` | 目标检测/K0、ROI HSV、目标地面几何、静态场地特征和局部场界参数 |
+| `PerceptionConfig` | 目标检测/K0、ROI HSV 和目标地面几何参数 |
 | `HsvColorClassifierConfig` | 四类 HSV 闭区间、颜色证据门槛和掩码去噪参数 |
 | `TargetGroundGeometryConfig` | 四类三维形状尺寸、搜索步长、评分权重和接受门限 |
-| `FieldFeatureConfig` | 场地颜色、形态学、公差、点划线和边界候选阈值 |
-| `FieldBoundaryConfig` | 共线拟合、矩形公差、时序确认、边界带、时效和遮挡开关 |
 | `CenterCrossLocalizerConfig` | 终端射线关联、锚点置信度、先验创新和不确定度下限 |
 | `LocalizationRuntimeConfig` / `FusionConfig` | 中心十字配置，以及起点、三轴 IMU 温度/矩阵校准、噪声、时效、物理跳变、视觉门控和历史长度 |
+| `StaticLandmarkTrackingConfig` / `SafeZoneCornerLocalizerConfig` | 地图搜索范围、三帧重捕获、角点基线/残差和不确定度下限 |
 | `HailoConfig` | 模型资产、身份、类别映射和后端粗筛阈值 |
 | `RuntimeGeometry` | `camera_model`、可选 `ground_projector` |
 
@@ -134,13 +133,16 @@ UART/TCP 生命周期和 motion 的停止语义分别见相邻模块 README，�
 旋转后的机器人 `gyro_z` 转换为定位内部“左转为正、右转为负”；本车若实测左转为负
 应设为 `-1`。bias 与温度系数必须是有限三向量，比例/交叉轴矩阵必须有限且可逆，
 安装旋转必须是有限正交 3×3 右手旋转。模板的零值和单位阵不是实车标定结果。
-`localization.fusion.max_interpolated_overrun_samples` 控制可恢复的连续采样超期帧数；
-当前只允许 `0` 或 `1`，默认 `1` 表示单次双编码器有效异常会等待下一帧并插值 IMU，
-连续第二帧仍清除连续位姿。
+`localization.fusion.max_interpolated_overrun_samples` 控制是否允许单帧插值恢复；
+当前只允许 `0` 或 `1`，默认 `1` 表示单次双编码器有效异常会等待下一帧并插值 IMU。
+若下一帧仍为 overrun，`allow_wheel_only=true` 且双编码器/时间/序号/轮速均合法时，
+两段改用纯轮式并放大协方差；连续第三帧仍清除连续位姿。
+轮速合法性使用协议固定 10 ms 遥测释放周期；overrun 帧的 IMU 时间戳会重复，UART
+接收也可能成批到达，两者都不能作为该帧编码器轮速的分母。
 `motion.odometry.max_consecutive_overrun_samples` 只约束解团/20 分流程中
 `EncoderTravelTracker` 的定距积分：允许的连续采样超期（`SAMPLE_OVERRUN`）帧数，
 超出即抛错停车；`null` 关闭该中止，仅保留计数诊断。默认 `1` 保持原行为；
-它不改变融合插值策略。
+它不改变融合的单帧插值、两帧纯轮式和三帧中止策略。
 
 ## 3. 装配几何对象
 
@@ -214,34 +216,22 @@ mission = config.mission.build_state_machine()
 配置对象和已构建对象应在进程生命周期内复用，不能在逐帧循环中重新读取
 YAML、重新生成去畸变映射或重复创建 Hailo 设备。
 
-传统视觉场地检测器同样只装配一次；它不创建 Hailo 或修改世界模型：
+中心十字绝对位姿的纯几何消费方仍可单独装配；当前仓库没有场地特征模型
+推理生产者，因此运行时不能形成从图像到该定位器的完整链路：
 
 ```python
-field_detector = config.perception.build_field_feature_detector(
-    static_map=config.world.static_map,
-    max_observation_age_ms=config.processing.max_observation_age_ms,
-    ground_projector=ground_projector,
-)
-field_boundary_estimator = config.perception.build_field_boundary_estimator(
-    static_map=config.world.static_map,
-    ground_projector=ground_projector,
-)
 center_cross_localizer = config.build_center_cross_localizer(
     ground_projector=ground_projector,
 )
+static_landmark_tracker = config.build_static_field_landmark_tracker()
+safe_zone_corner_localizer = config.build_safe_zone_corner_localizer()
 ```
 
-场地检测配置关闭时 `field_detector` 返回 `None`。局部场界估计配置关闭时
-`field_boundary_estimator` 返回 `None`；启用它必须同时启用场地检测，并使用
-带 BEV 的地面映射。没有地面映射时场地检测器仍可输出部分图像观测，但不能分配
-安全区入口视角左右，也不能把像素伪装成毫米坐标。
-启用场地检测时，`world.static_map` 还必须同时包含红/蓝物资与伤员分区以及
-至少一个正方形出发区；检测器从这些多边形推导安全区和出发区物理尺寸，不在
-perception 保存副本。定位器还要求 `localization.enabled=true` 和地面映射；任一条件缺失时返回
-`None`。它从 `config.world.static_map` 读取中心十字交点和终端方向，不创建
-另一套地图、标定或 BEV。固定区域和地标的完整注释示例见
-`configs/runtime.example.yaml` 的 `world.static_map`；HSV、形态学和线段阈值
-仍属于 `perception.field_features`，不应移入 world。
+`build_center_cross_localizer()` 要求 `localization.enabled=true` 和可用地面
+映射，任一条件缺失时返回 `None`。定位器从 `config.world.static_map` 读取
+中心十字交点和终端方向，不创建另一套地图、标定或 BEV。其输入
+`FieldFeatureDetectionResult` 必须由未来的场地特征模型后端产生；在该后端
+实现前，不要把合成观测当作现场检测结果。
 
 ## 6. 几何开关组合
 
@@ -365,7 +355,7 @@ uart:
 ```
 
 `build_channel()` 返回协议无关的 `UartFrameChannel`；进入上下文时才导入
-PySerial 并打开设备。115200 8N1 和 64-byte COBS 解码边界由冻结协议直接
+PySerial 并打开设备。230400 8N1 和 64-byte COBS 解码边界由冻结协议直接
 确定，不在 YAML 重复配置；消息类型、CRC 和字段布局同样不能塞进运行配置。
 完整生命周期和故障语义见
 [`communication` README](../communication/README.md)。
@@ -391,7 +381,7 @@ PySerial 并打开设备。115200 8N1 和 64-byte COBS 解码边界由冻结协�
 
 - `geometry`、`uart`、`remote`、`motion`、`motion.gripper` 和 `hailo`
   缺省时全部关闭；远程访问缺省为 `observe_only`。
-- `perception` 可以省略；此时目标三维拟合和场地特征检测均安全关闭，ROI HSV
+- `perception` 可以省略；此时目标三维拟合安全关闭，ROI HSV
   分类及检测门限采用 `runtime.example.yaml` 展示的初始值。现场颜色、尺寸和
   接受门限仍应在 YAML 中明确覆盖并重新标定。
 - 录制队列、通信超时、运动上限、跟踪和任务阈值缺省为

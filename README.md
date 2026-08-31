@@ -2,7 +2,7 @@
 
 2027 工创赛“智能救援”赛项的上位机视觉工程，目标平台为 Raspberry Pi 5、Hailo-8L 和 Camera Module 3 NoIR Wide。
 
-当前已完成相机、标定与地面几何、严格配置、录制回放、数据集工具、离线评测、COBS/CRC16 UART 帧通道及 STM32 二进制协议树莓派端、直接 TCP 远程消息通道、差速与双舵机夹爪控制、受监督手动驾驶采集入口、统一目标观测、Hailo YOLO Pose 后端、四类目标传统视觉地面几何估计基线、传统视觉场地特征观测与时序局部场界三态掩膜基线、中心十字绝对位姿候选与同帧红蓝安全区方向锚定、编码器/IMU 二维连续融合与延迟视觉纠偏、连续场地图远程发布，以及可用合成事件运行的目标跟踪、最小世界模型、规则状态机和受限四绿色物资 20 分模拟赛初版编排入口；尚未完成 STM32 新协议固件与真车标定验收、正式四类目标模型、完整区域/对手感知、现场接触/交付证据、固件失联看门狗闭环和正式比赛应用。这不是可直接参赛的完整程序。
+当前已完成相机、标定与地面几何、严格配置、录制回放、数据集工具、离线评测、COBS/CRC16 UART 帧通道及 STM32 二进制协议树莓派端、直接 TCP 远程消息通道、差速与双舵机夹爪控制、受监督手动驾驶采集入口、统一目标观测、Hailo YOLO Pose 后端、四类目标传统视觉地面几何估计基线、场地特征观测契约与纯几何定位消费层、编码器/IMU 二维连续融合、连续场地图远程发布，以及可用合成事件运行的目标跟踪、最小世界模型、规则状态机和受限四绿色物资 20 分模拟赛初版编排入口；尚未完成正式四类目标模型、场地特征模型推理后端、完整区域/对手感知、现场接触/交付证据、固件失联看门狗闭环和正式比赛应用。这不是可直接参赛的完整程序。
 
 ## 快速上手
 
@@ -62,8 +62,8 @@ python -m pytest
 | [`app`](src/rescue_vision/app/README.md) | 已实现受限初版 | 受监督驾驶/采集、固定出发解团试验、四绿色物资 20 分模拟赛软件流程、编码器+IMU航位推算和不阻塞 observe_only 图传/`map/state` 位姿发布；真车门禁与正式比赛能力待验收 |
 | [`data`](src/rescue_vision/data/README.md) | 已实现 | 记录检查、清单生成和按会话防泄漏划分 |
 | [`evaluation`](src/rescue_vision/evaluation/README.md) | 已实现 | 分类、地面误差、时延和失败样例报告 |
-| [`perception`](src/rescue_vision/perception/README.md) | 已实现基础设施 | Pose 框/K0、ROI HSV 分类分割、四类可配置三维模板地面中心估计，以及安全区、无编号出发区、中心十字、低精度边界候选和时序局部场界三态掩膜；硬遮挡默认关闭，正式模型、实物精度与树莓派性能待验证 |
-| [`localization`](src/rescue_vision/localization/README.md) | 已实现融合基础 | 中心十字四向候选、方向锚定、编码器/IMU 误差状态 EKF、延迟视觉纠偏和连续性降级；真车参数、远场精度与性能待验证 |
+| [`perception`](src/rescue_vision/perception/README.md) | 已实现基础设施 | Pose 框/K0、ROI HSV 分类分割、四类可配置三维模板地面中心估计，以及场地特征观测契约；传统 OpenCV 场地检测与局部场界已删除，模型推理后端未实现，实物精度与树莓派性能待验证 |
+| [`localization`](src/rescue_vision/localization/README.md) | 已实现融合基础 | 中心十字/安全区角点绝对位姿的纯几何消费层、静态地图软门控、编码器/IMU 误差状态 EKF 与连续性降级；当前没有场地特征模型生产者，独立连续留出、真车参数、远场精度与性能待验证 |
 | [`tracking`](src/rescue_vision/tracking/README.md) | 已实现纯逻辑 | 时间关联、轨迹确认、短时遮挡、衰减和删除 |
 | [`world`](src/rescue_vision/world/README.md) | 已实现纯逻辑 | 固定物理地图、红蓝任务区域派生、动态目标、危险状态、对手占据和不确定性 |
 | [`mission`](src/rescue_vision/mission/README.md) | 已实现纯逻辑 | 首次/容量/伤员/危险规则、安全降级和抽象动作 |
@@ -83,7 +83,7 @@ FrameSource → CameraFrame → CameraModel → 去畸变帧
                                       │          MultiTargetTracker
                                       │                     ↓
                                       │          WorldModel / MissionStateMachine
-                                      └─> FieldFeatureDetector
+                                      └─> 场地特征模型推理后端（未实现）
                                                  └─> FieldFeatureDetectionResult
                                                               ↓
                                                     CenterCrossLocalizer
@@ -106,7 +106,7 @@ PerceptionFrameRenderer → RemotePerceptionPublisher → RemoteMessageConnectio
                          （observe_only perception JPEG；独立低频旁路）
 
 OdometryImu → OdometryImuFusion → FieldPose2D
-             （树莓派先做温度零偏、交叉轴/比例和安装旋转校正；20 分模拟赛临时阶段暂不提交视觉位姿纠偏）
+             （树莓派先做温度零偏、交叉轴/比例和安装旋转校正；场地特征模型推理后端未实现，暂不提交视觉位姿纠偏）
 
 FieldPose2D → RemoteLocalizationPublisher → observation/map/state
               （独立低频 JSON 旁路）
@@ -120,7 +120,9 @@ PerceptionSnapshot + FieldPose2D → Simulation20PointSequence
 - 实时路径只处理最新帧；录像、显示和日志使用有界旁路。
 - 危险目标允许 `unknown`/疑似危险，不得用总体指标掩盖危险类漏检。
 - 规则状态机只消费显式世界、接触、交付和安全证据；20 分初版提供保守几何证据适配，真实接触传感器和现场交付验收尚未完成。
-- 场地特征检测只输出去畸变像素和可选机器人地面观测，不在定位完成前伪造 `FieldPoint` 或直接修改世界模型。
+- 场地特征观测契约只输出去畸变像素和可选机器人地面观测；检测实现不得在定位
+  完成前伪造 `FieldPoint` 或直接修改世界模型。传统 OpenCV 场地检测与局部场界
+  已删除，模型推理后端尚未实现。
 - 目标地面几何估计保留 K0 接触锚点和中心的语义区别；拟合不充分时中心为 `None`，不会用检测框中心兜底。
 - 原始录像、批量图片、标定临时输出、正式数据集和模型权重不提交 Git。
 

@@ -14,7 +14,7 @@
 | --- | --- | --- |
 | `rescue-vision-manual-capture` | `runtime.yaml`、车端输出根目录和显式监督确认 | 完整装配 TCP/UART/相机/运动/夹爪/记录；推荐生产入口 |
 | `rescue-vision-cluster-breakup` | `runtime.yaml` 和显式监督确认 | 定距越障、目标团搜索/居中、闭爪定距冲散、原地全开、张爪退出、停车合爪、闭爪退离并扫描绿色；找到绿色后停车 |
-| `rescue-vision-simulation-20-point` | `runtime.simulation-20min.yaml` 和显式监督确认 | 复用现有解团，跟踪/世界模型/规则门禁、受限预推导航、单绿色推送、接近时 transport 局部打开、接触确认后闭合、交付验证、退离、四次完成停车，并向 observe_only 观察端发布最新 `map/state` 位姿 |
+| `rescue-vision-simulation-20-point` | `runtime.simulation-20min.yaml` 和显式监督确认；可选 `--log-dir logs` 把终端输出按时间命名写入日志文件 | 复用现有解团，跟踪/世界模型/规则门禁、受限预推导航、单绿色推送、接近时 transport 局部打开、接触确认后闭合、交付验证、退离、四次完成停车，并向 observe_only 观察端发布最新 `map/state` 位姿 |
 | `ClusterBreakupSequence(...).step()` | `ClusterBreakupRuntimeConfig`、`motion.gripper.full_travel_time_s`、同一单调时间轴、编码器累计路程和最新 `PerceptionSnapshot` | 纯逻辑流程决策；不创建相机、Hailo、UART 或电机；冲散后全开、张爪退出、停车合爪，再进入闭爪退离 |
 | `EncoderTravelTracker.submit()` | 带有效双编码器的 `OdometryImu`；连续 `sample_overrun` 预算来自 `motion.odometry.max_consecutive_overrun_samples`，`null` 关闭中止仅保留计数 | 使用运行配置机械标定产生机器人中心累计有符号路程；连续异常超出配置预算时抛错 |
 | `OdometryImuFusion.submit_odometry()` | 同一 UART 消费链路中的 `OdometryImu` | 解团临时配置只输出编码器+IMU 连续 `FieldPose2D`；不调用 `submit_visual()` |
@@ -24,9 +24,8 @@
 | `send_video_frame()` | 已准备好的 `CameraFrame`、`CameraPipeline` 和已启动远程连接 | 在调用线程编码并提交带坐标/标定属性的 JPEG；实时入口应放在独立旁路调用 |
 | `build_camera_pipeline()` | 已加载的 `AppConfig` | 创建但不启动配置选择的真机源、可选去畸变和地面映射 |
 | `build_session_status()` | 同一 `AppConfig`、服务实例 ID、视频 FPS 和可用模式 | 创建声明运动、夹爪、视频模式、车辆和采集能力的会话状态 |
-| `run_manual_capture_session()` | 已启动连接、可选运动/夹爪执行器、采集会话、相机管线和可选 perception/BEV 旁路 | 运行单个完整车辆或仅相机 TCP 会话；断线/故障时清理当前记录 |
+| `run_manual_capture_session()` | 已启动连接、可选运动/夹爪执行器、采集会话、相机管线、可选 perception/BEV 旁路和可选 `OdometryImuFusion` | 运行单个完整车辆或仅相机 TCP 会话；断线/故障时清理当前记录 |
 | `BevFrameRenderer` | 已加载且包含 BEV 配置的 `GroundProjector`；显式 `start/stop` | 有界丢旧保新的后台 BEV 生成旁路；输出保留源帧号和采集时间 |
-| `LatestCenterCrossLocalization` | 场地检测器、中心十字定位器、有效像素掩码和可选 `OdometryImuFusion`；显式 `start/stop` | 有界视觉旁路；完整车辆输出连续融合位姿，仅相机模式保留新鲜单帧视觉语义 |
 | `Simulation20PointSequence` | `Simulation20PointRuntimeConfig`、跟踪器、世界模型、mission 和现有 `ClusterBreakupSequence` | 只读取完成的最新快照并返回轻量线速度/角速度/夹爪意图；任何旁路等待由调用方负责 |
 
 `run_manual_capture_session()` 不创建或打开硬件资源。调用方传入
@@ -133,10 +132,15 @@ else:
 预推点和保守走廊 → 对准/几何单目标接触 → 单目标推送 → 己方物资区内缩区域的
 连续完全进入证据 → 退离确认。完成四个不同的有效 `delivery_id` 后进入
 `FINISH_STOP`，`valid_green_deliveries=4`、`score_points=20`。目标丢失、第二目标
-进入接触走廊、定位/视觉过期、证据不足和旁路故障分别进入安全保持或终止停车；
-接近中的目标若变为危险会取消当前方案，远场危险目标和解团时的短暂接触不触发安全保持。
-安全保持不会自动恢复，必须由外部新鲜证据调用
-`resume_after_safety_hold()`。
+进入接触走廊、定位/视觉过期、证据不足和旁路瞬时故障（`side_path_recovering`）
+都保持当前状态零速，条件恢复后下一周期自动继续，不锁存需要人工恢复的状态；
+解团 `FAULT` 丢弃碰撞前轨迹并回到“稳定确认—扫描—候选评估”路径，重复解团仍受
+次数上限约束。扫描完成后若位姿存在但不确定度不合格，按“无易搬运绿色”
+进入 `PLAN_REBREAKUP` 评估（受次数/几何上限约束），只有位姿完全缺失时才
+原地等待。只有急停锁存、观察端不再是 `observe_only`、直接安全信号
+和 mission 规则终止才进入不可恢复的 `TERMINAL_STOP`；任何保持若导致 15 秒无
+有效运动，仍由 mission 规则终止。接近中的目标若变为危险会取消当前方案，远场
+危险目标和解团时的短暂接触不触发保持。
 
 蓝色或 `unknown` 不会成为绿色候选。常规导航只在它们实际阻挡预推、接近或推动
 走廊时取消当前绿色方案并重新评估；已经建立单目标持续推动后若走廊被阻挡则保持
@@ -156,8 +160,14 @@ else:
 ```bash
 rescue-vision-simulation-20-point \
   --config configs/runtime.simulation-20min.yaml \
-  --supervised-physical-stop-ready
+  --supervised-physical-stop-ready \
+  --log-dir logs
 ```
+
+传入 `--log-dir logs` 时，stdout/stderr 会同时写入
+`logs/<YYYYmmdd_HHMM>.log`（按行缓冲追加，同分钟重跑继续写入同一文件；配置
+错误和旁路 worker 的耗时打印也会进入该文件），便于现场留存完整终端日志；不传
+该参数则只输出到终端。
 
 未完成 STM32 看门狗真车闭环前，命令仍要求物理急停和全程监督；观察端只能是
 `observe_only`，不能下发运动、夹爪或状态跳转命令。
@@ -173,7 +183,7 @@ rescue-vision-manual-capture \
   --output-root data/rescue-targets/manual \
   --supervised-physical-stop-ready \
   --enable-localization \
-  --video-fps 2
+  --video-fps 10
 ```
 
 入口创建但不复制相机参数、运动限值或协议规则。连接后发送会话、视频、动态地图状态、车辆
@@ -187,27 +197,25 @@ rescue-vision-manual-capture \
 `perception` 或 `bev`；perception 由 `PerceptionFrameRenderer` 在最新帧后台
 旁路运行 `TargetPoseDetector`，BEV 只在当前地面映射包含 BEV 配置时由独立
 最新帧旁路生成。两者只发布带实际模式和坐标元数据的 JPEG，不阻塞运动安全循环。
-启用 `--enable-localization` 时，远程 BEV 优先使用同一定位旁路完成的最新帧：
-绿色轴和 `CROSS` 标出中心十字，半透明 `SAFE red/blue` 标出安全区，青色线段
-标出已关联终端；定位结果尚未完成时临时回退为纯 BEV，过期检测则显式显示
-`FIELD STALE`。该叠加只用于人眼诊断，全局位姿仍以 `observation/map/state`
-为机器可读权威。
+启用 `--enable-localization` 或 `localization.fusion.enabled` 时，唯一 UART
+消费回调把 100 Hz `OdometryImu` 送入 `OdometryImuFusion`，地图状态发布融合器
+的最新编码器+IMU 位姿；不再启动传统场地特征/中心十字视觉旁路，BEV 图传只
+使用纯 BEV 渲染器。该融合位姿的绝对起点来自
+`localization.fusion.initial_pose`，不是现场视觉定位证据。
 相机去畸变、录像提交、JPEG 和动态状态发布之间都会再次检查远程命令期限并刷新
-轮速；多个旁路耗时不会再累计成一次超过 100 ms 的轮速跃迁。任一单项操作
-若独占控制线程超过 100 ms，仍先停车并退出，而不是增大阈值掩盖实时性故障。
+轮速；多个旁路耗时不会再累计成一次超过 200 ms 的轮速跃迁。活动控制循环
+更新间隔超过 200 ms 时先停车并退出。
 未录制时只在下一图传期限到达后处理最新相机帧，不再按相机 20 FPS 逐帧
 去畸变；默认图传为 2 FPS，不需要实时画面时可显式传 `--video-fps 1`。开始
 录像后恢复逐相机帧处理，保证记录完整性。
-手动驾驶默认不启动 CPU 较重的场地特征/中心十字定位旁路；需要地图定位时
-显式添加 `--enable-localization`，或启用 `localization.fusion.enabled`。
+手动驾驶默认不启动编码器/IMU 融合；需要地图定位时显式添加
+`--enable-localization`，或启用 `localization.fusion.enabled`。
 只要 `world.static_map.regions` 非空，会话就声明并以 200 ms 周期发布轻量
 `observation/map/state` JSON；静态底图、区域和 FieldPoint 到显示像素的映射
-由电脑端固化。若同时启用可用地面映射、`field_features` 和 `localization`，
-状态携带新鲜机器人全局位姿。完整车辆配置启用 `localization.fusion` 时，唯一 UART 消费回调把
-100 Hz `OdometryImu` 同时送给车辆状态、运动日志和融合器；中心十字后台按相机
-采集时刻取先验、提交延迟纠偏，离开十字可见区后继续发布新鲜连续位姿。遥测
-超期或连续性中断时地图立即清除机器人位置。仅相机模式不创建融合器，也不会用
-配置起点冒充连续定位。
+由电脑端固化。完整车辆配置启用 `localization.fusion` 时，唯一 UART 消费回调把
+100 Hz `OdometryImu` 同时送给车辆状态、运动日志和融合器；该路径只做编码器+IMU
+连续推算，不再包含中心十字或安全区视觉纠偏。遥测超期或连续性中断时地图立即
+清除机器人位置。仅相机模式不创建融合器，也不会用配置起点冒充连续定位。
 手动会话的 `motion.jsonl` 逐条
 保存运动/夹爪执行结果、编码器/IMU、系统状态、命令回复和停车原因；
 这些事件与图像帧统一使用树莓派应用单调时间。
@@ -265,7 +273,8 @@ rescue-vision-cluster-breakup \
 
 流程按配置执行：等待有效编码器 → 固定距离直行越过减速带 → 按
 `search_angular_velocity_rad_s` 的符号持续转向搜索至少
-`cluster_min_detections` 个模型观测 → 用观测框联合中心做比例居中 → 低速接近。
+`cluster_min_detections` 个模型观测（按水平间隙 `cluster_group_gap_ratio`
+分组，只认成员最多的目标团）→ 用该团观测框联合中心做比例居中 → 低速接近。
 最近有效 K0 地面点进入 `gripper_open_distance_mm` 后，夹爪保持闭合，车辆以
 `breakup_speed_m_s` 推进 `breakup_distance_m`；到达后原地停车并切到已标定张开端点，
 保持 `motion.gripper.full_travel_time_s` 完全打开，再以
@@ -279,8 +288,9 @@ rescue-vision-cluster-breakup \
 在非转运阶段若视野只有 `unknown`/`blue_danger`，流程继续原地搜索，不直接锁定零速。
 
 `configs/runtime.simulation-20min.yaml` 是从当前车端 `runtime.yaml` 复制的临时配置：
-保留目标 perception 所需的 Hailo 和地面映射，关闭 `localization.enabled` 及
-`perception.field_features.enabled`，但开启 `localization.fusion.enabled`。
+保留目标 perception 所需的 Hailo 和地面映射，关闭 `localization.enabled`，
+但开启 `localization.fusion.enabled`；配置中已不存在
+`perception.field_features`/`perception.field_boundary`。
 解团入口把每条有效 `OdometryImu` 同时送入固定距离里程计和
 `OdometryImuFusion`，当前只消费编码器+IMU预测；单次双编码器有效的
 `sample_overrun` 会等待下一帧并做短时 IMU 插值，连续异常仍触发保守降级；初始场地位姿来自配置的
@@ -312,7 +322,11 @@ rescue-vision-cluster-breakup \
 不得在树莓派端取绝对值或增加符号补偿掩盖固件方向错误。
 20 分入口的终端日志只在状态变化或约每秒输出一次，并附带编码器累计路程、左右轮
 诊断、目标/已下发轮速和 STM32 电机输出/停止原因；请求非零轮速后约 750 ms 仍
-报告电机输出关闭时会立即进入停车异常，不再等待出发阶段超时。
+报告电机输出关闭时保持零速等待 STM32 重新使能（日志标记 `motor_blocked`），
+不再把单次未使能变成流程退出；持续失败仍由 15 秒无运动规则终止。单次命令
+回复拒绝只记录并触发有界重同步；相机/融合/遥测提交等旁路异常按
+`side_path_recovering` 保持并自动恢复；观察端断开只记录并限频重启观察服务，
+不参与运动健康判定。
 
 ## 安全边界
 
