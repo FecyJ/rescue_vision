@@ -317,6 +317,12 @@ def parse_yolo26_pose_output(
             and keypoints[1].point.u >= keypoints[2].point.u
         ):
             raise ValueError("safe_zone keypoints must satisfy u(K1) < u(K2).")
+        if model_class is not PoseModelClass.SAFE_ZONE:
+            # 训练标签中的未使用槽位为 0 0 0，但 Pose head 仍会为每个
+            # 类别输出三个回归槽；对非安全区类别只保留 K0，避免网络对
+            # 监督为零的槽位产生的任意值污染领域契约。
+            keypoints[1] = PoseKeypoint(None, 0.0)
+            keypoints[2] = PoseKeypoint(None, 0.0)
         parsed.append(
             ModelDetection(
                 model_class_id=class_id,
