@@ -865,26 +865,19 @@ def test_centering_filters_single_frame_error_and_delays_reverse_turn() -> None:
     )
     assert one_opposite_frame.angular_velocity_rad_s <= 0.0
 
-    settling = sequence.step(
+    reversed_direction = sequence.step(
         timestamp_ns=2_200_000_000,
         cumulative_distance_m=0.5,
         perception=cluster_snapshot(22, distance_mm=500.0, offset=-15.0),
     )
-    assert settling.angular_velocity_rad_s == pytest.approx(0.0)
+    assert reversed_direction.angular_velocity_rad_s > 0.0
 
-    delayed_reverse_1 = sequence.step(
+    continued_reverse = sequence.step(
         timestamp_ns=2_300_000_000,
         cumulative_distance_m=0.5,
         perception=cluster_snapshot(23, distance_mm=500.0, offset=-15.0),
     )
-    assert delayed_reverse_1.angular_velocity_rad_s == pytest.approx(0.0)
-
-    delayed_reverse_2 = sequence.step(
-        timestamp_ns=2_400_000_000,
-        cumulative_distance_m=0.5,
-        perception=cluster_snapshot(24, distance_mm=500.0, offset=-15.0),
-    )
-    assert delayed_reverse_2.angular_velocity_rad_s > 0.0
+    assert continued_reverse.angular_velocity_rad_s > 0.0
 
 
 def test_approach_nearest_distance_ignores_stray_target() -> None:

@@ -1011,6 +1011,7 @@ class BreakupDecision:
 @dataclass(frozen=True, slots=True)
 class _ClusterView:
     horizontal_error_ratio: float
+    raw_horizontal_error_ratio: float
     nearest_forward_distance_mm: float | None
 
 
@@ -1518,7 +1519,10 @@ class ClusterBreakupSequence:
                     0.0,
                     "closed_gripper_and_breakup_push",
                 )
-            angular = self._centering_angular(cluster.horizontal_error_ratio)
+            angular = self._centering_angular(
+                cluster.horizontal_error_ratio,
+                cluster.raw_horizontal_error_ratio,
+            )
             return self._decision(
                 timestamp_ns,
                 self.config.approach_speed_m_s,
@@ -1710,26 +1714,42 @@ class ClusterBreakupSequence:
         return self._decision(
             timestamp_ns,
             0.0,
-            self._centering_angular(cluster.horizontal_error_ratio),
+            self._centering_angular(
+                cluster.horizontal_error_ratio,
+                cluster.raw_horizontal_error_ratio,
+            ),
             "center_cluster",
         )
 
-    def _centering_angular(self, horizontal_error_ratio: float) -> float:
+    def _centering_angular(
+        self,
+        horizontal_error_ratio: float,
+        raw_horizontal_error_ratio: float | None = None,
+    ) -> float:
         # 图像右侧为正误差；机器人需右转，项目角速度右转为负。
+        raw_error = (
+            horizontal_error_ratio
+            if raw_horizontal_error_ratio is None
+            else raw_horizontal_error_ratio
+        )
         tolerance = self.config.center_tolerance_ratio
-        if abs(horizontal_error_ratio) <= tolerance:
+        reversal_limit = tolerance + self.config.center_reverse_deadband_ratio
+        if abs(horizontal_error_ratio) <= tolerance and abs(raw_error) <= tolerance:
             self._center_reverse_candidate_sign = None
             self._center_reverse_candidate_frames = 0
             return 0.0
-        requested = -self.config.center_kp_rad_s * horizontal_error_ratio
-        requested_sign = 1 if requested > 0.0 else -1
+        direction_error = (
+            raw_error if abs(raw_error) > reversal_limit else horizontal_error_ratio
+        )
+        if abs(direction_error) <= tolerance:
+            self._center_reverse_candidate_sign = None
+            self._center_reverse_candidate_frames = 0
+            return 0.0
+        requested_sign = -1 if direction_error > 0.0 else 1
         if self._center_turn_sign is None:
             self._center_turn_sign = requested_sign
         elif requested_sign != self._center_turn_sign:
-            reversal_limit = (
-                tolerance + self.config.center_reverse_deadband_ratio
-            )
-            if abs(horizontal_error_ratio) <= reversal_limit:
+            if abs(raw_error) <= reversal_limit:
                 self._center_reverse_candidate_sign = None
                 self._center_reverse_candidate_frames = 0
                 return 0.0
@@ -1749,6 +1769,10 @@ class ClusterBreakupSequence:
         else:
             self._center_reverse_candidate_sign = None
             self._center_reverse_candidate_frames = 0
+        control_error = horizontal_error_ratio
+        if abs(control_error) <= tolerance and abs(raw_error) > tolerance:
+            control_error = raw_error
+        requested = -self.config.center_kp_rad_s * control_error
         maximum = self.config.center_max_angular_velocity_rad_s
         return min(max(requested, -maximum), maximum)
 
@@ -1790,6 +1814,7 @@ class ClusterBreakupSequence:
         ]
         return _ClusterView(
             horizontal_error_ratio=self._filtered_center_error_ratio,
+            raw_horizontal_error_ratio=horizontal_error,
             nearest_forward_distance_mm=(
                 min(forward_distances) if forward_distances else None
             ),
@@ -1859,6 +1884,7 @@ class ClusterBreakupSequence:
         self._state_distance_m = distance_m
         if state is BreakupState.CENTER_CLUSTER:
             self._centered_frames = 0
+        if state is BreakupState.SEARCH_CLUSTER:
             self._filtered_center_error_ratio = None
             self._last_center_filter_frame_sequence = None
             self._center_turn_sign = None
