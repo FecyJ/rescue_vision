@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from threading import Event
 import time
 
 import cv2
 import numpy as np
 import pytest
+import rescue_vision.perception.visualization as visualization
 
 from rescue_vision.camera.frame import CameraFrame
 from rescue_vision.evaluation.report import evaluate_records
@@ -476,6 +478,41 @@ def test_perception_frame_renderer_keeps_latest_result_off_realtime_thread() -> 
         assert snapshot.frame_sequence == source_frame.sequence
         assert len(snapshot.observations) == 1
     finally:
+        renderer.stop()
+
+
+def test_perception_snapshot_is_published_before_slow_render(monkeypatch) -> None:
+    image = image_with_regions()
+    source_frame = CameraFrame(8, time.monotonic_ns() - 1_000_000, image)
+    render_started = Event()
+    release_render = Event()
+    original_render = visualization.render_target_observations
+
+    def blocked_render(*args, **kwargs):
+        render_started.set()
+        assert release_render.wait(timeout=1.0)
+        return original_render(*args, **kwargs)
+
+    monkeypatch.setattr(visualization, "render_target_observations", blocked_render)
+    renderer = PerceptionFrameRenderer(
+        lambda: detector([[detection()]]),
+    )
+    renderer.start()
+    try:
+        renderer.submit(source_frame)
+        assert render_started.wait(timeout=1.0)
+        deadline = time.monotonic() + 1.0
+        snapshot = None
+        while time.monotonic() < deadline:
+            snapshot = renderer.latest_snapshot()
+            if snapshot is not None:
+                break
+            time.sleep(0.001)
+        assert snapshot is not None
+        assert snapshot.frame_sequence == source_frame.sequence
+        assert renderer.latest() is None
+    finally:
+        release_render.set()
         renderer.stop()
 
 

@@ -61,6 +61,7 @@ def breakup_config(**changes: object) -> ClusterBreakupRuntimeConfig:
         "center_confirm_frames": 2,
         "center_kp_rad_s": 1.0,
         "center_max_angular_velocity_rad_s": 0.5,
+        "center_error_filter_alpha": 1.0,
         "approach_speed_m_s": 0.1,
         "gripper_open_distance_mm": 250.0,
         "breakup_speed_m_s": 0.25,
@@ -835,6 +836,55 @@ def test_centering_uses_largest_group_center() -> None:
     # 按 kp=0.5 得到左转角速度 +0.26；两人团在右侧不参与居中。
     assert decision.state is BreakupState.CENTER_CLUSTER
     assert decision.angular_velocity_rad_s == pytest.approx(0.26)
+
+
+def test_centering_filters_single_frame_error_and_delays_reverse_turn() -> None:
+    sequence = ClusterBreakupSequence(
+        breakup_config(
+            center_error_filter_alpha=0.35,
+            center_reverse_deadband_ratio=0.03,
+            center_reverse_confirm_frames=2,
+        ),
+        gripper_full_travel_time_s=1.0,
+    )
+    sequence.step(timestamp_ns=0, cumulative_distance_m=None, perception=None)
+    sequence.step(timestamp_ns=10_000_000, cumulative_distance_m=0.0, perception=None)
+    sequence.step(timestamp_ns=1_000_000_000, cumulative_distance_m=0.5, perception=None)
+
+    first_direction = sequence.step(
+        timestamp_ns=2_000_000_000,
+        cumulative_distance_m=0.5,
+        perception=cluster_snapshot(20, distance_mm=500.0, offset=15.0),
+    )
+    assert first_direction.angular_velocity_rad_s < 0.0
+
+    one_opposite_frame = sequence.step(
+        timestamp_ns=2_100_000_000,
+        cumulative_distance_m=0.5,
+        perception=cluster_snapshot(21, distance_mm=500.0, offset=-15.0),
+    )
+    assert one_opposite_frame.angular_velocity_rad_s <= 0.0
+
+    settling = sequence.step(
+        timestamp_ns=2_200_000_000,
+        cumulative_distance_m=0.5,
+        perception=cluster_snapshot(22, distance_mm=500.0, offset=-15.0),
+    )
+    assert settling.angular_velocity_rad_s == pytest.approx(0.0)
+
+    delayed_reverse_1 = sequence.step(
+        timestamp_ns=2_300_000_000,
+        cumulative_distance_m=0.5,
+        perception=cluster_snapshot(23, distance_mm=500.0, offset=-15.0),
+    )
+    assert delayed_reverse_1.angular_velocity_rad_s == pytest.approx(0.0)
+
+    delayed_reverse_2 = sequence.step(
+        timestamp_ns=2_400_000_000,
+        cumulative_distance_m=0.5,
+        perception=cluster_snapshot(24, distance_mm=500.0, offset=-15.0),
+    )
+    assert delayed_reverse_2.angular_velocity_rad_s > 0.0
 
 
 def test_approach_nearest_distance_ignores_stray_target() -> None:
