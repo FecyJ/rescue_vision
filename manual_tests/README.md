@@ -31,6 +31,9 @@
 - `stm32_monitor.py`：默认只读监测配置中的 STM32 COBS/CRC16 UART，周期显示
   编码器/IMU、系统状态、实际频率、序号丢帧和协议错误；可选只发送一次
   `QUERY_STATUS`，不发送运动或夹爪命令。
+- `pid_tune.py`：通过 UART 文本协议（115200）标定左右轮速度比例系数，使
+  「相同轮速指令走直线」；按多个速度各直行 1.5 m、积分实测轮速更新 scale、
+  原地转 90° 进入下一轮。
 
 手动驾驶默认关闭编码器/IMU 融合；需要地图定位时在命令中添加
 `--enable-localization`。这不会改变静态场地图发布，只控制融合与 `map/state`
@@ -224,6 +227,44 @@ PYTHONPATH=src .venv/bin/python \
 参数。`RESULT=departure_distance_reached` 表示达到编码器定距；退出码为 `2` 表示
 本次出现过 sample overrun 或连续 overrun 导致停止。`sample_dt_ms` 是 STM32 采样
 时间间隔，`host_dt_ms` 是树莓派接收时间间隔，不能用终端输出间隔代替。
+
+## 左右轮比例系数标定（走直线）
+
+该脚本面向 UART 文本协议（115200、`\r\n` 结尾）的底盘固件：`m<L>,<R>` 设
+双轮速度、`b0,0` 柔和刹车、`p<Kp>,<Ki>,<Kd>` 设共享速度环 PID、`v` 查询，
+并周期回传 `t<ms>,<实测左速>,<实测右速>,...`。它不复用仓库 v3 二进制
+`MotionController`，直接按上述文本协议收发。左右轮速度正值均表示前进；若
+实测速度方向相反，先核对固件方向，不要在脚本里加符号翻转。
+
+目标「给左右轮发送相同速度即可走直线」无法靠一组共享 PID 补偿左右轮机械
+不对称，因此脚本标定的是**每轮一个、与速度无关的比例系数**（scale），放在
+树莓派侧：下发时套用 `m<v*scaleL>,<v*scaleR>`。每轮先直行 `--distance-m`，
+持续积分实测左右轮路程，结束后按「实测 / (指令 × scale)」更新两个 scale，
+再原地转 `--turn-angle-deg`、等待 `--settle-seconds` 进入下一速度轮次，验证
+同一组 scale 在 0.05–0.20 m/s 各速度下均走直线。
+
+在架空轮，或已确认物理急停可立即触发且操作员全程监督的条件下运行：
+
+```bash
+PYTHONPATH=src .venv/bin/python \
+  manual_tests/pid_tune.py \
+  --device /dev/ttyAMA10 \
+  --wheel-track-m 0.19 \
+  --speeds-m-s 0.05,0.10,0.15,0.20 \
+  --supervised-physical-stop-ready
+```
+
+- `--wheel-track-m` 必须填入实测轮距，仅用于航向偏差换算和转 90° 时长。
+- `--speeds-m-s` 每个值必须落在 `[0.05, 0.20] m/s`；`--passes` 可对整组速度
+  重复多轮以收敛。
+- 可选 `--set-pid 3.5,0.25,0` 在标定前发一次 `p<Kp>,<Ki>,<Kd>`（范围
+  Kp/Ki ∈ [0,20]、Kd ∈ [0,5]），仅设置共享速度环，不参与左右平衡。
+- 每轮打印 `ROUND ... heading_dev_deg=... scales=(旧)->(新)`；`heading_dev_deg`
+  为正值表示左轮走得多、车辆向左偏。最终 `PID_TUNE_DONE` 给出
+  `left_scale/right_scale` 和 `right_over_left`，把这两个比例系数写入后续
+  直行代码即可。
+- scale 只保存在树莓派侧运行内存；断电不影响本脚本，但也不写入固件。正常
+  结束、Ctrl+C、超时或异常都先发 `b0,0`，这不替代物理急停。
 
 ## 编码器/IMU 连续融合真车验收
 
