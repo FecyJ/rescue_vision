@@ -26,8 +26,9 @@ class SafeZoneSide(str, Enum):
 
 
 class SafeZoneCornerRole(str, Enum):
-    """从场内面向安全区时，紫色围框四个地面角点的稳定语义。"""
+    """安全区定位使用的稳定几何点语义。"""
 
+    GROUND_ANCHOR = "ground_anchor"
     ENTRANCE_LEFT = "entrance_left"
     ENTRANCE_RIGHT = "entrance_right"
     BACK_LEFT = "back_left"
@@ -545,8 +546,11 @@ class SafeZonePoseObservation:
             raise ValueError("quality must contain FieldFeatureQuality values.")
         left = self.image_left_landmark.undistorted
         right = self.image_right_landmark.undistorted
-        if left is not None and right is not None and left.u >= right.u:
-            raise ValueError("safe-zone landmarks must satisfy u(K1) < u(K2).")
+        if left is not None and right is not None and left.u > right.u:
+            left_landmark = self.image_left_landmark
+            right_landmark = self.image_right_landmark
+            object.__setattr__(self, "image_left_landmark", right_landmark)
+            object.__setattr__(self, "image_right_landmark", left_landmark)
         if (
             self.physical_color is SafeZoneColor.UNKNOWN
             and FieldFeatureQuality.IDENTITY_UNRESOLVED not in self.quality

@@ -66,6 +66,14 @@ motion:
   # 单轮目标速度变化率；0.5 m/s² 时从静止到 0.30 m/s 约需 0.6 秒。
   max_wheel_acceleration_m_s2: 0.50
   max_remote_command_valid_for_ms: 500
+  # SOFT_BRAKE 安全同步等待 STM32 accepted 回复的单次超时，单位秒；超时会重试。
+  synchronization_timeout_s: 1.0
+  stall_guard:
+    # 有效编码器在持续轮速命令下不变化时，触发软刹车并终止当前会话。
+    enabled: true
+    timeout_ms: 300
+    min_command_speed_m_s: 0.01
+    stationary_encoder_delta_count: 0
   odometry:
     # 融合定位启用前必须用本车实测值替换；示例数值不是机械标定结果。
     enabled: false
@@ -101,6 +109,8 @@ motion:
   cluster_breakup:
     # 仅用于有物理急停、人员全程监督的解团试验；不是完整比赛入口。
     enabled: false
+    # true 时保留张爪退出和闭爪退离；现场试验可显式设为 false，在原地完成张爪/合爪后扫描。
+    post_breakup_retreat_enabled: true
     # 从约定出发姿态直行越过减速带，编码器累计机器人中心路程。
     departure_distance_m: 0.55
     departure_speed_m_s: 0.15
@@ -117,6 +127,9 @@ motion:
     center_confirm_frames: 3
     center_kp_rad_s: 1.20
     center_max_angular_velocity_rad_s: 0.55
+    center_error_filter_alpha: 0.35
+    center_reverse_deadband_ratio: 0.03
+    center_reverse_confirm_frames: 2
     approach_speed_m_s: 0.12
     # 最近有效 K0 地面点进入该前向距离后，保持闭爪并开始定距冲散；
     # 到达冲散距离后停车张爪，按 motion.gripper.full_travel_time_s 完全打开，
@@ -138,6 +151,24 @@ simulation_20_point:
   # 仅在已完成软件离线回放、真车门禁和现场确认后显式开启。
   enabled: false
   target_delivery_count: 4
+  first_breakup_distance_m: 0.5
+  safe_zone_calibration_enabled: false
+  safe_zone_calibration_distance_mm: 300.0
+  safe_zone_calibration_position_tolerance_mm: 50.0
+  safe_zone_calibration_heading_tolerance_rad: 0.12
+  safe_zone_calibration_speed_m_s: 0.05
+  safe_zone_calibration_angular_kp_rad_s: 1.0
+  safe_zone_calibration_max_angular_velocity_rad_s: 0.35
+  safe_zone_calibration_timeout_s: 15.0
+  # 启用后启动阶段先右转40°、直行1 m，再进入视觉解团；默认示例保持关闭。
+  startup_maneuver_enabled: false
+  startup_turn_angle_rad: 0.6981317007977318
+  startup_turn_angular_velocity_rad_s: -0.35
+  startup_forward_distance_m: 1.0
+  startup_forward_speed_m_s: 0.15
+  startup_motion_phase_timeout_s: 15.0
+  # 每次动作状态切换后的稳定停顿，单位秒；实际真车可按机械响应调整。
+  action_settle_time_s: 0.5
   prepush_offset_mm: 180.0
   robot_footprint_radius_mm: 160.0
   target_half_extent_mm: 25.0
@@ -168,12 +199,30 @@ simulation_20_point:
   retreat_clear_distance_mm: 180.0
   delivery_confirm_frames: 3
   disengage_confirm_frames: 3
-  max_breakup_attempts_per_delivery: 2
+  # 重复解团次数不含首次解团；4 表示单次交付循环合计最多 5 次。
+  max_breakup_attempts_per_delivery: 4
   max_breakup_attempts_total: 8
   breakup_settle_confirm_frames: 3
   min_green_clearance_mm: 80.0
   corridor_sample_step_mm: 40.0
   completed_target_exclusion_mm: 120.0
+
+green_grab:
+  # 无地面标定时识别单个绿色物资、开夹爪像素居中接近并合爪的简化试验；
+  # 依赖 hailo.enabled 的 v3 模型，不是完整比赛入口。
+  enabled: false
+  # 原地搜索角速度，单位 rad/s；左转为正、右转为负，符号即方向。
+  search_angular_velocity_rad_s: 0.30
+  approach_speed_m_s: 0.08
+  # 目标水平中心相对半幅图像的比例误差门限，及居中控制增益与角速度上限。
+  align_tolerance_ratio: 0.06
+  align_kp_rad_s: 1.2
+  align_max_angular_velocity_rad_s: 0.35
+  # 目标框下边进入该图像高度比例即视为足够接近，停车合爪。
+  engage_bottom_fraction: 0.85
+  # 连续看到绿色才确认并打开夹爪的帧数。
+  confirm_frames: 3
+  target_loss_timeout_ms: 500.0
 
 tracking:
   confirmation_hits: 2
@@ -205,19 +254,19 @@ world:
         negative_x: plain_boundary
         positive_y: red_safe_zone
         negative_y: blue_safe_zone
-    # v3 安全区地标。以下坐标仅由命题示意图启动，尚未实测，因此必须保持
-    # measured/usable=false；定位装配不会把它们作为绝对视觉证据。
+    # v3 安全区地标。红方坐标为现场记录的厘米值 (-33,114)、(0,114)、(33,114)
+    # 换算后的毫米值；蓝方按中心十字对称布置换算为对应负 y 坐标。
     safe_zone_landmarks:
       - color: red
-        ground_anchor_field_mm: [0.0, 1200.0]
-        near_field_corners_mm: [[-300.0, 1200.0], [300.0, 1200.0]]
-        measured: false
-        usable: false
+        ground_anchor_field_mm: [0.0, 1140.0]
+        near_field_corners_mm: [[-330.0, 1140.0], [330.0, 1140.0]]
+        measured: true
+        usable: true
       - color: blue
-        ground_anchor_field_mm: [0.0, -1200.0]
-        near_field_corners_mm: [[-300.0, -1200.0], [300.0, -1200.0]]
-        measured: false
-        usable: false
+        ground_anchor_field_mm: [0.0, -1140.0]
+        near_field_corners_mm: [[-330.0, -1140.0], [330.0, -1140.0]]
+        measured: true
+        usable: true
     # 以下 3000 mm 场界、600×300 mm 安全区和 300 mm 出发区来自命题示意图，
     # 是启动地图而非现场测量真值；现场尺寸或布置变化时只改这里。
     # 安全区多边形描述彩色有效区域，不包含外侧 660 mm 围栏厚度。
@@ -408,6 +457,8 @@ localization:
   safe_zone_corners:
     max_observation_age_ms: 250.0
     min_baseline_mm: 150.0
+    # K0-K1 或 K0-K2 与实测安全区长度的最大允许误差，单位 mm。
+    max_k0_corner_distance_error_mm: 80.0
     max_fit_residual_mm: 80.0
     position_uncertainty_floor_mm: 30.0
     heading_uncertainty_floor_deg: 3.0

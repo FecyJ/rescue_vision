@@ -50,11 +50,11 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `ProcessingConfig` | `max_observation_age_ms` |
 | `UartConfig` | 设备名、波特率、读写超时、有界接收容量和最大行长度 |
 | `RemoteConfig` | 服务端/客户端、观察/调试权限、连接/IO 超时和有界队列 |
-| `MotionRuntimeConfig` | 实测轮距、车体/车轮速度上限、单轮加速度上限、远程命令有效期、`odometry`、`gripper` 和解团试验参数 |
+| `MotionRuntimeConfig` | 实测轮距、车体/车轮速度上限、单轮加速度上限、远程命令有效期、`stall_guard`、`odometry`、`gripper` 和解团试验参数 |
 | `OdometryRuntimeConfig` | 每圈计数、左右有效轮径和校准后机器人 `gyro_z` 极性 |
 | `GripperRuntimeConfig` | 能力开关、左右开/闭安全角度、角度和与固定速度全行程时间 |
 | `ClusterBreakupRuntimeConfig` | 定距出发、左右搜索方向、居中、接近、张爪冲散、张爪退出、停车合爪、闭爪退离和绿色扫描参数 |
-| `Simulation20PointRuntimeConfig` | 预推/走廊、扫描、接触、交付确认、退离和重复解团上限；目标交付数固定为 4 |
+| `Simulation20PointRuntimeConfig` | 首次解团前推距离、解团后安全区校准、预推/走廊、扫描、接触、交付确认、退离和重复解团上限；目标交付数固定为 4 |
 | `TrackingConfig` | 关联、确认、滑行、衰减和删除阈值 |
 | `WorldRuntimeConfig` | 世界阈值、`TeamColor`、`StaticFieldMap` 及任务区域派生 |
 | `MissionConfig` | 比赛计时、安全超时和目标优先级；路径避障由应用规划器按实际走廊负责 |
@@ -63,7 +63,7 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 | `TargetGroundGeometryConfig` | 四类三维形状尺寸、搜索步长、评分权重和接受门限 |
 | `CenterCrossLocalizerConfig` | 终端射线关联、锚点置信度、先验创新和不确定度下限 |
 | `LocalizationRuntimeConfig` / `FusionConfig` | 中心十字配置，以及起点、三轴 IMU 温度/矩阵校准、噪声、时效、物理跳变、视觉门控和历史长度 |
-| `StaticLandmarkTrackingConfig` / `SafeZoneCornerLocalizerConfig` | 地图搜索范围、三帧重捕获、角点基线/残差和不确定度下限 |
+| `StaticLandmarkTrackingConfig` / `SafeZoneCornerLocalizerConfig` | 地图搜索范围、三帧重捕获、K0-角点长度门、角点基线/残差和不确定度下限 |
 | `HailoConfig` | 模型资产、身份、类别映射和后端粗筛阈值 |
 | `RuntimeGeometry` | `camera_model`、可选 `ground_projector` |
 

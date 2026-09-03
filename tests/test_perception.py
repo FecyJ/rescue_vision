@@ -160,7 +160,8 @@ def test_detector_uses_hsv_class_and_projects_k0() -> None:
     assert observation.class_probabilities.green_supply == pytest.approx(1.0)
     assert observation.class_probabilities.unknown == 0.0
     assert observation.detection_confidence == pytest.approx(0.8)
-    assert observation.ground_point == GroundPoint(10.0, 18.0)
+    # 临时修改：目标地面点 x 统一补偿 +225（见 detector.py 临时注释）。
+    assert observation.ground_point == GroundPoint(235.0, 18.0)
     assert observation.quality == frozenset()
     segmentation = observation.color_segmentation
     assert segmentation.status is ColorSegmentationStatus.ACCEPTED
@@ -328,11 +329,22 @@ def test_detector_rejects_stale_and_dispatches_field_classes() -> None:
         )
     assert raised.value.age_ms == pytest.approx(151.0)
     assert raised.value.max_age_ms == pytest.approx(150.0)
-    field_result = detector([[detection(class_id=4)]]).detect(
-        frame(image), image, result_timestamp_ns=1_010_000_000
+    # The field-coordinate assertion intentionally exercises the same ground
+    # projection path as a deployed camera configuration.
+    field_result = detector(
+        [[detection(class_id=4)]],
+        projector=GroundProjector(np.eye(3)),
+    ).detect(
+        frame(image),
+        image,
+        result_timestamp_ns=1_010_000_000,
     )
     assert field_result.observations == ()
     assert field_result.field_features.center_cross is not None
+    assert field_result.field_features.center_cross.intersection_ground == GroundPoint(
+        230.0,
+        6.0,
+    )
 
 
 def test_safe_zone_three_keypoints_share_frame_and_project_to_ground() -> None:
@@ -342,8 +354,8 @@ def test_safe_zone_three_keypoints_share_frame_and_project_to_ground() -> None:
         [[detection(
             class_id=5,
             k0=UndistortedPixel(5.0, 6.0),
-            k1=UndistortedPixel(3.0, 7.0),
-            k2=UndistortedPixel(7.0, 7.0),
+            k1=UndistortedPixel(7.0, 7.0),
+            k2=UndistortedPixel(3.0, 7.0),
         )]],
         projector=projector,
     ).detect(frame(image), image, result_timestamp_ns=1_010_000_000)
@@ -351,7 +363,9 @@ def test_safe_zone_three_keypoints_share_frame_and_project_to_ground() -> None:
     assert output.observations == ()
     assert output.field_features.frame_sequence == 7
     zone = output.field_features.safe_zones[0]
-    assert zone.ground_anchor.ground == GroundPoint(5.0, 6.0)
+    assert zone.ground_anchor.ground == GroundPoint(230.0, 6.0)
+    assert zone.image_left_landmark.ground == GroundPoint(228.0, 7.0)
+    assert zone.image_right_landmark.ground == GroundPoint(232.0, 7.0)
     assert zone.image_left_landmark.undistorted.u < zone.image_right_landmark.undistorted.u
     assert zone.physical_color.value == "unknown"
 

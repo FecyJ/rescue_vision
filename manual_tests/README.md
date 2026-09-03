@@ -12,14 +12,19 @@
 - `hailo_pose.py`：从实际 `runtime.yaml` 加载 YOLO Pose v3 部署包，检查单张去畸变图像的六类框、K0/K1/K2、目标 HSV 类别、场地特征和 ROI 分割摘要。
 - `target_ground_geometry.py`：旧接触锚点实验工具，不兼容 v3 K0 底面中心语义；仅用于复现旧结果，不作为新版模型验收入口。
 - `dataset_perception.py`：按数据清单批量运行 Hailo，覆盖式写出观测 JSONL，保留 Pose 类别、HSV 候选/覆盖率、UNKNOWN 和质量信息。
-- `camera_undistort_perception.py`：按实际 `runtime.yaml` 连续执行相机、去畸变、Hailo Pose、ROI HSV 掩码和 K0/地面点叠加预览，按 `Q/Esc` 退出；偶发过期帧会标红并丢弃，不会终止预览。
+- `camera_undistort_perception.py`：按实际 `runtime.yaml` 连续执行相机、去畸变、Hailo Pose、ROI HSV 掩码和 K0/地面点叠加预览；终端打印中心十字 K0、安全区 K0/K1/K2 的去畸变像素与机器人地面坐标，预览窗口也叠加对应地面坐标，按 `Q/Esc` 退出；偶发过期帧会标红并丢弃，不会终止预览。
 - `remote_link.py --config PATH`：在树莓派侧以 `remote.role: server` 监听电脑端客户端，连接后发送协议要求的最小会话状态，并持续打印收到的 control；该状态有意声明所有业务能力不可用，所以正式客户端应保持控制禁用。仅验证连接可使用 `observe_only`；用自制底层客户端检查 control 帧时使用 `debug_control`。
 - `remote_video.py --config PATH`：发送真实相机的最新 JPEG 帧和周期会话状态，接收电脑端的原图/perception 图像模式请求，但不接收或执行运动、夹爪和采集控制。
 - `remote_capture.py`：兼容旧人工命令的薄包装；正式入口为 `rescue-vision-manual-capture`。
 - `motion_minimal.py`：按配置以低速直行一小段，打开 UART 后先等待 v2
   `SOFT_BRAKE accepted` 安全同步，周期刷新轮速并在退出时柔和停车。
+- `keyboard_drive.py`：终端键盘操控前进/后退/转弯，相机与 Hailo Pose 模型
+  结果经独立旁路线程回传（终端打印类别/置信度/地面点，可选 `--display`
+  窗口），`Esc`/`q` 退出，`空格`停车；`X` 切换夹爪运输姿态。
 - `imu_rotation_monitor.py`：按配置低速原地旋转，周期打印 STM32 原始传感器系
   `gyro_z`、编码器和状态位；只发送轮速心跳，`Ctrl+C` 或异常时柔和停车。
+- `imu_static_calibration.py`：车辆静止时被动收集有效 IMU 样本，输出传感器坐标系
+  陀螺零偏、噪声、温度和可复制的配置片段；不发送任何运动命令。
 - `safe_zone_straight_diagnostic.py`：只执行配置中的 `LEAVE_START` 越障直行段，
   实时打印轮速目标/实际值、ODOMETRY_IMU 序号与双时钟间隔、编码器、IMU、UART
   队列和 STM32 状态；发现连续 overrun 时停车。
@@ -93,6 +98,42 @@ python manual_tests/motion_minimal.py \
 因此不能用一次 `drive()` 后长时间 `sleep` 替代；正常结束、Ctrl+C 或异常都会
 先发送 `SOFT_BRAKE`，这不能替代物理急停或固件看门狗。
 
+## 键盘操控驾驶检查
+
+在架空轮，或已确认物理急停可立即触发且操作员全程监督的条件下运行。脚本用
+终端按键操控车辆（通过 SSH 也有效），相机与 Hailo Pose 模型的识别结果在独立
+旁路线程处理并回传到终端，主线程只做轮速刷新、UART 排空和最新快照读取，
+因此慢取帧、慢去畸变或慢推理不会拖慢运动安全循环：
+
+```bash
+python manual_tests/keyboard_drive.py \
+  --config configs/runtime.yaml \
+  --supervised-physical-stop-ready
+```
+
+按键：`W`/`↑` 前进，`S`/`↓` 后退，`A`/`←` 原地左转，`D`/`→` 原地右转；
+按住前进与转向可组合成弧线；`Z` 夹爪打开、`X` 夹爪运输姿态、`C` 夹爪关闭，
+`空格` 松手停车，`Esc`/`q` 退出。默认速度取
+`min(0.15, motion.max_linear_velocity_m_s)` m/s、转向取
+`min(0.60, motion.max_angular_velocity_rad_s)` rad/s，可用 `--speed-m-s` 和
+`--turn-rad-s` 覆盖，但不得超出配置硬上限。终端每 200 ms 打印一行命令名、
+目标 twist、左右轮目标、夹爪目标角度、目标类别/置信度/地面点、中心十字与
+安全区数量，以及 STM32 电机/看门狗/急停/停车原因状态。
+
+需要在图像中显示场地绝对坐标和航角时，先在 `runtime.yaml` 中完成并启用
+`localization.fusion`，再添加 `--enable-localization`。窗口会显示融合得到的
+`field_xy=(x,y)mm` 和 `heading=...deg`；它们是场地全局坐标，不是机器人局部
+地面坐标。未启用或尚未收到有效编码器/IMU数据时显示
+`pose=unavailable`，不会伪造位姿。
+
+本地有显示器时可加 `--display` 弹出叠加识别框的 OpenCV 窗口（窗口聚焦时也可
+用 `q`/`Esc` 关闭）。运行前必须在 `runtime.yaml` 中启用 `uart`、`motion` 和
+`hailo`；夹爪键需要 `motion.gripper` 已标定并启用，其中 `X` 的运输姿态还要
+配置 `motion.gripper.transport_*_angle_deg`。未配置地面标定时目标无
+`g=(x,y)mm`，仍可正常识别与显示。正常退出、`Ctrl+C`、`SIGTERM` 或异常都会
+先 `SOFT_BRAKE` 停车，再关闭相机、Hailo 和串口；这不能替代物理急停或固件
+看门狗。
+
 ## IMU 原地旋转监视
 
 在架空轮，或已确认物理急停可立即触发且操作员全程监督的条件下运行。脚本默认
@@ -115,6 +156,7 @@ PYTHONPATH=src .venv/bin/python \
 `localization.fusion.imu_calibration`，不要把原始 `gyro_z` 直接与机器人系航向比较。
 
 ## 轮子启动 `sample_overrun` 检查
+
 
 该脚本只打开 UART，不打开相机、Hailo 或远程控制；必须在架空轮、物理急停就绪
 且人员全程监督时运行。它先完成 `SOFT_BRAKE` 序号同步，再以低速启动轮子，
@@ -139,6 +181,26 @@ PYTHONPATH=src .venv/bin/python \
 这些 STM32 粘滞告警。
 排除串口接线、波特率、非法帧或多个进程同时读取串口后，必须复位或重新上电
 STM32，再重新运行检查。
+
+## IMU 静止零偏标定
+
+车辆必须断开驱动动作并保持完全静止；工具只被动读取 `ODOMETRY_IMU`，不会发送
+轮速、软刹车或其他控制命令。默认预热 5 秒、采样 30 秒，输出原始传感器坐标系
+的陀螺零偏和噪声报告：
+
+```bash
+PYTHONPATH=src .venv/bin/python \
+  manual_tests/imu_static_calibration.py \
+  --config configs/runtime.yaml \
+  --output /tmp/imu_static_calibration.json \
+  --stationary-vehicle-confirmed
+```
+
+将报告中的 `recommended_config.localization.fusion.imu_calibration` 人工复核后
+复制到运行配置；它只标定静止零偏和噪声，不会推导安装旋转、动态比例/交叉轴或
+`gyro_z_sign`。这些仍需结合已知姿态和低速正反原地旋转复核。温漂补偿按需求保持
+关闭（温度系数为零）；静态零偏和正反转动态复核通过后，当前
+`localization.fusion.enabled` 已开启。
 
 ## 越障安全区直行诊断
 
@@ -278,8 +340,7 @@ python manual_tests/remote_video.py \
 rescue-vision-manual-capture \
   --config configs/runtime.yaml \
   --output-root /data/rescue-targets/remote_test \
-  --supervised-physical-stop-ready \
-  --accept-timeout-seconds 30
+  --supervised-physical-stop-ready
 ```
 
 入口始终声明 `motion_control`、`video_stream`、`vehicle_state`、

@@ -192,7 +192,7 @@ with source, detector:
 
 | 子包 | 常用入口 | 对接责任 |
 | --- | --- | --- |
-| [`app`](app/README.md) | `run_manual_capture_session()`、`ClusterBreakupSequence`、`Simulation20PointSequence`、`RemotePerceptionTransport`、`RemoteLocalizationPublisher`、`OdometryImuFusion`、三个 `rescue-vision-*` 入口 | 赛外受监督手动驾驶/采集、固定流程解团试验、受限四绿色物资 20 分流程、编码器+IMU航位推算和异步 observe_only perception/位姿图传 |
+| [`app`](app/README.md) | `run_manual_capture_session()`、`ClusterBreakupSequence`、`GreenGrabSequence`、`Simulation20PointSequence`、`RemotePerceptionTransport`、`RemoteLocalizationPublisher`、`OdometryImuFusion`、四个 `rescue-vision-*` 入口 | 赛外受监督手动驾驶/采集、固定流程解团试验、像素居中绿色抓取试验、受限四绿色物资 20 分流程、编码器+IMU航位推算和异步 observe_only perception/位姿图传 |
 | [`config`](config/README.md) | `load_runtime_config()`、`GripperRuntimeConfig`、`AppConfig.build_geometry()`、`HailoConfig.build_backend()` | 启动时严格加载、机械标定和装配 |
 | [`camera`](camera/README.md) | `FrameSource`、`CameraFrame`、`Picamera2Source`、`RecordingSource` | 产生带时间和序号的最新帧 |
 | [`communication`](communication/README.md) | `UartFrameChannel`、`RemoteMessageConnection`、`VideoModeCommand`、`VideoFrameAttributes`、`MapStateObservation`、`RemoteSessionStatus` | COBS UART、直接 TCP 远程消息、可选择 raw/perception/BEV 图传（可声明 perception-only）及轻量 FieldPoint 动态状态 schema |

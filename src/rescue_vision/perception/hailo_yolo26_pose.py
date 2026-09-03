@@ -314,9 +314,11 @@ def parse_yolo26_pose_output(
             model_class is PoseModelClass.SAFE_ZONE
             and keypoints[1].point is not None
             and keypoints[2].point is not None
-            and keypoints[1].point.u >= keypoints[2].point.u
+            and keypoints[1].point.u > keypoints[2].point.u
         ):
-            raise ValueError("safe_zone keypoints must satisfy u(K1) < u(K2).")
+            # 模型可能交换两个几何上相同的角点；它们连同置信度作为一组
+            # 交换，规范化后的 K1/K2 仍对应当前图像的左右语义。
+            keypoints[1], keypoints[2] = keypoints[2], keypoints[1]
         if model_class is not PoseModelClass.SAFE_ZONE:
             # 训练标签中的未使用槽位为 0 0 0，但 Pose head 仍会为每个
             # 类别输出三个回归槽；对非安全区类别只保留 K0，避免网络对

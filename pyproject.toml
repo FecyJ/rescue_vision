@@ -21,6 +21,7 @@ rescue-vision-manifest = "rescue_vision.data.build_manifest:main"
 rescue-vision-manual-capture = "rescue_vision.app.manual_capture:main"
 rescue-vision-cluster-breakup = "rescue_vision.app.cluster_breakup:main"
 rescue-vision-simulation-20-point = "rescue_vision.app.simulation_20_point:main"
+rescue-vision-green-grab = "rescue_vision.app.green_grab:main"
 rescue-vision-record = "rescue_vision.camera.record_cli:main"
 rescue-vision-split = "rescue_vision.data.split_manifest:main"
 

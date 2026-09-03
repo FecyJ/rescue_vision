@@ -14,7 +14,9 @@ from rescue_vision.motion.protocol import (
     CommandResult,
     ControllerProtocolError,
     MessageType,
+    OdometryImu,
     ParsedCarMessage,
+    SensorFlags,
     encode_emergency_stop_command,
     encode_gripper_command,
     encode_soft_brake_command,
@@ -32,6 +34,10 @@ _MAX_PENDING_WHEEL_COMMANDS = 4
 
 class MotionControlTimingError(RuntimeError):
     """活动运动控制循环停顿过久，已先发送柔和停车。"""
+
+
+class MotionStallError(RuntimeError):
+    """编码器在持续轮速命令下没有变化，已先发送柔和停车。"""
 
 
 class MotionSynchronizationError(RuntimeError):
@@ -68,6 +74,10 @@ class MotionLimits:
     max_wheel_velocity_m_s: float
     max_wheel_acceleration_m_s2: float
     max_remote_command_valid_for_ms: int
+    stall_guard_enabled: bool = True
+    stall_guard_timeout_ms: int = 300
+    stall_guard_min_command_speed_m_s: float = 0.01
+    stall_guard_stationary_encoder_delta_count: int = 0
 
     def __post_init__(self) -> None:
         for name in (
@@ -90,6 +100,43 @@ class MotionLimits:
             raise ValueError(
                 "max_remote_command_valid_for_ms must be an integer in "
                 f"[1, 5000], got {self.max_remote_command_valid_for_ms!r}."
+            )
+        if not isinstance(self.stall_guard_enabled, bool):
+            raise ValueError("stall_guard_enabled must be a boolean.")
+        if (
+            isinstance(self.stall_guard_timeout_ms, bool)
+            or not isinstance(self.stall_guard_timeout_ms, int)
+            or not 1 <= self.stall_guard_timeout_ms <= 5_000
+        ):
+            raise ValueError(
+                "stall_guard_timeout_ms must be an integer in [1, 5000], "
+                f"got {self.stall_guard_timeout_ms!r}."
+            )
+        object.__setattr__(
+            self,
+            "stall_guard_min_command_speed_m_s",
+            _positive_finite(
+                self.stall_guard_min_command_speed_m_s,
+                "stall_guard_min_command_speed_m_s",
+            ),
+        )
+        if self.stall_guard_min_command_speed_m_s > self.max_wheel_velocity_m_s:
+            raise ValueError(
+                "stall_guard_min_command_speed_m_s must not exceed "
+                "max_wheel_velocity_m_s."
+            )
+        if (
+            isinstance(self.stall_guard_stationary_encoder_delta_count, bool)
+            or not isinstance(
+                self.stall_guard_stationary_encoder_delta_count,
+                int,
+            )
+            or self.stall_guard_stationary_encoder_delta_count < 0
+        ):
+            raise ValueError(
+                "stall_guard_stationary_encoder_delta_count must be a "
+                "non-negative integer, got "
+                f"{self.stall_guard_stationary_encoder_delta_count!r}."
             )
 
 
@@ -131,6 +178,8 @@ class MotionController:
         self._link_degraded = False
         self._latest_protocol_healthy = True
         self.invalid_received_frames = 0
+        self._last_encoder_counts: tuple[int, int] | None = None
+        self._stall_started_ns: list[int | None] = [None, None]
 
     @property
     def target_wheel_speeds_m_s(self) -> tuple[float, float]:
@@ -196,7 +245,7 @@ class MotionController:
     def synchronize(
         self,
         *,
-        timeout_s: float = 0.5,
+        timeout_s: float = 1.0,
         on_message: Callable[[ParsedCarMessage], None] | None = None,
     ) -> None:
         """发送 `SOFT_BRAKE` 并等待同序号的 `accepted` 回复。
@@ -204,6 +253,8 @@ class MotionController:
         该方法应在每次打开 UART、重连或检测到运动序号/链路异常后调用。
         运动遥测可能在等待期间到达；若提供 ``on_message``，这些消息会按
         到达顺序交给调用方，避免为等待回复而丢弃定位数据。
+        超时或明确拒绝会清理本次待同步序号，调用方可再次调用以发送新的
+        ``SOFT_BRAKE`` 尝试。
         """
 
         if (
@@ -226,6 +277,7 @@ class MotionController:
         while not self.motion_synchronized:
             remaining_ns = deadline_ns - self._now()
             if remaining_ns <= 0:
+                self._clear_synchronization_attempt()
                 raise MotionSynchronizationError(
                     "Timed out waiting for SOFT_BRAKE accepted reply "
                     f"for command_sequence={sequence}."
@@ -235,6 +287,7 @@ class MotionController:
                     timeout=remaining_ns / 1_000_000_000.0
                 )
             except TimeoutError as exc:
+                self._clear_synchronization_attempt()
                 raise MotionSynchronizationError(
                     "Timed out waiting for SOFT_BRAKE accepted reply "
                     f"for command_sequence={sequence}."
@@ -526,6 +579,7 @@ class MotionController:
         self._last_sent_wheel_speeds_mm_s = (0, 0)
         self._last_acceleration_update_ns = current_ns
         self._last_wheel_command_ns = current_ns
+        self._stall_started_ns = [None, None]
 
     def _send_soft_brake(self) -> None:
         sequence = self._next_command_sequence()
@@ -538,6 +592,12 @@ class MotionController:
         if self._synchronization_enforced:
             self._synchronization_acknowledged = False
         self._reset_acceleration_state()
+
+    def _clear_synchronization_attempt(self) -> None:
+        """使失败的同步尝试可由上层重新发送新的停车序号。"""
+
+        self._synchronization_sequence = None
+        self._synchronization_acknowledged = False
 
     def _request_synchronization(self) -> None:
         self._synchronization_enforced = True
@@ -580,10 +640,13 @@ class MotionController:
                     self._synchronization_sequence = None
                     self._synchronization_acknowledged = True
                 else:
+                    self._clear_synchronization_attempt()
                     raise MotionSynchronizationError(
                         "STM32 rejected SOFT_BRAKE synchronization with "
                         f"{message.result.name.lower()}."
                     )
+        elif isinstance(message, OdometryImu):
+            self._observe_encoder_stall(message)
         elif isinstance(message, CarSystemStatus):
             # rx_degraded is a sticky STM32-side historical diagnostic.  It is
             # intentionally observable through CarSystemStatus, but it is not
@@ -611,6 +674,56 @@ class MotionController:
                 self._request_synchronization()
             elif self.motion_synchronized:
                 self._link_degraded = False
+
+    def _observe_encoder_stall(self, message: OdometryImu) -> None:
+        """检查有效编码器是否在持续轮速命令下保持不动。"""
+
+        current_counts = (
+            message.left_encoder_count,
+            message.right_encoder_count,
+        )
+        previous_counts = self._last_encoder_counts
+        self._last_encoder_counts = current_counts
+        if not self.limits.stall_guard_enabled or previous_counts is None:
+            self._stall_started_ns = [None, None]
+            return
+
+        encoder_valid = (
+            bool(message.sensor_flags & SensorFlags.LEFT_ENCODER_VALID),
+            bool(message.sensor_flags & SensorFlags.RIGHT_ENCODER_VALID),
+        )
+        timeout_ns = self.limits.stall_guard_timeout_ms * 1_000_000
+        max_encoder_delta = (
+            self.limits.stall_guard_stationary_encoder_delta_count
+        )
+        for index, (is_valid, command_speed) in enumerate(
+            zip(encoder_valid, self._commanded_wheel_speeds_m_s)
+        ):
+            if (
+                not is_valid
+                or abs(command_speed)
+                < self.limits.stall_guard_min_command_speed_m_s
+            ):
+                self._stall_started_ns[index] = None
+                continue
+            encoder_delta = abs(current_counts[index] - previous_counts[index])
+            if encoder_delta > max_encoder_delta:
+                self._stall_started_ns[index] = None
+                continue
+            started_ns = self._stall_started_ns[index]
+            if started_ns is None:
+                self._stall_started_ns[index] = message.received_timestamp_ns
+                continue
+            if message.received_timestamp_ns - started_ns < timeout_ns:
+                continue
+            side = "left" if index == 0 else "right"
+            self.soft_brake()
+            raise MotionStallError(
+                f"{side} wheel encoder did not change by more than "
+                f"{max_encoder_delta} count for at least "
+                f"{self.limits.stall_guard_timeout_ms} ms while commanded "
+                f"speed was {command_speed:.3f} m/s."
+            )
 
     def _next_command_sequence(self) -> int:
         sequence = self._command_sequence

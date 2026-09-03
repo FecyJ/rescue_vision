@@ -13,6 +13,7 @@ from rescue_vision.calibration.capture_extrinsics_ground import (
     build_board_calibration_document,
     capture_role,
     edge_margin_document,
+    parse_args,
     parse_global_coordinate,
     prompt_capture_count,
     prompt_edge_margins,
@@ -28,6 +29,11 @@ def test_prompt_margins_and_count_are_interactive_but_hardware_free() -> None:
 
     count_values = iter(["2", "six", "4"])
     assert prompt_capture_count(input_fn=lambda _prompt: next(count_values)) == 4
+
+
+def test_parse_args_terminal_flag_defaults_off() -> None:
+    assert parse_args([]).terminal is False
+    assert parse_args(["--terminal"]).terminal is True
 
 
 def test_coordinate_parser_accepts_space_and_comma_forms() -> None:

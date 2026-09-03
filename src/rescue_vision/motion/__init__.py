@@ -3,6 +3,7 @@
 from rescue_vision.motion.controller import (
     MotionController,
     MotionControlTimingError,
+    MotionStallError,
     MotionSynchronizationError,
     MotionLimits,
 )
@@ -56,6 +57,7 @@ __all__ = [
     "GripperCalibration",
     "MotionController",
     "MotionControlTimingError",
+    "MotionStallError",
     "MotionSynchronizationError",
     "MotionLimits",
     "MANUAL_MOTION_LOG_FILENAME",

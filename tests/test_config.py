@@ -94,6 +94,7 @@ motion:
   max_wheel_velocity_m_s: 0.30
   max_wheel_acceleration_m_s2: 0.50
   max_remote_command_valid_for_ms: 500
+  synchronization_timeout_s: 1.0
   gripper:
     enabled: false
     open_left_angle_deg: null
@@ -923,6 +924,13 @@ def test_motion_config_builds_controller_without_opening_uart(tmp_path) -> None:
     assert controller is not None
     assert controller.limits.wheel_track_m == pytest.approx(0.2)
     assert controller.limits.max_wheel_acceleration_m_s2 == pytest.approx(0.5)
+    assert controller.limits.stall_guard_enabled is True
+    assert controller.limits.stall_guard_timeout_ms == 300
+    assert controller.limits.stall_guard_min_command_speed_m_s == pytest.approx(
+        0.01
+    )
+    assert controller.limits.stall_guard_stationary_encoder_delta_count == 0
+    assert config.motion.synchronization_timeout_s == pytest.approx(1.0)
     assert executor is not None
     assert executor.controller is controller
     assert gripper_executor is not None
@@ -932,6 +940,47 @@ def test_motion_config_builds_controller_without_opening_uart(tmp_path) -> None:
     assert gripper_executor.calibration.transport_angles_deg == pytest.approx(
         (50.0, 150.0)
     )
+
+
+def test_motion_synchronization_timeout_is_configurable(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text().replace(
+            "  synchronization_timeout_s: 1.0",
+            "  synchronization_timeout_s: 2.5",
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(path)
+
+    assert config.motion.synchronization_timeout_s == pytest.approx(2.5)
+
+
+def test_motion_synchronization_timeout_defaults_to_one_second(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text().replace("  synchronization_timeout_s: 1.0\n", ""),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(path)
+
+    assert config.motion.synchronization_timeout_s == pytest.approx(1.0)
+
+
+def test_motion_synchronization_timeout_must_be_positive(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text().replace(
+            "  synchronization_timeout_s: 1.0",
+            "  synchronization_timeout_s: 0.0",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="motion.synchronization_timeout_s"):
+        load_runtime_config(path)
 
 
 def test_motion_acceleration_limit_must_be_positive(tmp_path) -> None:

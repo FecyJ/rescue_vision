@@ -24,6 +24,8 @@ from rescue_vision.motion import (
     GripperCalibration,
     MotionController,
     MotionControlTimingError,
+    MotionStallError,
+    MotionSynchronizationError,
     MotionLimits,
     RemoteGripperError,
     RemoteGripperExecutor,
@@ -207,6 +209,40 @@ def system_status_frame(
         uart_sequence,
         received_timestamp_ns,
         pack_protocol_frame(MessageType.SYSTEM_STATUS, payload),
+    )
+
+
+def odometry_frame(
+    uart_sequence: int,
+    received_timestamp_ns: int,
+    *,
+    telemetry_sequence: int = 0,
+    sample_timestamp_us: int = 0,
+    left_encoder_count: int = 0,
+    right_encoder_count: int = 0,
+    sensor_flags: SensorFlags = (
+        SensorFlags.LEFT_ENCODER_VALID | SensorFlags.RIGHT_ENCODER_VALID
+    ),
+) -> ReceivedUartFrame:
+    payload = struct.pack(
+        "<HQqqiiiiiihH",
+        telemetry_sequence,
+        sample_timestamp_us,
+        left_encoder_count,
+        right_encoder_count,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        int(sensor_flags),
+    )
+    return ReceivedUartFrame(
+        uart_sequence,
+        received_timestamp_ns,
+        pack_protocol_frame(MessageType.ODOMETRY_IMU, payload),
     )
 
 
@@ -438,6 +474,116 @@ def test_active_control_loop_gap_soft_brakes_instead_of_resuming_target() -> Non
     ]
 
 
+def test_encoder_stall_guard_soft_brakes_and_reports_fault() -> None:
+    channel = FakeCarChannel(
+        [
+            odometry_frame(0, 0, left_encoder_count=100, right_encoder_count=100),
+        ]
+    )
+    clock = FakeClock()
+    controller = MotionController(channel, limits(), monotonic_ns=clock)
+
+    controller.receive_message(timeout=0)
+    controller.forward(0.10)
+    clock.advance(0.04)
+    assert controller.update()
+    channel.received.extend(
+        [
+            odometry_frame(
+                1,
+                100_000_000,
+                telemetry_sequence=1,
+                left_encoder_count=100,
+                right_encoder_count=100,
+            ),
+            odometry_frame(
+                2,
+                200_000_000,
+                telemetry_sequence=2,
+                left_encoder_count=100,
+                right_encoder_count=100,
+            ),
+            odometry_frame(
+                3,
+                300_000_000,
+                telemetry_sequence=3,
+                left_encoder_count=100,
+                right_encoder_count=100,
+            ),
+            odometry_frame(
+                4,
+                400_000_000,
+                telemetry_sequence=4,
+                left_encoder_count=100,
+                right_encoder_count=100,
+            ),
+        ]
+    )
+
+    with pytest.raises(MotionStallError, match="left wheel encoder"):
+        controller.drain_messages()
+
+    assert controller.target_wheel_speeds_m_s == (0.0, 0.0)
+    assert controller.commanded_wheel_speeds_m_s == (0.0, 0.0)
+    assert channel.sent == [
+        encode_wheel_speed_command(0, 0.02, 0.02),
+        encode_soft_brake_command(1),
+    ]
+
+
+def test_encoder_stall_guard_does_not_trigger_when_encoder_moves() -> None:
+    channel = FakeCarChannel(
+        [
+            odometry_frame(0, 0, left_encoder_count=100, right_encoder_count=100),
+        ]
+    )
+    clock = FakeClock()
+    controller = MotionController(channel, limits(), monotonic_ns=clock)
+
+    controller.receive_message(timeout=0)
+    controller.forward(0.10)
+    clock.advance(0.04)
+    assert controller.update()
+    channel.received.extend(
+        [
+            odometry_frame(
+                1,
+                100_000_000,
+                telemetry_sequence=1,
+                left_encoder_count=101,
+                right_encoder_count=101,
+            ),
+            odometry_frame(
+                2,
+                200_000_000,
+                telemetry_sequence=2,
+                left_encoder_count=102,
+                right_encoder_count=102,
+            ),
+            odometry_frame(
+                3,
+                300_000_000,
+                telemetry_sequence=3,
+                left_encoder_count=103,
+                right_encoder_count=103,
+            ),
+            odometry_frame(
+                4,
+                400_000_000,
+                telemetry_sequence=4,
+                left_encoder_count=104,
+                right_encoder_count=104,
+            ),
+        ]
+    )
+
+    controller.drain_messages()
+
+    assert controller.target_wheel_speeds_m_s == pytest.approx((0.10, 0.10))
+    assert controller.commanded_wheel_speeds_m_s == pytest.approx((0.02, 0.02))
+    assert channel.sent == [encode_wheel_speed_command(0, 0.02, 0.02)]
+
+
 def test_idle_control_loop_gap_only_refreshes_zero_watchdog_command() -> None:
     channel = FakeCarChannel()
     clock = FakeClock()
@@ -620,6 +766,32 @@ def test_motion_synchronization_waits_for_matching_soft_brake_reply() -> None:
     assert channel.sent == [encode_soft_brake_command(0)]
     assert isinstance(received[0], CarSystemStatus)
     assert isinstance(received[1], CarCommandReply)
+
+
+def test_timed_out_motion_synchronization_can_send_a_new_attempt() -> None:
+    channel = FakeCarChannel()
+    controller = MotionController(channel, limits())
+
+    with pytest.raises(MotionSynchronizationError):
+        controller.synchronize(timeout_s=0.001)
+
+    assert controller.needs_synchronization
+    channel.received.append(
+        command_reply_frame(
+            1,
+            2_000,
+            command_sequence=1,
+            command_type=MessageType.SOFT_BRAKE,
+        )
+    )
+
+    controller.synchronize(timeout_s=0.001)
+
+    assert channel.sent == [
+        encode_soft_brake_command(0),
+        encode_soft_brake_command(1),
+    ]
+    assert controller.motion_synchronized
 
 
 def test_sticky_rx_degraded_status_does_not_gate_wheel_motion() -> None:
@@ -1235,6 +1407,44 @@ def test_remote_loop_drains_uart_and_stops_on_exit() -> None:
     assert channel.sent == [
         encode_wheel_speed_command(0, 0.0, 0.0),
         encode_wheel_speed_command(1, 0.05, 0.05),
+        encode_soft_brake_command(2),
+    ]
+
+
+def test_remote_loop_retries_timed_out_start_synchronization() -> None:
+    class RetrySynchronizationChannel(FakeCarChannel):
+        def send_frame(self, payload: bytes) -> None:
+            super().send_frame(payload)
+            if payload == encode_soft_brake_command(1):
+                self.received.append(
+                    command_reply_frame(
+                        0,
+                        1,
+                        command_sequence=1,
+                        command_type=MessageType.SOFT_BRAKE,
+                    )
+                )
+
+    channel = RetrySynchronizationChannel()
+    executor = RemoteMotionExecutor(MotionController(channel, limits()))
+    stop_checks = 0
+
+    def stop_requested() -> bool:
+        nonlocal stop_checks
+        stop_checks += 1
+        return stop_checks >= 3
+
+    run_remote_motion(
+        FakeRemoteReceiver(iter(())),
+        executor,
+        stop_requested=stop_requested,
+        synchronize_on_start=True,
+        synchronization_timeout_s=0.001,
+    )
+
+    assert channel.sent == [
+        encode_soft_brake_command(0),
+        encode_soft_brake_command(1),
         encode_soft_brake_command(2),
     ]
 

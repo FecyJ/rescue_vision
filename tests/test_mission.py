@@ -358,6 +358,36 @@ def test_stale_or_missing_transport_holds_and_recovers() -> None:
     assert recovered.action is AbstractAction.PUSH
 
 
+def test_grabbed_transport_does_not_require_visible_target() -> None:
+    """正面抓取后块被夹爪遮挡，不应触发 transport_target_missing。"""
+
+    machine = started_machine()
+    transport = TransportStatus((1,), 1, grabbed=True)
+    decision = machine.step(
+        snapshot(2, ()),
+        transport=transport,
+        safety=SafetySignals.nominal(2),
+    )
+    assert decision.activity is ActivityState.PUSHING
+    assert decision.action is AbstractAction.PUSH
+
+
+def test_grabbed_delivery_counts_green_without_visible_target() -> None:
+    """抓取转运的交付：块被遮挡，仍按单个绿色普通物资记分。"""
+
+    machine = started_machine()
+    transport = TransportStatus((1,), 1, grabbed=True)
+    decision = machine.step(
+        snapshot(2, ()),
+        transport=transport,
+        safety=SafetySignals.nominal(2),
+        delivery=delivery("d1", (1,), DeliveryDestination.OWN_MATERIAL),
+    )
+    assert decision.activity is ActivityState.SEARCHING
+    assert decision.action is AbstractAction.SEARCH
+    assert machine.progress.delivered_green_supply == 1
+
+
 def test_suspected_danger_is_never_selected_or_pushed() -> None:
     machine = started_machine()
     suspected = target(

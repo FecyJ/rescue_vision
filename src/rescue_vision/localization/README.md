@@ -9,7 +9,7 @@
 | 入口 | 用途 |
 | --- | --- |
 | `CenterCrossLocalizer` | 双轴十字产生四向候选；单 K0 在新鲜航向先验下只产生位置观测 |
-| `SafeZoneCornerLocalizer` | 枚举红/蓝身份和 K1/K2 两种世界角点对应 |
+| `SafeZoneCornerLocalizer` | 枚举红/蓝身份和 K1/K2 世界角点对应，用 K0/K1/K2 连线估计航向并做长度门控 |
 | `StaticFieldLandmarkTracker` | 有界确认、地图搜索提示和旧帧去重辅助 |
 | `VisualLocalizationPipeline` | 同帧选择并保证每个帧序最多提交一次视觉更新 |
 | `FieldPositionObservation` | 不含航向测量的中心十字位置证据 |
@@ -38,7 +38,8 @@ visual = config.build_visual_localization_pipeline(
 
 `visual is None` 表示 `localization.enabled`、地面映射或融合门禁未满足。安全区
 坐标来自 `world.static_map.safe_zone_landmarks`；只有 `measured: true` 且
-`usable: true` 的地标才进入绝对位姿假设。示例配置保持两者为 `false`。
+`usable: true` 的地标才进入绝对位姿假设。示例配置已换入红方现场记录及其
+关于中心十字的蓝方对称坐标。
 
 ## 连续融合调用顺序
 
@@ -66,6 +67,11 @@ if visual is not None and snapshot is not None and snapshot.field_features is no
 - 双轴十字可产生四向全位姿候选，由安全区身份或先验消歧。
 - 只有十字 K0 时，以先验航向把 `(0,0)` 地标换算成机器人场地位置，并调用
   `submit_position_landmark()`；融合测量矩阵只更新 x/y，不测量航向。
+- 安全区定位先按 K0/K1/K2 的可用组合计算点对连线方向，使用连线方向估计
+  `heading_rad`。位置至少需要 K0 与 K1 或 K2 之一；对应的 K0-K1 或 K0-K2
+  观测距离必须与 `world.static_map.safe_zone_landmarks` 中的实测距离相差不超过
+  `localization.safe_zone_corners.max_k0_corner_distance_error_mm`，否则不提交
+  安全区位置纠偏。两点通过时用两点刚体变换，三点通过时用三点残差复核。
 - 安全区颜色未知时枚举 red/blue；对每种身份再枚举 K1/K2 两种世界对应。
   无先验时对称解保持歧义，不提交纠偏。
 - 同帧同时得到十字和安全区全位姿时只提交一项，避免相关证据重复压缩方差。

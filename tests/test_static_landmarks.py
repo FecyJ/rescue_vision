@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 
 import pytest
@@ -254,6 +255,72 @@ def test_safe_zone_corner_pair_recovers_unique_pose() -> None:
     assert angular_distance(observation.pose.heading_rad, pose.heading_rad) < 1e-9
     assert observation.fit_residual_mm < 1e-6
     assert observation.source == "red_safe_zone_corners"
+
+
+def test_safe_zone_k0_and_one_corner_can_recover_pose() -> None:
+    pose = FieldPose2D(FieldPoint(120.0, -240.0), math.radians(23.0))
+    zone = replace(
+        _safe_zone_from_pose(pose),
+        image_right_landmark=FieldPoseKeypoint(None, None, 0.0),
+        quality=frozenset({FieldFeatureQuality.KEYPOINT_UNAVAILABLE}),
+    )
+    result = FieldFeatureDetectionResult(
+        1, 1_000_000, 1_100_000, (640, 480), (zone,), None
+    )
+
+    observation = SafeZoneCornerLocalizer(static_map()).localize(
+        result,
+        prior_pose=pose,
+    )
+
+    assert observation is not None
+    assert observation.pose.position.x == pytest.approx(pose.position.x, abs=1e-6)
+    assert observation.pose.position.y == pytest.approx(pose.position.y, abs=1e-6)
+    assert angular_distance(observation.pose.heading_rad, pose.heading_rad) < 1e-9
+    assert observation.used_roles == (
+        SafeZoneCornerRole.GROUND_ANCHOR,
+        SafeZoneCornerRole.ENTRANCE_LEFT,
+    )
+
+
+def test_safe_zone_rejects_position_when_k0_corner_lengths_do_not_match() -> None:
+    pose = FieldPose2D(FieldPoint(120.0, -240.0), math.radians(23.0))
+    zone = _safe_zone_from_pose(pose)
+    anchor = zone.ground_anchor.ground
+    assert anchor is not None
+    bad_zone = replace(
+        zone,
+        ground_anchor=FieldPoseKeypoint(
+            zone.ground_anchor.undistorted,
+            GroundPoint(anchor.x + 300.0, anchor.y),
+            zone.ground_anchor.confidence,
+        ),
+    )
+    result = FieldFeatureDetectionResult(
+        1, 1_000_000, 1_100_000, (640, 480), (bad_zone,), None
+    )
+
+    assert SafeZoneCornerLocalizer(static_map()).localize(
+        result,
+        prior_pose=pose,
+    ) is None
+
+
+def test_safe_zone_k1_k2_without_k0_cannot_correct_position() -> None:
+    pose = FieldPose2D(FieldPoint(120.0, -240.0), math.radians(23.0))
+    zone = replace(
+        _safe_zone_from_pose(pose),
+        ground_anchor=FieldPoseKeypoint(None, None, 0.0),
+        quality=frozenset({FieldFeatureQuality.KEYPOINT_UNAVAILABLE}),
+    )
+    result = FieldFeatureDetectionResult(
+        1, 1_000_000, 1_100_000, (640, 480), (zone,), None
+    )
+
+    assert SafeZoneCornerLocalizer(static_map()).localize(
+        result,
+        prior_pose=pose,
+    ) is None
 
 
 def test_safe_zone_single_corner_cannot_create_pose() -> None:

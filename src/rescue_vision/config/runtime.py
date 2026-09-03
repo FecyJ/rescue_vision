@@ -415,6 +415,7 @@ def _localization_defaults() -> dict[str, Any]:
         "safe_zone_corners": {
             "max_observation_age_ms": 250.0,
             "min_baseline_mm": 150.0,
+            "max_k0_corner_distance_error_mm": 80.0,
             "max_fit_residual_mm": 80.0,
             "position_uncertainty_floor_mm": 30.0,
             "heading_uncertainty_floor_deg": 3.0,
@@ -687,10 +688,19 @@ class ClusterBreakupRuntimeConfig:
     green_confirm_frames: int
     target_loss_timeout_ms: float
     motion_phase_timeout_s: float
+    post_breakup_retreat_enabled: bool = True
+    # CENTER_CLUSTER 的横向误差 EMA 系数；较小值抑制单帧检测抖动。
+    center_error_filter_alpha: float = 0.35
+    # 反向转向相对居中门限的附加滞回区，单位为图像半幅比例。
+    center_reverse_deadband_ratio: float = 0.03
+    # 反向转向必须连续满足的观测帧数。
+    center_reverse_confirm_frames: int = 2
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
             raise ValueError("enabled must be a boolean.")
+        if not isinstance(self.post_breakup_retreat_enabled, bool):
+            raise ValueError("post_breakup_retreat_enabled must be a boolean.")
         for name in (
             "departure_distance_m",
             "departure_speed_m_s",
@@ -730,10 +740,25 @@ class ClusterBreakupRuntimeConfig:
             )
         if self.center_tolerance_ratio > 1.0:
             raise ValueError("center_tolerance_ratio must be <= 1.0.")
+        alpha = float(self.center_error_filter_alpha)
+        if not math.isfinite(alpha) or not 0.0 < alpha <= 1.0:
+            raise ValueError(
+                "center_error_filter_alpha must be finite and in (0, 1]."
+            )
+        reverse_deadband = float(self.center_reverse_deadband_ratio)
+        if not math.isfinite(reverse_deadband) or reverse_deadband < 0.0:
+            raise ValueError(
+                "center_reverse_deadband_ratio must be finite and non-negative."
+            )
+        if self.center_tolerance_ratio + reverse_deadband > 1.0:
+            raise ValueError(
+                "center_tolerance_ratio + center_reverse_deadband_ratio must be <= 1.0."
+            )
         for name in (
             "cluster_min_detections",
             "center_confirm_frames",
             "green_confirm_frames",
+            "center_reverse_confirm_frames",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -781,6 +806,38 @@ class Simulation20PointRuntimeConfig:
     min_green_clearance_mm: float
     corridor_sample_step_mm: float
     completed_target_exclusion_mm: float
+    # 首次解团的固定前推距离；后续重复解团继续使用 motion.cluster_breakup 的值。
+    first_breakup_distance_m: float = 0.5
+    # 每次解团退离后，是否执行“面向己方安全区—距安全区线 300 mm—视觉校准”。
+    safe_zone_calibration_enabled: bool = False
+    safe_zone_calibration_distance_mm: float = 300.0
+    safe_zone_calibration_position_tolerance_mm: float = 50.0
+    safe_zone_calibration_heading_tolerance_rad: float = 0.12
+    safe_zone_calibration_speed_m_s: float = 0.05
+    safe_zone_calibration_angular_kp_rad_s: float = 1.0
+    safe_zone_calibration_max_angular_velocity_rad_s: float = 0.35
+    safe_zone_calibration_timeout_s: float = 15.0
+    # Front-grab transport experiment: an isolated green supply is approached
+    # from the front (gripper open, straight forward, close) instead of the
+    # back-side prepush, then the robot reorients toward the own-material zone
+    # and pushes. Opt-in so direct dataclass construction keeps legacy behavior.
+    front_grab_enabled: bool = False
+    isolated_green_clearance_mm: float = 200.0
+    # 正面抓取合爪后，块在夹爪内的固定前向偏移，单位 mm；横向固定为 0。
+    # 用于块被遮挡后按机器人位姿推算其场地点，不再依赖视觉目标。
+    front_grab_block_forward_mm: float = 65.0
+    # Initial non-visual positioning maneuver.  It is opt-in so callers that
+    # construct this dataclass directly retain the previous deterministic
+    # test behavior; the production simulation config enables it explicitly.
+    startup_maneuver_enabled: bool = False
+    startup_turn_angle_rad: float = math.radians(40.0)
+    startup_turn_angular_velocity_rad_s: float = -0.35
+    startup_forward_distance_m: float = 1.0
+    startup_forward_speed_m_s: float = 0.15
+    startup_motion_phase_timeout_s: float = 15.0
+    # State-transition dwell time.  Keep the direct-construction default at
+    # zero for replay/tests; production configs can enable a hardware pause.
+    action_settle_time_s: float = 0.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -823,10 +880,43 @@ class Simulation20PointRuntimeConfig:
             "min_green_clearance_mm",
             "corridor_sample_step_mm",
             "completed_target_exclusion_mm",
+            "first_breakup_distance_m",
+            "safe_zone_calibration_distance_mm",
+            "safe_zone_calibration_position_tolerance_mm",
+            "safe_zone_calibration_heading_tolerance_rad",
+            "safe_zone_calibration_speed_m_s",
+            "safe_zone_calibration_angular_kp_rad_s",
+            "safe_zone_calibration_max_angular_velocity_rad_s",
+            "safe_zone_calibration_timeout_s",
+            "isolated_green_clearance_mm",
+            "front_grab_block_forward_mm",
+            "startup_turn_angle_rad",
+            "startup_forward_distance_m",
+            "startup_forward_speed_m_s",
+            "startup_motion_phase_timeout_s",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive.")
+        if (
+            not math.isfinite(float(self.action_settle_time_s))
+            or float(self.action_settle_time_s) < 0.0
+        ):
+            raise ValueError("action_settle_time_s must be finite and non-negative.")
+        if not isinstance(self.startup_maneuver_enabled, bool):
+            raise ValueError("startup_maneuver_enabled must be a boolean.")
+        if not isinstance(self.front_grab_enabled, bool):
+            raise ValueError("front_grab_enabled must be a boolean.")
+        if not isinstance(self.safe_zone_calibration_enabled, bool):
+            raise ValueError("safe_zone_calibration_enabled must be a boolean.")
+        startup_turn_velocity = float(self.startup_turn_angular_velocity_rad_s)
+        if not math.isfinite(startup_turn_velocity) or abs(startup_turn_velocity) < 0.001:
+            raise ValueError(
+                "startup_turn_angular_velocity_rad_s must be a finite angular "
+                f"velocity with |value| >= 0.001, got {self.startup_turn_angular_velocity_rad_s!r}."
+            )
+        if self.startup_turn_angle_rad >= 2.0 * math.pi:
+            raise ValueError("startup_turn_angle_rad must be smaller than 2*pi.")
         scan_velocity = float(self.scan_angular_velocity_rad_s)
         if not math.isfinite(scan_velocity) or abs(scan_velocity) < 0.001:
             raise ValueError(
@@ -858,6 +948,56 @@ class Simulation20PointRuntimeConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class GreenGrabRuntimeConfig:
+    """无地面标定时，像素居中接近单个绿色物资并合爪的试验参数。"""
+
+    enabled: bool
+    search_angular_velocity_rad_s: float
+    approach_speed_m_s: float
+    align_tolerance_ratio: float
+    align_kp_rad_s: float
+    align_max_angular_velocity_rad_s: float
+    engage_bottom_fraction: float
+    confirm_frames: int
+    target_loss_timeout_ms: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("enabled must be a boolean.")
+        for name in (
+            "approach_speed_m_s",
+            "align_tolerance_ratio",
+            "align_kp_rad_s",
+            "align_max_angular_velocity_rad_s",
+            "target_loss_timeout_ms",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive.")
+        search = float(self.search_angular_velocity_rad_s)
+        if not math.isfinite(search) or abs(search) < 0.001:
+            raise ValueError(
+                "search_angular_velocity_rad_s must be a finite angular "
+                f"velocity with |value| >= 0.001 rad/s (positive means left "
+                f"turn), got {search!r}."
+            )
+        if self.align_tolerance_ratio >= 1.0:
+            raise ValueError("align_tolerance_ratio must be < 1.0.")
+        engage = float(self.engage_bottom_fraction)
+        if not math.isfinite(engage) or not 0.0 < engage <= 1.0:
+            raise ValueError(
+                "engage_bottom_fraction must be finite and in (0, 1], "
+                f"got {self.engage_bottom_fraction!r}."
+            )
+        if (
+            isinstance(self.confirm_frames, bool)
+            or not isinstance(self.confirm_frames, int)
+            or self.confirm_frames <= 0
+        ):
+            raise ValueError("confirm_frames must be a positive integer.")
+
+
+@dataclass(frozen=True, slots=True)
 class MotionRuntimeConfig:
     enabled: bool
     wheel_track_m: float | None
@@ -866,6 +1006,11 @@ class MotionRuntimeConfig:
     max_wheel_velocity_m_s: float
     max_wheel_acceleration_m_s2: float
     max_remote_command_valid_for_ms: int
+    synchronization_timeout_s: float
+    stall_guard_enabled: bool
+    stall_guard_timeout_ms: int
+    stall_guard_min_command_speed_m_s: float
+    stall_guard_stationary_encoder_delta_count: int
     gripper: GripperRuntimeConfig
     odometry: OdometryRuntimeConfig
     cluster_breakup: ClusterBreakupRuntimeConfig
@@ -895,6 +1040,14 @@ class MotionRuntimeConfig:
                 ),
                 max_remote_command_valid_for_ms=(
                     self.max_remote_command_valid_for_ms
+                ),
+                stall_guard_enabled=self.stall_guard_enabled,
+                stall_guard_timeout_ms=self.stall_guard_timeout_ms,
+                stall_guard_min_command_speed_m_s=(
+                    self.stall_guard_min_command_speed_m_s
+                ),
+                stall_guard_stationary_encoder_delta_count=(
+                    self.stall_guard_stationary_encoder_delta_count
                 ),
             ),
         )
@@ -1075,6 +1228,7 @@ class AppConfig:
     perception: PerceptionConfig
     localization: LocalizationRuntimeConfig
     hailo: HailoConfig
+    green_grab: GreenGrabRuntimeConfig
 
     def build_camera_model(self) -> CameraModel | None:
         """内参启用时加载并校验与运行分辨率一致的相机模型。"""
@@ -1258,6 +1412,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "perception",
             "localization",
             "hailo",
+            "green_grab",
         },
         "root",
     )
@@ -1494,6 +1649,8 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "max_wheel_velocity_m_s",
             "max_wheel_acceleration_m_s2",
             "max_remote_command_valid_for_ms",
+            "synchronization_timeout_s",
+            "stall_guard",
             "gripper",
             "odometry",
             "cluster_breakup",
@@ -1525,6 +1682,43 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         raise ValueError(
             "motion.max_remote_command_valid_for_ms must be <= 5000."
         )
+    synchronization_timeout_s = _finite_float(
+        motion_raw.get("synchronization_timeout_s", 1.0),
+        "motion.synchronization_timeout_s",
+        minimum=0.001,
+    )
+    stall_guard_raw = _mapping(
+        motion_raw.get("stall_guard", {}),
+        "motion.stall_guard",
+    )
+    _reject_unknown(
+        stall_guard_raw,
+        {
+            "enabled",
+            "timeout_ms",
+            "min_command_speed_m_s",
+            "stationary_encoder_delta_count",
+        },
+        "motion.stall_guard",
+    )
+    stall_guard_enabled = stall_guard_raw.get("enabled", True)
+    if not isinstance(stall_guard_enabled, bool):
+        raise ValueError("motion.stall_guard.enabled must be a boolean.")
+    stall_guard_timeout_ms = _positive_int(
+        stall_guard_raw.get("timeout_ms", 300),
+        "motion.stall_guard.timeout_ms",
+    )
+    if stall_guard_timeout_ms > 5_000:
+        raise ValueError("motion.stall_guard.timeout_ms must be <= 5000.")
+    stall_guard_min_command_speed_m_s = _finite_float(
+        stall_guard_raw.get("min_command_speed_m_s", 0.01),
+        "motion.stall_guard.min_command_speed_m_s",
+        minimum=0.001,
+    )
+    stall_guard_stationary_encoder_delta_count = _nonnegative_int(
+        stall_guard_raw.get("stationary_encoder_delta_count", 0),
+        "motion.stall_guard.stationary_encoder_delta_count",
+    )
     gripper_raw = _mapping(
         motion_raw.get("gripper", {}),
         "motion.gripper",
@@ -1703,6 +1897,9 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         "center_confirm_frames",
         "center_kp_rad_s",
         "center_max_angular_velocity_rad_s",
+        "center_error_filter_alpha",
+        "center_reverse_deadband_ratio",
+        "center_reverse_confirm_frames",
         "approach_speed_m_s",
         "gripper_open_distance_mm",
         "breakup_speed_m_s",
@@ -1714,6 +1911,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         "green_confirm_frames",
         "target_loss_timeout_ms",
         "motion_phase_timeout_s",
+        "post_breakup_retreat_enabled",
     }
     _reject_unknown(breakup_raw, breakup_keys, "motion.cluster_breakup")
     breakup_enabled = breakup_raw.get("enabled", False)
@@ -1769,6 +1967,18 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         center_max_angular_velocity_rad_s=breakup_float(
             "center_max_angular_velocity_rad_s", 0.55
         ),
+        center_error_filter_alpha=breakup_float(
+            "center_error_filter_alpha", 0.35
+        ),
+        center_reverse_deadband_ratio=_finite_float(
+            breakup_raw.get("center_reverse_deadband_ratio", 0.03),
+            "motion.cluster_breakup.center_reverse_deadband_ratio",
+            minimum=0.0,
+        ),
+        center_reverse_confirm_frames=_positive_int(
+            breakup_raw.get("center_reverse_confirm_frames", 2),
+            "motion.cluster_breakup.center_reverse_confirm_frames",
+        ),
         approach_speed_m_s=breakup_float("approach_speed_m_s", 0.12),
         gripper_open_distance_mm=breakup_float(
             "gripper_open_distance_mm", 260.0
@@ -1791,6 +2001,9 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "target_loss_timeout_ms", 500.0
         ),
         motion_phase_timeout_s=breakup_float("motion_phase_timeout_s", 10.0),
+        post_breakup_retreat_enabled=breakup_raw.get(
+            "post_breakup_retreat_enabled", True
+        ),
     )
     motion = MotionRuntimeConfig(
         enabled=motion_enabled,
@@ -1816,6 +2029,13 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             minimum=0.001,
         ),
         max_remote_command_valid_for_ms=max_remote_validity,
+        synchronization_timeout_s=synchronization_timeout_s,
+        stall_guard_enabled=stall_guard_enabled,
+        stall_guard_timeout_ms=stall_guard_timeout_ms,
+        stall_guard_min_command_speed_m_s=stall_guard_min_command_speed_m_s,
+        stall_guard_stationary_encoder_delta_count=(
+            stall_guard_stationary_encoder_delta_count
+        ),
         gripper=gripper,
         odometry=odometry,
         cluster_breakup=cluster_breakup,
@@ -1890,6 +2110,25 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         "min_green_clearance_mm",
         "corridor_sample_step_mm",
         "completed_target_exclusion_mm",
+        "first_breakup_distance_m",
+        "safe_zone_calibration_enabled",
+        "safe_zone_calibration_distance_mm",
+        "safe_zone_calibration_position_tolerance_mm",
+        "safe_zone_calibration_heading_tolerance_rad",
+        "safe_zone_calibration_speed_m_s",
+        "safe_zone_calibration_angular_kp_rad_s",
+        "safe_zone_calibration_max_angular_velocity_rad_s",
+        "safe_zone_calibration_timeout_s",
+        "front_grab_enabled",
+        "isolated_green_clearance_mm",
+        "front_grab_block_forward_mm",
+        "startup_maneuver_enabled",
+        "startup_turn_angle_rad",
+        "startup_turn_angular_velocity_rad_s",
+        "startup_forward_distance_m",
+        "startup_forward_speed_m_s",
+        "startup_motion_phase_timeout_s",
+        "action_settle_time_s",
     }
     _reject_unknown(simulation_raw, simulation_keys, "simulation_20_point")
     simulation_enabled = simulation_raw.get("enabled", False)
@@ -1974,7 +2213,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "simulation_20_point.disengage_confirm_frames",
         ),
         max_breakup_attempts_per_delivery=_positive_int(
-            simulation_raw.get("max_breakup_attempts_per_delivery", 2),
+            simulation_raw.get("max_breakup_attempts_per_delivery", 4),
             "simulation_20_point.max_breakup_attempts_per_delivery",
         ),
         max_breakup_attempts_total=_positive_int(
@@ -1994,6 +2233,64 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         completed_target_exclusion_mm=simulation_float(
             "completed_target_exclusion_mm", 120.0
         ),
+        first_breakup_distance_m=simulation_float(
+            "first_breakup_distance_m", 0.5
+        ),
+        safe_zone_calibration_enabled=simulation_raw.get(
+            "safe_zone_calibration_enabled", False
+        ),
+        safe_zone_calibration_distance_mm=simulation_float(
+            "safe_zone_calibration_distance_mm", 300.0
+        ),
+        safe_zone_calibration_position_tolerance_mm=simulation_float(
+            "safe_zone_calibration_position_tolerance_mm", 50.0
+        ),
+        safe_zone_calibration_heading_tolerance_rad=simulation_float(
+            "safe_zone_calibration_heading_tolerance_rad", 0.12
+        ),
+        safe_zone_calibration_speed_m_s=simulation_float(
+            "safe_zone_calibration_speed_m_s", 0.05
+        ),
+        safe_zone_calibration_angular_kp_rad_s=simulation_float(
+            "safe_zone_calibration_angular_kp_rad_s", 1.0
+        ),
+        safe_zone_calibration_max_angular_velocity_rad_s=simulation_float(
+            "safe_zone_calibration_max_angular_velocity_rad_s", 0.35
+        ),
+        safe_zone_calibration_timeout_s=simulation_float(
+            "safe_zone_calibration_timeout_s", 15.0
+        ),
+        front_grab_enabled=simulation_raw.get("front_grab_enabled", False),
+        isolated_green_clearance_mm=simulation_float(
+            "isolated_green_clearance_mm", 200.0
+        ),
+        front_grab_block_forward_mm=simulation_float(
+            "front_grab_block_forward_mm", 65.0
+        ),
+        startup_maneuver_enabled=simulation_raw.get(
+            "startup_maneuver_enabled", False
+        ),
+        startup_turn_angle_rad=simulation_float(
+            "startup_turn_angle_rad", math.radians(40.0)
+        ),
+        startup_turn_angular_velocity_rad_s=_signed_angular_velocity(
+            simulation_raw.get("startup_turn_angular_velocity_rad_s", -0.35),
+            "simulation_20_point.startup_turn_angular_velocity_rad_s",
+        ),
+        startup_forward_distance_m=simulation_float(
+            "startup_forward_distance_m", 1.0
+        ),
+        startup_forward_speed_m_s=simulation_float(
+            "startup_forward_speed_m_s", 0.15
+        ),
+        startup_motion_phase_timeout_s=simulation_float(
+            "startup_motion_phase_timeout_s", 15.0
+        ),
+        action_settle_time_s=_finite_float(
+            simulation_raw.get("action_settle_time_s", 0.0),
+            "simulation_20_point.action_settle_time_s",
+            minimum=0.0,
+        ),
     )
     if simulation_20_point.enabled:
         for name in (
@@ -2001,17 +2298,29 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "approach_speed_m_s",
             "push_speed_m_s",
             "retreat_speed_m_s",
+            "startup_forward_speed_m_s",
+            "safe_zone_calibration_speed_m_s",
         ):
             if getattr(simulation_20_point, name) > motion.max_linear_velocity_m_s:
                 raise ValueError(
                     f"simulation_20_point.{name} exceeds "
                     "motion.max_linear_velocity_m_s."
                 )
+        if simulation_20_point.startup_maneuver_enabled:
+            if (
+                abs(simulation_20_point.startup_turn_angular_velocity_rad_s)
+                > motion.max_angular_velocity_rad_s
+            ):
+                raise ValueError(
+                    "simulation_20_point.startup_turn_angular_velocity_rad_s "
+                    "exceeds motion.max_angular_velocity_rad_s."
+                )
         for name in (
             "scan_angular_velocity_rad_s",
             "navigation_max_angular_velocity_rad_s",
             "alignment_max_angular_velocity_rad_s",
             "push_max_angular_velocity_rad_s",
+            "safe_zone_calibration_max_angular_velocity_rad_s",
         ):
             if (
                 getattr(simulation_20_point, name)
@@ -2019,6 +2328,72 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             ):
                 raise ValueError(
                     f"simulation_20_point.{name} exceeds "
+                    "motion.max_angular_velocity_rad_s."
+                )
+
+    green_grab_raw = _mapping(root.get("green_grab", {}), "green_grab")
+    _reject_unknown(
+        green_grab_raw,
+        {
+            "enabled",
+            "search_angular_velocity_rad_s",
+            "approach_speed_m_s",
+            "align_tolerance_ratio",
+            "align_kp_rad_s",
+            "align_max_angular_velocity_rad_s",
+            "engage_bottom_fraction",
+            "confirm_frames",
+            "target_loss_timeout_ms",
+        },
+        "green_grab",
+    )
+    green_grab_enabled = green_grab_raw.get("enabled", False)
+    if not isinstance(green_grab_enabled, bool):
+        raise ValueError("green_grab.enabled must be a boolean.")
+
+    def green_grab_float(name: str, default: float) -> float:
+        return _finite_float(
+            green_grab_raw.get(name, default),
+            f"green_grab.{name}",
+            minimum=0.001,
+        )
+
+    green_grab = GreenGrabRuntimeConfig(
+        enabled=green_grab_enabled,
+        search_angular_velocity_rad_s=_signed_angular_velocity(
+            green_grab_raw.get("search_angular_velocity_rad_s", 0.30),
+            "green_grab.search_angular_velocity_rad_s",
+        ),
+        approach_speed_m_s=green_grab_float("approach_speed_m_s", 0.08),
+        align_tolerance_ratio=green_grab_float("align_tolerance_ratio", 0.06),
+        align_kp_rad_s=green_grab_float("align_kp_rad_s", 1.2),
+        align_max_angular_velocity_rad_s=green_grab_float(
+            "align_max_angular_velocity_rad_s", 0.35
+        ),
+        engage_bottom_fraction=green_grab_float(
+            "engage_bottom_fraction", 0.85
+        ),
+        confirm_frames=_positive_int(
+            green_grab_raw.get("confirm_frames", 3),
+            "green_grab.confirm_frames",
+        ),
+        target_loss_timeout_ms=green_grab_float(
+            "target_loss_timeout_ms", 500.0
+        ),
+    )
+    if green_grab.enabled:
+        if green_grab.approach_speed_m_s > motion.max_linear_velocity_m_s:
+            raise ValueError(
+                "green_grab.approach_speed_m_s exceeds "
+                "motion.max_linear_velocity_m_s."
+            )
+        for name in (
+            "search_angular_velocity_rad_s",
+            "align_max_angular_velocity_rad_s",
+        ):
+            if getattr(green_grab, name) > motion.max_angular_velocity_rad_s:
+                raise ValueError(
+                    f"green_grab.{name} exceeds "
                     "motion.max_angular_velocity_rad_s."
                 )
 
@@ -3002,6 +3377,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     safe_zone_corner_names = {
         "max_observation_age_ms",
         "min_baseline_mm",
+        "max_k0_corner_distance_error_mm",
         "max_fit_residual_mm",
         "position_uncertainty_floor_mm",
         "heading_uncertainty_floor_deg",
@@ -3020,6 +3396,11 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         min_baseline_mm=_finite_float(
             safe_zone_corners_raw["min_baseline_mm"],
             "localization.safe_zone_corners.min_baseline_mm",
+            minimum=0.001,
+        ),
+        max_k0_corner_distance_error_mm=_finite_float(
+            safe_zone_corners_raw["max_k0_corner_distance_error_mm"],
+            "localization.safe_zone_corners.max_k0_corner_distance_error_mm",
             minimum=0.001,
         ),
         max_fit_residual_mm=_finite_float(
@@ -3457,4 +3838,5 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         perception,
         localization,
         hailo,
+        green_grab,
     )

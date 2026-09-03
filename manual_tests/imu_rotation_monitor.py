@@ -164,7 +164,10 @@ def main() -> None:
 
     with channel:
         try:
-            controller.synchronize(on_message=consume)
+            controller.synchronize(
+                timeout_s=config.motion.synchronization_timeout_s,
+                on_message=consume,
+            )
             while True:
                 now_ns = time.monotonic_ns()
                 controller.update(now_ns=now_ns)

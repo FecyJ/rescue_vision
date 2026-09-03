@@ -104,6 +104,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "corner or its 180-degree opposite."
         ),
     )
+    parser.add_argument(
+        "--terminal",
+        action="store_true",
+        help=(
+            "Drive capture from the terminal instead of an OpenCV preview "
+            "window. Use this over SSH or any session without a visible "
+            "display; no GUI window is created."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -347,6 +356,75 @@ def make_preview(
     return preview
 
 
+def capture_and_record_board(
+    camera: Any,
+    index: int,
+    target: int,
+    reference: tuple[float, float],
+    images_dir: Path,
+    detected_dir: Path,
+    session_dir: Path,
+    records: list[CapturedBoardImage],
+    *,
+    square_size_mm: float,
+    long_margin_mm: float,
+    short_margin_mm: float,
+    detected_corner_order: Literal["reference_first", "reference_last"],
+    max_detection_scale: float,
+) -> tuple[bool, float]:
+    """Capture one frame, validate the full board, and record it when valid.
+
+    Returns ``(saved, sharpness)``.  ``saved`` is true only when all 11x8
+    internal corners were detected and the image, overlay and JSON were
+    written; otherwise the caller should retry the same station.
+    """
+
+    frame = camera.capture_array("main")
+    metadata = camera.capture_metadata()
+    found, corners, sharpness = detect_chessboard(
+        frame,
+        max_detection_scale=max_detection_scale,
+    )
+    if not found or corners is None:
+        return False, sharpness
+
+    image_name = f"board_{index + 1:03d}.png"
+    image_path = images_dir / image_name
+    detected_path = detected_dir / image_name
+    if not cv2.imwrite(str(image_path), frame):
+        raise OSError(f"Failed to write captured image {image_path}")
+    detected_preview = frame.copy()
+    cv2.drawChessboardCorners(detected_preview, PATTERN_SIZE, corners, True)
+    if not cv2.imwrite(str(detected_path), detected_preview):
+        raise OSError(f"Failed to write detection preview {detected_path}")
+
+    record = CapturedBoardImage(
+        name=f"station_{index + 1:02d}",
+        image_path=image_path,
+        reference_outer_corner_global_mm=reference,
+        role=capture_role(index, target),
+        sharpness=sharpness,
+    )
+    records.append(record)
+    save_json(
+        session_dir / "board_calibration.json",
+        build_board_calibration_document(
+            session_dir,
+            square_size_mm=square_size_mm,
+            long_margin_mm=long_margin_mm,
+            short_margin_mm=short_margin_mm,
+            detected_corner_order=detected_corner_order,
+            images=records,
+        ),
+    )
+    print(
+        f"Saved {image_name}; role={record.role}; "
+        f"sharpness={sharpness:.1f}; "
+        f"LensPosition={metadata.get('LensPosition')}"
+    )
+    return True, sharpness
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     if not math.isfinite(args.square_size_mm) or args.square_size_mm <= 0.0:
@@ -393,8 +471,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         camera.configure(camera_config)
         camera.start()
         camera_started = True
-        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-        window_created = True
+        window_created = False
+        if not args.terminal:
+            cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+            window_created = True
 
         print("Waiting for exposure and white balance to settle...")
         time.sleep(2.0)
@@ -425,84 +505,65 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
 
         print(f"Output: {session_dir.resolve()}")
-        print("每个站位输入外框左下角全局坐标后，将棋盘放好并按 Enter/Space 拍摄。")
-        print("最后一张自动标为 holdout；Q/Esc 可退出并保留已完成 JSON。\n")
+        print("每个站位先输入外框左下角全局坐标，再把棋盘放到定位模板对应位置。")
+        if args.terminal:
+            print("终端模式：棋盘放好后按 Enter 拍摄；输入 q 退出并保留已完成 JSON。")
+        else:
+            print("窗口模式：按 Enter/Space 拍摄；按 Q/Esc 退出并保留已完成 JSON。")
+        print("最后一张自动标为 holdout。\n")
 
         status = "等待输入当前站位坐标。"
         for index in range(target):
             reference = prompt_global_coordinate(index + 1, target)
             status = "棋盘放置完成后按 Enter/Space；检测不到完整棋盘会拒绝本次拍摄。"
             while True:
-                frame = camera.capture_array("main")
-                preview = make_preview(
-                    frame,
-                    len(records),
-                    target,
-                    lens_position,
-                    status,
-                    args.preview_scale,
-                    reference,
-                )
-                cv2.imshow(WINDOW_NAME, preview)
-                key = cv2.waitKeyEx(1)
-                if key in (ord("q"), ord("Q"), 27):
-                    return
-                if key not in (32, 10, 13):
-                    continue
+                if args.terminal:
+                    choice = input(
+                        f"第 {index + 1}/{target} 站：棋盘放好后按 Enter 拍摄"
+                        "（输入 q 退出）："
+                    ).strip()
+                    if choice.lower() in {"q", "quit", "exit"}:
+                        return
+                else:
+                    frame = camera.capture_array("main")
+                    preview = make_preview(
+                        frame,
+                        len(records),
+                        target,
+                        lens_position,
+                        status,
+                        args.preview_scale,
+                        reference,
+                    )
+                    cv2.imshow(WINDOW_NAME, preview)
+                    key = cv2.waitKeyEx(1)
+                    if key in (ord("q"), ord("Q"), 27):
+                        return
+                    if key not in (32, 10, 13):
+                        continue
 
-                metadata = camera.capture_metadata()
-                found, corners, sharpness = detect_chessboard(
-                    frame,
+                saved, sharpness = capture_and_record_board(
+                    camera,
+                    index,
+                    target,
+                    reference,
+                    images_dir,
+                    detected_dir,
+                    session_dir,
+                    records,
+                    square_size_mm=args.square_size_mm,
+                    long_margin_mm=long_margin_mm,
+                    short_margin_mm=short_margin_mm,
+                    detected_corner_order=args.detected_corner_order,
                     max_detection_scale=args.max_detection_scale,
                 )
-                if not found or corners is None:
-                    status = (
-                        "Rejected: full 11x8 corners not detected; "
-                        f"sharpness={sharpness:.1f}; adjust board and retry."
-                    )
-                    print(status)
-                    continue
-
-                image_name = f"board_{index + 1:03d}.png"
-                image_path = images_dir / image_name
-                detected_path = detected_dir / image_name
-                if not cv2.imwrite(str(image_path), frame):
-                    raise OSError(f"Failed to write captured image {image_path}")
-                detected_preview = frame.copy()
-                cv2.drawChessboardCorners(
-                    detected_preview,
-                    PATTERN_SIZE,
-                    corners,
-                    True,
+                if saved:
+                    break
+                status = (
+                    "Rejected: full 11x8 corners not detected; "
+                    f"sharpness={sharpness:.1f}; adjust board and retry."
                 )
-                if not cv2.imwrite(str(detected_path), detected_preview):
-                    raise OSError(f"Failed to write detection preview {detected_path}")
-
-                record = CapturedBoardImage(
-                    name=f"station_{index + 1:02d}",
-                    image_path=image_path,
-                    reference_outer_corner_global_mm=reference,
-                    role=capture_role(index, target),
-                    sharpness=sharpness,
-                )
-                records.append(record)
-                save_json(
-                    session_dir / "board_calibration.json",
-                    build_board_calibration_document(
-                        session_dir,
-                        square_size_mm=args.square_size_mm,
-                        long_margin_mm=long_margin_mm,
-                        short_margin_mm=short_margin_mm,
-                        detected_corner_order=args.detected_corner_order,
-                        images=records,
-                    ),
-                )
-                print(
-                    f"Saved {image_name}; role={record.role}; "
-                    f"sharpness={sharpness:.1f}; "
-                    f"LensPosition={metadata.get('LensPosition')}"
-                )
-                break
+                print(status)
 
         print(f"\nFinished. Valid images saved: {len(records)}/{target}")
         print(f"Board JSON: {session_dir / 'board_calibration.json'}")

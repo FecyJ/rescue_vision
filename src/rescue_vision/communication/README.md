@@ -615,8 +615,7 @@ python manual_tests/remote_video.py \
 rescue-vision-manual-capture \
   --config configs/runtime.yaml \
   --output-root /data/rescue-targets/remote_test \
-  --supervised-physical-stop-ready \
-  --accept-timeout-seconds 30
+  --supervised-physical-stop-ready
 ```
 
 `remote_video.py` 只是单链路人工检查。`rescue-vision-manual-capture` 是

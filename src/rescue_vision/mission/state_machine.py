@@ -112,6 +112,9 @@ class MissionConfig:
 class TransportStatus:
     engaged_track_ids: tuple[int, ...] = ()
     contact_started_ns: int | None = None
+    # 正面抓取：块已被夹爪夹住，处于夹爪内、被车体遮挡，因此不要求目标在
+    # 快照中可见；视觉目标解析/缺失检查对这类转运不适用。
+    grabbed: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -139,6 +142,10 @@ class TransportStatus:
             )
         ):
             raise ValueError("contact_started_ns must be non-negative.")
+        if not isinstance(self.grabbed, bool):
+            raise ValueError("grabbed must be a boolean.")
+        if self.grabbed and not self.engaged_track_ids:
+            raise ValueError("grabbed transport requires engaged_track_ids.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -421,20 +428,29 @@ class MissionStateMachine:
                 timestamp_ns,
                 TerminationReason.TOO_MANY_TARGETS,
             )
-        if transport.engaged_track_ids and transport_targets is None:
+        if transport.grabbed:
+            # 抓取转运：块在夹爪内被遮挡，视觉目标解析、缺失、违规与疑似危险
+            # 检查均不适用；单个被抓取的块始终是合法向己方物资区的搬运。
+            if len(transport.engaged_track_ids) > 1:
+                return self._terminate(
+                    timestamp_ns,
+                    TerminationReason.TOO_MANY_TARGETS,
+                )
+        elif transport.engaged_track_ids and transport_targets is None:
             return self._hold(
                 timestamp_ns,
                 "transport_target_missing",
             )
-        assert transport_targets is not None
-        transport_violation = self._transport_violation(transport_targets)
-        if transport_violation is not None:
-            return self._terminate(timestamp_ns, transport_violation)
-        if any(
-            target.hazard_state is HazardState.SUSPECTED
-            for target in transport_targets
-        ):
-            return self._hold(timestamp_ns, "suspected_danger_engaged")
+        else:
+            assert transport_targets is not None
+            transport_violation = self._transport_violation(transport_targets)
+            if transport_violation is not None:
+                return self._terminate(timestamp_ns, transport_violation)
+            if any(
+                target.hazard_state is HazardState.SUSPECTED
+                for target in transport_targets
+            ):
+                return self._hold(timestamp_ns, "suspected_danger_engaged")
 
         if WorldUncertainty.STALE_VISION in snapshot.uncertainties:
             return self._hold(timestamp_ns, "stale_vision")
@@ -467,6 +483,24 @@ class MissionStateMachine:
         ):
             return self._avoid(timestamp_ns, "opponent_occupancy")
         if delivery is not None:
+            if transport.grabbed:
+                # 抓取转运的交付：块在夹爪内（被遮挡），不做视觉目标解析，
+                # 直接按抓取结果处理。
+                result = self._process_grabbed_delivery(
+                    timestamp_ns,
+                    delivery,
+                )
+                assert delivery_signature is not None
+                self._processed_deliveries[delivery.delivery_id] = (
+                    _DeliveryRecord(
+                        signature=delivery_signature,
+                        activity=result.activity,
+                        action=result.action,
+                        reason=result.reason,
+                        target_track_id=result.target_track_id,
+                    )
+                )
+                return result
             if delivery_targets is None:
                 return self._hold(timestamp_ns, "delivery_target_missing")
             if any(
@@ -499,6 +533,25 @@ class MissionStateMachine:
                     )
                 )
                 return result
+
+        if transport.grabbed:
+            # 抓取转运：块在夹爪内，机器人到达己方物资区即视为送达，否则继续
+            # 朝己方物资区搬运（PUSH）。
+            if snapshot.robot_in_region(RegionKind.OWN_MATERIAL):
+                return self._set_activity(
+                    timestamp_ns,
+                    ActivityState.VERIFYING_DELIVERY,
+                    AbstractAction.DELIVER,
+                    "delivery_region_reached",
+                    transport.engaged_track_ids[0],
+                )
+            return self._set_activity(
+                timestamp_ns,
+                ActivityState.PUSHING,
+                AbstractAction.PUSH,
+                "legal_transport",
+                transport.engaged_track_ids[0],
+            )
 
         if transport_targets:
             target = transport_targets[0]
@@ -639,6 +692,45 @@ class MissionStateMachine:
         if injured_count and len(targets) != 1:
             return TerminationReason.INJURED_MIXED_TRANSPORT
         return None
+
+    def _process_grabbed_delivery(
+        self,
+        timestamp_ns: int,
+        delivery: DeliveryEvidence,
+    ) -> MissionDecision:
+        """抓取转运的交付：块在夹爪内被遮挡，类别已知为绿色普通物资。
+
+        正面抓取只夹取绿色普通物资（见 simulation_20_point 的选择门禁），因此
+        交付无需从快照解析目标类别，直接按单个绿色普通物资记分。
+        """
+
+        if delivery.destination is not DeliveryDestination.OWN_MATERIAL:
+            return self._hold(timestamp_ns, "grabbed_delivery_wrong_destination")
+        if not delivery.fully_entered:
+            return self._set_activity(
+                timestamp_ns,
+                ActivityState.VERIFYING_DELIVERY,
+                AbstractAction.DELIVER,
+                "delivery_not_fully_entered",
+            )
+        if self._phase is MissionPhase.FIRST_NORMAL_REQUIRED:
+            self._phase = MissionPhase.GENERAL_RESCUE
+        self._progress = MissionProgress(
+            delivered_green_supply=(
+                self._progress.delivered_green_supply + len(delivery.track_ids)
+            ),
+            delivered_black_core=self._progress.delivered_black_core,
+            delivered_orange_injured=self._progress.delivered_orange_injured,
+            wrong_zone_targets=self._progress.wrong_zone_targets,
+            opponent_zone_targets=self._progress.opponent_zone_targets,
+            out_of_field_targets=self._progress.out_of_field_targets,
+        )
+        return self._set_activity(
+            timestamp_ns,
+            ActivityState.SEARCHING,
+            AbstractAction.SEARCH,
+            "delivery_accepted",
+        )
 
     def _process_delivery(
         self,

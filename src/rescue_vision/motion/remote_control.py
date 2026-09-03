@@ -19,7 +19,10 @@ from rescue_vision.communication import (
     UartError,
 )
 from rescue_vision.exception_notes import add_exception_note
-from rescue_vision.motion.controller import MotionController
+from rescue_vision.motion.controller import (
+    MotionController,
+    MotionSynchronizationError,
+)
 from rescue_vision.motion.protocol import ParsedCarMessage
 
 
@@ -640,9 +643,13 @@ def run_remote_motion(
     on_cycle: Callable[[], None] | None = None,
     poll_interval_s: float = 0.05,
     synchronize_on_start: bool = False,
-    synchronization_timeout_s: float = 0.5,
+    synchronization_timeout_s: float = 1.0,
 ) -> None:
-    """循环执行远程运动，并为应用装配层提供有界的同线程钩子。"""
+    """循环执行远程运动，并为应用装配层提供有界的同线程钩子。
+
+    启动或运行中同步超时会保持零速并重试；其他控制/通信异常仍会进入
+    统一停车路径并向调用方传播。
+    """
 
     if not 0.0 < poll_interval_s <= 0.1:
         raise ValueError("poll_interval_s must be in (0, 0.1].")
@@ -654,18 +661,33 @@ def run_remote_motion(
         raise ValueError(
             "synchronization_timeout_s must be finite and > 0."
         )
-    try:
-        if synchronize_on_start:
-            executor.controller.synchronize(
-                timeout_s=float(synchronization_timeout_s),
-                on_message=on_car_message,
-            )
+
+    def synchronize_until_ready() -> bool:
+        """等待同步成功；超时只保持零速并重新发送同步帧。"""
+
         while not stop_requested():
-            if executor.controller.needs_synchronization:
+            try:
                 executor.controller.synchronize(
                     timeout_s=float(synchronization_timeout_s),
                     on_message=on_car_message,
                 )
+            except MotionSynchronizationError:
+                # MotionController clears the failed sequence, so the next
+                # attempt sends a fresh SOFT_BRAKE instead of waiting forever
+                # for the same missing reply. Keep this short pause bounded so
+                # a stop request is observed promptly after a fast failure.
+                time.sleep(0.02)
+                continue
+            return True
+        return False
+
+    try:
+        if synchronize_on_start:
+            synchronize_until_ready()
+        while not stop_requested():
+            if executor.controller.needs_synchronization:
+                if not synchronize_until_ready():
+                    break
             timed_out = executor.check_timeout()
             if not timed_out:
                 executor.controller.update()

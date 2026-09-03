@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from threading import Thread
+from threading import Event, Lock, Thread
 from typing import Protocol, TextIO
 
 from rescue_vision.app.cluster_breakup import (
@@ -26,6 +26,8 @@ from rescue_vision.app.cluster_breakup import (
     ClusterBreakupSequence,
     GripperPosture,
 )
+from rescue_vision.camera.frame import CameraFrame
+from rescue_vision.camera.viewer import OpenCvFrameViewer
 from rescue_vision.config import (
     AppConfig,
     Simulation20PointRuntimeConfig,
@@ -48,16 +50,23 @@ from rescue_vision.mission import (
     SafetySignals,
     TransportStatus,
 )
-from rescue_vision.perception import PerceptionSnapshot, TargetClass
+from rescue_vision.perception import (
+    PerceptionSnapshot,
+    SafeZoneColor,
+    SafeZoneObservation,
+    TargetClass,
+)
 from rescue_vision.tracking import MultiTargetTracker, TrackStatus
 from rescue_vision.world import (
     HazardState,
     RegionKind,
     StaticRegion,
+    StaticFieldMap,
     WorldModel,
     WorldSnapshot,
     WorldTarget,
     WorldUncertainty,
+    TeamColor,
 )
 
 
@@ -66,6 +75,8 @@ class Simulation20PointState(str, Enum):
 
     BOOT = "boot"
     PREFLIGHT = "preflight"
+    STARTUP_TURN_RIGHT = "startup_turn_right"
+    STARTUP_FORWARD = "startup_forward"
     LEAVE_START = "leave_start"
     SEARCH_CLUSTER = "search_cluster"
     CENTER_CLUSTER = "center_cluster"
@@ -75,6 +86,9 @@ class Simulation20PointState(str, Enum):
     BREAKUP_OPEN_RETREAT = "breakup_open_retreat"
     BREAKUP_CLOSE = "breakup_close"
     RETREAT_FROM_CLUSTER = "retreat_from_cluster"
+    BREAKUP_SAFE_ZONE_TURN = "breakup_safe_zone_turn"
+    BREAKUP_SAFE_ZONE_FORWARD = "breakup_safe_zone_forward"
+    BREAKUP_SAFE_ZONE_CALIBRATE = "breakup_safe_zone_calibrate"
     RESET_TARGET_TRACKS = "reset_target_tracks"
     SCAN_GREEN = "scan_green"
     EVALUATE_EASY_GREEN = "evaluate_easy_green"
@@ -84,6 +98,8 @@ class Simulation20PointState(str, Enum):
     ALIGN_GREEN = "align_green"
     APPROACH_GREEN = "approach_green"
     ENGAGE_GREEN = "engage_green"
+    CLOSE_GRIPPER_FOR_FRONT_GRAB = "close_gripper_for_front_grab"
+    REORIENT_TO_DESTINATION = "reorient_to_destination"
     PUSH_TO_MATERIAL_ZONE = "push_to_material_zone"
     VERIFY_DELIVERY = "verify_delivery"
     DISENGAGE_AND_RETREAT = "disengage_and_retreat"
@@ -216,6 +232,103 @@ class _SimulationRemoteTransport(Protocol):
     def submit(self, frame: object) -> None: ...
 
 
+class _LocalPreview:
+    """在独立线程显示最新 perception 帧，不占用运动控制循环。"""
+
+    def __init__(self, *, title: str = "20-point simulation perception") -> None:
+        self._viewer = OpenCvFrameViewer(title)
+        self._condition = Event()
+        self._stop_event = Event()
+        self._lock = Lock()
+        self._pending_frame: CameraFrame | None = None
+        self._worker_error: BaseException | None = None
+        self._thread: Thread | None = None
+        self._user_requested_stop = False
+
+    def start(self) -> None:
+        if self._thread is not None:
+            raise RuntimeError("Local preview is already started.")
+        self._stop_event.clear()
+        self._condition.clear()
+        with self._lock:
+            self._pending_frame = None
+            self._worker_error = None
+            self._user_requested_stop = False
+        self._thread = Thread(
+            target=self._worker_loop,
+            name="rescue-20-point-local-preview",
+            daemon=True,
+        )
+        try:
+            self._thread.start()
+        except BaseException:
+            self._thread = None
+            raise
+
+    def submit(self, frame: CameraFrame | None) -> None:
+        if frame is None:
+            return
+        if not isinstance(frame, CameraFrame):
+            raise TypeError("local preview frame must be a CameraFrame or None.")
+        if self._thread is None:
+            raise RuntimeError("Local preview is not started.")
+        self._raise_worker_error()
+        with self._lock:
+            self._pending_frame = frame
+        self._condition.set()
+
+    def check_health(self) -> None:
+        if self._thread is None:
+            raise RuntimeError("Local preview is not started.")
+        self._raise_worker_error()
+
+    @property
+    def user_requested_stop(self) -> bool:
+        with self._lock:
+            return self._user_requested_stop
+
+    def stop(self) -> None:
+        thread = self._thread
+        if thread is None:
+            return
+        self._stop_event.set()
+        self._condition.set()
+        thread.join(timeout=2.0)
+        self._thread = None
+        self._condition.clear()
+        self._viewer.close()
+        if thread.is_alive():
+            raise RuntimeError("Local preview worker did not stop.")
+        self._raise_worker_error()
+
+    def _worker_loop(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                self._condition.wait(timeout=0.1)
+                self._condition.clear()
+                with self._lock:
+                    frame = self._pending_frame
+                    self._pending_frame = None
+                if frame is None:
+                    continue
+                if not self._viewer.show(frame.image_bgr):
+                    with self._lock:
+                        self._user_requested_stop = True
+                    break
+        except BaseException as exc:
+            with self._lock:
+                self._worker_error = exc
+            self._stop_event.set()
+        finally:
+            self._viewer.close()
+
+    def _raise_worker_error(self) -> None:
+        with self._lock:
+            error = self._worker_error
+        if error is not None:
+            raise RuntimeError("Local preview failed.") from error
+
+
 def _publish_remote_simulation_state(
     remote_transport: _SimulationRemoteTransport | None,
     *,
@@ -235,6 +348,63 @@ def _publish_remote_simulation_state(
     remote_transport.submit_localization(pose, timestamp_ns)
     if rendered is not None:
         remote_transport.submit(rendered)
+
+
+def _overlay_remote_pose(
+    frame: CameraFrame | None,
+    pose: FusedPoseEstimate | None,
+    now_ns: int,
+) -> CameraFrame | None:
+    """在远程 perception 图像副本上叠加场地绝对位姿。"""
+
+    if frame is None:
+        return None
+    import cv2
+
+    image = frame.image_bgr.copy()
+    if pose is None or pose.pose is None:
+        quality = (
+            "no_estimate"
+            if pose is None
+            else ",".join(sorted(item.value for item in pose.quality))
+        )
+        text = f"pose=unavailable ({quality or 'no_quality'})"
+    else:
+        age_ms = "n/a"
+        if pose.estimate_timestamp_ns is not None:
+            age_ms = f"{max(0.0, (now_ns - pose.estimate_timestamp_ns) / 1_000_000.0):.0f}ms"
+        text = (
+            f"field_xy=({pose.pose.position.x:+.0f},{pose.pose.position.y:+.0f})mm "
+            f"heading={math.degrees(pose.pose.heading_rad):+.1f}deg age={age_ms}"
+        )
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.75
+    thickness = 2
+    (width, height), baseline = cv2.getTextSize(text, font, scale, thickness)
+    x, y = 12, 32
+    cv2.rectangle(
+        image,
+        (x - 5, y - height - baseline - 5),
+        (x + width + 5, y + baseline + 5),
+        (255, 255, 255),
+        cv2.FILLED,
+    )
+    cv2.putText(
+        image,
+        text,
+        (x, y),
+        font,
+        scale,
+        (0, 0, 0),
+        thickness,
+        cv2.LINE_AA,
+    )
+    return CameraFrame(
+        sequence=frame.sequence,
+        timestamp_ns=frame.timestamp_ns,
+        image_bgr=image,
+        metadata=frame.metadata,
+    )
 
 
 class _TeeStream:
@@ -301,7 +471,12 @@ def _end_time_named_log(
 
 @dataclass(frozen=True, slots=True)
 class GreenTransportPlan:
-    """一枚绿色普通物资的目标场地点、预推点和安全推送走廊。"""
+    """一枚绿色普通物资的目标场地点、预推点和安全推送走廊。
+
+    ``front_grab`` 为真时表示该目标足够孤立，走正面抓取（开夹爪直行、合爪、
+    转向己方物资区再推送），不做背面预推；此时 ``prepush_field`` 退化为目标
+    场地点，仅用于候选排序。
+    """
 
     track_id: int
     target_field: FieldPoint
@@ -310,6 +485,7 @@ class GreenTransportPlan:
     push_direction_y: float
     prepush_field: FieldPoint
     clearance_mm: float
+    front_grab: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -477,6 +653,9 @@ class Simulation20PointSequence:
         mission: MissionStateMachine,
         breakup: _BreakupDriver,
         breakup_factory: Callable[[], _BreakupDriver] | None = None,
+        gripper_close_settle_time_s: float = 1.0,
+        team_color: TeamColor = TeamColor.UNKNOWN,
+        static_map: StaticFieldMap | None = None,
     ) -> None:
         if not isinstance(config, Simulation20PointRuntimeConfig):
             raise TypeError("config must be a Simulation20PointRuntimeConfig.")
@@ -492,12 +671,27 @@ class Simulation20PointSequence:
             raise TypeError("breakup must provide step().")
         if breakup_factory is not None and not callable(breakup_factory):
             raise TypeError("breakup_factory must be callable or None.")
+        if not math.isfinite(float(gripper_close_settle_time_s)) or float(
+            gripper_close_settle_time_s
+        ) <= 0.0:
+            raise ValueError(
+                "gripper_close_settle_time_s must be finite and positive."
+            )
+        if not isinstance(team_color, TeamColor):
+            raise TypeError("team_color must be a TeamColor.")
+        if static_map is not None and not isinstance(static_map, StaticFieldMap):
+            raise TypeError("static_map must be a StaticFieldMap or None.")
         self.config = config
         self._tracker = tracker
         self._world_model = world_model
         self._mission = mission
         self._breakup: _BreakupDriver | None = breakup
         self._breakup_factory = breakup_factory
+        self._gripper_close_settle_time_ns = round(
+            float(gripper_close_settle_time_s) * 1_000_000_000
+        )
+        self._team_color = team_color
+        self._static_map = static_map
         self.state = Simulation20PointState.BOOT
         self._started = False
         self._start_timestamp_ns: int | None = None
@@ -526,6 +720,15 @@ class Simulation20PointSequence:
         self._retreat_base_distance_m: float | None = None
         self._rebreakup_mode = False
         self._cycle_mission_decision: MissionDecision | None = None
+        self._startup_turn_last_heading: float | None = None
+        self._startup_turn_progress_rad = 0.0
+        self._startup_phase_started_ns: int | None = None
+        self._startup_forward_base_distance_m: float | None = None
+        self._front_grab_close_started_ns: int | None = None
+        self._last_decision_state: Simulation20PointState | None = None
+        self._action_settle_until_ns = 0
+        self._safe_zone_calibration_started_ns: int | None = None
+        self._safe_zone_calibration_started_frame: int | None = None
 
     @classmethod
     def from_app_config(cls, config: AppConfig) -> Simulation20PointSequence:
@@ -538,10 +741,18 @@ class Simulation20PointSequence:
         if gripper is None:
             raise RuntimeError("20-point flow requires enabled gripper calibration.")
 
-        def make_breakup() -> ClusterBreakupSequence:
+        def make_breakup(
+            *,
+            skip_departure: bool = False,
+            initial: bool = False,
+        ) -> ClusterBreakupSequence:
             return ClusterBreakupSequence(
                 config.motion.cluster_breakup,
                 gripper_full_travel_time_s=gripper.full_travel_time_s,
+                skip_departure=skip_departure,
+                breakup_distance_m=(
+                    runtime.first_breakup_distance_m if initial else None
+                ),
             )
 
         return cls(
@@ -549,8 +760,14 @@ class Simulation20PointSequence:
             tracker=config.tracking.build_tracker(),
             world_model=config.world.build_model(),
             mission=config.mission.build_state_machine(),
-            breakup=make_breakup(),
-            breakup_factory=make_breakup,
+            breakup=make_breakup(
+                skip_departure=runtime.startup_maneuver_enabled,
+                initial=True,
+            ),
+            breakup_factory=lambda: make_breakup(),
+            gripper_close_settle_time_s=gripper.full_travel_time_s,
+            team_color=config.world.team_color,
+            static_map=config.world.static_map,
         )
 
     @property
@@ -600,7 +817,14 @@ class Simulation20PointSequence:
         self._start_timestamp_ns = timestamp_ns
         self._last_timestamp_ns = timestamp_ns
         self._last_motion_timestamp_ns = timestamp_ns
-        self.state = Simulation20PointState.LEAVE_START
+        if self.config.startup_maneuver_enabled:
+            self.state = Simulation20PointState.STARTUP_TURN_RIGHT
+            self._startup_turn_last_heading = None
+            self._startup_turn_progress_rad = 0.0
+            self._startup_phase_started_ns = timestamp_ns
+            self._startup_forward_base_distance_m = None
+        else:
+            self.state = Simulation20PointState.LEAVE_START
         return self._decision(
             timestamp_ns,
             0.0,
@@ -678,8 +902,21 @@ class Simulation20PointSequence:
         if direct_safety is not None:
             return self._terminal(timestamp_ns, direct_safety)
 
+        # The startup maneuver is deliberately open-loop with respect to the
+        # camera: do not feed pre-positioning frames into the tracker/world
+        # model, so the first visual breakup starts from a fresh observation
+        # set after the configured right turn and 1 m translation.
+        world_perception = (
+            None
+            if self.state
+            in {
+                Simulation20PointState.STARTUP_TURN_RIGHT,
+                Simulation20PointState.STARTUP_FORWARD,
+            }
+            else perception
+        )
         try:
-            snapshot = self._update_world(timestamp_ns, perception, pose)
+            snapshot = self._update_world(timestamp_ns, world_perception, pose)
         except (RuntimeError, ValueError) as exc:
             # A single inconsistent snapshot (timestamp skew, malformed
             # observation) must not latch a permanent stop: keep the current
@@ -716,8 +953,25 @@ class Simulation20PointSequence:
             # intentionally ignore non-terminal mission activity instead of
             # interrupting their fixed encoder-driven actions.
             return self._hold(timestamp_ns, mission_decision.reason)
+        if self.state is Simulation20PointState.STARTUP_TURN_RIGHT:
+            return self._step_startup_turn(timestamp_ns, pose, snapshot)
+        if self.state is Simulation20PointState.STARTUP_FORWARD:
+            return self._step_startup_forward(
+                timestamp_ns, cumulative_distance_m, snapshot
+            )
         if self.state is Simulation20PointState.RESET_TARGET_TRACKS:
             return self._step_reset_tracks(timestamp_ns, perception, pose, snapshot)
+        if self.state in {
+            Simulation20PointState.BREAKUP_SAFE_ZONE_TURN,
+            Simulation20PointState.BREAKUP_SAFE_ZONE_FORWARD,
+            Simulation20PointState.BREAKUP_SAFE_ZONE_CALIBRATE,
+        }:
+            return self._step_breakup_safe_zone_calibration(
+                timestamp_ns,
+                perception,
+                pose,
+                snapshot,
+            )
         if self._breakup is not None:
             return self._step_breakup(
                 timestamp_ns,
@@ -750,6 +1004,10 @@ class Simulation20PointSequence:
             return self._step_engage(
                 timestamp_ns, pose, snapshot, cumulative_distance_m, safety
             )
+        if self.state is Simulation20PointState.CLOSE_GRIPPER_FOR_FRONT_GRAB:
+            return self._step_close_gripper_for_front_grab(timestamp_ns)
+        if self.state is Simulation20PointState.REORIENT_TO_DESTINATION:
+            return self._step_reorient_to_destination(timestamp_ns, pose, snapshot)
         if self.state is Simulation20PointState.PUSH_TO_MATERIAL_ZONE:
             return self._step_push(timestamp_ns, pose, snapshot, safety)
         if self.state is Simulation20PointState.VERIFY_DELIVERY:
@@ -759,7 +1017,12 @@ class Simulation20PointSequence:
                 timestamp_ns, snapshot, cumulative_distance_m, safety
             )
         if self.state is Simulation20PointState.PLAN_REBREAKUP:
-            return self._step_plan_rebreakup(timestamp_ns, snapshot)
+            return self._step_plan_rebreakup(
+                timestamp_ns,
+                pose,
+                snapshot,
+                mission_decision,
+            )
         if self.state is Simulation20PointState.CENTER_REBREAKUP_CLUSTER:
             return self._step_breakup(
                 timestamp_ns,
@@ -775,6 +1038,113 @@ class Simulation20PointSequence:
             f"unhandled_state:{self.state.value}",
             mission_decision=mission_decision,
             world_snapshot=snapshot,
+        )
+
+    def _step_startup_turn(
+        self,
+        timestamp_ns: int,
+        pose: FusedPoseEstimate | None,
+        snapshot: WorldSnapshot,
+    ) -> SimulationDecision:
+        """执行启动右转；只使用融合后的编码器/IMU 航向，不使用视觉。"""
+
+        if self._startup_phase_timed_out(timestamp_ns):
+            return self._terminal(
+                timestamp_ns,
+                "startup_turn_timeout",
+                world_snapshot=snapshot,
+            )
+        if pose is None or pose.pose is None:
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "startup_turn_waiting_for_odometry_pose",
+                world_snapshot=snapshot,
+            )
+        heading = pose.pose.heading_rad
+        previous = self._startup_turn_last_heading
+        self._startup_turn_last_heading = heading
+        if previous is None:
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                self.config.startup_turn_angular_velocity_rad_s,
+                "startup_turn_right",
+                world_snapshot=snapshot,
+            )
+        # Positive heading is a left turn in the project convention. Count
+        # only rightward increments so an unexpected opposite turn cannot
+        # falsely complete this safety-critical fixed maneuver.
+        rightward_delta = normalize_angle(previous - heading)
+        if rightward_delta > 0.0:
+            self._startup_turn_progress_rad += rightward_delta
+        if self._startup_turn_progress_rad >= self.config.startup_turn_angle_rad:
+            self.state = Simulation20PointState.STARTUP_FORWARD
+            self._startup_phase_started_ns = timestamp_ns
+            self._startup_forward_base_distance_m = None
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "startup_turn_right_complete",
+                world_snapshot=snapshot,
+            )
+        return self._decision(
+            timestamp_ns,
+            0.0,
+            self.config.startup_turn_angular_velocity_rad_s,
+            "startup_turn_right",
+            world_snapshot=snapshot,
+        )
+
+    def _step_startup_forward(
+        self,
+        timestamp_ns: int,
+        cumulative_distance_m: float | None,
+        snapshot: WorldSnapshot,
+    ) -> SimulationDecision:
+        """执行启动直行；只使用编码器累计路程，不使用视觉。"""
+
+        if self._startup_phase_timed_out(timestamp_ns):
+            return self._terminal(
+                timestamp_ns,
+                "startup_forward_timeout",
+                world_snapshot=snapshot,
+            )
+        if cumulative_distance_m is None:
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "startup_forward_waiting_for_odometry",
+                world_snapshot=snapshot,
+            )
+        if self._startup_forward_base_distance_m is None:
+            self._startup_forward_base_distance_m = cumulative_distance_m
+        travelled_m = cumulative_distance_m - self._startup_forward_base_distance_m
+        if travelled_m >= self.config.startup_forward_distance_m - 1e-9:
+            self.state = Simulation20PointState.LEAVE_START
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "startup_forward_complete_start_visual_breakup",
+                world_snapshot=snapshot,
+            )
+        return self._decision(
+            timestamp_ns,
+            self.config.startup_forward_speed_m_s,
+            0.0,
+            "startup_forward",
+            world_snapshot=snapshot,
+        )
+
+    def _startup_phase_timed_out(self, timestamp_ns: int) -> bool:
+        started_ns = self._startup_phase_started_ns
+        return started_ns is not None and (
+            timestamp_ns - started_ns
+            >= round(self.config.startup_motion_phase_timeout_s * 1_000_000_000)
         )
 
     def _update_world(
@@ -842,6 +1212,25 @@ class Simulation20PointSequence:
         breakup = self._breakup
         if breakup is None:
             raise RuntimeError("breakup driver is missing while breakup is active.")
+        interrupt_plan = self._front_grab_plan_during_breakup(snapshot, pose)
+        if interrupt_plan is not None:
+            # Stop the fixed breakup action at this control boundary.  The
+            # open posture lets a green block directly ahead enter the
+            # gripper; the next cycles use the normal align/approach/contact
+            # path and do not call the breakup driver again.
+            self._breakup = None
+            self._rebreakup_mode = False
+            self._selected_plan = interrupt_plan
+            self._selected_track_id = interrupt_plan.track_id
+            self.state = Simulation20PointState.ALIGN_GREEN
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                f"green_front_grab_interrupt_breakup:{interrupt_plan.track_id}",
+                posture=GripperPosture.OPEN,
+                world_snapshot=snapshot,
+            )
         breakup_decision = breakup.step(
             timestamp_ns=timestamp_ns,
             cumulative_distance_m=cumulative_distance_m,
@@ -875,6 +1264,22 @@ class Simulation20PointSequence:
                 world_snapshot=snapshot,
             )
         if breakup_decision.state is BreakupState.SCAN_GREEN:
+            if self.config.safe_zone_calibration_enabled:
+                self._breakup = None
+                self._rebreakup_mode = False
+                self._safe_zone_calibration_started_ns = timestamp_ns
+                self._safe_zone_calibration_started_frame = (
+                    None if perception is None else perception.frame_sequence
+                )
+                self.state = Simulation20PointState.BREAKUP_SAFE_ZONE_TURN
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    0.0,
+                    "breakup_complete_begin_safe_zone_calibration",
+                    posture=breakup_decision.gripper_posture,
+                    world_snapshot=snapshot,
+                )
             self.state = Simulation20PointState.SCAN_GREEN
             if pose is None or pose.pose is None:
                 return self._decision(
@@ -928,6 +1333,283 @@ class Simulation20PointSequence:
             world_snapshot=snapshot,
         )
 
+    def _own_safe_zone(
+        self,
+        perception: PerceptionSnapshot | None,
+    ) -> SafeZoneObservation | None:
+        if (
+            perception is None
+            or perception.dropped_stale_age_ms is not None
+            or perception.field_features is None
+            or self._team_color is TeamColor.UNKNOWN
+        ):
+            return None
+        expected_color = SafeZoneColor(self._team_color.value)
+        candidates = tuple(
+            zone
+            for zone in perception.field_features.safe_zones
+            if zone.physical_color is expected_color
+        )
+        return max(candidates, key=lambda zone: zone.confidence, default=None)
+
+    def _map_safe_zone_heading(
+        self,
+        pose: FusedPoseEstimate | None,
+    ) -> float | None:
+        """Return the map-defined normal pointing from the robot to its zone line.
+
+        The safe-zone entrance line has two possible normals.  The current fused
+        field position selects the normal that points toward the closest point on
+        that line.  This is only the initial turn cue; the final 300 mm approach
+        remains controlled by the observed K0/K1/K2 ground points.
+        """
+
+        if (
+            pose is None
+            or pose.pose is None
+            or self._static_map is None
+            or self._team_color is TeamColor.UNKNOWN
+        ):
+            return None
+        landmarks = self._static_map.safe_zone_landmarks_for(self._team_color)
+        if landmarks is None:
+            return None
+        first = landmarks.near_field_corner_a
+        second = landmarks.near_field_corner_b
+        line_x = second.x - first.x
+        line_y = second.y - first.y
+        line_length = math.hypot(line_x, line_y)
+        if line_length <= 1e-6:
+            return None
+        unit_x = line_x / line_length
+        unit_y = line_y / line_length
+        offset_x = pose.pose.position.x - first.x
+        offset_y = pose.pose.position.y - first.y
+        projection_x = first.x + (offset_x * unit_x + offset_y * unit_y) * unit_x
+        projection_y = first.y + (offset_x * unit_x + offset_y * unit_y) * unit_y
+        to_line_x = projection_x - pose.pose.position.x
+        to_line_y = projection_y - pose.pose.position.y
+        normals = ((-unit_y, unit_x), (unit_y, -unit_x))
+        if math.hypot(to_line_x, to_line_y) <= 1e-6:
+            to_line_x = landmarks.ground_anchor_field.x - pose.pose.position.x
+            to_line_y = landmarks.ground_anchor_field.y - pose.pose.position.y
+        normal_x, normal_y = max(
+            normals,
+            key=lambda normal: normal[0] * to_line_x + normal[1] * to_line_y,
+        )
+        return math.atan2(normal_y, normal_x)
+
+    @staticmethod
+    def _safe_zone_line_metrics(
+        zone: SafeZoneObservation,
+    ) -> tuple[GroundPoint, float, float, float] | None:
+        k0 = zone.ground_anchor.ground
+        left = zone.image_left_landmark.ground
+        right = zone.image_right_landmark.ground
+        if k0 is None or left is None or right is None:
+            return None
+        line_x = right.x - left.x
+        line_y = right.y - left.y
+        line_length = math.hypot(line_x, line_y)
+        if line_length <= 1e-6:
+            return None
+        line_angle = math.atan2(line_y, line_x)
+        bearing = math.atan2(k0.y, k0.x)
+        normals = (
+            normalize_angle(line_angle + math.pi / 2.0),
+            normalize_angle(line_angle - math.pi / 2.0),
+        )
+        normal_angle = min(
+            normals,
+            key=lambda angle: abs(normalize_angle(angle - bearing)),
+        )
+        perpendicular_error = math.asin(
+            min(1.0, abs(math.cos(line_angle)))
+        )
+        return k0, normal_angle, bearing, perpendicular_error
+
+    def _safe_zone_calibration_timed_out(self, timestamp_ns: int) -> bool:
+        started = self._safe_zone_calibration_started_ns
+        return started is not None and (
+            timestamp_ns - started
+            >= round(self.config.safe_zone_calibration_timeout_s * 1_000_000_000)
+        )
+
+    def _step_breakup_safe_zone_calibration(
+        self,
+        timestamp_ns: int,
+        perception: PerceptionSnapshot | None,
+        pose: FusedPoseEstimate | None,
+        snapshot: WorldSnapshot,
+    ) -> SimulationDecision:
+        if self._safe_zone_calibration_timed_out(timestamp_ns):
+            return self._terminal(
+                timestamp_ns,
+                "safe_zone_calibration_timeout",
+                world_snapshot=snapshot,
+            )
+        heading_tolerance = self.config.safe_zone_calibration_heading_tolerance_rad
+        if self.state is Simulation20PointState.BREAKUP_SAFE_ZONE_TURN:
+            zone = self._own_safe_zone(perception)
+            if zone is None:
+                desired_heading = self._map_safe_zone_heading(pose)
+                if desired_heading is None or pose is None or pose.pose is None:
+                    return self._hold(
+                        timestamp_ns,
+                        "waiting_own_safe_zone_map_and_pose",
+                    )
+                heading_error = normalize_angle(
+                    desired_heading - pose.pose.heading_rad
+                )
+                if abs(heading_error) <= heading_tolerance:
+                    self.state = Simulation20PointState.BREAKUP_SAFE_ZONE_FORWARD
+                    return self._decision(
+                        timestamp_ns,
+                        0.0,
+                        0.0,
+                        "map_safe_zone_heading_reached_wait_visual_zone",
+                        world_snapshot=snapshot,
+                    )
+                angular = _clamp(
+                    self.config.safe_zone_calibration_angular_kp_rad_s
+                    * heading_error,
+                    -self.config.safe_zone_calibration_max_angular_velocity_rad_s,
+                    self.config.safe_zone_calibration_max_angular_velocity_rad_s,
+                )
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    angular,
+                    "turn_to_own_safe_zone_from_fused_map_pose",
+                    world_snapshot=snapshot,
+                )
+            metrics = self._safe_zone_line_metrics(zone)
+            if metrics is None:
+                return self._hold(
+                    timestamp_ns,
+                    "safe_zone_calibration_keypoints_missing",
+                )
+            _k0, normal_angle, _bearing, perpendicular_error = metrics
+            if (
+                abs(normal_angle) <= heading_tolerance
+                and perpendicular_error <= heading_tolerance
+            ):
+                self.state = Simulation20PointState.BREAKUP_SAFE_ZONE_FORWARD
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    0.0,
+                    "safe_zone_facing_forward",
+                    world_snapshot=snapshot,
+                )
+            angular = _clamp(
+                self.config.safe_zone_calibration_angular_kp_rad_s * normal_angle,
+                -self.config.safe_zone_calibration_max_angular_velocity_rad_s,
+                self.config.safe_zone_calibration_max_angular_velocity_rad_s,
+            )
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                angular,
+                "turn_to_face_own_safe_zone",
+                world_snapshot=snapshot,
+            )
+
+        zone = self._own_safe_zone(perception)
+        if zone is None:
+            return self._hold(timestamp_ns, "waiting_own_safe_zone_observation")
+        metrics = self._safe_zone_line_metrics(zone)
+        if metrics is None:
+            return self._hold(timestamp_ns, "safe_zone_calibration_keypoints_missing")
+        k0, normal_angle, bearing, perpendicular_error = metrics
+
+        if self.state is Simulation20PointState.BREAKUP_SAFE_ZONE_FORWARD:
+            distance = self.config.safe_zone_calibration_distance_mm
+            tolerance = self.config.safe_zone_calibration_position_tolerance_mm
+            if k0.x < distance - tolerance:
+                return self._hold(
+                    timestamp_ns,
+                    "safe_zone_calibration_overshot_distance",
+                )
+            if (
+                abs(normal_angle) > heading_tolerance
+                or perpendicular_error > heading_tolerance
+            ):
+                angular = _clamp(
+                    self.config.safe_zone_calibration_angular_kp_rad_s
+                    * normal_angle,
+                    -self.config.safe_zone_calibration_max_angular_velocity_rad_s,
+                    self.config.safe_zone_calibration_max_angular_velocity_rad_s,
+                )
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    angular,
+                    "reestablish_safe_zone_line_perpendicular",
+                    world_snapshot=snapshot,
+                )
+            if abs(k0.x - distance) <= tolerance and abs(k0.y) <= tolerance:
+                self.state = Simulation20PointState.BREAKUP_SAFE_ZONE_CALIBRATE
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    0.0,
+                    "safe_zone_line_at_300mm_wait_visual_calibration",
+                    world_snapshot=snapshot,
+                )
+            angular = _clamp(
+                self.config.safe_zone_calibration_angular_kp_rad_s * bearing,
+                -self.config.safe_zone_calibration_max_angular_velocity_rad_s,
+                self.config.safe_zone_calibration_max_angular_velocity_rad_s,
+            )
+            return self._decision(
+                timestamp_ns,
+                self.config.safe_zone_calibration_speed_m_s,
+                angular,
+                "approach_own_safe_zone_to_300mm",
+                world_snapshot=snapshot,
+            )
+
+        expected_source = f"{self._team_color.value}_safe_zone_corners"
+        current_frame = None if perception is None else perception.frame_sequence
+        if (
+            current_frame is not None
+            and (
+                self._safe_zone_calibration_started_frame is None
+                or current_frame > self._safe_zone_calibration_started_frame
+            )
+            and pose is not None
+            and pose.pose is not None
+            and pose.anchor_source == expected_source
+        ):
+            self._begin_reset_tracks(perception)
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "safe_zone_visual_calibration_accepted_reset_tracks",
+                world_snapshot=snapshot,
+            )
+        return self._hold(
+            timestamp_ns,
+            "waiting_own_safe_zone_visual_calibration",
+        )
+
+    def _front_grab_plan_during_breakup(
+        self,
+        snapshot: WorldSnapshot,
+        pose: FusedPoseEstimate | None,
+    ) -> GreenTransportPlan | None:
+        """返回解团期间可立即切换的孤立绿色正面夹取计划。"""
+
+        if not self._pose_usable(pose):
+            return None
+        assert pose is not None and pose.pose is not None
+        for plan in self._candidate_plans(snapshot, pose.pose):
+            if plan.front_grab:
+                return plan
+        return None
+
     def _begin_reset_tracks(self, perception: PerceptionSnapshot | None) -> None:
         self._ignore_frames_through = self._last_tracker_frame_sequence
         if perception is not None:
@@ -946,6 +1628,7 @@ class Simulation20PointSequence:
         self._rebreakup_mode = False
         self._selected_track_id = None
         self._selected_plan = None
+        self._front_grab_close_started_ns = None
         self._transport = TransportStatus()
         self._delivery_confirm_count = 0
         self._disengage_confirm_count = 0
@@ -1034,6 +1717,20 @@ class Simulation20PointSequence:
                 mission_decision=mission_decision,
                 world_snapshot=snapshot,
             )
+        if self._pose_usable(pose):
+            plans = self._candidate_plans(snapshot, pose.pose)
+            if plans:
+                self._selected_plan = plans[0]
+                self._selected_track_id = plans[0].track_id
+                self.state = Simulation20PointState.SELECT_GREEN
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    0.0,
+                    f"green_candidate_selected_during_scan:{plans[0].track_id}",
+                    mission_decision=mission_decision,
+                    world_snapshot=snapshot,
+                )
         if self._scan_span_reached(pose):
             self.state = Simulation20PointState.EVALUATE_EASY_GREEN
             return self._decision(
@@ -1125,6 +1822,19 @@ class Simulation20PointSequence:
                 world_snapshot=snapshot,
             )
         self._selected_plan = plan
+        if plan.front_grab:
+            # 孤立绿色块走正面抓取，跳过背面预推导航，直接进入视觉居中；
+            # 在真正接触前始终保持全开，避免运输姿态夹不进物块。
+            self.state = Simulation20PointState.ALIGN_GREEN
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "green_selected_front_grab_align",
+                posture=GripperPosture.OPEN,
+                mission_decision=mission_decision,
+                world_snapshot=snapshot,
+            )
         self.state = Simulation20PointState.PLAN_PREPUSH
         return self._decision(
             timestamp_ns,
@@ -1279,7 +1989,7 @@ class Simulation20PointSequence:
                 0.0,
                 0.0,
                 "green_centerline_aligned",
-                posture=GripperPosture.TRANSPORT,
+                posture=self._green_approach_posture(),
                 mission_decision=mission_decision,
                 world_snapshot=snapshot,
             )
@@ -1292,9 +2002,17 @@ class Simulation20PointSequence:
                 self.config.alignment_max_angular_velocity_rad_s,
             ),
             "align_green_centerline",
+            posture=self._green_approach_posture(),
             mission_decision=mission_decision,
             world_snapshot=snapshot,
         )
+
+    def _green_approach_posture(self) -> GripperPosture:
+        """正面抓取时保持全开，普通推送时保持运输姿态。"""
+
+        if self._selected_plan is not None and self._selected_plan.front_grab:
+            return GripperPosture.OPEN
+        return GripperPosture.TRANSPORT
 
     def _step_approach(
         self,
@@ -1352,7 +2070,7 @@ class Simulation20PointSequence:
                 0.0,
                 0.0,
                 "green_contact_distance_reached",
-                posture=GripperPosture.TRANSPORT,
+                posture=self._green_approach_posture(),
                 mission_decision=mission_decision,
                 world_snapshot=snapshot,
             )
@@ -1365,7 +2083,7 @@ class Simulation20PointSequence:
                 self.config.alignment_max_angular_velocity_rad_s,
             ),
             "approach_selected_green",
-            posture=GripperPosture.TRANSPORT,
+            posture=self._green_approach_posture(),
             mission_decision=mission_decision,
             world_snapshot=snapshot,
         )
@@ -1419,12 +2137,16 @@ class Simulation20PointSequence:
                 0.0,
                 0.0,
                 "engage_evidence_not_ready",
-                posture=GripperPosture.TRANSPORT,
+                posture=self._green_approach_posture(),
             )
         assert self._selected_track_id is not None
         self._transport = TransportStatus(
             engaged_track_ids=(self._selected_track_id,),
             contact_started_ns=timestamp_ns,
+            grabbed=(
+                self._selected_plan is not None
+                and self._selected_plan.front_grab
+            ),
         )
         # Contact establishment is a boundary event like delivery evidence:
         # re-evaluate within the same cycle so the rule machine judges the
@@ -1450,6 +2172,18 @@ class Simulation20PointSequence:
                 world_snapshot=snapshot,
             )
         self._retreat_base_distance_m = cumulative_distance_m
+        if self._selected_plan is not None and self._selected_plan.front_grab:
+            self._front_grab_close_started_ns = timestamp_ns
+            self.state = Simulation20PointState.CLOSE_GRIPPER_FOR_FRONT_GRAB
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "single_green_contact_engaged_close_gripper",
+                posture=GripperPosture.CLOSED,
+                mission_decision=mission_decision,
+                world_snapshot=snapshot,
+            )
         self.state = Simulation20PointState.PUSH_TO_MATERIAL_ZONE
         return self._decision(
             timestamp_ns,
@@ -1461,6 +2195,77 @@ class Simulation20PointSequence:
             world_snapshot=snapshot,
         )
 
+    def _step_close_gripper_for_front_grab(
+        self,
+        timestamp_ns: int,
+    ) -> SimulationDecision:
+        """等待夹爪完成闭合，再允许原地转向和推送。"""
+
+        started_ns = self._front_grab_close_started_ns
+        if started_ns is None:
+            return self._hold(timestamp_ns, "front_grab_close_start_missing")
+        if timestamp_ns - started_ns < self._gripper_close_settle_time_ns:
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "waiting_for_front_grab_gripper_close",
+                posture=GripperPosture.CLOSED,
+                world_snapshot=self._world_snapshot,
+            )
+        self._front_grab_close_started_ns = None
+        self.state = Simulation20PointState.REORIENT_TO_DESTINATION
+        return self._decision(
+            timestamp_ns,
+            0.0,
+            0.0,
+            "front_grab_gripper_closed_reorient",
+            posture=GripperPosture.CLOSED,
+            world_snapshot=self._world_snapshot,
+        )
+
+    def _step_reorient_to_destination(
+        self,
+        timestamp_ns: int,
+        pose: FusedPoseEstimate | None,
+        snapshot: WorldSnapshot,
+    ) -> SimulationDecision:
+        """正面抓取合爪后，把航向转向己方物资区目的地再推送。
+
+        目标已被夹爪夹住，原地转向把车头对准目的地质心；到位后进入推送。
+        依赖场系位姿，位姿缺失时零速等待（与 NAVIGATE_PREPUSH 同级降级）。
+        """
+
+        if pose is None or pose.pose is None:
+            return self._hold(timestamp_ns, "reorient_pose_missing")
+        destination = self._destination(snapshot)
+        if destination is None:
+            return self._hold(timestamp_ns, "reorient_destination_missing")
+        desired_heading = _angle_to(pose.pose.position, destination)
+        heading_error = normalize_angle(desired_heading - pose.pose.heading_rad)
+        if abs(heading_error) <= self.config.navigation_heading_tolerance_rad:
+            self.state = Simulation20PointState.PUSH_TO_MATERIAL_ZONE
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "reorient_complete_push_to_material_zone",
+                posture=GripperPosture.CLOSED,
+                world_snapshot=snapshot,
+            )
+        return self._decision(
+            timestamp_ns,
+            0.0,
+            _clamp(
+                self.config.navigation_angular_kp_rad_s * heading_error,
+                -self.config.navigation_max_angular_velocity_rad_s,
+                self.config.navigation_max_angular_velocity_rad_s,
+            ),
+            "reorient_to_destination",
+            posture=GripperPosture.CLOSED,
+            world_snapshot=snapshot,
+        )
+
     def _step_push(
         self,
         timestamp_ns: int,
@@ -1468,6 +2273,8 @@ class Simulation20PointSequence:
         snapshot: WorldSnapshot,
         safety: SafetySignals,
     ) -> SimulationDecision:
+        if self._front_grab_grabbed():
+            return self._step_push_front_grab(timestamp_ns, pose, snapshot)
         target = self._selected_target(snapshot)
         if target is None or target.ground_point is None:
             return self._hold(timestamp_ns, "pushing_target_missing")
@@ -1529,6 +2336,62 @@ class Simulation20PointSequence:
             world_snapshot=snapshot,
         )
 
+    def _step_push_front_grab(
+        self,
+        timestamp_ns: int,
+        pose: FusedPoseEstimate | None,
+        snapshot: WorldSnapshot,
+    ) -> SimulationDecision:
+        """正面抓取合爪后：块在夹爪内被遮挡，按机器人位姿朝己方物资区搬运。"""
+
+        mission_decision = self._cycle_mission_decision
+        assert mission_decision is not None
+        if mission_decision.action not in {AbstractAction.PUSH, AbstractAction.DELIVER}:
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "mission_did_not_allow_push",
+                posture=GripperPosture.CLOSED,
+                mission_decision=mission_decision,
+                world_snapshot=snapshot,
+            )
+        if pose is None or pose.pose is None:
+            return self._hold(timestamp_ns, "pushing_pose_missing")
+        if self._field_point_fully_entered(
+            snapshot,
+            self._grabbed_block_field(pose.pose),
+        ):
+            self.state = Simulation20PointState.VERIFY_DELIVERY
+            self._delivery_confirm_count = 0
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "material_zone_reached_verify_delivery",
+                posture=GripperPosture.CLOSED,
+                mission_decision=mission_decision,
+                world_snapshot=snapshot,
+            )
+        destination = self._destination(snapshot)
+        if destination is None:
+            return self._hold(timestamp_ns, "pushing_destination_missing")
+        desired_heading = _angle_to(pose.pose.position, destination)
+        heading_error = normalize_angle(desired_heading - pose.pose.heading_rad)
+        return self._decision(
+            timestamp_ns,
+            self.config.push_speed_m_s,
+            _clamp(
+                self.config.push_angular_kp_rad_s * heading_error,
+                -self.config.push_max_angular_velocity_rad_s,
+                self.config.push_max_angular_velocity_rad_s,
+            ),
+            "push_grabbed_green_to_material_zone",
+            posture=GripperPosture.CLOSED,
+            mission_decision=mission_decision,
+            world_snapshot=snapshot,
+        )
+
     def _step_verify(
         self,
         timestamp_ns: int,
@@ -1536,6 +2399,8 @@ class Simulation20PointSequence:
         snapshot: WorldSnapshot,
         safety: SafetySignals,
     ) -> SimulationDecision:
+        if self._front_grab_grabbed():
+            return self._step_verify_front_grab(timestamp_ns, pose, snapshot, safety)
         target = self._selected_target(snapshot)
         if target is None or not self._target_is_fresh(target, timestamp_ns):
             return self._hold(timestamp_ns, "delivery_target_missing")
@@ -1604,6 +2469,77 @@ class Simulation20PointSequence:
             world_snapshot=snapshot,
         )
 
+    def _step_verify_front_grab(
+        self,
+        timestamp_ns: int,
+        pose: FusedPoseEstimate | None,
+        snapshot: WorldSnapshot,
+        safety: SafetySignals,
+    ) -> SimulationDecision:
+        """正面抓取的交付验证：块在夹爪内，用机器人位姿判断是否已入己方物资区。"""
+
+        if pose is None or pose.pose is None:
+            return self._hold(timestamp_ns, "delivery_pose_missing")
+        if not self._field_point_fully_entered(
+            snapshot,
+            self._grabbed_block_field(pose.pose),
+        ):
+            self._delivery_confirm_count = 0
+            return self._decision(
+                timestamp_ns,
+                self.config.push_speed_m_s,
+                0.0,
+                "delivery_not_fully_entered",
+                mission_decision=self._cycle_mission_decision,
+                world_snapshot=snapshot,
+            )
+        self._delivery_confirm_count += 1
+        if self._delivery_confirm_count < self.config.delivery_confirm_frames:
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "delivery_evidence_confirming",
+                mission_decision=self._cycle_mission_decision,
+                world_snapshot=snapshot,
+            )
+        self._delivery_sequence += 1
+        assert self._selected_track_id is not None
+        evidence = DeliveryEvidence(
+            delivery_id=f"simulation-20-point-delivery-{self._delivery_sequence}",
+            track_ids=(self._selected_track_id,),
+            destination=DeliveryDestination.OWN_MATERIAL,
+            fully_entered=True,
+        )
+        mission_decision = self._mission.step(
+            snapshot,
+            transport=self._transport,
+            safety=safety,
+            delivery=evidence,
+        )
+        self._last_mission_decision = mission_decision
+        self._cycle_mission_decision = mission_decision
+        if mission_decision.terminal:
+            return self._terminal(
+                timestamp_ns,
+                f"delivery_rejected:{mission_decision.reason}",
+                mission_decision=mission_decision,
+                world_snapshot=snapshot,
+            )
+        if self._selected_plan is not None:
+            self._completed_target_points.append(self._selected_plan.target_field)
+        self._retreat_base_distance_m = None
+        self._disengage_confirm_count = 0
+        self.state = Simulation20PointState.DISENGAGE_AND_RETREAT
+        return self._decision(
+            timestamp_ns,
+            0.0,
+            0.0,
+            "delivery_evidence_accepted",
+            mission_decision=mission_decision,
+            world_snapshot=snapshot,
+        )
+
     def _step_disengage(
         self,
         timestamp_ns: int,
@@ -1611,6 +2547,8 @@ class Simulation20PointSequence:
         cumulative_distance_m: float | None,
         safety: SafetySignals,
     ) -> SimulationDecision:
+        if self._front_grab_grabbed():
+            return self._step_disengage_front_grab(timestamp_ns, cumulative_distance_m)
         if self._retreat_base_distance_m is None:
             self._retreat_base_distance_m = cumulative_distance_m
         if cumulative_distance_m is None or self._retreat_base_distance_m is None:
@@ -1645,6 +2583,39 @@ class Simulation20PointSequence:
             world_snapshot=snapshot,
         )
 
+    def _step_disengage_front_grab(
+        self,
+        timestamp_ns: int,
+        cumulative_distance_m: float | None,
+    ) -> SimulationDecision:
+        """正面抓取的退离：张爪释放块，倒退后退离，不要求块重新出现在前方。"""
+
+        if self._retreat_base_distance_m is None:
+            self._retreat_base_distance_m = cumulative_distance_m
+        if cumulative_distance_m is None or self._retreat_base_distance_m is None:
+            return self._hold(timestamp_ns, "retreat_requires_encoder_distance")
+        travelled = abs(cumulative_distance_m - self._retreat_base_distance_m)
+        mission_decision = self._cycle_mission_decision
+        if travelled >= self.config.retreat_distance_m:
+            self._transport = TransportStatus()
+            self.state = Simulation20PointState.UPDATE_PROGRESS
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "retreat_clear_transport",
+                posture=GripperPosture.OPEN,
+                mission_decision=mission_decision,
+            )
+        return self._decision(
+            timestamp_ns,
+            -self.config.retreat_speed_m_s,
+            0.0,
+            "retreat_after_delivery",
+            posture=GripperPosture.OPEN,
+            mission_decision=mission_decision,
+        )
+
     def _step_update_progress(
         self,
         timestamp_ns: int,
@@ -1671,14 +2642,39 @@ class Simulation20PointSequence:
     def _step_plan_rebreakup(
         self,
         timestamp_ns: int,
+        pose: FusedPoseEstimate | None,
         snapshot: WorldSnapshot,
+        mission_decision: MissionDecision | None,
     ) -> SimulationDecision:
+        # A previous navigation attempt can be cancelled by one transient
+        # frame (for example an unconfirmed/unknown neighbour).  Do not keep
+        # a newly safe single green trapped in rebreakup merely because it no
+        # longer forms a two-target cluster.  Candidate selection is checked
+        # before the rebreakup count and geometry limits, but still uses the
+        # same complete planning gate as normal scanning.
+        if self._pose_usable(pose):
+            assert pose is not None and pose.pose is not None
+            plans = self._candidate_plans(snapshot, pose.pose)
+            if plans:
+                self._selected_plan = plans[0]
+                self._selected_track_id = plans[0].track_id
+                self.state = Simulation20PointState.SELECT_GREEN
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    0.0,
+                    f"green_candidate_recovered_from_rebreakup:{plans[0].track_id}",
+                    mission_decision=mission_decision,
+                    world_snapshot=snapshot,
+                )
         if self._current_breakup_attempts >= self.config.max_breakup_attempts_per_delivery:
             return self._hold(timestamp_ns, "breakup_attempt_limit_per_delivery")
         if self._total_breakup_attempts >= self.config.max_breakup_attempts_total:
             return self._hold(timestamp_ns, "breakup_attempt_limit_total")
         if self._breakup_factory is None:
             return self._hold(timestamp_ns, "rebreakup_driver_unavailable")
+        if not self._pose_usable(pose):
+            return self._hold(timestamp_ns, "rebreakup_pose_uncertain")
         if not self._rebreakup_plan_is_safe(snapshot):
             return self._hold(timestamp_ns, "no_safe_rebreakup_plan")
         self._breakup = self._breakup_factory()
@@ -1727,57 +2723,164 @@ class Simulation20PointSequence:
         )
         return tuple(plans)
 
+    def _green_candidate_diagnostic(
+        self,
+        pose: FusedPoseEstimate | None,
+    ) -> str:
+        """返回当前绿色候选为何未能进入预推规划的紧凑诊断。"""
+
+        snapshot = self._world_snapshot
+        if snapshot is None:
+            return "green_candidate=(snapshot=none)"
+        classes = ",".join(
+            f"{target_class.value}:{sum(1 for target in snapshot.targets if target.target_class is target_class)}"
+            for target_class in TargetClass
+        )
+        green_targets = tuple(
+            target
+            for target in snapshot.targets
+            if target.target_class is TargetClass.GREEN_SUPPLY
+        )
+        confirmed_count = sum(
+            target.ever_confirmed
+            and target.track_status is TrackStatus.CONFIRMED
+            for target in green_targets
+        )
+        clear_count = sum(
+            target.hazard_state is HazardState.CLEAR for target in green_targets
+        )
+        ground_count = sum(
+            target.ground_point is not None for target in green_targets
+        )
+        field_count = sum(
+            target.field_point is not None for target in green_targets
+        )
+        fresh_count = sum(
+            self._target_is_fresh(target, snapshot.timestamp_ns)
+            for target in green_targets
+        )
+        base_safe = tuple(
+            target
+            for target in green_targets
+            if self._candidate_target_is_safe(snapshot, target)
+        )
+        pose_usable = self._pose_usable(pose)
+        planable: tuple[int, ...] = ()
+        plan_reasons: dict[str, int] = {}
+        if pose_usable:
+            planable_ids: list[int] = []
+            for target in base_safe:
+                plan, reason = self._plan_with_rejection(
+                    snapshot,
+                    pose.pose,
+                    target.track_id,
+                )
+                if plan is not None:
+                    planable_ids.append(target.track_id)
+                else:
+                    plan_reasons[reason] = plan_reasons.get(reason, 0) + 1
+            planable = tuple(planable_ids)
+        plan_blocked = len(base_safe) - len(planable) if pose_usable else 0
+        rejection_text = (
+            "none"
+            if not plan_reasons
+            else "|".join(
+                f"{reason}:{count}"
+                for reason, count in sorted(plan_reasons.items())
+            )
+        )
+        return (
+            "green_candidate=("
+            f"targets={len(snapshot.targets)},classes={classes},"
+            f"green={len(green_targets)},confirmed={confirmed_count},"
+            f"clear={clear_count},ground={ground_count},field={field_count},"
+            f"fresh={fresh_count},base_safe={len(base_safe)},"
+            f"pose_usable={pose_usable},planable={len(planable)},"
+            f"plan_blocked={plan_blocked},plan_reasons={rejection_text},"
+            f"plan_ids={list(planable)}"
+            ")"
+        )
+
     def _find_plan(
         self,
         snapshot: WorldSnapshot,
         pose: FieldPose2D,
         track_id: int | None,
     ) -> GreenTransportPlan | None:
+        plan, _ = self._plan_with_rejection(snapshot, pose, track_id)
+        return plan
+
+    def _plan_with_rejection(
+        self,
+        snapshot: WorldSnapshot,
+        pose: FieldPose2D,
+        track_id: int | None,
+    ) -> tuple[GreenTransportPlan | None, str]:
         if track_id is None:
-            return None
+            return None, "missing_track_id"
         target = snapshot.target(track_id)
         destination = self._destination(snapshot)
         if target is None or destination is None:
-            return None
+            return None, "missing_target_or_destination"
         if not self._candidate_target_is_safe(snapshot, target):
-            return None
+            return None, "base_safety_rejected"
         assert target.field_point is not None
         push_dx = destination.x - target.field_point.x
         push_dy = destination.y - target.field_point.y
         norm = math.hypot(push_dx, push_dy)
         if norm <= 1e-6:
-            return None
+            return None, "target_already_at_destination"
         push_dx /= norm
         push_dy /= norm
-        prepush = FieldPoint(
-            target.field_point.x - push_dx * self.config.prepush_offset_mm,
-            target.field_point.y - push_dy * self.config.prepush_offset_mm,
-        )
-        if not self._segment_safe(
+        clearance, clearance_blocker = self._green_clearance_with_blocker(
             snapshot,
-            pose.position,
-            prepush,
-            ignored_track_id=target.track_id,
-        ):
-            return None
-        if not self._segment_safe(
+            target,
+        )
+        if clearance < self.config.min_green_clearance_mm:
+            if clearance_blocker is None:
+                return None, "clearance_insufficient"
+            return None, f"clearance_blocked_by_track_{clearance_blocker}"
+        front_grab = (
+            self.config.front_grab_enabled
+            and clearance >= self.config.isolated_green_clearance_mm
+        )
+        if front_grab:
+            # 孤立绿色块走正面抓取，无需绕到背面预推点；prepush 点退化为目标
+            # 场地点，仅用于候选排序。
+            prepush = target.field_point
+        else:
+            prepush = FieldPoint(
+                target.field_point.x - push_dx * self.config.prepush_offset_mm,
+                target.field_point.y - push_dy * self.config.prepush_offset_mm,
+            )
+            prepush_blocker = self._segment_block_reason(
+                snapshot,
+                pose.position,
+                prepush,
+                ignored_track_id=target.track_id,
+            )
+            if prepush_blocker is not None:
+                return None, f"prepush_{prepush_blocker}"
+        push_blocker = self._segment_block_reason(
             snapshot,
             target.field_point,
             destination,
             ignored_track_id=target.track_id,
-        ):
-            return None
-        clearance = self._green_clearance(snapshot, target)
-        if clearance < self.config.min_green_clearance_mm:
-            return None
-        return GreenTransportPlan(
-            track_id=target.track_id,
-            target_field=target.field_point,
-            destination_field=destination,
-            push_direction_x=push_dx,
-            push_direction_y=push_dy,
-            prepush_field=prepush,
-            clearance_mm=clearance,
+        )
+        if push_blocker is not None:
+            return None, f"push_{push_blocker}"
+        return (
+            GreenTransportPlan(
+                track_id=target.track_id,
+                target_field=target.field_point,
+                destination_field=destination,
+                push_direction_x=push_dx,
+                push_direction_y=push_dy,
+                prepush_field=prepush,
+                clearance_mm=clearance,
+                front_grab=front_grab,
+            ),
+            "planable",
         )
 
     def _candidate_target_is_safe(
@@ -1811,22 +2914,33 @@ class Simulation20PointSequence:
         return True
 
     def _green_clearance(self, snapshot: WorldSnapshot, target: WorldTarget) -> float:
+        clearance, _ = self._green_clearance_with_blocker(snapshot, target)
+        return clearance
+
+    def _green_clearance_with_blocker(
+        self,
+        snapshot: WorldSnapshot,
+        target: WorldTarget,
+    ) -> tuple[float, int | None]:
         assert target.field_point is not None
         clearance = float("inf")
+        blocker_id: int | None = None
         for other in snapshot.targets:
             if other.track_id == target.track_id:
                 continue
             if other.field_point is None:
-                return -float("inf")
-            clearance = min(
-                clearance,
+                return -float("inf"), other.track_id
+            current_clearance = (
                 _distance(target.field_point, other.field_point)
                 - 2.0 * self.config.target_half_extent_mm
-                - self.config.safety_margin_mm,
+                - self.config.safety_margin_mm
             )
+            if current_clearance < clearance:
+                clearance = current_clearance
+                blocker_id = other.track_id
         if math.isinf(clearance):
-            return 1_000_000.0
-        return clearance
+            return 1_000_000.0, None
+        return clearance, blocker_id
 
     def _segment_safe(
         self,
@@ -1836,6 +2950,24 @@ class Simulation20PointSequence:
         *,
         ignored_track_id: int | None,
     ) -> bool:
+        return (
+            self._segment_block_reason(
+                snapshot,
+                start,
+                end,
+                ignored_track_id=ignored_track_id,
+            )
+            is None
+        )
+
+    def _segment_block_reason(
+        self,
+        snapshot: WorldSnapshot,
+        start: FieldPoint,
+        end: FieldPoint,
+        *,
+        ignored_track_id: int | None,
+    ) -> str | None:
         length = _distance(start, end)
         sample_count = max(
             1,
@@ -1850,7 +2982,7 @@ class Simulation20PointSequence:
             if region.kind is RegionKind.OPPONENT_SAFE
         )
         if not field_regions:
-            return False
+            return "field_region_missing"
         obstacle_radius = (
             self.config.robot_footprint_radius_mm
             + self.config.target_half_extent_mm
@@ -1863,14 +2995,14 @@ class Simulation20PointSequence:
                 start.y + ratio * (end.y - start.y),
             )
             if not any(region.contains(point) for region in field_regions):
-                return False
+                return "outside_field"
             if any(region.contains(point) for region in opponent_regions):
-                return False
+                return "opponent_safe_zone"
             for target in snapshot.targets:
                 if target.track_id == ignored_track_id:
                     continue
                 if target.field_point is None:
-                    return False
+                    return f"track_{target.track_id}_missing_field_point"
                 if target.hazard_state is not HazardState.CLEAR or (
                     target.target_class is TargetClass.UNKNOWN
                 ):
@@ -1878,8 +3010,8 @@ class Simulation20PointSequence:
                 else:
                     radius = obstacle_radius
                 if _distance(point, target.field_point) < radius:
-                    return False
-        return True
+                    return f"track_{target.track_id}_blocks_corridor"
+        return None
 
     def _destination(self, snapshot: WorldSnapshot) -> FieldPoint | None:
         regions = tuple(
@@ -1896,11 +3028,35 @@ class Simulation20PointSequence:
     ) -> bool:
         if target.field_point is None:
             return False
+        return self._field_point_fully_entered(snapshot, target.field_point)
+
+    def _field_point_fully_entered(
+        self,
+        snapshot: WorldSnapshot,
+        field_point: FieldPoint,
+    ) -> bool:
         inset = self.config.delivery_inset_mm + self.config.target_half_extent_mm
         return any(
-            _inside_inset(region, target.field_point, inset)
+            _inside_inset(region, field_point, inset)
             for region in snapshot.regions
             if region.kind is RegionKind.OWN_MATERIAL
+        )
+
+    def _front_grab_grabbed(self) -> bool:
+        """是否处于正面抓取后已合爪（块在夹爪内、被遮挡）的转运状态。"""
+
+        return (
+            self._selected_plan is not None
+            and self._selected_plan.front_grab
+            and bool(self._transport.engaged_track_ids)
+        )
+
+    def _grabbed_block_field(self, pose: FieldPose2D) -> FieldPoint:
+        """已夹取物块在夹爪内的固定机器人相对位置换算为场地点。"""
+
+        return _field_from_robot(
+            pose,
+            GroundPoint(self.config.front_grab_block_forward_mm, 0.0),
         )
 
     def _target_is_fresh(self, target: WorldTarget, timestamp_ns: int) -> bool:
@@ -2001,6 +3157,15 @@ class Simulation20PointSequence:
         再确认目标已经脱离，不能靠旧目标位置完成交付收尾。
         """
 
+        if self.state in {
+            Simulation20PointState.STARTUP_TURN_RIGHT,
+            Simulation20PointState.STARTUP_FORWARD,
+            # The first safe-zone turn is driven by the fused field pose and
+            # static-map line normal; the visual zone is only needed after the
+            # turn for the local 300 mm approach.
+            Simulation20PointState.BREAKUP_SAFE_ZONE_TURN,
+        }:
+            return True
         if self.state in _FIXED_BREAKUP_STATES:
             return True
         if self.state is not Simulation20PointState.DISENGAGE_AND_RETREAT:
@@ -2056,6 +3221,23 @@ class Simulation20PointSequence:
         mission_decision: MissionDecision | None = None,
         world_snapshot: WorldSnapshot | None = None,
     ) -> SimulationDecision:
+        if (
+            self._last_decision_state is not None
+            and self.state is not self._last_decision_state
+        ):
+            self._action_settle_until_ns = max(
+                self._action_settle_until_ns,
+                timestamp_ns
+                + round(self.config.action_settle_time_s * 1_000_000_000),
+            )
+        if (
+            (linear != 0.0 or angular != 0.0)
+            and timestamp_ns < self._action_settle_until_ns
+        ):
+            linear = 0.0
+            angular = 0.0
+            reason = f"action_settling:{reason}"
+        self._last_decision_state = self.state
         if linear != 0.0 or angular != 0.0:
             self._last_motion_timestamp_ns = timestamp_ns
         return SimulationDecision(
@@ -2108,6 +3290,7 @@ def _run_hardware(
     config_path: Path,
     *,
     supervised_stop_ready: bool,
+    local_preview: bool = False,
     jpeg_quality: int = 80,
     observer_image_interval_s: float = 1.0,
     log_dir: Path | None = None,
@@ -2167,6 +3350,18 @@ def _run_hardware(
         raise RuntimeError(
             "20-point simulation requires transport gripper angles."
         )
+    print(
+        "gripper_config="
+        f"path={config_path.resolve()} "
+        f"open=({gripper.open_left_angle_deg:g},"
+        f"{gripper.open_right_angle_deg:g}) "
+        f"transport=({gripper.transport_angles_deg[0]:g},"
+        f"{gripper.transport_angles_deg[1]:g}) "
+        f"closed=({gripper.closed_left_angle_deg:g},"
+        f"{gripper.closed_right_angle_deg:g}) "
+        f"angle_sum={gripper.angle_sum_deg:g}",
+        flush=True,
+    )
 
     class _MotionChannelContext:
         """Ensure the soft brake is sent before UART shutdown on every exit."""
@@ -2207,6 +3402,7 @@ def _run_hardware(
         )
     )
     camera_pump = CameraPerceptionPump(pipeline.source, pipeline.prepare, renderer)
+    preview = _LocalPreview() if local_preview else None
     remote_transport = None
     if config.remote.enabled:
         server = config.remote.build_server()
@@ -2266,13 +3462,18 @@ def _run_hardware(
             # Hailo/相机预热与运动通道同步并行；等待预热期间主线程仍排空
             # UART，避免 100 Hz 遥测在启动门禁处挤满接收队列。
             camera_start_thread = camera_pump.start_in_background()
+            if preview is not None:
+                preview.start()
             # A transient UART blip must not abort startup: retry the initial
             # SOFT_BRAKE synchronization within the bounded preflight window,
             # aborting immediately on a latched emergency stop.
             sync_deadline_ns = time.monotonic_ns() + _PREFLIGHT_RETRY_WINDOW_NS
             while True:
                 try:
-                    controller.synchronize(on_message=consume)
+                    controller.synchronize(
+                        timeout_s=config.motion.synchronization_timeout_s,
+                        on_message=consume,
+                    )
                     break
                 except MotionSynchronizationError:
                     if (
@@ -2301,6 +3502,10 @@ def _run_hardware(
                     consume(message)
                 camera_pump.check_health()
                 latest_snapshot = renderer.latest_snapshot()
+                if preview is not None:
+                    preview.submit(renderer.latest())
+                    if preview.user_requested_stop:
+                        stop_requested = True
                 if (
                     latest_snapshot is not None
                     and latest_snapshot.field_features is not None
@@ -2347,7 +3552,10 @@ def _run_hardware(
                     consume(message)
                 if controller.needs_synchronization:
                     try:
-                        controller.synchronize(on_message=consume)
+                        controller.synchronize(
+                            timeout_s=config.motion.synchronization_timeout_s,
+                            on_message=consume,
+                        )
                     except MotionSynchronizationError:
                         # Bounded by the retry window above; SOFT_BRAKE has
                         # already zeroed the controller state.
@@ -2366,7 +3574,10 @@ def _run_hardware(
                     and loop_start_ns >= next_resynchronization_attempt_ns
                 ):
                     try:
-                        controller.synchronize(on_message=consume)
+                        controller.synchronize(
+                            timeout_s=config.motion.synchronization_timeout_s,
+                            on_message=consume,
+                        )
                     except MotionSynchronizationError:
                         # SOFT_BRAKE has already zeroed the controller state.
                         # Keep the process alive and retry after a bounded
@@ -2416,6 +3627,12 @@ def _run_hardware(
                 except Exception as exc:
                     if branch_error is None:
                         branch_error = f"camera_pump:{exc}"
+                if preview is not None:
+                    try:
+                        preview.check_health()
+                    except Exception as exc:
+                        if branch_error is None:
+                            branch_error = f"local_preview:{exc}"
                 try:
                     fresh_snapshot = renderer.latest_snapshot()
                 except Exception as exc:
@@ -2435,6 +3652,19 @@ def _run_hardware(
                     if branch_error is None:
                         branch_error = f"fusion_pump:{exc}"
                     pose = None
+                rendered_for_observers = _overlay_remote_pose(
+                    renderer.latest(),
+                    pose,
+                    now_ns,
+                )
+                if preview is not None:
+                    try:
+                        preview.submit(rendered_for_observers)
+                        if preview.user_requested_stop:
+                            stop_requested = True
+                    except Exception as exc:
+                        if branch_error is None:
+                            branch_error = f"local_preview:{exc}"
                 decision = sequence.step(
                     now_ns,
                     perception=latest_snapshot,
@@ -2477,7 +3707,7 @@ def _run_hardware(
                             remote_transport,
                             pose=pose,
                             timestamp_ns=now_ns,
-                            rendered=renderer.latest(),
+                            rendered=rendered_for_observers,
                         )
                     except Exception as exc:
                         print(f"remote_observation_error={exc}", flush=True)
@@ -2530,6 +3760,12 @@ def _run_hardware(
                             gripper.closed_right_angle_deg,
                         )
                     controller.set_gripper_angles(*angles)
+                    print(
+                        "gripper_command="
+                        f"posture={decision.gripper_posture.value} "
+                        f"left={angles[0]:g} right={angles[1]:g}",
+                        flush=True,
+                    )
                     last_posture = decision.gripper_posture
                 motion_requested = (
                     decision.linear_velocity_m_s != 0.0
@@ -2591,9 +3827,21 @@ def _run_hardware(
                         if pose is None or pose.heading_uncertainty_rad is None
                         else f"{pose.heading_uncertainty_rad:.3f}"
                     )
+                    # 场地坐标原样回传 FieldPoint 的 x/y 与 heading，方便在日志/回传
+                    # 窗口中直接核对机器人绝对位姿，而不是只看不确定度指标。
+                    pose_field_text = (
+                        "none"
+                        if pose is None or pose.pose is None
+                        else (
+                            f"x_mm={pose.pose.position.x:.1f},"
+                            f"y_mm={pose.pose.position.y:.1f},"
+                            f"heading_rad={pose.pose.heading_rad:.3f}"
+                        )
+                    )
                     localization_text = (
                         "localization=("
                         f"pose={pose is not None and pose.pose is not None},"
+                        f"field=({pose_field_text}),"
                         f"quality={localization_quality or 'unknown'},"
                         f"position_sigma_mm={position_sigma_text},"
                         f"heading_sigma_rad={heading_sigma_text},"
@@ -2612,6 +3860,15 @@ def _run_hardware(
                             f"{latest_snapshot.dropped_stale_age_ms is not None},"
                             f"frame_sequence={latest_snapshot.frame_sequence})"
                         )
+                    candidate_text = "green_candidate=not_evaluating"
+                    if decision.state in {
+                        Simulation20PointState.SCAN_GREEN,
+                        Simulation20PointState.EVALUATE_EASY_GREEN,
+                        Simulation20PointState.SELECT_GREEN,
+                        Simulation20PointState.PLAN_PREPUSH,
+                        Simulation20PointState.PLAN_REBREAKUP,
+                    }:
+                        candidate_text = sequence._green_candidate_diagnostic(pose)
                     print(
                         f"state={decision.state.value} reason={decision.reason} "
                         f"deliveries={decision.valid_green_deliveries} "
@@ -2621,6 +3878,7 @@ def _run_hardware(
                         f"commanded_wheel_m_s={controller.commanded_wheel_speeds_m_s} "
                         f"motor_blocked={motor_blocked_reason or 'none'} "
                         f"{perception_text} "
+                        f"{candidate_text} "
                         f"{status_text} {localization_text}",
                         flush=True,
                     )
@@ -2635,33 +3893,37 @@ def _run_hardware(
             controller.soft_brake()
     finally:
         try:
-            if camera_start_thread is not None or camera_started:
-                camera_pump.stop()
+            if preview is not None:
+                preview.stop()
         finally:
             try:
-                controller.soft_brake()
-            except Exception:
-                pass
-            try:
-                if remote_restart_thread is not None and (
-                    remote_restart_thread.is_alive()
-                ):
-                    # Wait for a pending observe-only restart so transport
-                    # shutdown does not race its stop()/start() pair.
-                    remote_restart_thread.join(timeout=2.0)
-                if remote_transport is not None:
-                    remote_transport.stop()
+                if camera_start_thread is not None or camera_started:
+                    camera_pump.stop()
             finally:
                 try:
-                    if fusion_started:
-                        fusion_pump.stop()
+                    controller.soft_brake()
+                except Exception:
+                    pass
+                try:
+                    if remote_restart_thread is not None and (
+                        remote_restart_thread.is_alive()
+                    ):
+                        # Wait for a pending observe-only restart so transport
+                        # shutdown does not race its stop()/start() pair.
+                        remote_restart_thread.join(timeout=2.0)
+                    if remote_transport is not None:
+                        remote_transport.stop()
                 finally:
-                    signal.signal(signal.SIGTERM, previous_sigterm)
-                    _end_time_named_log(
-                        log_stream,
-                        original_stdout,
-                        original_stderr,
-                    )
+                    try:
+                        if fusion_started:
+                            fusion_pump.stop()
+                    finally:
+                        signal.signal(signal.SIGTERM, previous_sigterm)
+                        _end_time_named_log(
+                            log_stream,
+                            original_stdout,
+                            original_stderr,
+                        )
 
 
 def main() -> None:
@@ -2673,6 +3935,13 @@ def main() -> None:
         "--supervised-physical-stop-ready",
         action="store_true",
         help="Confirm a physical emergency stop and continuous supervision.",
+    )
+    parser.add_argument(
+        "--local-preview",
+        action="store_true",
+        help=(
+            "在本机窗口显示同一相机/模型的最新叠加结果；按 Q 或 Esc 退出。"
+        ),
     )
     parser.add_argument("--jpeg-quality", type=int, default=80)
     parser.add_argument("--observer-image-interval-seconds", type=float, default=1.0)
@@ -2696,6 +3965,7 @@ def main() -> None:
     _run_hardware(
         args.config,
         supervised_stop_ready=args.supervised_physical_stop_ready,
+        local_preview=args.local_preview,
         jpeg_quality=args.jpeg_quality,
         observer_image_interval_s=args.observer_image_interval_seconds,
         log_dir=args.log_dir,

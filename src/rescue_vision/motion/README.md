@@ -10,6 +10,9 @@
 为唯一权威。树莓派端已经使用 COBS、CRC16 和固定长度二进制消息统一运动、
 夹爪、固件看门狗及编码器/IMU 遥测，并删除旧文本协议兼容层；当前控制器还会
 在打开 UART、重连或链路异常后等待 `SOFT_BRAKE accepted` 完成序号安全同步。
+同步单次应答等待由 `motion.synchronization_timeout_s` 配置，默认 1 秒；
+`run_remote_motion()` 在超时后保持零速并重发新的 `SOFT_BRAKE`，不会把暂时缺失的
+回复直接转换成会话退出。
 真车联调和标定仍待验收。
 
 ## 常用类和函数
@@ -23,12 +26,13 @@
 | `set_wheel_speeds()` | 左右轮速度 m/s | 绕过车体 twist 换算，仍执行轮速限幅校验 |
 | `update()` | 可选本机单调时间 ns | 按单轮最大加速度推进，并至少 20 Hz 刷新轮速；返回是否发送 |
 | `MotionControlTimingError` | 活动控制更新间隔超过 200 ms | 先发送柔和停车，再终止当前控制链路 |
+| `MotionStallError` | 有效编码器在持续轮速命令下不变化 | 先发送柔和停车，再终止当前控制链路 |
 | `forward()` / `backward()` | 非负速度 m/s | 直行前进/后退 |
 | `turn_left()` / `turn_right()` | 非负角速度 rad/s | 原地左转/右转 |
 | `set_gripper_angles()` | 左右舵机角度 degree | 同时下发严格 `[0, 180]` 角度 |
 | `gripper_target_angles_deg` | 无 | 启动遥测或本进程最近下发的左右舵机目标；尚无时为 `None` |
 | `soft_brake()` / `emergency_stop()` | 无 | 固件斜坡制动/紧急停止 |
-| `synchronize()` | 等待秒数、可选回调 | 发送 `SOFT_BRAKE` 并等待同序号 `accepted`；等待期间转发遥测 |
+| `synchronize()` | 等待秒数、可选回调 | 发送 `SOFT_BRAKE` 并等待同序号 `accepted`；等待期间转发遥测；一次超时后可安全重试 |
 | `needs_synchronization` / `motion_synchronized` / `link_degraded` | 无 | 查询序号同步和仍会阻止运动的 STM32 链路告警；`rx_degraded` 仅记录诊断，不单独阻止后续有效控制 |
 | `query_state()` | 无 | 请求固件立即返回状态 |
 | `receive_message()` | 可选等待秒数 | 丢弃损坏帧，返回编码器/IMU、系统状态或命令回复 |
@@ -67,7 +71,8 @@ right = linear + angular × wheel_track / 2
 ## 1. 从运行配置装配
 
 先在 `configs/runtime.yaml` 填入实测轮距和调试限速，并启用 `uart` 与
-`motion`。需要远程夹爪时，还要实测左右开/闭安全端点、单物块运输半开姿态、
+`motion`。`motion.synchronization_timeout_s` 控制每次 `SOFT_BRAKE` 应答等待，
+默认值为 `1.0` 秒；超时由远程运动循环自动重试。需要远程夹爪时，还要实测左右开/闭安全端点、单物块运输半开姿态、
 `angle_sum_deg` 和固定速度全行程时间，写入 `motion.gripper` 后单独启用。所有路径、设备名、机械参数和上限只从
 这份配置取得：
 
@@ -90,7 +95,9 @@ if channel is None or controller is None:
 ```python
 with channel:
     try:
-        controller.synchronize()
+        controller.synchronize(
+            timeout_s=config.motion.synchronization_timeout_s,
+        )
         # 在这里执行下文的 drive、转向、回传处理等片段。
         ...
     finally:
@@ -136,6 +143,33 @@ controller.update()
 同一 `update()` 循环按 `max_wheel_acceleration_m_s2` 逐级降低左右轮命令；
 不会直接发送柔和停车命令。死手关闭、命令过期、非法输入及退出
 仍使用独立的柔和停车安全路径。
+
+### 堵转保护
+
+`MotionLimits` 的 `stall_guard_*` 参数启用后，控制器分别检查左右轮：当对应
+编码器标记为有效、实际已下发轮速达到
+`stall_guard_min_command_speed_m_s`，且连续
+`stall_guard_timeout_ms` 内的编码器增量不超过
+`stall_guard_stationary_encoder_delta_count` 时，控制器先发送 `SOFT_BRAKE`，
+清零本地轮速目标，再抛出 `MotionStallError`。运动循环应让该故障结束当前车控
+会话，不能自动重发原运动命令；必须人工检查车轮、减速箱、电机和驱动板后再
+重新启动。编码器无效或命令低于监测阈值时不会据此判定堵转，因此该保护不能
+替代 STM32/驱动板的硬件限流、保险丝和过温保护，也不能证明堵转电流安全。
+
+运行配置使用 `motion.stall_guard`：
+
+```yaml
+stall_guard:
+  enabled: true
+  timeout_ms: 300
+  min_command_speed_m_s: 0.01
+  stationary_encoder_delta_count: 0
+```
+
+检测逻辑只在 `drain_messages()` 或等价的 UART 遥测消费路径收到
+`ODOMETRY_IMU` 时运行；实时运动入口必须持续排空遥测。`timeout_ms` 是树莓派
+收到遥测的单调时间窗口，不是 STM32 采样时间。实际电流和热保护仍需在硬件侧
+测量与验收。
 
 ## 3. 直接设置左右轮速度
 
@@ -381,6 +415,7 @@ def run_debug_motion_session(
             executor,
             stop_requested=stop_requested,
             on_car_message=publish_or_record,
+            synchronization_timeout_s=config.motion.synchronization_timeout_s,
         )
 ```
 
@@ -431,7 +466,8 @@ finally:
 - 死手保持开启且 twist 回到零时，零目标和其他有效目标一样经过单轮加速度
   限制；普通回中不发送 `SOFT_BRAKE`，只由周期轮速命令逐步降到零。
 - 死手关闭、命令过期、非法 payload、未知控制模式和循环正常退出均进入柔和
-  停车；协议或通信异常也会尝试停车并继续抛出原始异常。
+  停车；`run_remote_motion()` 的 `SOFT_BRAKE` 应答超时会保持零速并重试，底层
+  UART 异常、其他协议异常或回调异常仍会尝试停车并继续抛出原始异常。
 - `drain_messages()` / `run_remote_motion()` 会持续排空 100 Hz 回传。COBS
   损坏、空帧、超长帧、CRC 错误、未知类型、错误方向、固定长度或枚举非法的
   帧均被丢弃，下一帧继续解析；它们不会被记录成伪业务消息或误判为命令成功。

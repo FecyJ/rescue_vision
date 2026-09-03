@@ -15,6 +15,7 @@ from rescue_vision.app.manual_capture import (
     CameraPipeline,
     CaptureSession,
     ManualCaptureRuntime,
+    RemoteObservationSequences,
     VehicleState,
     _accept_with_shutdown,
     _validate_mode,
@@ -349,7 +350,6 @@ def test_accept_wait_drains_uart_between_tcp_polls() -> None:
     accepted = _accept_with_shutdown(
         server,  # type: ignore[arg-type]
         controller,  # type: ignore[arg-type]
-        timeout_s=1.0,
         stop_requested=lambda: False,
     )
 
@@ -368,7 +368,6 @@ def test_accept_wait_distributes_uart_messages_to_localization() -> None:
     accepted = _accept_with_shutdown(
         server,  # type: ignore[arg-type]
         controller,  # type: ignore[arg-type]
-        timeout_s=1.0,
         stop_requested=lambda: False,
         on_car_message=received.append,  # type: ignore[arg-type]
     )
@@ -498,26 +497,25 @@ def test_camera_only_session_publishes_static_map_with_unlocalized_robot(
     assert map_state.targets == ()
 
 
-def test_accept_timeout_is_a_clean_stop(monkeypatch) -> None:
-    moments = iter((10.0, 11.0))
-    monkeypatch.setattr(
-        manual_capture_module.time,
-        "monotonic",
-        lambda: next(moments),
-    )
-    server = PollingServer(object(), timeouts_before_connection=0)
+def test_accept_wait_can_stop_without_a_connection() -> None:
+    server = PollingServer(object(), timeouts_before_connection=100)
     controller = CountingDrainController()
+    checks = 0
+
+    def stop_requested() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks > 2
 
     accepted = _accept_with_shutdown(
         server,  # type: ignore[arg-type]
         controller,  # type: ignore[arg-type]
-        timeout_s=0.5,
-        stop_requested=lambda: False,
+        stop_requested=stop_requested,
     )
 
     assert accepted is None
-    assert controller.drain_count == 1
-    assert server.accept_timeouts == []
+    assert controller.drain_count == 2
+    assert server.accept_timeouts == [0.1, 0.1]
 
 
 def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
@@ -895,7 +893,7 @@ def test_manual_session_switches_between_raw_and_perception_video(tmp_path) -> N
             MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 500),
         )
     )
-    renderer = LaggingFakePerceptionRenderer()
+    renderer = FakePerceptionRenderer()
     status = build_session_status(
         config,
         server_instance_id="test-server",
@@ -924,6 +922,99 @@ def test_manual_session_switches_between_raw_and_perception_video(tmp_path) -> N
     ]
     assert "raw" in modes
     assert "perception" in modes
+    raw_sequences = [
+        attributes["frame_sequence"]
+        for topic, attributes in connection.observation_attributes
+        if topic == RemoteTopic.VIDEO_FRAME.value
+        and attributes["mode"] == VideoFrameMode.RAW.value
+    ]
+    perception_sequences = [
+        attributes["frame_sequence"]
+        for topic, attributes in connection.observation_attributes
+        if topic == RemoteTopic.VIDEO_FRAME.value
+        and attributes["mode"] == VideoFrameMode.PERCEPTION.value
+    ]
+    assert raw_sequences
+    assert perception_sequences
+    assert perception_sequences[0] == raw_sequences[-1] + 1
+
+
+def test_observation_sequences_continue_across_client_reconnects(tmp_path) -> None:
+    config = _config()
+    pipeline = CameraPipeline(
+        FakeSource(
+            CameraFrame(
+                sequence=0,
+                timestamp_ns=0,
+                image_bgr=np.zeros((3, 4, 3), dtype=np.uint8),
+            )
+        ),
+        None,
+        ImageCoordinateSystem.RAW_PIXEL,
+        None,
+    )
+    counters = RemoteObservationSequences()
+
+    first_capture = CaptureSession(
+        output_root=tmp_path,
+        config=config,
+        config_snapshot={},
+        pipeline=pipeline,
+        sequence_counters=counters,
+    )
+    first_vehicle = VehicleState(
+        safety_mode=VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP,
+        sequence_counters=counters,
+    )
+    first_capture_status = first_capture.status()
+    first_vehicle_status = first_vehicle.observation()
+
+    second_capture = CaptureSession(
+        output_root=tmp_path,
+        config=config,
+        config_snapshot={},
+        pipeline=pipeline,
+        sequence_counters=counters,
+    )
+    second_vehicle = VehicleState(
+        safety_mode=VehicleSafetyMode.SUPERVISED_PHYSICAL_STOP,
+        sequence_counters=counters,
+    )
+    second_capture_status = second_capture.status()
+    second_vehicle_status = second_vehicle.observation()
+
+    assert second_capture_status.status_sequence == (
+        first_capture_status.status_sequence + 1
+    )
+    assert second_vehicle_status.state_sequence == (
+        first_vehicle_status.state_sequence + 1
+    )
+
+    first_runtime = object.__new__(ManualCaptureRuntime)
+    first_runtime.map_state_available = True
+    first_runtime.map_team_color = RemoteTeamColor.BLUE
+    first_runtime.odometry_imu_fusion = None
+    first_runtime.connection = FakeConnection([])
+    first_runtime.sequence_counters = counters
+    first_runtime.map_state_sequence = counters.map_state
+    first_runtime._send_map_state(1)
+
+    second_runtime = object.__new__(ManualCaptureRuntime)
+    second_runtime.map_state_available = True
+    second_runtime.map_team_color = RemoteTeamColor.BLUE
+    second_runtime.odometry_imu_fusion = None
+    second_runtime.connection = FakeConnection([])
+    second_runtime.sequence_counters = counters
+    second_runtime.map_state_sequence = counters.map_state
+    second_runtime._send_map_state(2)
+
+    first_map = MapStateObservation.from_payload(
+        first_runtime.connection.observations[0][1]
+    )
+    second_map = MapStateObservation.from_payload(
+        second_runtime.connection.observations[0][1]
+    )
+    assert second_map.state_sequence == first_map.state_sequence + 1
 
 
 def test_bev_renderer_keeps_latest_result_off_motion_loop() -> None:

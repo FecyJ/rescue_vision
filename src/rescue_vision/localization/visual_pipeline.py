@@ -6,6 +6,7 @@ from typing import Protocol
 
 from rescue_vision.localization.center_cross import CenterCrossLocalizer
 from rescue_vision.localization.fusion import FusedPoseEstimate, VisualFusionResult
+from rescue_vision.localization.types import CenterCrossSelectionSource
 from rescue_vision.localization.static_landmarks import (
     SafeZoneCornerLocalizer,
     StaticFieldLandmarkTracker,
@@ -60,7 +61,12 @@ class VisualLocalizationPipeline:
         )
         selected = selected_safe_zone or (
             selected_cross
-            if selected_cross is not None and selected_cross.selected_pose is not None
+            if (
+                selected_cross is not None
+                and selected_cross.selected_pose is not None
+                and selected_cross.selection_source
+                is not CenterCrossSelectionSource.PRIOR
+            )
             else None
         )
         if selected is not None:

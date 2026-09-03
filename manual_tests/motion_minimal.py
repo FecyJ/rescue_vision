@@ -89,7 +89,9 @@ def main() -> None:
 
     with channel:
         try:
-            controller.synchronize()
+            controller.synchronize(
+                timeout_s=config.motion.synchronization_timeout_s,
+            )
             controller.forward(args.speed_m_s)
             deadline_ns = time.monotonic_ns() + round(
                 args.duration_seconds * 1_000_000_000

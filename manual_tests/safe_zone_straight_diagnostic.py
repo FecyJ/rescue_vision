@@ -266,7 +266,10 @@ def main() -> int:
             f"status=({format_status(latest_status)})",
             flush=True,
         )
-        controller.synchronize(on_message=consume)
+        controller.synchronize(
+            timeout_s=config.motion.synchronization_timeout_s,
+            on_message=consume,
+        )
         print("RESYNC_SYNC=accepted", flush=True)
         if controller.link_degraded:
             raise RuntimeError(
@@ -301,7 +304,10 @@ def main() -> int:
     try:
         with channel:
             try:
-                controller.synchronize(on_message=consume)
+                controller.synchronize(
+                    timeout_s=config.motion.synchronization_timeout_s,
+                    on_message=consume,
+                )
                 print("SOFT_BRAKE_SYNC=accepted", flush=True)
                 service(_BASELINE_TIMEOUT_S)
                 if baseline_odometry is None:

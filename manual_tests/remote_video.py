@@ -147,7 +147,9 @@ def main() -> None:
                                                 "Perception video mode is not configured."
                                             )
                                         perception_renderer.clear_latest()
-                                        minimum_perception_sequence = frame.sequence
+                                        minimum_perception_sequence = (
+                                            frame.sequence + 1
+                                        )
                                     else:
                                         minimum_perception_sequence = None
                                     print(

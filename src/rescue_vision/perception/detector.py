@@ -39,6 +39,17 @@ from rescue_vision.perception.types import (
 )
 
 
+# 当前相机/模型地面投影实测的统一前向偏差；目标和场地关键点共用同一修正。
+MODEL_GROUND_FORWARD_BIAS_MM = 225.0
+
+
+def _correct_model_ground_point(point: GroundPoint) -> GroundPoint:
+    return GroundPoint(
+        point.x + MODEL_GROUND_FORWARD_BIAS_MM,
+        point.y,
+    )
+
+
 class StaleObservationError(ValueError):
     """推理完成时，输入帧已经超过允许的观测年龄。"""
 
@@ -297,6 +308,8 @@ class TargetPoseDetector:
                     if self._ground_projector is not None
                     else None
                 )
+                if ground_point is not None:
+                    ground_point = _correct_model_ground_point(ground_point)
 
             processed.append(
                 _ProcessedDetection(
@@ -361,6 +374,8 @@ class TargetPoseDetector:
             if self._ground_projector is not None
             else None
         )
+        if ground is not None:
+            ground = _correct_model_ground_point(ground)
         return FieldPoseKeypoint(keypoint.point, ground, keypoint.confidence)
 
     @staticmethod
@@ -421,8 +436,12 @@ class TargetPoseDetector:
             end = UndistortedPixel(float(line[2]), float(line[3]))
             start_ground = end_ground = None
             if self._ground_projector is not None:
-                start_ground = self._ground_projector.pixel_to_ground(start)
-                end_ground = self._ground_projector.pixel_to_ground(end)
+                start_ground = _correct_model_ground_point(
+                    self._ground_projector.pixel_to_ground(start)
+                )
+                end_ground = _correct_model_ground_point(
+                    self._ground_projector.pixel_to_ground(end)
+                )
             axes.append(LineSegmentObservation(start, end, start_ground, end_ground))
             residuals.append(self._point_line_distance(point, line))
         angle_deg = None

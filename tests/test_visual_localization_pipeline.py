@@ -3,6 +3,7 @@ from __future__ import annotations
 from rescue_vision.geometry.types import FieldPoint
 from rescue_vision.localization import (
     CenterCrossPoseObservation,
+    CenterCrossSelectionSource,
     FieldPose2D,
     FieldPositionObservation,
     FusedPoseEstimate,
@@ -60,6 +61,22 @@ class Center:
         )
 
 
+class PriorGuidedCenter(Center):
+    def localize(self, result, *, prior_pose=None):
+        del prior_pose
+        return CenterCrossPoseObservation(
+            result.frame_sequence,
+            result.capture_timestamp_ns,
+            result.result_timestamp_ns,
+            (),
+            (),
+            FieldPose2D(FieldPoint(30.0, 40.0), 0.5),
+            CenterCrossSelectionSource.PRIOR,
+            0.8,
+            frozenset(),
+        )
+
+
 class SafeZone:
     def localize(self, result, *, prior_pose=None):
         del result, prior_pose
@@ -101,4 +118,17 @@ def test_pipeline_submits_each_frame_at_most_once() -> None:
     assert pipeline.submit(empty_result(1)).accepted
     assert pipeline.submit(empty_result(1)) is None
     assert pipeline.submit(empty_result(0)) is None
+    assert fusion.position_submissions == 1
+
+
+def test_prior_guided_center_cross_updates_position_only() -> None:
+    fusion = Fusion()
+    pipeline = VisualLocalizationPipeline(
+        center_cross_localizer=PriorGuidedCenter(),
+        safe_zone_localizer=SafeZone(),
+        landmark_tracker=Tracker(),
+        fusion=fusion,
+    )
+
+    assert pipeline.submit(empty_result(1)).accepted
     assert fusion.position_submissions == 1

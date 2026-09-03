@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from itertools import combinations
 import math
 
 import numpy as np
@@ -374,6 +375,7 @@ class StaticFieldLandmarkTracker:
 class SafeZoneCornerLocalizerConfig:
     max_observation_age_ms: float = 250.0
     min_baseline_mm: float = 150.0
+    max_k0_corner_distance_error_mm: float = 80.0
     max_fit_residual_mm: float = 80.0
     position_uncertainty_floor_mm: float = 30.0
     heading_uncertainty_floor_deg: float = 3.0
@@ -382,6 +384,7 @@ class SafeZoneCornerLocalizerConfig:
         for name in (
             "max_observation_age_ms",
             "min_baseline_mm",
+            "max_k0_corner_distance_error_mm",
             "max_fit_residual_mm",
             "position_uncertainty_floor_mm",
             "heading_uncertainty_floor_deg",
@@ -441,6 +444,40 @@ class SafeZoneCornerPoseObservation:
         return f"{self.physical_color.value}_safe_zone_corners"
 
 
+def _point_distance(
+    first: GroundPoint | FieldPoint,
+    second: GroundPoint | FieldPoint,
+) -> float:
+    return math.hypot(first.x - second.x, first.y - second.y)
+
+
+def _line_rotation(
+    ground_first: GroundPoint,
+    ground_second: GroundPoint,
+    field_first: FieldPoint,
+    field_second: FieldPoint,
+) -> float:
+    ground_angle = math.atan2(
+        ground_second.y - ground_first.y,
+        ground_second.x - ground_first.x,
+    )
+    field_angle = math.atan2(
+        field_second.y - field_first.y,
+        field_second.x - field_first.x,
+    )
+    return normalize_angle(field_angle - ground_angle)
+
+
+def _mean_angles(angles: list[float]) -> float | None:
+    if not angles:
+        return None
+    sine = sum(math.sin(angle) for angle in angles)
+    cosine = sum(math.cos(angle) for angle in angles)
+    if math.hypot(sine, cosine) <= 1e-9:
+        return None
+    return normalize_angle(math.atan2(sine, cosine))
+
+
 class SafeZoneCornerLocalizer:
     """枚举 v3 安全区身份和图像左右角点对应，并用先验选择唯一位姿。"""
 
@@ -476,9 +513,14 @@ class SafeZoneCornerLocalizer:
         for zone in result.safe_zones:
             left = zone.image_left_landmark
             right = zone.image_right_landmark
-            if left.ground is None or right.ground is None:
+            if left.ground is None and right.ground is None:
                 continue
-            if math.hypot(left.ground.x - right.ground.x, left.ground.y - right.ground.y) < self.config.min_baseline_mm:
+            if (
+                left.ground is not None
+                and right.ground is not None
+                and _point_distance(left.ground, right.ground)
+                < self.config.min_baseline_mm
+            ):
                 continue
             colors = (
                 (zone.physical_color,)
@@ -496,37 +538,178 @@ class SafeZoneCornerLocalizer:
                         if swap
                         else (landmarks.near_field_corner_a, landmarks.near_field_corner_b)
                     )
-                    ground_points = [left.ground, right.ground]
-                    field_points = [world_left, world_right]
-                    confidences = [left.confidence, right.confidence]
-                    used_roles = (
-                        (SafeZoneCornerRole.ENTRANCE_RIGHT, SafeZoneCornerRole.ENTRANCE_LEFT)
-                        if swap
-                        else (SafeZoneCornerRole.ENTRANCE_LEFT, SafeZoneCornerRole.ENTRANCE_RIGHT)
-                    )
+                    correspondences: list[
+                        tuple[GroundPoint, FieldPoint, SafeZoneCornerRole, float]
+                    ] = []
                     if zone.ground_anchor.ground is not None:
-                        ground_points.append(zone.ground_anchor.ground)
-                        field_points.append(landmarks.ground_anchor_field)
-                        confidences.append(zone.ground_anchor.confidence)
-                    ground = np.asarray([(point.x, point.y) for point in ground_points], dtype=np.float64)
-                    field = np.asarray([(point.x, point.y) for point in field_points], dtype=np.float64)
-                    active = list(range(len(ground_points)))
-                    selected_ground = ground[active]
-                    selected_field = field[active]
-                    ground_mean = np.mean(selected_ground, axis=0)
-                    field_mean = np.mean(selected_field, axis=0)
-                    u, _singular, vt = np.linalg.svd((selected_ground - ground_mean).T @ (selected_field - field_mean))
-                    rotation = vt.T @ u.T
-                    if np.linalg.det(rotation) < 0.0:
-                        vt[-1, :] *= -1.0
-                        rotation = vt.T @ u.T
-                    translation = field_mean - rotation @ ground_mean
-                    predicted = (rotation @ selected_ground.T).T + translation
-                    point_errors = np.linalg.norm(predicted - selected_field, axis=1)
+                        correspondences.append(
+                            (
+                                zone.ground_anchor.ground,
+                                landmarks.ground_anchor_field,
+                                SafeZoneCornerRole.GROUND_ANCHOR,
+                                zone.ground_anchor.confidence,
+                            )
+                        )
+                    correspondences.extend(
+                        (
+                            ground_point,
+                            field_point,
+                            role,
+                            confidence,
+                        )
+                        for ground_point, field_point, role, confidence in (
+                            (
+                                left.ground,
+                                world_left,
+                                (
+                                    SafeZoneCornerRole.ENTRANCE_RIGHT
+                                    if swap
+                                    else SafeZoneCornerRole.ENTRANCE_LEFT
+                                ),
+                                left.confidence,
+                            ),
+                            (
+                                right.ground,
+                                world_right,
+                                (
+                                    SafeZoneCornerRole.ENTRANCE_LEFT
+                                    if swap
+                                    else SafeZoneCornerRole.ENTRANCE_RIGHT
+                                ),
+                                right.confidence,
+                            ),
+                        )
+                        if ground_point is not None
+                    )
+                    if len(correspondences) < 2:
+                        continue
+
+                    anchor_entry = next(
+                        (
+                            item
+                            for item in correspondences
+                            if item[2] is SafeZoneCornerRole.GROUND_ANCHOR
+                        ),
+                        None,
+                    )
+                    if anchor_entry is None:
+                        # Position correction must include K0. K1/K2 alone
+                        # may define a line, but cannot pass the requested
+                        # K0-to-corner metric consistency check.
+                        continue
+                    anchor_ground, anchor_field, _anchor_role, _anchor_confidence = (
+                        anchor_entry
+                    )
+                    matching_corners = []
+                    for ground_point, field_point, role, _confidence in correspondences:
+                        if role is SafeZoneCornerRole.GROUND_ANCHOR:
+                            continue
+                        observed_distance = _point_distance(anchor_ground, ground_point)
+                        expected_distance = _point_distance(anchor_field, field_point)
+                        if (
+                            abs(observed_distance - expected_distance)
+                            <= self.config.max_k0_corner_distance_error_mm
+                        ):
+                            matching_corners.append(
+                                (ground_point, field_point, role, _confidence)
+                            )
+                    if not matching_corners:
+                        continue
+                    selected_correspondences = (
+                        correspondences
+                        if len(matching_corners) == 2
+                        else [anchor_entry, matching_corners[0]]
+                    )
+
+                    line_angles = [
+                        _line_rotation(
+                            first_ground,
+                            second_ground,
+                            first_field,
+                            second_field,
+                        )
+                        for (
+                            first_ground,
+                            first_field,
+                            _first_role,
+                            _first_confidence,
+                        ), (
+                            second_ground,
+                            second_field,
+                            _second_role,
+                            _second_confidence,
+                        ) in combinations(selected_correspondences, 2)
+                    ]
+                    heading = _mean_angles(line_angles)
+                    if heading is None:
+                        continue
+                    cosine = math.cos(heading)
+                    sine = math.sin(heading)
+                    ground_mean = np.mean(
+                        np.asarray(
+                            [
+                                (point.x, point.y)
+                                for point, _field, _role, _confidence
+                                in selected_correspondences
+                            ],
+                            dtype=np.float64,
+                        ),
+                        axis=0,
+                    )
+                    field_mean = np.mean(
+                        np.asarray(
+                            [
+                                (point.x, point.y)
+                                for _ground, point, _role, _confidence
+                                in selected_correspondences
+                            ],
+                            dtype=np.float64,
+                        ),
+                        axis=0,
+                    )
+                    translation = field_mean - np.asarray(
+                        (
+                            cosine * ground_mean[0] - sine * ground_mean[1],
+                            sine * ground_mean[0] + cosine * ground_mean[1],
+                        ),
+                        dtype=np.float64,
+                    )
+                    predicted = np.asarray(
+                        [
+                            (
+                                cosine * ground_point.x
+                                - sine * ground_point.y
+                                + translation[0],
+                                sine * ground_point.x
+                                + cosine * ground_point.y
+                                + translation[1],
+                            )
+                            for ground_point, _field_point, _role, _confidence
+                            in selected_correspondences
+                        ],
+                        dtype=np.float64,
+                    )
+                    expected = np.asarray(
+                        [
+                            (field_point.x, field_point.y)
+                            for _ground_point, field_point, _role, _confidence
+                            in selected_correspondences
+                        ],
+                        dtype=np.float64,
+                    )
+                    point_errors = np.linalg.norm(predicted - expected, axis=1)
                     residual = float(np.sqrt(np.mean(point_errors**2)))
                     if residual > self.config.max_fit_residual_mm:
                         continue
-                    heading = normalize_angle(math.atan2(float(rotation[1, 0]), float(rotation[0, 0])))
+                    used_roles = tuple(
+                        role for _ground_point, _field_point, role, _confidence
+                        in selected_correspondences
+                    )
+                    confidences = [
+                        confidence
+                        for _ground_point, _field_point, _role, confidence
+                        in selected_correspondences
+                    ]
                     confidence = min(
                         1.0,
                         zone.confidence * float(np.mean(confidences))
@@ -538,7 +721,10 @@ class SafeZoneCornerLocalizer:
                         result.result_timestamp_ns,
                         color,
                         used_roles,
-                        FieldPose2D(FieldPoint(float(translation[0]), float(translation[1])), heading),
+                        FieldPose2D(
+                            FieldPoint(float(translation[0]), float(translation[1])),
+                            heading,
+                        ),
                         max(self.config.position_uncertainty_floor_mm, residual),
                         math.radians(self.config.heading_uncertainty_floor_deg),
                         residual,

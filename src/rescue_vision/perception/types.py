@@ -415,13 +415,13 @@ class ModelDetection:
             raise ValueError(
                 f"{model_class.value} must not expose K1/K2 in YOLO Pose v3."
             )
-        if (
-            model_class is PoseModelClass.SAFE_ZONE
-            and self.keypoints[1].point is not None
-            and self.keypoints[2].point is not None
-            and self.keypoints[1].point.u >= self.keypoints[2].point.u
-        ):
-            raise ValueError("safe_zone keypoints must satisfy u(K1) < u(K2).")
+        # if (
+        #     model_class is PoseModelClass.SAFE_ZONE
+        #     and self.keypoints[1].point is not None
+        #     and self.keypoints[2].point is not None
+        #     and self.keypoints[1].point.u >= self.keypoints[2].point.u
+        # ):
+        #     raise ValueError("safe_zone keypoints must satisfy u(K1) < u(K2).")
 
     @property
     def model_class(self) -> PoseModelClass:

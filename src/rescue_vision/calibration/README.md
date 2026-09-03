@@ -200,6 +200,11 @@ python -m rescue_vision.calibration.capture_extrinsics_ground \
   --session src/rescue_vision/calibration/calibration_captures/ground_mapping_YYYYMMDD_HHMMSS
 ```
 
+默认用 OpenCV 预览窗口触发拍摄，窗口需要本地显示器才能看到并接收键盘输入。
+通过 SSH 或没有可见显示器的会话，加 `--terminal` 改为终端驱动：每个站位输入坐标后，
+终端提示“棋盘放好后按 Enter 拍摄”，直接回车即抓拍并检测，输入 `q` 退出并保留已完成
+记录；该模式不会创建任何 GUI 窗口。两种模式保存的原图、检测图和 JSON 完全一致。
+
 脚本启动后依次询问长边方向边距、短边方向边距和采集张数。这里假设左右长边
 边距相同、上下短边边距相同；最后一张自动标记为 `holdout`，前面的图片标记为
 `fit`。每个站位先输入外框左下角全局坐标，再把棋盘放到定位模板对应位置，按

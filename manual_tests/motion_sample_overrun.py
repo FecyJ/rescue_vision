@@ -232,7 +232,10 @@ def main() -> int:
                     if isinstance(message, CarSystemStatus):
                         require_motion_status_healthy(message)
 
-                controller.synchronize(on_message=observe_sync_message)
+                controller.synchronize(
+                    timeout_s=config.motion.synchronization_timeout_s,
+                    on_message=observe_sync_message,
+                )
                 print("SOFT_BRAKE_SYNC=accepted", flush=True)
                 stats = OverrunProbeStats(started_timestamp_ns=time.monotonic_ns())
 
@@ -298,7 +301,10 @@ def main() -> int:
                             f"status={format_status(stats.latest_status)}",
                             flush=True,
                         )
-                        controller.synchronize(on_message=observe_resync_message)
+                        controller.synchronize(
+                            timeout_s=config.motion.synchronization_timeout_s,
+                            on_message=observe_resync_message,
+                        )
                         print("RESYNC_SYNC=accepted", flush=True)
                         if controller.link_degraded:
                             raise RuntimeError(

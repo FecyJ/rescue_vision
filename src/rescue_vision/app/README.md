@@ -14,7 +14,8 @@
 | --- | --- | --- |
 | `rescue-vision-manual-capture` | `runtime.yaml`、车端输出根目录和显式监督确认 | 完整装配 TCP/UART/相机/运动/夹爪/记录；推荐生产入口 |
 | `rescue-vision-cluster-breakup` | `runtime.yaml` 和显式监督确认 | 定距越障、目标团搜索/居中、闭爪定距冲散、原地全开、张爪退出、停车合爪、闭爪退离并扫描绿色；找到绿色后停车 |
-| `rescue-vision-simulation-20-point` | `runtime.simulation-20min.yaml` 和显式监督确认；可选 `--log-dir logs` 把终端输出按时间命名写入日志文件 | 复用现有解团，跟踪/世界模型/规则门禁、受限预推导航、单绿色推送、接近时 transport 局部打开、接触确认后闭合、交付验证、退离、四次完成停车，并向 observe_only 观察端发布最新 `map/state` 位姿 |
+| `rescue-vision-green-grab` | `runtime.yaml` 和显式监督确认；依赖 `hailo.enabled` 的 v3 模型 | 识别单个绿色物资、开夹爪像素居中接近、框下边达到阈值后停车合爪；无地面标定、不产生 `GroundPoint` |
+| `rescue-vision-simulation-20-point` | `runtime.simulation-20min.yaml` 和显式监督确认；可选 `--local-preview`、`--log-dir logs` | 启动后按配置先执行不依赖视觉的右转/直行定位动作，再开始视觉解团；首次解团前推 0.5 m，之后每次解团退离后先按融合位姿/当前地图方向转向，安全区入视野后前进至 K1-K0-K2 线中心约 300 mm 处并等待安全区视觉校准，然后扫描/搬运；同时发布最新 `map/state` 位姿 |
 | `ClusterBreakupSequence(...).step()` | `ClusterBreakupRuntimeConfig`、`motion.gripper.full_travel_time_s`、同一单调时间轴、编码器累计路程和最新 `PerceptionSnapshot` | 纯逻辑流程决策；不创建相机、Hailo、UART 或电机；冲散后全开、张爪退出、停车合爪，再进入闭爪退离 |
 | `EncoderTravelTracker.submit()` | 带有效双编码器的 `OdometryImu`；连续 `sample_overrun` 预算来自 `motion.odometry.max_consecutive_overrun_samples`，`null` 关闭中止仅保留计数 | 使用运行配置机械标定产生机器人中心累计有符号路程；连续异常超出配置预算时抛错 |
 | `VisualLocalizationPipeline.submit()` | v3 同帧中心十字/安全区结果 | 每帧最多提交一次全位姿或位置纠偏 |
@@ -27,7 +28,7 @@
 | `build_session_status()` | 同一 `AppConfig`、服务实例 ID、视频 FPS 和可用模式 | 创建声明运动、夹爪、视频模式、车辆和采集能力的会话状态 |
 | `run_manual_capture_session()` | 已启动连接、可选运动/夹爪执行器、采集会话、相机管线、可选 perception/BEV 旁路和可选 `OdometryImuFusion` | 运行单个完整车辆或仅相机 TCP 会话；断线/故障时清理当前记录 |
 | `BevFrameRenderer` | 已加载且包含 BEV 配置的 `GroundProjector`；显式 `start/stop` | 有界丢旧保新的后台 BEV 生成旁路；输出保留源帧号和采集时间 |
-| `Simulation20PointSequence` | `Simulation20PointRuntimeConfig`、跟踪器、世界模型、mission 和现有 `ClusterBreakupSequence` | 只读取完成的最新快照并返回轻量线速度/角速度/夹爪意图；任何旁路等待由调用方负责 |
+| `Simulation20PointSequence` | `Simulation20PointRuntimeConfig`、跟踪器、世界模型、mission 和现有 `ClusterBreakupSequence` | 只读取完成的最新快照并返回轻量线速度/角速度/夹爪意图；解团完成后可进入安全区校准动作；任何旁路等待由调用方负责 |
 
 `run_manual_capture_session()` 不创建或打开硬件资源。调用方传入
 `RemoteMotionExecutor`，并在 `motion.gripper.enabled=true` 时传入共享同一个
@@ -129,14 +130,19 @@ else:
     )
 ```
 
-流程的顺序是：现有解团 → 轨迹重置/稳定确认 → 最小航向扫描 → 易搬运绿色筛选 →
+流程的顺序是：可选的启动固定右转/直行定位（仅编码器/IMU）→ 视觉现有解团 →
+退离后先用融合位姿和当前静态地图中的己方安全区方向原地转向，安全区进入视野后
+再在距 K1-K0-K2 线 300 mm 处完成视觉校准 →
+轨迹重置/稳定确认 → 最小航向扫描 → 易搬运绿色筛选 →
 预推点和保守走廊 → 对准/几何单目标接触 → 单目标推送 → 己方物资区内缩区域的
 连续完全进入证据 → 退离确认。完成四个不同的有效 `delivery_id` 后进入
 `FINISH_STOP`，`valid_green_deliveries=4`、`score_points=20`。目标丢失、第二目标
 进入接触走廊、定位/视觉过期、证据不足和旁路瞬时故障（`side_path_recovering`）
 都保持当前状态零速，条件恢复后下一周期自动继续，不锁存需要人工恢复的状态；
 解团 `FAULT` 丢弃碰撞前轨迹并回到“稳定确认—扫描—候选评估”路径，重复解团仍受
-次数上限约束。扫描完成后若位姿存在但不确定度不合格，按“无易搬运绿色”
+次数上限约束。`PLAN_REBREAKUP` 不会锁死已恢复的候选：每个新鲜周期都先重新检查
+可执行绿色，恢复后立即回到 `SELECT_GREEN`；仅在当前无候选时才考虑再次解团。
+扫描完成后若位姿存在但不确定度不合格，按“无易搬运绿色”
 进入 `PLAN_REBREAKUP` 评估（受次数/几何上限约束），只有位姿完全缺失时才
 原地等待。只有急停锁存、观察端不再是 `observe_only`、直接安全信号
 和 mission 规则终止才进入不可恢复的 `TERMINAL_STOP`；任何保持若导致 15 秒无
@@ -145,7 +151,15 @@ else:
 
 蓝色或 `unknown` 不会成为绿色候选。常规导航只在它们实际阻挡预推、接近或推动
 走廊时取消当前绿色方案并重新评估；已经建立单目标持续推动后若走廊被阻挡则保持
-零速，不带着物块自动绕行。解团阶段沿用固定直线动作，不为蓝色物块规划替代方向。
+零速，不带着物块自动绕行。解团阶段沿用固定动作，但新鲜快照若形成可执行的孤立
+绿色正面夹取方案，会在当前控制边界停止解团并切入夹取流程。
+
+试验性配置 `front_grab_enabled=true` 时，孤立绿色块（最近邻居净空 ≥
+`isolated_green_clearance_mm`）不再绕到背面预推：`SELECT_GREEN` 直接进入
+`ALIGN_GREEN` 正面抓取（开夹爪直行、合爪），合爪后经新增
+`REORIENT_TO_DESTINATION` 原地转向己方物资区质心再推送。该路径跳过
+`PLAN_PREPUSH`/`NAVIGATE_PREPUSH`，且不放松危险/未知目标的走廊膨胀；仅作
+真车联调，正式比赛前需与设计文档核对。
 
 真实车入口负责资源生命周期：UART 通道打开后，相机/Hailo 预热在独立启动线程中
 与运动同步并行；预热等待期间主线程持续排空 UART，感知旁路就绪后才进入相机门禁。
@@ -162,8 +176,13 @@ else:
 rescue-vision-simulation-20-point \
   --config configs/runtime.simulation-20min.yaml \
   --supervised-physical-stop-ready \
+  --local-preview \
   --log-dir logs
 ```
+
+`--local-preview` 会在同一进程中显示相机去畸变图和后台 Hailo 模型叠加结果，
+不应再同时运行 `manual_tests/camera_undistort_perception.py`；两个程序会竞争同一
+相机和模型资源。预览窗口按 `Q` 或 `Esc` 后，20 分流程会执行停车清理。
 
 传入 `--log-dir logs` 时，stdout/stderr 会同时写入
 `logs/<YYYYmmdd_HHMM>.log`（按行缓冲追加，同分钟重跑继续写入同一文件；配置
@@ -187,7 +206,9 @@ rescue-vision-manual-capture \
   --video-fps 10
 ```
 
-入口创建但不复制相机参数、运动限值或协议规则。连接后发送会话、视频、动态地图状态、车辆
+入口创建但不复制相机参数、运动限值或协议规则。`motion.synchronization_timeout_s`
+控制启动/重同步时每次 `SOFT_BRAKE` 应答等待，默认 1 秒；超时保持零速并自动重试。
+连接后发送会话、视频、动态地图状态、车辆
 和采集状态，并同时接收 `control/debug/motion`、
 `control/debug/gripper`、`control/debug/capture` 与不执行动作的
 `control/video/mode`。运动命令继续由
@@ -221,8 +242,8 @@ rescue-vision-manual-capture \
 保存运动/夹爪执行结果、编码器/IMU、系统状态、命令回复和停车原因；
 这些事件与图像帧统一使用树莓派应用单调时间。
 等待首个客户端及断线重连期间，入口仍以有界周期排空 STM32 主动遥测，避免
-未连接时填满 UART 接收队列；等待达到 `--accept-timeout-seconds` 后会先
-停车并正常退出，不创建空 recording。
+未连接时填满 UART 接收队列；没有客户端连接时会持续等待，不会因等待时长自动
+退出或创建空 recording。
 
 ### 仅相机远程调试
 
@@ -255,7 +276,8 @@ rescue-vision-manual-capture \
 完整车辆调试时不要带 `--camera-only`，并继续满足物理急停和全程监督要求。
 
 录像写盘队列满、写盘失败、相机异常、UART 异常、远程断线、非法控制或应用
-退出都会离开统一运动循环，并在 UART 尚可写时先发送柔和制动。断电、
+退出都会离开统一运动循环，并在 UART 尚可写时先发送柔和制动；SOFT_BRAKE
+应答超时只会在零速状态重试。断电、
 `SIGKILL` 和 UART 物理断开仍只能由固件看门狗停车。
 完整车辆模式中的 UART 异常同样会退出；仅相机模式根本不打开 UART，因此不受
 未上电单片机影响。
@@ -278,26 +300,36 @@ rescue-vision-cluster-breakup \
 分组，只认成员最多的目标团）→ 用该团观测框联合中心做比例居中 → 低速接近。
 最近有效 K0 地面点进入 `gripper_open_distance_mm` 后，夹爪保持闭合，车辆以
 `breakup_speed_m_s` 推进 `breakup_distance_m`；到达后原地停车并切到已标定张开端点，
-保持 `motion.gripper.full_travel_time_s` 完全打开，再以
-`retreat_speed_m_s` 张爪倒退 `gripper_open_retreat_distance_m`。到达后停车切回闭合
-端点，保持同一全行程时间，最后以 `retreat_speed_m_s` 闭爪倒退
-`retreat_distance_m`。最后进入 `SCAN_GREEN`，按
+保持 `motion.gripper.full_travel_time_s` 完全打开。仅当
+`post_breakup_retreat_enabled=true` 时，才以 `retreat_speed_m_s` 张爪倒退
+`gripper_open_retreat_distance_m`。到达后停车切回闭合端点，保持同一全行程时间，
+最后以 `retreat_speed_m_s` 闭爪倒退 `retreat_distance_m`。当前 20 分配置关闭该
+开关，因此张爪和合爪都在原地完成，合爪后直接进入 `SCAN_GREEN`，按
 `scan_green_angular_velocity_rad_s` 的符号原地扫描，连续看到配置帧数的
-`green_supply` 后停车退出。当前不会继续接近或交付绿色目标；
+`green_supply` 后停车退出。20 分流程的上层扫描会在每个新鲜快照中提前检查完整
+绿色候选；候选一旦满足确认、地面/场地坐标、区域和走廊安全条件，就立即停止扫描
+并进入 `SELECT_GREEN`，否则才继续配置的扫描覆盖。解团期间也复用同一候选检查；若
+发现可直接正面夹取的孤立绿色块，则立即停止解团、张开夹爪并进入 `ALIGN_GREEN`。
 搜索/扫描角速度均为带符号值（左转为正、右转为负），方向由符号唯一决定，
 不在入口中固定为左转。解团阶段不额外插入 `BREAKUP_SAFETY_CHECK` 或危险/未知类别门禁；
 在非转运阶段若视野只有 `unknown`/`blue_danger`，流程继续原地搜索，不直接锁定零速。
 
+20 分专用配置的 `action_settle_time_s=0.5` 会作用于所有应用状态切换：新状态的首个
+运动决策先输出零速，持续接收并更新编码器/IMU与视觉数据，停顿结束后才下发该状态的
+线速度或角速度。它覆盖启动转向后直行、解团各阶段、扫描到接近、夹取后转向和交付后
+退离；直接急停、规则终止和故障停车不等待该停顿。
+
 `configs/runtime.simulation-20min.yaml` 是从当前车端 `runtime.yaml` 复制的临时配置：
-保留目标 perception 所需的 Hailo 和地面映射，关闭 `localization.enabled`，
-但开启 `localization.fusion.enabled`；配置中已不存在
+保留目标 perception 所需的 Hailo 和地面映射，开启 `localization.enabled`（中心十字
+视觉纠偏）和 `localization.fusion.enabled`；温漂补偿按需求关闭，配置中已不存在
 `perception.field_features`/`perception.field_boundary`。
-解团入口把每条有效 `OdometryImu` 同时送入固定距离里程计和
-`OdometryImuFusion`，当前只消费编码器+IMU预测；单次双编码器有效的
+解团入口会把每条有效 `OdometryImu` 同时送入固定距离里程计和
+`OdometryImuFusion`；单次双编码器有效的
 `sample_overrun` 会等待下一帧并做短时 IMU 插值，连续异常仍触发保守降级；初始场地位姿来自配置的
-`localization.fusion.initial_pose`，连续估计会在 `progress` 中打印。尚未接入
-中心十字、安全区或其他视觉位姿纠偏；后续只需在独立视觉旁路中调用
-`fusion.submit_visual()`。
+`localization.fusion.initial_pose`，连续估计会在 `progress` 中打印 x/y/heading 场坐标。
+新鲜 v3 中心十字/安全区结果经 `VisualLocalizationPipeline` 提交 `fusion.submit_visual()`
+视觉纠偏；当前地面映射仍是近场调试产物，中心十字远场绝对定位精度未验证，
+仅作受监督试验，现场应以 conservative 门禁确认视觉纠偏不会把车拉偏。
 
 取帧和全尺寸去畸变在独立输入旁路运行，Hailo 推理再使用单槽最新帧后台旁路；
 运动循环只刷新轮速、排空 UART 并消费最新结构化观测。观测过期、
@@ -322,12 +354,41 @@ rescue-vision-cluster-breakup \
 定距出发时若左右轮程明显反向，会立即停车并报告前进编码器符号不符合冻结协议；
 不得在树莓派端取绝对值或增加符号补偿掩盖固件方向错误。
 20 分入口的终端日志只在状态变化或约每秒输出一次，并附带编码器累计路程、左右轮
-诊断、目标/已下发轮速和 STM32 电机输出/停止原因；请求非零轮速后约 750 ms 仍
+诊断、目标/已下发轮速和 STM32 电机输出/停止原因。在扫描、候选选择和重复解团
+状态，日志还会输出 `green_candidate=(...)`，其中包含绿色目标、确认、地面/场地
+点、新鲜度、基础安全、可规划数量及路径/净空阻塞数量；它用于区分“看见绿色”与
+“可安全转运绿色”。请求非零轮速后约 750 ms 仍
 报告电机输出关闭时保持零速等待 STM32 重新使能（日志标记 `motor_blocked`），
 不再把单次未使能变成流程退出；持续失败仍由 15 秒无运动规则终止。单次命令
 回复拒绝只记录并触发有界重同步；相机/融合/遥测提交等旁路异常按
 `side_path_recovering` 保持并自动恢复；观察端断开只记录并限频重启观察服务，
 不参与运动健康判定。
+
+## 绿色抓取试验
+
+该入口面向“只有内参、尚无地面标定”的早期联调，验证绿色物资识别、开夹爪、
+接近与合爪的完整动作链。它只消费现有 `TargetPoseDetector`（Hailo YOLO Pose v3）
+输出的检测框做像素居中，不把像素伪造成 `GroundPoint`。先在 `configs/runtime.yaml`
+启用 `hailo`（含已部署的 v3 模型）、`uart`、`motion`、`motion.gripper` 和
+`green_grab`，然后运行：
+
+```bash
+rescue-vision-green-grab \
+  --config configs/runtime.yaml \
+  --supervised-physical-stop-ready
+```
+
+流程为：无绿色时按 `search_angular_velocity_rad_s` 原地扫描，连续
+`confirm_frames` 帧看到 `green_supply` 后打开夹爪并按水平误差居中，框下边达到
+`engage_bottom_fraction * 图像高度` 后停车合爪，保持 `motion.gripper.full_travel_time_s`
+后结束。居中角速度由 `align_kp_rad_s` 按比例误差计算并受
+`align_max_angular_velocity_rad_s` 限幅（图像右侧为正误差、右转为负角速度）。
+对齐/接近中目标短暂丢失保持零速，超过 `target_loss_timeout_ms` 则合爪回到搜索。
+所有速度、比例阈值、确认帧数和超时均来自 `green_grab`，不在入口另写一套参数。
+
+取帧、去畸变和 Hailo 推理在 `CameraPerceptionPump` 的独立旁路运行，运动循环只
+刷新轮速、排空 UART 并消费最新结构化观测；急停锁存、命令拒绝、UART 健康降级、
+观测过期或退出都走统一停车路径。当前不是比赛程序，仍需物理急停与全程监督。
 
 ## 安全边界
 
@@ -346,7 +407,7 @@ rescue-vision-cluster-breakup \
 `CarState`，不代表有物理位置传感器或已经完成抓取。
 
 解团试验仍不是比赛模式：当前固件看门狗未经真车验收，所以必须保留物理急停和
-全程监督。当前流程在冲散距离结束后原地全开，以张爪退出
-`gripper_open_retreat_distance_m`，停车合爪并等待全行程，再执行闭爪
-`retreat_distance_m`；仍需现场确认机械结构不会形成抓取或承载。张爪退出和闭爪
-等待均由状态机控制，不能在退出段中提前合爪。
+全程监督。当前 20 分配置启用 `post_breakup_retreat_enabled`：冲散后先张爪后退
+`gripper_open_retreat_distance_m=0.05 m`，再合爪后退 `retreat_distance_m=0.15 m`，
+随后扫描绿色；两段距离均为原配置的一半，仍需现场确认机械结构不会形成抓取或
+承载。

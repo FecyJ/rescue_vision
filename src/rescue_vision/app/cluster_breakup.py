@@ -709,7 +709,9 @@ class RemoteLocalizationPublisher:
             localization_confidence=estimate.confidence,
             localization_position_uncertainty_mm=estimate.position_uncertainty_mm,
             localization_heading_uncertainty_rad=estimate.heading_uncertainty_rad,
-            localization_source="odometry_imu",
+            # 视觉闭环定位接通后锚点来源会变成 center_cross/safe_zone 等，直接
+            # 透传真实来源，观察端才能看到“已由视觉纠偏”而非永远显示 odometry_imu。
+            localization_source=estimate.anchor_source or "odometry_imu",
             targets=(),
         )
 
@@ -1330,6 +1332,8 @@ class ClusterBreakupSequence:
         config: ClusterBreakupRuntimeConfig,
         *,
         gripper_full_travel_time_s: float,
+        skip_departure: bool = False,
+        breakup_distance_m: float | None = None,
     ) -> None:
         if not isinstance(config, ClusterBreakupRuntimeConfig):
             raise TypeError("config must be a ClusterBreakupRuntimeConfig.")
@@ -1344,8 +1348,25 @@ class ClusterBreakupSequence:
             raise ValueError(
                 "gripper_full_travel_time_s must be finite and positive."
             )
+        if not isinstance(skip_departure, bool):
+            raise TypeError("skip_departure must be a boolean.")
+        if breakup_distance_m is not None and (
+            isinstance(breakup_distance_m, bool)
+            or not isinstance(breakup_distance_m, (int, float))
+            or not math.isfinite(float(breakup_distance_m))
+            or float(breakup_distance_m) <= 0.0
+        ):
+            raise ValueError(
+                "breakup_distance_m must be finite and positive when provided."
+            )
         self.config = config
         self._gripper_full_travel_time_s = float(gripper_full_travel_time_s)
+        self._skip_departure = skip_departure
+        self._breakup_distance_m = (
+            config.breakup_distance_m
+            if breakup_distance_m is None
+            else float(breakup_distance_m)
+        )
         self.state = BreakupState.WAIT_ODOMETRY
         self._state_started_ns: int | None = None
         self._state_distance_m: float | None = None
@@ -1353,7 +1374,18 @@ class ClusterBreakupSequence:
         self._last_cluster_seen_ns: int | None = None
         self._last_frame_sequence: int | None = None
         self._centered_frames = 0
+        self._filtered_center_error_ratio: float | None = None
+        self._last_center_filter_frame_sequence: int | None = None
+        self._center_turn_sign: int | None = None
+        self._center_reverse_candidate_sign: int | None = None
+        self._center_reverse_candidate_frames = 0
         self._green_frames = 0
+
+    @property
+    def breakup_distance_m(self) -> float:
+        """当前实例 BREAKUP_PUSH 使用的编码器定距，单位 m。"""
+
+        return self._breakup_distance_m
 
     @property
     def _search_direction_name(self) -> str:
@@ -1378,6 +1410,18 @@ class ClusterBreakupSequence:
                 if self._elapsed_s(timestamp_ns) >= self.config.motion_phase_timeout_s:
                     return self._fault(timestamp_ns, "odometry_start_timeout")
                 return self._decision(timestamp_ns, 0.0, 0.0, "waiting_odometry")
+            if self._skip_departure:
+                self._transition(
+                    BreakupState.SEARCH_CLUSTER,
+                    timestamp_ns,
+                    cumulative_distance_m,
+                )
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    self.config.search_angular_velocity_rad_s,
+                    f"initial_position_complete_search_{self._search_direction_name}",
+                )
             self._transition(BreakupState.LEAVE_START, timestamp_ns, cumulative_distance_m)
             return self._decision(
                 timestamp_ns,
@@ -1487,7 +1531,7 @@ class ClusterBreakupSequence:
                 return self._fault(timestamp_ns, "breakup_push_timeout")
             if self._reached_distance(
                 cumulative_distance_m,
-                self.config.breakup_distance_m,
+                self._breakup_distance_m,
             ):
                 self._transition(
                     BreakupState.BREAKUP_RELEASE,
@@ -1516,6 +1560,18 @@ class ClusterBreakupSequence:
                     0.0,
                     0.0,
                     "hold_open_gripper_before_open_retreat",
+                )
+            if not self.config.post_breakup_retreat_enabled:
+                self._transition(
+                    BreakupState.BREAKUP_CLOSE,
+                    timestamp_ns,
+                    cumulative_distance_m,
+                )
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    0.0,
+                    "open_gripper_in_place_close",
                 )
             self._transition(
                 BreakupState.BREAKUP_OPEN_RETREAT,
@@ -1563,6 +1619,18 @@ class ClusterBreakupSequence:
                     0.0,
                     0.0,
                     "hold_closed_gripper_before_retreat",
+                )
+            if not self.config.post_breakup_retreat_enabled:
+                self._transition(
+                    BreakupState.SCAN_GREEN,
+                    timestamp_ns,
+                    cumulative_distance_m,
+                )
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    self.config.scan_green_angular_velocity_rad_s,
+                    "close_gripper_in_place_scan_green",
                 )
             self._transition(
                 BreakupState.RETREAT,
@@ -1648,7 +1716,39 @@ class ClusterBreakupSequence:
 
     def _centering_angular(self, horizontal_error_ratio: float) -> float:
         # 图像右侧为正误差；机器人需右转，项目角速度右转为负。
+        tolerance = self.config.center_tolerance_ratio
+        if abs(horizontal_error_ratio) <= tolerance:
+            self._center_reverse_candidate_sign = None
+            self._center_reverse_candidate_frames = 0
+            return 0.0
         requested = -self.config.center_kp_rad_s * horizontal_error_ratio
+        requested_sign = 1 if requested > 0.0 else -1
+        if self._center_turn_sign is None:
+            self._center_turn_sign = requested_sign
+        elif requested_sign != self._center_turn_sign:
+            reversal_limit = (
+                tolerance + self.config.center_reverse_deadband_ratio
+            )
+            if abs(horizontal_error_ratio) <= reversal_limit:
+                self._center_reverse_candidate_sign = None
+                self._center_reverse_candidate_frames = 0
+                return 0.0
+            if self._center_reverse_candidate_sign == requested_sign:
+                self._center_reverse_candidate_frames += 1
+            else:
+                self._center_reverse_candidate_sign = requested_sign
+                self._center_reverse_candidate_frames = 1
+            if (
+                self._center_reverse_candidate_frames
+                < self.config.center_reverse_confirm_frames
+            ):
+                return 0.0
+            self._center_turn_sign = requested_sign
+            self._center_reverse_candidate_sign = None
+            self._center_reverse_candidate_frames = 0
+        else:
+            self._center_reverse_candidate_sign = None
+            self._center_reverse_candidate_frames = 0
         maximum = self.config.center_max_angular_velocity_rad_s
         return min(max(requested, -maximum), maximum)
 
@@ -1673,13 +1773,23 @@ class ClusterBreakupSequence:
         x_max = max(item.box.x_max for item in cluster)
         center_u = 0.5 * (x_min + x_max)
         horizontal_error = (center_u - width * 0.5) / (width * 0.5)
+        if self._last_center_filter_frame_sequence != perception.frame_sequence:
+            alpha = self.config.center_error_filter_alpha
+            if self._filtered_center_error_ratio is None:
+                self._filtered_center_error_ratio = horizontal_error
+            else:
+                self._filtered_center_error_ratio += alpha * (
+                    horizontal_error - self._filtered_center_error_ratio
+                )
+            self._last_center_filter_frame_sequence = perception.frame_sequence
+        assert self._filtered_center_error_ratio is not None
         forward_distances = [
             item.ground_point.x
             for item in cluster
             if item.ground_point is not None and item.ground_point.x > 0.0
         ]
         return _ClusterView(
-            horizontal_error_ratio=horizontal_error,
+            horizontal_error_ratio=self._filtered_center_error_ratio,
             nearest_forward_distance_mm=(
                 min(forward_distances) if forward_distances else None
             ),
@@ -1749,6 +1859,11 @@ class ClusterBreakupSequence:
         self._state_distance_m = distance_m
         if state is BreakupState.CENTER_CLUSTER:
             self._centered_frames = 0
+            self._filtered_center_error_ratio = None
+            self._last_center_filter_frame_sequence = None
+            self._center_turn_sign = None
+            self._center_reverse_candidate_sign = None
+            self._center_reverse_candidate_frames = 0
         if state is BreakupState.SCAN_GREEN:
             self._green_frames = 0
 
@@ -1921,7 +2036,10 @@ def _run_hardware(
                     )
 
     def synchronize_controller() -> None:
-        controller.synchronize(on_message=handle_sync_message)
+        controller.synchronize(
+            timeout_s=config.motion.synchronization_timeout_s,
+            on_message=handle_sync_message,
+        )
         if fusion_pump is not None:
             fusion_pump.wait_until_ready(on_wait=service_uart_during_camera_startup)
 

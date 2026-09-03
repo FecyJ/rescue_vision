@@ -92,6 +92,15 @@ MAP_STATE_PERIOD_MS = 200
 CAMERA_ONLY_CONTROL_BATCH_LIMIT = 32
 
 
+@dataclass(slots=True)
+class RemoteObservationSequences:
+    """同一车端服务实例内跨 TCP 重连共享的业务观察序号。"""
+
+    vehicle_state: int = 0
+    capture_status: int = 0
+    map_state: int = 0
+
+
 @dataclass(frozen=True, slots=True)
 class CameraPipeline:
     """配置驱动的帧源和图像坐标身份。"""
@@ -236,6 +245,7 @@ class CaptureSession:
         config_snapshot: dict[str, object],
         pipeline: CameraPipeline,
         motion_logging_enabled: bool = True,
+        sequence_counters: RemoteObservationSequences | None = None,
     ) -> None:
         self.output_root = output_root
         self.config = config
@@ -244,11 +254,16 @@ class CaptureSession:
         if not isinstance(motion_logging_enabled, bool):
             raise TypeError("motion_logging_enabled must be a boolean.")
         self.motion_logging_enabled = motion_logging_enabled
+        self.sequence_counters = (
+            RemoteObservationSequences()
+            if sequence_counters is None
+            else sequence_counters
+        )
         self.recorder: FrameRecorder | None = None
         self.motion_log: ManualMotionLogWriter | None = None
         self.recording_id: str | None = None
         self.recording_directory: Path | None = None
-        self.status_sequence = 0
+        self.status_sequence = self.sequence_counters.capture_status
         self.last_outcome: tuple[str, CaptureOutcome] | None = None
         self.outcomes: dict[str, CaptureOutcome] = {}
         self.stop_reason: CaptureStopReason | None = None
@@ -305,7 +320,8 @@ class CaptureSession:
             error_code=None if outcome is None else outcome.error_code,
             error_message=None if outcome is None else outcome.error_message,
         )
-        self.status_sequence += 1
+        self.sequence_counters.capture_status += 1
+        self.status_sequence = self.sequence_counters.capture_status
         return status
 
     def execute(
@@ -624,7 +640,12 @@ class CaptureSession:
 class VehicleState:
     """把运动/夹爪执行结果和最新 UART 遥测汇总为协议观察。"""
 
-    def __init__(self, *, safety_mode: VehicleSafetyMode) -> None:
+    def __init__(
+        self,
+        *,
+        safety_mode: VehicleSafetyMode,
+        sequence_counters: RemoteObservationSequences | None = None,
+    ) -> None:
         if safety_mode is VehicleSafetyMode.FIRMWARE_WATCHDOG:
             raise ValueError(
                 "Manual capture firmware_watchdog needs fresh "
@@ -636,7 +657,12 @@ class VehicleState:
         }:
             raise ValueError(f"Unsupported safety_mode {safety_mode!r}.")
         self.safety_mode = safety_mode
-        self.sequence = 0
+        self.sequence_counters = (
+            RemoteObservationSequences()
+            if sequence_counters is None
+            else sequence_counters
+        )
+        self.sequence = self.sequence_counters.vehicle_state
         self.system_status: CarSystemStatus | None = None
         self.motion_state = VehicleMotionState.STOPPED
         self.stop_reason = (
@@ -734,7 +760,8 @@ class VehicleState:
                 self.last_applied_gripper_command_id
             ),
         )
-        self.sequence += 1
+        self.sequence_counters.vehicle_state += 1
+        self.sequence = self.sequence_counters.vehicle_state
         return observation
 
 
@@ -760,6 +787,8 @@ class ManualCaptureRuntime:
         visual_localization: VisualLocalizationPipeline | None = None,
         stop_requested: Callable[[], bool],
         safety_mode: VehicleSafetyMode,
+        synchronization_timeout_s: float = 1.0,
+        sequence_counters: RemoteObservationSequences | None = None,
     ) -> None:
         self.connection = connection
         self.executor = executor
@@ -776,6 +805,12 @@ class ManualCaptureRuntime:
         self.odometry_imu_fusion = odometry_imu_fusion
         self.visual_localization = visual_localization
         self.stop_requested = stop_requested
+        self.synchronization_timeout_s = synchronization_timeout_s
+        self.sequence_counters = (
+            RemoteObservationSequences()
+            if sequence_counters is None
+            else sequence_counters
+        )
         if (executor is None) != (not session_status.motion_control_available):
             raise ValueError(
                 "executor presence must match motion_control_available."
@@ -790,7 +825,10 @@ class ManualCaptureRuntime:
             raise ValueError(
                 "map_team_color presence must match map_state_available."
             )
-        self.vehicle = VehicleState(safety_mode=safety_mode)
+        self.vehicle = VehicleState(
+            safety_mode=safety_mode,
+            sequence_counters=self.sequence_counters,
+        )
         self.video_mode = VideoFrameMode.RAW
         self.last_sent_video_sequence: int | None = None
         self.minimum_rendered_sequence: int | None = None
@@ -802,7 +840,7 @@ class ManualCaptureRuntime:
         self.next_vehicle_status_ns = now_ns + VEHICLE_STATUS_PERIOD_MS * 1_000_000
         self.next_capture_status_ns = now_ns + CAPTURE_STATUS_PERIOD_MS * 1_000_000
         self.next_map_state_ns = now_ns
-        self.map_state_sequence = 0
+        self.map_state_sequence = self.sequence_counters.map_state
 
     def run(self) -> None:
         self._send_initial_status()
@@ -821,6 +859,7 @@ class ManualCaptureRuntime:
                     on_cycle=self._cycle,
                     poll_interval_s=0.02,
                     synchronize_on_start=True,
+                    synchronization_timeout_s=self.synchronization_timeout_s,
                 )
         finally:
             if self.gripper_executor is not None:
@@ -1026,7 +1065,9 @@ class ManualCaptureRuntime:
                 assert renderer is not None
                 renderer.clear_latest()
                 self.minimum_rendered_sequence = (
-                    None if self.latest_frame is None else self.latest_frame.sequence
+                    None
+                    if self.latest_frame is None
+                    else self.latest_frame.sequence + 1
                 )
             if command.mode is VideoFrameMode.PERCEPTION:
                 assert self.perception_renderer is not None
@@ -1153,7 +1194,8 @@ class ManualCaptureRuntime:
             ),
             targets=(),
         )
-        self.map_state_sequence += 1
+        self.sequence_counters.map_state += 1
+        self.map_state_sequence = self.sequence_counters.map_state
         self.connection.send_observation(
             RemoteTopic.MAP_STATE.value,
             state.to_payload(),
@@ -1262,6 +1304,8 @@ def run_manual_capture_session(
     visual_localization: VisualLocalizationPipeline | None = None,
     stop_requested: Callable[[], bool] = lambda: False,
     safety_mode: VehicleSafetyMode = VehicleSafetyMode.UNAVAILABLE,
+    synchronization_timeout_s: float = 1.0,
+    sequence_counters: RemoteObservationSequences | None = None,
 ) -> None:
     runtime = ManualCaptureRuntime(
         connection=connection,
@@ -1280,6 +1324,8 @@ def run_manual_capture_session(
         visual_localization=visual_localization,
         stop_requested=stop_requested,
         safety_mode=safety_mode,
+        synchronization_timeout_s=synchronization_timeout_s,
+        sequence_counters=sequence_counters,
     )
     try:
         runtime.run()
@@ -1379,24 +1425,21 @@ def _accept_with_shutdown(
     server: RemoteTcpServer,
     controller: MotionController | None,
     *,
-    timeout_s: float,
     stop_requested: Callable[[], bool],
     on_car_message: Callable[[ParsedCarMessage], None] | None = None,
 ) -> RemoteMessageConnection | None:
-    deadline = time.monotonic() + timeout_s
     while not stop_requested():
         # STM32 continuously publishes 100 Hz localization telemetry, including
         # while no remote client is connected. Keep the UART's bounded queue healthy
-        # instead of leaving it unconsumed for the whole accept timeout.
+        # while waiting indefinitely for a client.
         if controller is not None:
             for message in controller.drain_messages():
                 if on_car_message is not None:
                     on_car_message(message)
-        remaining_s = deadline - time.monotonic()
-        if remaining_s <= 0:
-            return None
         try:
-            return server.accept(timeout=min(0.1, remaining_s))
+            # Use a short poll so SIGTERM can stop the service and UART telemetry
+            # continues to be drained even before the first client connects.
+            return server.accept(timeout=0.1)
         except TimeoutError:
             continue
     return None
@@ -1451,7 +1494,6 @@ def main() -> None:
     )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
-    parser.add_argument("--accept-timeout-seconds", type=float, default=30.0)
     parser.add_argument("--video-fps", type=float, default=2.0)
     parser.add_argument("--jpeg-quality", type=int, default=80)
     parser.add_argument(
@@ -1480,8 +1522,6 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
-    if args.accept_timeout_seconds <= 0:
-        parser.error("--accept-timeout-seconds must be positive")
     if args.video_fps <= 0:
         parser.error("--video-fps must be positive")
     if not 1 <= args.jpeg_quality <= 100:
@@ -1552,6 +1592,7 @@ def main() -> None:
         (VideoFrameMode.PERCEPTION,) if perception_renderer is not None else ()
     ) + ((VideoFrameMode.BEV,) if bev_renderer is not None else ())
     server_instance_id = f"manual-capture-{uuid.uuid4()}"
+    sequence_counters = RemoteObservationSequences()
     shutdown_requested = threading.Event()
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     signal.signal(
@@ -1574,7 +1615,6 @@ def main() -> None:
                     connection = _accept_with_shutdown(
                         server,
                         controller,
-                        timeout_s=args.accept_timeout_seconds,
                         stop_requested=shutdown_requested.is_set,
                         on_car_message=(
                             None
@@ -1594,6 +1634,7 @@ def main() -> None:
                         config_snapshot=config_snapshot,
                         pipeline=pipeline,
                         motion_logging_enabled=not args.camera_only,
+                        sequence_counters=sequence_counters,
                     )
                     status = build_session_status(
                         config,
@@ -1626,6 +1667,10 @@ def main() -> None:
                                     if not args.camera_only
                                     else VehicleSafetyMode.UNAVAILABLE
                                 ),
+                                synchronization_timeout_s=(
+                                    config.motion.synchronization_timeout_s
+                                ),
+                                sequence_counters=sequence_counters,
                             )
                     except RemoteDisconnectedError:
                         # 新连接会创建全新的状态和命令期限，不继承死手使能。

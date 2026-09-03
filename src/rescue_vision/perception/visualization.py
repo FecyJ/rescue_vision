@@ -261,15 +261,21 @@ class PerceptionFrameRenderer:
             raise TypeError("detector_factory must be callable.")
         self._detector_factory = detector_factory
         self._condition = Event()
+        self._render_condition = Event()
         self._lock = Lock()
         self._pending_frame: CameraFrame | None = None
+        self._pending_render: tuple[CameraFrame, PerceptionSnapshot] | None = None
         self._latest_frame: CameraFrame | None = None
         self._latest_snapshot: PerceptionSnapshot | None = None
         self._worker_error: BaseException | None = None
         self._detector: TargetPoseDetector | None = None
         self._stop_event = Event()
         self._thread: Thread | None = None
+        self._render_thread: Thread | None = None
         self._started = False
+        self._render_ms_total = 0.0
+        self._render_ms_max = 0.0
+        self._render_frame_count = 0
 
     @property
     def started(self) -> bool:
@@ -280,12 +286,17 @@ class PerceptionFrameRenderer:
             raise RuntimeError("PerceptionFrameRenderer is already started.")
         self._stop_event.clear()
         self._condition.clear()
+        self._render_condition.clear()
         with self._lock:
             self._pending_frame = None
+            self._pending_render = None
             self._latest_frame = None
             self._latest_snapshot = None
             self._worker_error = None
             self._detector = None
+            self._render_ms_total = 0.0
+            self._render_ms_max = 0.0
+            self._render_frame_count = 0
         detector: TargetPoseDetector | None = None
         try:
             detector = self._detector_factory()
@@ -300,8 +311,14 @@ class PerceptionFrameRenderer:
                 name="rescue-perception-video",
                 daemon=True,
             )
+            self._render_thread = Thread(
+                target=self._render_worker_loop,
+                name="rescue-perception-render",
+                daemon=True,
+            )
             self._started = True
             self._thread.start()
+            self._render_thread.start()
         except BaseException as start_error:
             self._started = False
             self._thread = None
@@ -332,7 +349,7 @@ class PerceptionFrameRenderer:
             return self._latest_frame
 
     def latest_snapshot(self) -> PerceptionSnapshot | None:
-        """返回与最新渲染帧同源的观测；没有完成推理时返回 ``None``。"""
+        """返回最新完成推理的结构化观测；不等待可视化渲染。"""
 
         self._require_started()
         self._raise_worker_error()
@@ -348,6 +365,7 @@ class PerceptionFrameRenderer:
             self._latest_frame = None
             self._latest_snapshot = None
             self._pending_frame = None
+            self._pending_render = None
 
     def check_health(self) -> None:
         self._require_started()
@@ -358,14 +376,22 @@ class PerceptionFrameRenderer:
             return
         self._stop_event.set()
         self._condition.set()
+        self._render_condition.set()
         thread = self._thread
         if thread is not None:
             thread.join(timeout=5.0)
         if thread is not None and thread.is_alive():
             raise RuntimeError("PerceptionFrameRenderer worker did not stop.")
+        render_thread = self._render_thread
+        if render_thread is not None:
+            render_thread.join(timeout=5.0)
+        if render_thread is not None and render_thread.is_alive():
+            raise RuntimeError("PerceptionFrameRenderer render worker did not stop.")
         self._thread = None
+        self._render_thread = None
         self._started = False
         self._condition.clear()
+        self._render_condition.clear()
         self._raise_worker_error()
 
     def _require_started(self) -> None:
@@ -389,8 +415,6 @@ class PerceptionFrameRenderer:
         frame_count = 0
         detect_ms_total = 0.0
         detect_ms_max = 0.0
-        render_ms_total = 0.0
-        render_ms_max = 0.0
         age_ms_total = 0.0
         age_ms_max = 0.0
         stale_dropped_count = 0
@@ -415,21 +439,6 @@ class PerceptionFrameRenderer:
                         ),
                     )
                     detect_ms = (monotonic_ns() - detect_start_ns) / 1_000_000.0
-                    render_start_ns = monotonic_ns()
-                    rendered = CameraFrame(
-                        sequence=frame.sequence,
-                        timestamp_ns=frame.timestamp_ns,
-                        image_bgr=render_target_observations(
-                            frame.image_bgr,
-                            result.observations,
-                            dropped_stale_age_ms=result.dropped_stale_age_ms,
-                            field_features=result.field_features,
-                        ),
-                        metadata={
-                            "perception_stale_dropped": result.stale_dropped,
-                        },
-                    )
-                    render_ms = (monotonic_ns() - render_start_ns) / 1_000_000.0
                     completed_ns = max(
                         (item.result_timestamp_ns for item in result.observations),
                         default=(
@@ -447,13 +456,14 @@ class PerceptionFrameRenderer:
                         dropped_stale_age_ms=result.dropped_stale_age_ms,
                     )
                     with self._lock:
-                        self._latest_frame = rendered
                         self._latest_snapshot = snapshot
+                        self._pending_render = (frame, snapshot)
+                    self._render_condition.set()
                     frame_count += 1
                     detect_ms_total += detect_ms
                     detect_ms_max = max(detect_ms_max, detect_ms)
-                    render_ms_total += render_ms
-                    render_ms_max = max(render_ms_max, render_ms)
+                    # Measure freshness at the point the control snapshot is
+                    # published; rendering is an independent observer path.
                     age_ms = (monotonic_ns() - frame.timestamp_ns) / 1_000_000.0
                     age_ms_total += age_ms
                     age_ms_max = max(age_ms_max, age_ms)
@@ -461,13 +471,20 @@ class PerceptionFrameRenderer:
                         stale_dropped_count += 1
                     now_ns = monotonic_ns()
                     if now_ns >= next_report_ns:
+                        with self._lock:
+                            render_frame_count = self._render_frame_count
+                            render_ms_total = self._render_ms_total
+                            render_ms_max = self._render_ms_max
+                            self._render_frame_count = 0
+                            self._render_ms_total = 0.0
+                            self._render_ms_max = 0.0
                         if frame_count:
                             print(
                                 "perception_timing=(frames="
                                 f"{frame_count},"
                                 f"detect_ms_avg={detect_ms_total / frame_count:.1f},"
                                 f"detect_ms_max={detect_ms_max:.1f},"
-                                f"render_ms_avg={render_ms_total / frame_count:.1f},"
+                                f"render_ms_avg={render_ms_total / max(1, render_frame_count):.1f},"
                                 f"render_ms_max={render_ms_max:.1f},"
                                 f"age_ms_avg={age_ms_total / frame_count:.1f},"
                                 f"age_ms_max={age_ms_max:.1f},"
@@ -477,8 +494,6 @@ class PerceptionFrameRenderer:
                         frame_count = 0
                         detect_ms_total = 0.0
                         detect_ms_max = 0.0
-                        render_ms_total = 0.0
-                        render_ms_max = 0.0
                         age_ms_total = 0.0
                         age_ms_max = 0.0
                         stale_dropped_count = 0
@@ -486,6 +501,7 @@ class PerceptionFrameRenderer:
         except BaseException as error:
             with self._lock:
                 self._worker_error = error
+            self._stop_event.set()
         finally:
             if detector is not None:
                 try:
@@ -497,3 +513,43 @@ class PerceptionFrameRenderer:
                 with self._lock:
                     if self._detector is detector:
                         self._detector = None
+
+    def _render_worker_loop(self) -> None:
+        """Render only the newest completed result on an observer thread."""
+
+        try:
+            while not self._stop_event.is_set():
+                self._render_condition.wait(timeout=0.05)
+                self._render_condition.clear()
+                while not self._stop_event.is_set():
+                    with self._lock:
+                        pending = self._pending_render
+                        self._pending_render = None
+                    if pending is None:
+                        break
+                    frame, snapshot = pending
+                    render_start_ns = monotonic_ns()
+                    rendered = CameraFrame(
+                        sequence=frame.sequence,
+                        timestamp_ns=frame.timestamp_ns,
+                        image_bgr=render_target_observations(
+                            frame.image_bgr,
+                            snapshot.observations,
+                            dropped_stale_age_ms=snapshot.dropped_stale_age_ms,
+                            field_features=snapshot.field_features,
+                        ),
+                        metadata={
+                            "perception_stale_dropped": snapshot.dropped_stale_age_ms
+                            is not None,
+                        },
+                    )
+                    render_ms = (monotonic_ns() - render_start_ns) / 1_000_000.0
+                    with self._lock:
+                        self._latest_frame = rendered
+                        self._render_frame_count += 1
+                        self._render_ms_total += render_ms
+                        self._render_ms_max = max(self._render_ms_max, render_ms)
+        except BaseException as error:
+            with self._lock:
+                self._worker_error = error
+            self._stop_event.set()

@@ -77,6 +77,16 @@ def breakup_config(**changes: object) -> ClusterBreakupRuntimeConfig:
     return ClusterBreakupRuntimeConfig(**values)  # type: ignore[arg-type]
 
 
+def test_breakup_distance_override_is_kept_on_the_initial_instance() -> None:
+    sequence = ClusterBreakupSequence(
+        breakup_config(breakup_distance_m=0.4),
+        gripper_full_travel_time_s=1.0,
+        breakup_distance_m=0.5,
+    )
+
+    assert sequence.breakup_distance_m == pytest.approx(0.5)
+
+
 def observation(
     *,
     frame_sequence: int,
@@ -613,6 +623,54 @@ def test_breakup_search_accepts_negative_rightward_velocity() -> None:
     assert decision.reason == "departure_complete_search_right"
 
 
+def test_breakup_can_skip_both_post_push_retreats() -> None:
+    sequence = ClusterBreakupSequence(
+        breakup_config(post_breakup_retreat_enabled=False),
+        gripper_full_travel_time_s=1.0,
+    )
+    sequence.state = BreakupState.BREAKUP_RELEASE
+    sequence._state_started_ns = 0
+    sequence._state_distance_m = 0.5
+
+    closing = sequence.step(
+        timestamp_ns=1_000_000_000,
+        cumulative_distance_m=0.5,
+        perception=None,
+    )
+    assert closing.state is BreakupState.BREAKUP_CLOSE
+    assert closing.gripper_posture is GripperPosture.CLOSED
+    assert closing.linear_velocity_m_s == 0.0
+    assert closing.reason == "open_gripper_in_place_close"
+
+    scanning = sequence.step(
+        timestamp_ns=2_000_000_000,
+        cumulative_distance_m=0.5,
+        perception=None,
+    )
+    assert scanning.state is BreakupState.SCAN_GREEN
+    assert scanning.gripper_posture is GripperPosture.CLOSED
+    assert scanning.linear_velocity_m_s == 0.0
+    assert scanning.angular_velocity_rad_s > 0.0
+    assert scanning.reason == "close_gripper_in_place_scan_green"
+
+
+def test_breakup_can_skip_fixed_departure_after_external_positioning() -> None:
+    sequence = ClusterBreakupSequence(
+        breakup_config(search_angular_velocity_rad_s=-0.4),
+        gripper_full_travel_time_s=1.0,
+        skip_departure=True,
+    )
+    decision = sequence.step(
+        timestamp_ns=0,
+        cumulative_distance_m=1.0,
+        perception=None,
+    )
+    assert decision.state is BreakupState.SEARCH_CLUSTER
+    assert decision.linear_velocity_m_s == 0.0
+    assert decision.angular_velocity_rad_s == pytest.approx(-0.4)
+    assert decision.reason == "initial_position_complete_search_right"
+
+
 def test_breakup_scan_green_follows_signed_velocity() -> None:
     sequence = ClusterBreakupSequence(
         breakup_config(
@@ -1044,7 +1102,9 @@ def test_remote_localization_publisher_sends_latest_map_state_without_blocking()
     assert state.robot_x_mm == pytest.approx(-1350.0)
     assert state.robot_y_mm == pytest.approx(-1200.0)
     assert state.robot_heading_rad == pytest.approx(1.5)
-    assert state.localization_source == "odometry_imu"
+    # 发布器应透传融合锚点来源，而不是硬编码 odometry_imu；视觉闭环定位接通后
+    # 来源会变为 center_cross/safe_zone 等，观察端据此区分是否已由视觉纠偏。
+    assert state.localization_source == "configured_start"
 
 
 def test_remote_perception_transport_does_not_wait_for_observer() -> None:

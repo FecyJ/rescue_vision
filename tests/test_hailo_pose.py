@@ -63,19 +63,24 @@ def test_pose_parser_rejects_old_single_keypoint_layout() -> None:
         )
 
 
-def test_pose_parser_rejects_reversed_safe_zone_image_landmarks() -> None:
+def test_pose_parser_normalizes_reversed_safe_zone_image_landmarks() -> None:
     image = np.zeros((100, 200, 3), dtype=np.uint8)
     _, transform = letterbox_bgr_to_rgb(image, (640, 640))
     output = np.zeros((1, 1, 15), dtype=np.float32)
     output[0, 0] = [32, 192, 320, 352, 0.9, 5, 160, 320, 0.8, 220, 320, 0.8, 120, 320, 0.8]
-    with pytest.raises(ValueError, match=r"u\(K1\) < u\(K2\)"):
-        parse_yolo26_pose_output(
-            output,
-            kpt_shape=(3, 3),
-            transform=transform,
-            score_threshold=0.25,
-            max_detections=10,
-        )
+    parsed = parse_yolo26_pose_output(
+        output,
+        kpt_shape=(3, 3),
+        transform=transform,
+        score_threshold=0.25,
+        max_detections=10,
+    )
+    left = parsed[0].keypoints[1]
+    right = parsed[0].keypoints[2]
+    assert left.point is not None and right.point is not None
+    assert left.point.u < right.point.u
+    assert left.point.u == pytest.approx(37.5)
+    assert right.point.u == pytest.approx(68.75)
 
 
 def test_pose_parser_skips_padding_boxes_and_sanitizes_nan_k0() -> None:

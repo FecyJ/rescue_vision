@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 import yaml
 
+from rescue_vision.camera.frame import CameraFrame
 from rescue_vision.app.cluster_breakup import (
     BreakupDecision,
     BreakupState,
@@ -36,8 +37,12 @@ from rescue_vision.mission import (
 from rescue_vision.perception import (
     ClassProbabilities,
     ColorSegmentationStatus,
+    FieldFeatureDetectionResult,
+    FieldPoseKeypoint,
     PerceptionSnapshot,
     RoiColorSegmentation,
+    SafeZoneColor,
+    SafeZoneObservation,
     TargetClass,
     TargetObservation,
     UndistortedBoundingBox,
@@ -47,8 +52,12 @@ from rescue_vision.world import (
     HazardState,
     RegionKind,
     StaticRegion,
+    StaticSafeZoneLandmarks,
+    StaticFieldMap,
     WorldModel,
     WorldModelConfig,
+    TeamColor,
+    default_static_field_map,
 )
 
 
@@ -144,6 +153,40 @@ def snapshot(
     )
 
 
+def safe_zone_snapshot(
+    frame_sequence: int,
+    timestamp_ns: int,
+    *,
+    k0: GroundPoint = GroundPoint(300.0, 0.0),
+    left: GroundPoint = GroundPoint(300.0, -300.0),
+    right: GroundPoint = GroundPoint(300.0, 300.0),
+) -> PerceptionSnapshot:
+    zone = SafeZoneObservation(
+        UndistortedBoundingBox(0.0, 0.0, 100.0, 100.0),
+        FieldPoseKeypoint(UndistortedPixel(50.0, 50.0), k0, 0.95),
+        FieldPoseKeypoint(UndistortedPixel(20.0, 50.0), left, 0.95),
+        FieldPoseKeypoint(UndistortedPixel(80.0, 50.0), right, 0.95),
+        SafeZoneColor.BLUE,
+        0.95,
+        frozenset(),
+    )
+    features = FieldFeatureDetectionResult(
+        frame_sequence,
+        timestamp_ns,
+        timestamp_ns,
+        (100, 100),
+        (zone,),
+        None,
+    )
+    return PerceptionSnapshot(
+        frame_sequence,
+        timestamp_ns,
+        timestamp_ns,
+        (),
+        features,
+    )
+
+
 class _ImmediateGreenBreakup:
     def step(self, *, timestamp_ns, cumulative_distance_m, perception):
         del cumulative_distance_m, perception
@@ -210,9 +253,11 @@ def make_sequence(
     config: Simulation20PointRuntimeConfig | None = None,
     breakup: object | None = None,
     breakup_factory: object | None = None,
+    team_color: TeamColor = TeamColor.UNKNOWN,
     confirmation_hits: int = 1,
     match_duration_s: float = 1000.0,
     no_motion_timeout_s: float = 15.0,
+    static_map: StaticFieldMap | None = None,
 ) -> Simulation20PointSequence:
     regions = (
         StaticRegion(
@@ -259,6 +304,8 @@ def make_sequence(
         ),
         breakup=breakup or _ImmediateGreenBreakup(),
         breakup_factory=breakup_factory,
+        team_color=team_color,
+        static_map=static_map,
     )
 
 
@@ -269,6 +316,7 @@ def pose(
     heading: float = 0.0,
     position_uncertainty_mm: float = 20.0,
     heading_uncertainty_rad: float = 0.02,
+    anchor_source: str = "configured_start",
 ):
     return FusedPoseEstimate(
         pose=FieldPose2D(FieldPoint(x, y), heading),
@@ -276,7 +324,7 @@ def pose(
         position_uncertainty_mm=position_uncertainty_mm,
         heading_uncertainty_rad=heading_uncertainty_rad,
         confidence=0.9,
-        anchor_source="configured_start",
+        anchor_source=anchor_source,
         quality=frozenset(),
     )
 
@@ -326,6 +374,24 @@ def test_simulation_remote_state_submits_latest_localization() -> None:
     ]
 
 
+def test_overlay_remote_pose_copies_frame_and_adds_field_pose_text() -> None:
+    from rescue_vision.app.simulation_20_point import _overlay_remote_pose
+
+    original = np.zeros((80, 320, 3), dtype=np.uint8)
+    frame = CameraFrame(sequence=7, timestamp_ns=10, image_bgr=original)
+
+    result = _overlay_remote_pose(
+        frame,
+        pose(x=1350.0, y=1350.0, heading=-np.pi / 2.0),
+        now_ns=1_000_000_010,
+    )
+
+    assert result is not None
+    assert result.sequence == frame.sequence
+    assert np.any(result.image_bgr != 0)
+    assert np.array_equal(original, np.zeros((80, 320, 3), dtype=np.uint8))
+
+
 def test_time_named_log_tees_output_and_restores_streams(tmp_path: Path) -> None:
     original_stdout = sys.stdout
     original_stderr = sys.stderr
@@ -369,6 +435,8 @@ def start_sequence(sequence: Simulation20PointSequence) -> None:
 def test_simulation_config_is_explicit_and_strict(tmp_path: Path) -> None:
     config = load_runtime_config("configs/runtime.simulation-20min.yaml")
     assert config.simulation_20_point.enabled
+    assert config.localization.fusion.enabled
+    assert config.motion.wheel_track_m == pytest.approx(0.235)
     assert config.simulation_20_point.target_delivery_count == 4
     assert config.remote.access_mode.value == "observe_only"
     assert config.localization.fusion.max_interpolated_overrun_samples == 1
@@ -386,6 +454,32 @@ def test_simulation_config_is_explicit_and_strict(tmp_path: Path) -> None:
         config.simulation_20_point.scan_angular_velocity_rad_s
         == pytest.approx(-0.30)
     )
+    assert config.simulation_20_point.startup_maneuver_enabled
+    assert config.simulation_20_point.startup_turn_angle_rad == pytest.approx(
+        np.pi / 4.0
+    )
+    assert config.simulation_20_point.startup_forward_distance_m == pytest.approx(1.2)
+    assert config.simulation_20_point.action_settle_time_s == pytest.approx(0.5)
+    assert config.simulation_20_point.first_breakup_distance_m == pytest.approx(0.5)
+    assert config.simulation_20_point.safe_zone_calibration_enabled
+    assert config.localization.center_cross.enabled
+    red_landmarks = config.world.static_map.safe_zone_landmarks_for(TeamColor.RED)
+    assert red_landmarks is not None
+    assert red_landmarks.ground_anchor_field == FieldPoint(0.0, 1140.0)
+    assert red_landmarks.near_field_corner_a == FieldPoint(-330.0, 1140.0)
+    assert red_landmarks.near_field_corner_b == FieldPoint(330.0, 1140.0)
+    assert red_landmarks.measured and red_landmarks.usable
+    blue_landmarks = config.world.static_map.safe_zone_landmarks_for(TeamColor.BLUE)
+    assert blue_landmarks is not None
+    assert blue_landmarks.ground_anchor_field == FieldPoint(0.0, -1140.0)
+    # 蓝色安全区的 A/B 按“面朝蓝区时的左/右角点”定义；面朝 -y 时左侧为 +x。
+    assert blue_landmarks.near_field_corner_a == FieldPoint(330.0, -1140.0)
+    assert blue_landmarks.near_field_corner_b == FieldPoint(-330.0, -1140.0)
+    assert blue_landmarks.measured and blue_landmarks.usable
+    assert config.simulation_20_point.max_breakup_attempts_per_delivery == 4
+    assert config.motion.cluster_breakup.post_breakup_retreat_enabled
+    assert config.motion.cluster_breakup.gripper_open_retreat_distance_m == pytest.approx(0.15)
+    assert config.motion.cluster_breakup.retreat_distance_m == pytest.approx(0.15)
     assert config.build_simulation_20_point_sequence().state is Simulation20PointState.BOOT
 
     raw = yaml.safe_load(
@@ -398,6 +492,127 @@ def test_simulation_config_is_explicit_and_strict(tmp_path: Path) -> None:
         load_runtime_config(invalid)
 
 
+def test_breakup_recalibrates_at_own_safe_zone_before_scanning() -> None:
+    config = runtime_config(
+        safe_zone_calibration_enabled=True,
+        safe_zone_calibration_timeout_s=10.0,
+    )
+    sequence = make_sequence(
+        config=config,
+        breakup=_FixedBreakup(BreakupState.SCAN_GREEN),
+        team_color=TeamColor.BLUE,
+    )
+    start_sequence(sequence)
+    safe = safe_zone_snapshot(1, 2)
+
+    began = sequence.step(
+        2,
+        perception=safe,
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+    assert began.state is Simulation20PointState.BREAKUP_SAFE_ZONE_TURN
+    assert began.linear_velocity_m_s == 0.0
+    assert began.angular_velocity_rad_s == 0.0
+
+    facing = sequence.step(
+        3,
+        perception=safe_zone_snapshot(2, 3),
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+    assert facing.state is Simulation20PointState.BREAKUP_SAFE_ZONE_FORWARD
+    assert facing.linear_velocity_m_s == 0.0
+
+    at_distance = sequence.step(
+        4,
+        perception=safe_zone_snapshot(3, 4),
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+    assert at_distance.state is Simulation20PointState.BREAKUP_SAFE_ZONE_CALIBRATE
+    assert at_distance.linear_velocity_m_s == 0.0
+
+    waiting = sequence.step(
+        5,
+        perception=safe_zone_snapshot(4, 5),
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+    assert waiting.state is Simulation20PointState.BREAKUP_SAFE_ZONE_CALIBRATE
+    assert waiting.reason == "waiting_own_safe_zone_visual_calibration"
+
+    calibrated = sequence.step(
+        6,
+        perception=safe_zone_snapshot(5, 6),
+        pose=pose(anchor_source="blue_safe_zone_corners"),
+        cumulative_distance_m=0.0,
+    )
+    assert calibrated.state is Simulation20PointState.RESET_TARGET_TRACKS
+
+
+def test_breakup_turns_from_fused_map_pose_before_safe_zone_enters_view() -> None:
+    base_map = default_static_field_map()
+    static_map = StaticFieldMap(
+        base_map.center_cross,
+        base_map.regions,
+        (
+            StaticSafeZoneLandmarks(
+                TeamColor.BLUE,
+                FieldPoint(0.0, -1200.0),
+                FieldPoint(-300.0, -1200.0),
+                FieldPoint(300.0, -1200.0),
+                measured=False,
+                usable=False,
+            ),
+        ),
+    )
+    sequence = make_sequence(
+        config=runtime_config(safe_zone_calibration_enabled=True),
+        breakup=_FixedBreakup(BreakupState.SCAN_GREEN),
+        team_color=TeamColor.BLUE,
+        static_map=static_map,
+    )
+    start_sequence(sequence)
+
+    began = sequence.step(
+        2,
+        perception=None,
+        pose=pose(x=0.0, y=-1600.0, heading=0.0),
+        cumulative_distance_m=0.0,
+    )
+    assert began.state is Simulation20PointState.BREAKUP_SAFE_ZONE_TURN
+    assert began.angular_velocity_rad_s == 0.0
+
+    turning = sequence.step(
+        1_000_000_003,
+        perception=None,
+        pose=pose(x=0.0, y=-1600.0, heading=0.0),
+        cumulative_distance_m=0.0,
+    )
+    assert turning.state is Simulation20PointState.BREAKUP_SAFE_ZONE_TURN
+    assert turning.linear_velocity_m_s == 0.0
+    assert turning.angular_velocity_rad_s > 0.0
+
+    facing = sequence.step(
+        2_000_000_004,
+        perception=snapshot(2, 2_000_000_004),
+        pose=pose(x=0.0, y=-1600.0, heading=np.pi / 2.0),
+        cumulative_distance_m=0.0,
+    )
+    assert facing.state is Simulation20PointState.BREAKUP_SAFE_ZONE_FORWARD
+    assert facing.linear_velocity_m_s == 0.0
+
+    approaching = sequence.step(
+        3_000_000_005,
+        perception=safe_zone_snapshot(1, 3_000_000_005, k0=GroundPoint(500.0, 0.0)),
+        pose=pose(x=0.0, y=-1600.0, heading=np.pi / 2.0),
+        cumulative_distance_m=0.0,
+    )
+    assert approaching.state is Simulation20PointState.BREAKUP_SAFE_ZONE_FORWARD
+    assert approaching.linear_velocity_m_s > 0.0
+
+
 def test_preflight_failure_latches_terminal_stop() -> None:
     sequence = make_sequence()
     decision = sequence.preflight(
@@ -406,6 +621,112 @@ def test_preflight_failure_latches_terminal_stop() -> None:
     )
     assert decision.state is Simulation20PointState.TERMINAL_STOP
     assert decision.linear_velocity_m_s == 0.0
+
+
+def test_startup_maneuver_turns_right_then_drives_one_meter_before_breakup() -> None:
+    sequence = make_sequence(
+        config=runtime_config(
+            startup_maneuver_enabled=True,
+            startup_turn_angle_rad=np.deg2rad(40.0),
+            startup_turn_angular_velocity_rad_s=-0.35,
+            startup_forward_distance_m=1.0,
+            startup_forward_speed_m_s=0.15,
+            startup_motion_phase_timeout_s=15.0,
+        )
+    )
+    start_sequence(sequence)
+    assert sequence.state is Simulation20PointState.STARTUP_TURN_RIGHT
+
+    first_turn = sequence.step(
+        2,
+        perception=None,
+        pose=pose(heading=0.0),
+        cumulative_distance_m=0.0,
+        health=replace(
+            SimulationHealth(), camera_fresh=False, localization_fresh=False
+        ),
+    )
+    assert first_turn.state is Simulation20PointState.STARTUP_TURN_RIGHT
+    assert first_turn.linear_velocity_m_s == 0.0
+    assert first_turn.angular_velocity_rad_s == pytest.approx(-0.35)
+
+    turning = sequence.step(
+        3,
+        perception=None,
+        pose=pose(heading=-0.4),
+        cumulative_distance_m=0.0,
+    )
+    assert turning.state is Simulation20PointState.STARTUP_TURN_RIGHT
+    assert turning.angular_velocity_rad_s == pytest.approx(-0.35)
+
+    turn_complete = sequence.step(
+        4,
+        perception=None,
+        pose=pose(heading=-np.deg2rad(40.0)),
+        cumulative_distance_m=0.0,
+    )
+    assert turn_complete.state is Simulation20PointState.STARTUP_FORWARD
+    assert turn_complete.linear_velocity_m_s == 0.0
+    assert turn_complete.angular_velocity_rad_s == 0.0
+
+    forward = sequence.step(
+        5,
+        perception=None,
+        pose=pose(heading=-np.deg2rad(40.0)),
+        cumulative_distance_m=0.0,
+    )
+    assert forward.state is Simulation20PointState.STARTUP_FORWARD
+    assert forward.linear_velocity_m_s == pytest.approx(0.15)
+    assert forward.angular_velocity_rad_s == 0.0
+
+    forward_complete = sequence.step(
+        6,
+        perception=None,
+        pose=pose(heading=-np.deg2rad(40.0)),
+        cumulative_distance_m=1.0,
+    )
+    assert forward_complete.state is Simulation20PointState.LEAVE_START
+    assert forward_complete.linear_velocity_m_s == 0.0
+
+    # The next cycle hands control to the visual breakup driver.  The test
+    # double reports GREEN_FOUND, proving that no visual breakup step ran
+    # before the fixed maneuver completed.
+    breakup_started = sequence.step(
+        7,
+        perception=None,
+        pose=pose(heading=-np.deg2rad(40.0)),
+        cumulative_distance_m=1.0,
+    )
+    assert breakup_started.state is Simulation20PointState.RESET_TARGET_TRACKS
+
+
+def test_action_transition_settle_holds_first_motion_command() -> None:
+    sequence = make_sequence(
+        config=runtime_config(action_settle_time_s=0.5),
+        breakup=_FixedBreakup(BreakupState.BREAKUP_PUSH),
+    )
+    start_sequence(sequence)
+
+    settling = sequence.step(
+        2,
+        perception=None,
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+    assert settling.state is Simulation20PointState.BREAKUP_PUSH
+    assert settling.reason == "action_settling:fixed_breakup_action"
+    assert settling.linear_velocity_m_s == 0.0
+    assert settling.angular_velocity_rad_s == 0.0
+
+    resumed = sequence.step(
+        500_000_003,
+        perception=None,
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+    assert resumed.state is Simulation20PointState.BREAKUP_PUSH
+    assert resumed.reason == "fixed_breakup_action"
+    assert resumed.linear_velocity_m_s == pytest.approx(0.1)
 
 
 def test_existing_breakup_is_followed_by_track_reset_and_full_scan() -> None:
@@ -441,26 +762,130 @@ def test_existing_breakup_is_followed_by_track_reset_and_full_scan() -> None:
 
     scanning = sequence.step(
         5,
-        perception=green(4, 5),
+        perception=green(1, 2),
         pose=pose(heading=0.2),
         cumulative_distance_m=0.0,
     )
-    assert scanning.state is Simulation20PointState.SCAN_GREEN
-    evaluated = sequence.step(
+    assert scanning.state is Simulation20PointState.SELECT_GREEN
+    assert scanning.reason == "green_candidate_selected_during_scan:1"
+    diagnostic = sequence._green_candidate_diagnostic(pose(heading=0.2))
+    assert "green=1" in diagnostic
+    assert "base_safe=1" in diagnostic
+    assert "planable=1" in diagnostic
+    assert "plan_reasons=none" in diagnostic
+    selected = sequence.step(
         6,
         perception=green(5, 6),
         pose=pose(heading=0.8),
         cumulative_distance_m=0.0,
     )
-    assert evaluated.state is Simulation20PointState.EVALUATE_EASY_GREEN
-    selected = sequence.step(
+    assert selected.state is Simulation20PointState.PLAN_PREPUSH
+    planned = sequence.step(
         7,
         perception=green(6, 7),
         pose=pose(heading=0.8),
         cumulative_distance_m=0.0,
     )
-    assert selected.state is Simulation20PointState.SELECT_GREEN
-    assert selected.selected_track_id == 1
+    assert planned.state is Simulation20PointState.NAVIGATE_PREPUSH
+    assert planned.selected_track_id == 1
+
+
+def test_isolated_green_interrupts_breakup_immediately() -> None:
+    sequence = make_sequence(
+        config=runtime_config(
+            front_grab_enabled=True,
+            isolated_green_clearance_mm=80.0,
+        ),
+        breakup=_ApproachBreakup(),
+    )
+    start_sequence(sequence)
+
+    interrupted = sequence.step(
+        2,
+        perception=snapshot(
+            1,
+            2,
+            observation(1, 2, GroundPoint(600.0, 0.0)),
+        ),
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+
+    assert interrupted.state is Simulation20PointState.ALIGN_GREEN
+    assert interrupted.reason == "green_front_grab_interrupt_breakup:1"
+    assert interrupted.gripper_posture is GripperPosture.OPEN
+    assert sequence._breakup is None
+    assert sequence.selected_track_id == 1
+
+
+def test_clustered_green_with_front_grab_enabled_still_uses_prepush() -> None:
+    sequence = make_sequence(
+        config=runtime_config(
+            front_grab_enabled=True,
+            isolated_green_clearance_mm=200.0,
+        )
+    )
+    start_sequence(sequence)
+    # 绿色块旁 180 mm 垂向处有一个绿色邻居：净空约 120 mm（< 200 阈值），
+    # 但仍在 140 mm 走廊障碍半径之外，因此既不孤立也不挡走廊，走 prepush。
+    green = lambda frame, timestamp: snapshot(
+        frame,
+        timestamp,
+        observation(frame, timestamp, GroundPoint(600.0, 0.0)),
+        observation(frame, timestamp, GroundPoint(426.9, 49.4)),
+    )
+
+    sequence.step(2, perception=green(1, 2), pose=pose(), cumulative_distance_m=0.0)
+    sequence.step(3, perception=green(2, 3), pose=pose(), cumulative_distance_m=0.0)
+    sequence.step(4, perception=green(3, 4), pose=pose(), cumulative_distance_m=0.0)
+    scanning = sequence.step(
+        5,
+        perception=green(4, 5),
+        pose=pose(heading=0.0),
+        cumulative_distance_m=0.0,
+    )
+    assert scanning.state is Simulation20PointState.SELECT_GREEN
+    plan = sequence._selected_plan
+    assert plan is not None
+    assert not plan.front_grab
+    selected = sequence.step(
+        6,
+        perception=green(5, 6),
+        pose=pose(heading=0.0),
+        cumulative_distance_m=0.0,
+    )
+    assert selected.state is Simulation20PointState.PLAN_PREPUSH
+
+
+def test_front_grab_reorient_turns_toward_destination_then_pushes() -> None:
+    sequence = make_sequence(
+        config=runtime_config(
+            front_grab_enabled=True,
+            isolated_green_clearance_mm=200.0,
+        )
+    )
+    start_sequence(sequence)
+    sequence._breakup = None
+    sequence.state = Simulation20PointState.REORIENT_TO_DESTINATION
+    # 机器人 (-1000, 0) 航向 0（朝 +x）；己方物资区质心 (0, 1400)，
+    # 期望航向 atan2(1400, 1000) ≈ 0.95 rad，当前航向误差超过容差 → 左转。
+    away = sequence.step(
+        2,
+        perception=None,
+        pose=pose(heading=0.0),
+        cumulative_distance_m=0.0,
+    )
+    assert away.state is Simulation20PointState.REORIENT_TO_DESTINATION
+    assert away.angular_velocity_rad_s > 0.0
+    assert away.linear_velocity_m_s == 0.0
+    facing = sequence.step(
+        3,
+        perception=None,
+        pose=pose(heading=float(np.arctan2(1400.0, 1000.0))),
+        cumulative_distance_m=0.0,
+    )
+    assert facing.state is Simulation20PointState.PUSH_TO_MATERIAL_ZONE
+    assert facing.reason == "reorient_complete_push_to_material_zone"
 
 
 def test_unknown_or_dangerous_target_cannot_become_easy_green() -> None:
@@ -622,6 +1047,36 @@ def test_evaluate_pose_uncertain_falls_through_to_rebreakup_evaluation() -> None
     assert planned.state is Simulation20PointState.PLAN_REBREAKUP
     assert planned.reason == "rebreakup_driver_unavailable"
     assert planned.linear_velocity_m_s == 0.0
+
+
+def test_rebreakup_recovers_a_newly_planable_green_before_attempt_limits() -> None:
+    sequence = make_sequence(
+        config=runtime_config(
+            max_breakup_attempts_per_delivery=1,
+            max_breakup_attempts_total=1,
+        )
+    )
+    start_sequence(sequence)
+    sequence._breakup = None
+    sequence._current_breakup_attempts = 1
+    sequence._total_breakup_attempts = 1
+    sequence.state = Simulation20PointState.PLAN_REBREAKUP
+
+    recovered = sequence.step(
+        2,
+        perception=snapshot(
+            1,
+            2,
+            observation(1, 2, GroundPoint(600.0, 0.0)),
+        ),
+        pose=pose(),
+        cumulative_distance_m=0.0,
+    )
+
+    assert recovered.state is Simulation20PointState.SELECT_GREEN
+    assert recovered.reason == "green_candidate_recovered_from_rebreakup:1"
+    assert recovered.selected_track_id == 1
+    assert recovered.linear_velocity_m_s == 0.0
 
 
 def test_rebreakup_proceeds_without_clearance_progress_gate() -> None:
@@ -906,6 +1361,9 @@ def test_blue_in_prepush_corridor_cancels_plan_for_reselection() -> None:
     assert decision.reason == "navigate_corridor_blocked_reselect_green"
     assert decision.selected_track_id is None
     assert decision.linear_velocity_m_s == 0.0
+    diagnostic = sequence._green_candidate_diagnostic(pose())
+    assert "planable=0" in diagnostic
+    assert "blocks_corridor" in diagnostic
 
 
 def test_four_green_deliveries_latch_finish_stop_and_twenty_points() -> None:
@@ -961,9 +1419,8 @@ def test_four_green_deliveries_latch_finish_stop_and_twenty_points() -> None:
             feed(target)
         assert sequence.state is Simulation20PointState.SCAN_GREEN
         feed(target, heading=0.0)
-        assert feed(target, heading=0.6).state is Simulation20PointState.EVALUATE_EASY_GREEN
-        assert feed(target).state is Simulation20PointState.SELECT_GREEN
-        assert feed(target).state is Simulation20PointState.PLAN_PREPUSH
+        assert feed(target, heading=0.6).state is Simulation20PointState.PLAN_PREPUSH
+        assert feed(target).state is Simulation20PointState.NAVIGATE_PREPUSH
         assert feed(target).state is Simulation20PointState.NAVIGATE_PREPUSH
 
         plan = sequence._selected_plan
