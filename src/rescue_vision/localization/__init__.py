@@ -8,6 +8,7 @@ from rescue_vision.localization.fusion import (
     ImuFrameCalibration,
     OdometryCalibration,
     OdometryImuFusion,
+    VisualAnchorHealth,
     VisualFusionResult,
 )
 from rescue_vision.localization.static_landmarks import (
@@ -57,6 +58,7 @@ __all__ = [
     "StaticFieldLandmarkTracker",
     "StaticLandmarkTrack",
     "StaticLandmarkTrackingConfig",
+    "VisualAnchorHealth",
     "VisualFusionResult",
     "VisualLocalizationPipeline",
     "angular_distance",

@@ -13,8 +13,9 @@
 | `StaticFieldLandmarkTracker` | 有界确认、地图搜索提示和旧帧去重辅助 |
 | `VisualLocalizationPipeline` | 同帧选择并保证每个帧序最多提交一次视觉更新 |
 | `FieldPositionObservation` | 不含航向测量的中心十字位置证据 |
-| `OdometryImuFusion` | 编码器/IMU 预测、延迟全位姿或位置视觉纠偏和历史重放 |
+| `OdometryImuFusion` | 编码器/IMU 预测、延迟全位姿或位置视觉纠偏和历史重放；支持扰动协方差注入与锚健康观测量 |
 | `FusedPoseEstimate` | 可空 `FieldPose2D`、不确定度、锚点来源和质量 |
+| `VisualAnchorHealth` | 视觉锚最近接受时间、连续拒绝计数与拒绝原因 |
 
 场地坐标原点是中心十字交点，`+x` 向场地图右侧，`+y` 指向红色安全区。
 `heading_rad` 是场地 `+x` 到机器人前向的逆时针角。
@@ -76,6 +77,32 @@ if visual is not None and snapshot is not None and snapshot.field_features is no
   无先验时对称解保持歧义，不提交纠偏。
 - 同帧同时得到十字和安全区全位姿时只提交一项，避免相关证据重复压缩方差。
 
+解团推撞等编码器把滑移误记为行进的事件结束后，先注入一次扰动协方差再继续
+常驻纠偏；否则模型不确定度仍偏小，随后到达的真锚会被创新门限当作离群值
+拒绝。注入只膨胀最新条目的协方差（对角平方相加），不动状态均值、锚点来源
+与历史结构，会随预测传播到后续条目：
+
+```python
+fusion.inject_disturbance(
+    position_uncertainty_mm=150.0,
+    heading_uncertainty_rad=0.08,
+)
+```
+
+量级来自 20 分应用的 `simulation_20_point` 配置（配置校验强制分别小于应用
+位姿门限），历史为空时静默忽略。读取锚健康量判断定位是否明显偏离：
+
+```python
+health = fusion.visual_anchor_health()
+if health is not None and health.last_accepted_ns is not None:
+    anchor_age_s = (current_timestamp_ns - health.last_accepted_ns) / 1e9
+```
+
+`last_accepted_ns` 使用被匹配历史条目的 `timestamp_ns`，与
+`FusedPoseEstimate.estimate_timestamp_ns` 同域可比；`None` 表示从未接受过
+视觉锚或连续性已丢失。`consecutive_rejections` 只累计对齐超限与创新门限两类
+拒绝；`last_rejection_reason` 为 `"alignment_error"` 或 `"innovation_gate"`。
+
 读取连续结果：
 
 ```python
@@ -88,7 +115,11 @@ else:
 
 ## 时效和安全降级
 
-- 视觉按相机采集时间与有限融合历史对齐，超过门限或创新过大则拒绝。
+- 视觉按相机采集时间与有限融合历史对齐，超过门限或创新过大则拒绝；这两类
+  拒绝累计到 `VisualAnchorHealth.consecutive_rejections` 并记录拒绝原因，
+  `(False, None, None)` 的“无观测/无历史”不计入也不清零。接受任意视觉锚即清零
+  计数并记录 `last_accepted_ns`；连续性丢失同时清零三者（之后只有绝对视觉可
+  重新初始化并再次记录接受）。
 - 旧视觉坐标只用于关联和搜索提示，绝不重复提交。
 - 单点中心十字不能在连续性丢失后初始化完整位姿；可靠安全区三点或已消歧
   双轴十字可以按现有绝对视觉规则重新锚定。

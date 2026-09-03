@@ -293,6 +293,54 @@ class VisualFusionResult:
     innovation_mahalanobis: float | None
 
 
+#: 视觉锚拒绝的可报告原因；`(False, None, None)` 的“无观测/无历史”不算拒绝。
+_VISUAL_REJECTION_REASONS = frozenset({"alignment_error", "innovation_gate"})
+
+
+@dataclass(frozen=True, slots=True)
+class VisualAnchorHealth:
+    """视觉锚点接受/拒绝的连续观测量，供应用层判断定位是否明显偏离。
+
+    ``last_accepted_ns`` 使用被匹配历史条目的 ``timestamp_ns``（host 映射的
+    控制器时间域），与 ``FusedPoseEstimate.estimate_timestamp_ns`` 和入口主循环
+    的 ``now_ns`` 同域可比；``None`` 表示从未接受过视觉锚或连续性已丢失。
+    ``consecutive_rejections`` 只累计对齐超限与创新门限两类拒绝，``(False,
+    None, None)`` 的“无观测/无历史”不计入也不清零。
+    """
+
+    last_accepted_ns: int | None
+    consecutive_rejections: int
+    last_rejection_reason: str | None
+
+    def __post_init__(self) -> None:
+        if self.last_accepted_ns is not None and (
+            isinstance(self.last_accepted_ns, bool)
+            or not isinstance(self.last_accepted_ns, int)
+            or self.last_accepted_ns < 0
+        ):
+            raise ValueError(
+                "last_accepted_ns must be a non-negative int or None, got "
+                f"{self.last_accepted_ns!r}."
+            )
+        if (
+            isinstance(self.consecutive_rejections, bool)
+            or not isinstance(self.consecutive_rejections, int)
+            or self.consecutive_rejections < 0
+        ):
+            raise ValueError(
+                "consecutive_rejections must be a non-negative int, got "
+                f"{self.consecutive_rejections!r}."
+            )
+        if self.last_rejection_reason is not None and (
+            self.last_rejection_reason not in _VISUAL_REJECTION_REASONS
+        ):
+            raise ValueError(
+                "last_rejection_reason must be one of "
+                f"{sorted(_VISUAL_REJECTION_REASONS)} or None, got "
+                f"{self.last_rejection_reason!r}."
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class _Prediction:
     distance_mm: float
@@ -375,6 +423,9 @@ class OdometryImuFusion:
         self._anchor_source: str | None = None
         self._anchor_confidence = 0.0
         self._continuity_loss_reason: str | None = None
+        self._last_visual_accepted_ns: int | None = None
+        self._consecutive_visual_rejections = 0
+        self._last_visual_rejection_reason: str | None = None
         self._status = frozenset({FusionQuality.INITIALIZING})
 
     @property
@@ -389,6 +440,80 @@ class OdometryImuFusion:
             raise ValueError("reason must be a non-empty string.")
         with self._lock:
             self._lose_continuity(f"explicit_reset:{reason.strip()}")
+
+    def inject_disturbance(
+        self,
+        *,
+        position_uncertainty_mm: float,
+        heading_uncertainty_rad: float,
+    ) -> None:
+        """在最新历史条目的协方差对角上注入一次独立扰动量（平方相加）。
+
+        用于解团推撞等编码器把滑移误记为行进的事件之后：主动膨胀不确定度，
+        使随后到达的真锚能够通过视觉创新门限而不是被当作离群值拒绝。不动
+        状态均值、历史结构、锚点来源或质量标记；协方差只增不减，注入会自然
+        传播到后续预测条目，直到下一次视觉锚接受时被卡尔曼校正压缩。历史为
+        空时静默忽略（绝对视觉初始化不经过创新门限，注入没有意义）。
+        """
+
+        if (
+            isinstance(position_uncertainty_mm, bool)
+            or not isinstance(position_uncertainty_mm, float)
+            or not math.isfinite(position_uncertainty_mm)
+            or position_uncertainty_mm < 0.0
+        ):
+            raise ValueError(
+                "position_uncertainty_mm must be a finite non-negative float, "
+                f"got {position_uncertainty_mm!r}."
+            )
+        if (
+            isinstance(heading_uncertainty_rad, bool)
+            or not isinstance(heading_uncertainty_rad, float)
+            or not math.isfinite(heading_uncertainty_rad)
+            or heading_uncertainty_rad < 0.0
+        ):
+            raise ValueError(
+                "heading_uncertainty_rad must be a finite non-negative float, "
+                f"got {heading_uncertainty_rad!r}."
+            )
+        with self._lock:
+            entry = self._state_entry()
+            if entry is None:
+                return
+            injected = np.diag(
+                [
+                    position_uncertainty_mm**2,
+                    position_uncertainty_mm**2,
+                    heading_uncertainty_rad**2,
+                    0.0,
+                ]
+            )
+            covariance = entry.covariance + injected
+            entry.covariance = (covariance + covariance.T) / 2.0
+
+    def visual_anchor_health(self) -> VisualAnchorHealth:
+        """返回视觉锚接受/拒绝的健康快照（线程安全）。"""
+
+        with self._lock:
+            return VisualAnchorHealth(
+                self._last_visual_accepted_ns,
+                self._consecutive_visual_rejections,
+                self._last_visual_rejection_reason,
+            )
+
+    def _note_visual_rejection(self, reason: str) -> None:
+        if reason not in _VISUAL_REJECTION_REASONS:
+            raise ValueError(
+                "reason must be one of "
+                f"{sorted(_VISUAL_REJECTION_REASONS)}, got {reason!r}."
+            )
+        self._consecutive_visual_rejections += 1
+        self._last_visual_rejection_reason = reason
+
+    def _note_visual_acceptance(self, timestamp_ns: int) -> None:
+        self._last_visual_accepted_ns = timestamp_ns
+        self._consecutive_visual_rejections = 0
+        self._last_visual_rejection_reason = None
 
     def submit_odometry(self, message: OdometryImu) -> FusedPoseEstimate:
         if not isinstance(message, OdometryImu):
@@ -869,6 +994,7 @@ class OdometryImuFusion:
             if entry is None or index is None:
                 if self._is_absolute_visual(observation):
                     self._initialize_from_visual(observation)
+                    self._note_visual_acceptance(observation.capture_timestamp_ns)
                     return VisualFusionResult(True, None, 0.0)
                 return VisualFusionResult(False, None, None)
             alignment_error_ns = abs(
@@ -884,8 +1010,10 @@ class OdometryImuFusion:
                 ):
                     self._lose_continuity("visual_reanchor_after_stale_history")
                     self._initialize_from_visual(observation)
+                    self._note_visual_acceptance(observation.capture_timestamp_ns)
                     return VisualFusionResult(True, alignment_error_ns, 0.0)
                 self._status = frozenset({FusionQuality.VISUAL_REJECTED})
+                self._note_visual_rejection("alignment_error")
                 return VisualFusionResult(False, alignment_error_ns, None)
             measurement = np.array(
                 [
@@ -913,6 +1041,7 @@ class OdometryImuFusion:
             )
             if mahalanobis > self.config.visual_innovation_gate:
                 self._status = frozenset({FusionQuality.VISUAL_REJECTED})
+                self._note_visual_rejection("innovation_gate")
                 return VisualFusionResult(False, alignment_error_ns, mahalanobis)
             gain = entry.covariance @ h.T @ np.linalg.inv(innovation_covariance)
             corrected_state = entry.state + gain @ innovation
@@ -940,6 +1069,7 @@ class OdometryImuFusion:
             self._history = deque(entries)
             self._anchor_source = source
             self._anchor_confidence = confidence
+            self._note_visual_acceptance(entry.timestamp_ns)
             self._status = frozenset({FusionQuality.FUSED})
             return VisualFusionResult(True, alignment_error_ns, mahalanobis)
 
@@ -958,6 +1088,7 @@ class OdometryImuFusion:
             alignment_error_ns = abs(entry.timestamp_ns - observation.capture_timestamp_ns)
             if alignment_error_ns > round(self.config.max_visual_alignment_error_ms * 1_000_000):
                 self._status = frozenset({FusionQuality.VISUAL_REJECTED})
+                self._note_visual_rejection("alignment_error")
                 return VisualFusionResult(False, alignment_error_ns, None)
             measurement = np.asarray(
                 [observation.position.x, observation.position.y],
@@ -974,6 +1105,7 @@ class OdometryImuFusion:
             mahalanobis = float(innovation.T @ np.linalg.solve(innovation_covariance, innovation))
             if mahalanobis > self.config.visual_innovation_gate:
                 self._status = frozenset({FusionQuality.VISUAL_REJECTED})
+                self._note_visual_rejection("innovation_gate")
                 return VisualFusionResult(False, alignment_error_ns, mahalanobis)
             gain = entry.covariance @ h.T @ np.linalg.inv(innovation_covariance)
             # 此观测没有航向或陀螺零偏证据；不利用历史交叉协方差间接改写它们。
@@ -1000,6 +1132,7 @@ class OdometryImuFusion:
             self._history = deque(entries)
             self._anchor_source = observation.source
             self._anchor_confidence = observation.confidence
+            self._note_visual_acceptance(entry.timestamp_ns)
             self._status = frozenset({FusionQuality.FUSED})
             return VisualFusionResult(True, alignment_error_ns, mahalanobis)
 
@@ -1373,6 +1506,9 @@ class OdometryImuFusion:
         self._anchor_source = None
         self._anchor_confidence = 0.0
         self._continuity_loss_reason = reason.strip()
+        self._last_visual_accepted_ns = None
+        self._consecutive_visual_rejections = 0
+        self._last_visual_rejection_reason = None
         self._status = frozenset({FusionQuality.CONTINUITY_LOST})
 
     def _state_entry(self) -> _HistoryEntry | None:

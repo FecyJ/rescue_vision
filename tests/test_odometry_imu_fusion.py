@@ -18,6 +18,7 @@ from rescue_vision.localization import (
     OdometryCalibration,
     OdometryImuFusion,
     SafeZoneCornerPoseObservation,
+    VisualAnchorHealth,
 )
 from rescue_vision.perception import SafeZoneColor, SafeZoneCornerRole
 from rescue_vision.motion import OdometryImu, SensorFlags
@@ -697,3 +698,177 @@ def test_configuration_rejects_invalid_values() -> None:
                 (0.0, 0.0, 1.0),
             )
         )
+
+
+def test_visual_anchor_health_rejects_invalid_values() -> None:
+    with pytest.raises(ValueError, match="last_accepted_ns"):
+        VisualAnchorHealth(True, 0, None)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="consecutive_rejections"):
+        VisualAnchorHealth(None, -1, None)
+    with pytest.raises(ValueError, match="consecutive_rejections"):
+        VisualAnchorHealth(None, True, None)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="last_rejection_reason"):
+        VisualAnchorHealth(None, 0, "other")
+    VisualAnchorHealth(123, 0, None)
+    VisualAnchorHealth(None, 2, "innovation_gate")
+
+
+def test_inject_disturbance_inflates_uncertainty_without_changing_state() -> None:
+    estimator = fusion()
+    estimator.submit_odometry(odom(0, 10_000, 0, 0))
+    estimator.submit_odometry(odom(1, 20_000, 1000, 1000))
+    before = estimator.latest_estimate(1_030_000_000)
+    assert before.pose is not None
+    assert before.position_uncertainty_mm is not None
+    assert before.heading_uncertainty_rad is not None
+
+    estimator.inject_disturbance(
+        position_uncertainty_mm=150.0, heading_uncertainty_rad=0.08
+    )
+    after = estimator.latest_estimate(1_030_000_000)
+
+    assert after.pose == before.pose
+    assert after.anchor_source == before.anchor_source
+    assert after.confidence == before.confidence
+    assert after.quality == before.quality
+    assert after.position_uncertainty_mm is not None
+    assert after.position_uncertainty_mm > before.position_uncertainty_mm
+    assert after.position_uncertainty_mm == pytest.approx(
+        math.hypot(before.position_uncertainty_mm, 150.0), rel=0.05
+    )
+    assert after.heading_uncertainty_rad is not None
+    assert after.heading_uncertainty_rad > before.heading_uncertainty_rad
+    assert after.heading_uncertainty_rad == pytest.approx(
+        math.hypot(before.heading_uncertainty_rad, 0.08), rel=0.05
+    )
+
+
+@pytest.mark.parametrize(
+    ("position", "heading"),
+    [
+        (-1.0, 0.08),
+        (float("nan"), 0.08),
+        (float("inf"), 0.08),
+        (150.0, -0.01),
+        (150.0, float("nan")),
+        (150.0, True),  # type: ignore[list-item]
+        (1, 0.08),  # type: ignore[list-item]
+    ],
+)
+def test_inject_disturbance_rejects_invalid_values(
+    position: object, heading: object
+) -> None:
+    estimator = fusion()
+    with pytest.raises(ValueError):
+        estimator.inject_disturbance(  # type: ignore[arg-type]
+            position_uncertainty_mm=position,
+            heading_uncertainty_rad=heading,
+        )
+
+
+def test_inject_disturbance_is_noop_without_history() -> None:
+    estimator = fusion()
+    estimator.inject_disturbance(
+        position_uncertainty_mm=150.0, heading_uncertainty_rad=0.08
+    )
+    moved = estimator.submit_odometry(odom(0, 10_000, 0, 0))
+    assert moved.pose is not None
+    assert estimator.visual_anchor_health() == VisualAnchorHealth(None, 0, None)
+
+
+def test_injected_covariance_allows_anchor_through_gate() -> None:
+    estimator = fusion()
+    estimator.submit_odometry(odom(0, 10_000, 0, 0))
+    estimator.submit_odometry(odom(1, 20_000, 1000, 1000))
+    anchor = visual(1_020_000_000, FieldPose2D(FieldPoint(350.0, 200.0), 0.0))
+
+    rejected = estimator.submit_visual(anchor)
+    assert not rejected.accepted
+    assert rejected.innovation_mahalanobis is not None
+    assert rejected.innovation_mahalanobis > 25.0
+    health = estimator.visual_anchor_health()
+    assert health.last_accepted_ns is None
+    assert health.consecutive_rejections == 1
+    assert health.last_rejection_reason == "innovation_gate"
+
+    estimator.inject_disturbance(
+        position_uncertainty_mm=150.0, heading_uncertainty_rad=0.08
+    )
+    accepted = estimator.submit_visual(anchor)
+    assert accepted.accepted
+    health = estimator.visual_anchor_health()
+    assert health.last_accepted_ns == 1_020_000_000
+    assert health.consecutive_rejections == 0
+    assert health.last_rejection_reason is None
+
+
+def test_visual_anchor_health_tracks_rejection_reasons_and_reset() -> None:
+    estimator = fusion(
+        max_telemetry_age_ms=100.0,
+        max_visual_alignment_error_ms=5.0,
+    )
+    estimator.submit_odometry(odom(0, 10_000, 0, 0))
+
+    stale_aligned = estimator.submit_visual(
+        visual(1_030_000_000, FieldPose2D(FieldPoint(100.0, 200.0), 0.0))
+    )
+    assert not stale_aligned.accepted
+    health = estimator.visual_anchor_health()
+    assert health.last_accepted_ns is None
+    assert health.consecutive_rejections == 1
+    assert health.last_rejection_reason == "alignment_error"
+
+    estimator.reset("controller restart")
+    health = estimator.visual_anchor_health()
+    assert health == VisualAnchorHealth(None, 0, None)
+
+    anchored = estimator.submit_visual(
+        visual(1_040_000_000, FieldPose2D(FieldPoint(10.0, 20.0), 0.3))
+    )
+    assert anchored.accepted
+    health = estimator.visual_anchor_health()
+    assert health.last_accepted_ns == 1_040_000_000
+    assert health.consecutive_rejections == 0
+    assert health.last_rejection_reason is None
+
+
+def test_prior_cross_without_history_is_not_a_rejection_or_acceptance() -> None:
+    estimator = fusion()
+    prior = replace(
+        visual(1_000_000_000, FieldPose2D(FieldPoint(100.0, 200.0), 0.0)),
+        selection_source=CenterCrossSelectionSource.PRIOR,
+    )
+    result = estimator.submit_visual(prior)
+    assert not result.accepted
+    assert result.innovation_mahalanobis is None
+    assert estimator.visual_anchor_health() == VisualAnchorHealth(None, 0, None)
+
+
+def test_position_landmark_rejection_and_acceptance_track_health() -> None:
+    estimator = fusion()
+    estimator.submit_odometry(odom(0, 10_000, 0, 0))
+    estimator.submit_odometry(odom(1, 20_000, 1000, 1000))
+
+    def landmark(x: float) -> FieldPositionObservation:
+        return FieldPositionObservation(
+            3,
+            1_020_000_000,
+            1_020_000_001,
+            FieldPoint(x, 200.0),
+            10.0,
+            0.9,
+            "center_cross_position",
+        )
+
+    rejected = estimator.submit_position_landmark(landmark(500.0))
+    assert not rejected.accepted
+    health = estimator.visual_anchor_health()
+    assert health.consecutive_rejections == 1
+    assert health.last_rejection_reason == "innovation_gate"
+
+    accepted = estimator.submit_position_landmark(landmark(200.0))
+    assert accepted.accepted
+    health = estimator.visual_anchor_health()
+    assert health.last_accepted_ns == 1_020_000_000
+    assert health.consecutive_rejections == 0
+    assert health.last_rejection_reason is None
