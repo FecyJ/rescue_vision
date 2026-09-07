@@ -16,7 +16,7 @@
 | `FieldFeatureDetectionResult` | 同帧中心十字和安全区集合 |
 | `CenterCrossObservation` | bbox、K0、可选局部双轴精修 |
 | `SafeZoneObservation` | bbox、K0、图像左 K1、图像右 K2及身份状态 |
-| `PerceptionFrameRenderer` / `PerceptionSnapshot` | 丢旧保新的后台推理、结构化快照和叠加图 |
+| `PerceptionFrameRenderer` / `PerceptionSnapshot` | 丢旧保新的后台推理、先发布结构化快照，再由独立旁路生成叠加图 |
 
 `TargetGroundGeometryEstimator` 是旧接触锚点实验链路，不属于 v3 主链路；本次
 迁移未修改它。跟踪和任务流程直接消费 `TargetObservation.ground_point`，其
@@ -69,7 +69,7 @@ renderer = PerceptionFrameRenderer(
 renderer.start()
 try:
     renderer.submit(frame)       # 单槽，自动丢弃旧待处理帧
-    snapshot = renderer.latest_snapshot()
+    snapshot = renderer.latest_snapshot()  # 推理完成即返回，不等待叠加渲染
 finally:
     renderer.stop()              # 同时关闭检测器和 Hailo 资源
 ```

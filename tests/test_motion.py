@@ -354,6 +354,91 @@ def test_motion_functions_encode_differential_drive_and_stops() -> None:
     ]
 
 
+def test_nonzero_wheel_targets_are_raised_to_motor_minimum() -> None:
+    channel = FakeCarChannel()
+    controller = MotionController(channel, limits())
+
+    controller.set_wheel_speeds(0.01, -0.019)
+
+    assert controller.target_wheel_speeds_m_s == pytest.approx((0.02, -0.02))
+
+    controller.set_wheel_speeds(0.0, 0.0)
+    assert controller.target_wheel_speeds_m_s == (0.0, 0.0)
+
+
+def test_drive_applies_per_wheel_speed_weights() -> None:
+    channel = FakeCarChannel()
+    clock = FakeClock()
+    weighted_limits = MotionLimits(
+        wheel_track_m=0.20,
+        max_linear_velocity_m_s=0.30,
+        max_angular_velocity_rad_s=2.0,
+        max_wheel_velocity_m_s=0.40,
+        max_wheel_acceleration_m_s2=10.0,
+        max_remote_command_valid_for_ms=500,
+        left_wheel_speed_weight=1.05,
+        right_wheel_speed_weight=0.95,
+    )
+    controller = MotionController(channel, weighted_limits, monotonic_ns=clock)
+
+    controller.forward(0.1)
+    clock.advance(0.05)
+    assert controller.update()
+
+    assert controller.commanded_wheel_speeds_m_s == pytest.approx(
+        (0.105, 0.095)
+    )
+
+
+def test_wheel_limited_drive_scales_weighted_wheels_to_limit() -> None:
+    channel = FakeCarChannel()
+    clock = FakeClock()
+    weighted_limits = MotionLimits(
+        wheel_track_m=0.20,
+        max_linear_velocity_m_s=0.30,
+        max_angular_velocity_rad_s=2.0,
+        max_wheel_velocity_m_s=0.30,
+        max_wheel_acceleration_m_s2=10.0,
+        max_remote_command_valid_for_ms=500,
+        left_wheel_speed_weight=1.2,
+        right_wheel_speed_weight=1.0,
+    )
+    controller = MotionController(channel, weighted_limits, monotonic_ns=clock)
+
+    applied_linear, applied_angular = controller.drive_wheel_limited(0.30, 0.0)
+
+    # left = 0.30 * 1.2 = 0.36 超过单轮上限，需按比例缩到 0.30。
+    assert applied_linear == pytest.approx(0.30 / 1.2)
+    assert applied_angular == pytest.approx(0.0)
+
+
+def test_motion_limits_reject_non_positive_wheel_weight() -> None:
+    with pytest.raises(ValueError, match="left_wheel_speed_weight"):
+        MotionLimits(
+            wheel_track_m=0.20,
+            max_linear_velocity_m_s=0.30,
+            max_angular_velocity_rad_s=2.0,
+            max_wheel_velocity_m_s=0.40,
+            max_wheel_acceleration_m_s2=0.50,
+            max_remote_command_valid_for_ms=500,
+            left_wheel_speed_weight=0.0,
+        )
+
+
+def test_motion_limits_reject_minimum_above_maximum_wheel_velocity() -> None:
+    with pytest.raises(ValueError, match="min_wheel_velocity_m_s"):
+        MotionLimits(
+            wheel_track_m=0.20,
+            max_linear_velocity_m_s=0.30,
+            max_angular_velocity_rad_s=2.0,
+            max_wheel_velocity_m_s=0.04,
+            max_wheel_acceleration_m_s2=0.50,
+            max_remote_command_valid_for_ms=500,
+            min_wheel_velocity_m_s=0.05,
+            stall_guard_min_command_speed_m_s=0.01,
+        )
+
+
 def test_gripper_angles_encode_left_then_right_and_reject_invalid_values() -> None:
     channel = FakeCarChannel()
     controller = MotionController(channel, limits())
@@ -485,7 +570,7 @@ def test_encoder_stall_guard_soft_brakes_and_reports_fault() -> None:
 
     controller.receive_message(timeout=0)
     controller.forward(0.10)
-    clock.advance(0.04)
+    clock.advance(0.10)
     assert controller.update()
     channel.received.extend(
         [
@@ -526,7 +611,7 @@ def test_encoder_stall_guard_soft_brakes_and_reports_fault() -> None:
     assert controller.target_wheel_speeds_m_s == (0.0, 0.0)
     assert controller.commanded_wheel_speeds_m_s == (0.0, 0.0)
     assert channel.sent == [
-        encode_wheel_speed_command(0, 0.02, 0.02),
+        encode_wheel_speed_command(0, 0.05, 0.05),
         encode_soft_brake_command(1),
     ]
 
@@ -643,6 +728,37 @@ def test_soft_brake_clears_pending_acceleration_target() -> None:
         encode_soft_brake_command(1),
         encode_wheel_speed_command(2, 0.0, 0.0),
     ]
+
+
+def test_temporary_wheel_acceleration_limit_is_applied_and_restored() -> None:
+    channel = FakeCarChannel()
+    clock = FakeClock()
+    controller = MotionController(channel, limits(), monotonic_ns=clock)
+
+    controller.set_wheel_acceleration_limit_m_s2(0.10)
+    controller.forward(0.30)
+    clock.advance(0.1)
+    controller.update()
+
+    assert controller.wheel_acceleration_limit_m_s2 == pytest.approx(0.10)
+    assert controller.commanded_wheel_speeds_m_s == pytest.approx((0.01, 0.01))
+
+    controller.set_wheel_acceleration_limit_m_s2(None)
+    clock.advance(0.1)
+    controller.update()
+
+    assert controller.wheel_acceleration_limit_m_s2 == pytest.approx(0.50)
+    assert controller.commanded_wheel_speeds_m_s == pytest.approx((0.06, 0.06))
+
+
+def test_temporary_wheel_acceleration_limit_can_exceed_global_limit() -> None:
+    controller = MotionController(FakeCarChannel(), limits())
+
+    controller.set_wheel_acceleration_limit_m_s2(0.51)
+    assert controller.wheel_acceleration_limit_m_s2 == pytest.approx(0.51)
+
+    with pytest.raises(ValueError, match="acceleration_m_s2"):
+        controller.set_wheel_acceleration_limit_m_s2(0.0)
 
 
 def test_motion_limits_reject_instead_of_clamping() -> None:

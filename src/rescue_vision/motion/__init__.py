@@ -45,6 +45,11 @@ from rescue_vision.motion.recording import (
     ManualMotionLogWriter,
     inspect_manual_motion_log,
 )
+from rescue_vision.motion.d2_safe_zone_telemetry import (
+    MATCH_D2_TELEMETRY_DEFAULT_QUEUE_CAPACITY,
+    MATCH_D2_TELEMETRY_STAGE,
+    D2TelemetryLogger,
+)
 
 __all__ = [
     "CarCommandReply",
@@ -63,6 +68,9 @@ __all__ = [
     "MANUAL_MOTION_LOG_FILENAME",
     "MANUAL_MOTION_STREAM_NAME",
     "ManualMotionLogWriter",
+    "MATCH_D2_TELEMETRY_DEFAULT_QUEUE_CAPACITY",
+    "MATCH_D2_TELEMETRY_STAGE",
+    "D2TelemetryLogger",
     "MessageType",
     "OdometryImu",
     "ParsedCarMessage",

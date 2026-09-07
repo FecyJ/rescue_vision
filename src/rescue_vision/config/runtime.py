@@ -765,186 +765,285 @@ class ClusterBreakupRuntimeConfig:
                 raise ValueError(f"{name} must be a positive integer.")
 
 
+
+
 @dataclass(frozen=True, slots=True)
-class Simulation20PointRuntimeConfig:
-    """单车四次绿色物资转运的受限模拟赛参数。"""
+class MatchRuntimeConfig:
+    """固定启动、解团循环和绿色物资转运的 正式策略参数。"""
 
     enabled: bool
-    target_delivery_count: int
-    prepush_offset_mm: float
-    robot_footprint_radius_mm: float
-    target_half_extent_mm: float
-    safety_margin_mm: float
-    delivery_inset_mm: float
-    max_position_uncertainty_mm: float
-    max_heading_uncertainty_rad: float
-    target_max_age_ms: float
-    scan_min_heading_span_rad: float
-    scan_angular_velocity_rad_s: float
-    navigation_speed_m_s: float
-    navigation_angular_kp_rad_s: float
-    navigation_max_angular_velocity_rad_s: float
-    navigation_position_tolerance_mm: float
-    navigation_heading_tolerance_rad: float
-    approach_speed_m_s: float
-    alignment_kp_rad_s: float
-    alignment_max_angular_velocity_rad_s: float
-    engage_distance_mm: float
-    engage_lateral_tolerance_mm: float
-    contact_corridor_length_mm: float
-    push_speed_m_s: float
-    push_angular_kp_rad_s: float
-    push_max_angular_velocity_rad_s: float
-    retreat_speed_m_s: float
-    retreat_distance_m: float
-    retreat_clear_distance_mm: float
-    delivery_confirm_frames: int
-    disengage_confirm_frames: int
-    max_breakup_attempts_per_delivery: int
-    max_breakup_attempts_total: int
-    breakup_settle_confirm_frames: int
-    min_green_clearance_mm: float
-    corridor_sample_step_mm: float
-    completed_target_exclusion_mm: float
-    # 首次解团的固定前推距离；后续重复解团继续使用 motion.cluster_breakup 的值。
-    first_breakup_distance_m: float = 0.5
-    # 每次解团退离后，是否执行“面向己方安全区—距安全区线 300 mm—视觉校准”。
-    safe_zone_calibration_enabled: bool = False
-    safe_zone_calibration_distance_mm: float = 300.0
-    safe_zone_calibration_position_tolerance_mm: float = 50.0
-    safe_zone_calibration_heading_tolerance_rad: float = 0.12
-    safe_zone_calibration_speed_m_s: float = 0.05
-    safe_zone_calibration_angular_kp_rad_s: float = 1.0
-    safe_zone_calibration_max_angular_velocity_rad_s: float = 0.35
-    safe_zone_calibration_timeout_s: float = 15.0
-    # Front-grab transport experiment: an isolated green supply is approached
-    # from the front (gripper open, straight forward, close) instead of the
-    # back-side prepush, then the robot reorients toward the own-material zone
-    # and pushes. Opt-in so direct dataclass construction keeps legacy behavior.
-    front_grab_enabled: bool = False
-    isolated_green_clearance_mm: float = 200.0
-    # 正面抓取合爪后，块在夹爪内的固定前向偏移，单位 mm；横向固定为 0。
-    # 用于块被遮挡后按机器人位姿推算其场地点，不再依赖视觉目标。
-    front_grab_block_forward_mm: float = 65.0
-    # Initial non-visual positioning maneuver.  It is opt-in so callers that
-    # construct this dataclass directly retain the previous deterministic
-    # test behavior; the production simulation config enables it explicitly.
-    startup_maneuver_enabled: bool = False
-    startup_turn_angle_rad: float = math.radians(40.0)
-    startup_turn_angular_velocity_rad_s: float = -0.35
-    startup_forward_distance_m: float = 1.0
-    startup_forward_speed_m_s: float = 0.15
-    startup_motion_phase_timeout_s: float = 15.0
-    # State-transition dwell time.  Keep the direct-construction default at
-    # zero for replay/tests; production configs can enable a hardware pause.
+    robot_footprint_radius_mm: float = 160.0
+    safety_margin_mm: float = 80.0
+    startup_turn_angle_rad: float = math.radians(45.0)
+    startup_turn_angular_velocity_rad_s: float = -0.30
+    startup_turn_settle_time_s: float = 0.5
+    startup_forward_distance_m: float = 1.2
+    startup_forward_speed_m_s: float = 0.12
+    startup_forward_settle_time_s: float = 0.5
+    startup_straight_pid_kp_rad_s_per_m_s: float = 0.0
+    startup_straight_pid_ki_rad_s_per_m: float = 0.0
+    startup_straight_pid_kd_rad_s_per_m_s2: float = 0.0
+    startup_straight_pid_integral_limit: float = 0.10
+    startup_straight_pid_deadband_m_s: float = 0.0
+    startup_straight_pid_max_angular_velocity_rad_s: float = 0.12
+    cluster_search_angular_velocity_rad_s: float = -0.30
+    cluster_search_sweep_angle_rad: float = 2.0 * math.pi
+    cluster_min_detections: int = 2
+    cluster_group_ground_mm: float = 250.0
+    cluster_breakup_standoff_mm: float = 260.0
+    cluster_approach_speed_m_s: float = 0.12
+    cluster_align_tolerance_rad: float = 0.10
+    cluster_align_hold_ms: float = 500.0
+    cluster_align_kp_rad_s: float = 1.0
+    cluster_align_max_angular_velocity_rad_s: float = 0.35
+    cluster_relocate_distance_m: float = 0.30
+    cluster_relocate_speed_m_s: float = 0.10
+    # 正式流程 专用：搜索目标团时，可靠的单个绿色普通物资可以抢占解团流程。
+    # 正式运行配置显式开启；纯逻辑调用方可按场景关闭。
+    opportunistic_single_green_enabled: bool = False
+    # 目标周围该半径内不能有其它新鲜轨迹，单位 mm；需结合目标尺寸和
+    # GroundPoint 实测误差现场复核。
+    opportunistic_single_green_clearance_mm: float = 120.0
+    # 正式流程 绿色目标的远距离二次对准距离：第一次对准后先接近到距目标
+    # 该距离，再停车重新取样并旋转对准，单位 mm；机会抓取开关不影响该门禁。
+    opportunistic_single_green_realign_standoff_mm: float = 350.0
+    breakup_forward_distance_m: float = 0.7
+    breakup_forward_speed_m_s: float = 0.40
+    breakup_backward_distance_m: float = 0.2
+    breakup_backward_speed_m_s: float = 0.08
+    close_gripper_spin_angular_velocity_rad_s: float = -0.30
+    spin_angle_rad: float = 2.0 * math.pi
+    green_path_half_width_mm: float = 50.0
+    green_max_age_ms: float = 500.0
+    green_align_hold_ms: float = 500.0
+    green_alignment_tolerance_mm: float = 10.0
+    green_alignment_kp_rad_s: float = 1.0
+    green_alignment_max_angular_velocity_rad_s: float = 0.35
+    green_approach_speed_m_s: float = 0.08
+    green_grab_offset_mm: float = 60.0
+    # 正式流程 到达抓取偏移后，以车体原点为中心复核绿色物资，不要求目标在车前，单位 mm。
+    green_preclose_recheck_range_mm: float = 200.0
+    # 正式流程 到位停车后保持局部张爪并等待新鲜目标确认的时间，单位 ms。
+    green_preclose_recheck_hold_ms: float = 500.0
+    # 正式流程 本次闭爪最多携带的绿色物块总数；2 表示最多复核并收入 1 个额外物块。
+    green_preclose_max_carried_blocks: int = 2
+    transport_rotate_angular_velocity_rad_s: float = 0.30
+    transport_align_tolerance_mm: float = 30.0
+    # 普通 正式流程的单段安全区运输速度，单位 m/s。
+    # 正式流程 安全区三段直行速度，分别为夹取后→d1、d1→d2、d2→末段，单位 m/s。
+    safe_zone_grab_to_d1_speed_m_s: float = 0.08
+    safe_zone_d1_to_d2_speed_m_s: float = 0.08
+    safe_zone_d2_to_final_speed_m_s: float = 0.08
+    # 正式流程 d2→安全区末端的临时单轮最大加速度；None 继承 motion 全局值。
+    safe_zone_d2_to_final_max_wheel_acceleration_m_s2: float | None = None
+    # 解团目标对准达到起始间距后，先完全停车再开始推散。
+    breakup_settle_time_s: float = 0.5
+    # 正式流程 每个转向/直行动作切换前的零速保持时间；纯逻辑默认 0，真机配置应
+    # 显式设置为现场允许的停顿，例如 0.3 s。
     action_settle_time_s: float = 0.0
+    # 解团地图的物理半幅和夹爪前端偏移；解团中点必须落在两者相减后的范围内。
+    breakup_field_half_extent_mm: float = 1500.0
+    breakup_gripper_offset_mm: float = 200.0
+    # 安全区扫描失败后的 FieldPoint 导航目标；这是动作航点，不替代静态地图
+    # 中记录的安全区几何地标。
+    safe_zone_fallback_target_field: FieldPoint = FieldPoint(-165.0, 1440.0)
+    # 安全区一圈扫描失败后的静态地图角点接近；重新看到己方安全区即返回
+    # TRANSPORT_ALIGN_RED_ZONE，未在最大距离内看到则安全停车。
+    safe_zone_fallback_heading_tolerance_rad: float = 0.20
+    safe_zone_fallback_heading_kp_rad_s: float = 1.0
+    safe_zone_fallback_max_angular_velocity_rad_s: float = 0.30
+    safe_zone_calibration_start_offset_mm: float = 500.0
+    safe_zone_open_offset_mm: float = 137.0
+    # 正式流程 夹取后→d1、d1→d2 直线段的软刹车过冲，使用带符号的
+    # FieldPoint 分量（mm）。正值表示刹车后仍向对应的场地正轴方向移动，
+    # 策略会把停车目标向反方向提前。
+    safe_zone_d2_braking_overrun_x_mm: float = 0.0
+    safe_zone_d2_braking_overrun_y_mm: float = 0.0
+    # 正式流程 d2→末段的固定刹车过冲提前量，正值表示向 +y 方向过冲，单位 mm。
+    safe_zone_d2_to_final_braking_overrun_mm: float = 0.0
+    safe_zone_calibration_stop_speed_threshold_m_s: float = 0.02
+    safe_zone_calibration_stop_confirm_time_s: float = 0.30
+    # 正式流程 match flow: independent reverse distance after delivery before
+    # re-arming cluster search, in metres.
+    safe_zone_exit_distance_m: float = 0.30
+    # 正式流程 match flow: clockwise turn magnitude after exiting the safe zone.
+    safe_zone_exit_turn_angle_rad: float = math.pi
+    required_transports: int = 4
+    return_backup_speed_m_s: float = 0.08
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
             raise ValueError("enabled must be a boolean.")
-        if (
-            isinstance(self.target_delivery_count, bool)
-            or not isinstance(self.target_delivery_count, int)
-            or self.target_delivery_count != 4
-        ):
+        if not isinstance(self.opportunistic_single_green_enabled, bool):
             raise ValueError(
-                "target_delivery_count must be exactly 4 for the 20-point flow."
+                "opportunistic_single_green_enabled must be a boolean."
+            )
+        if not isinstance(self.safe_zone_fallback_target_field, FieldPoint):
+            raise ValueError(
+                "safe_zone_fallback_target_field must be a FieldPoint."
             )
         for name in (
-            "prepush_offset_mm",
             "robot_footprint_radius_mm",
-            "target_half_extent_mm",
             "safety_margin_mm",
-            "delivery_inset_mm",
-            "max_position_uncertainty_mm",
-            "max_heading_uncertainty_rad",
-            "target_max_age_ms",
-            "scan_min_heading_span_rad",
-            "navigation_speed_m_s",
-            "navigation_angular_kp_rad_s",
-            "navigation_max_angular_velocity_rad_s",
-            "navigation_position_tolerance_mm",
-            "navigation_heading_tolerance_rad",
-            "approach_speed_m_s",
-            "alignment_kp_rad_s",
-            "alignment_max_angular_velocity_rad_s",
-            "engage_distance_mm",
-            "engage_lateral_tolerance_mm",
-            "contact_corridor_length_mm",
-            "push_speed_m_s",
-            "push_angular_kp_rad_s",
-            "push_max_angular_velocity_rad_s",
-            "retreat_speed_m_s",
-            "retreat_distance_m",
-            "retreat_clear_distance_mm",
-            "min_green_clearance_mm",
-            "corridor_sample_step_mm",
-            "completed_target_exclusion_mm",
-            "first_breakup_distance_m",
-            "safe_zone_calibration_distance_mm",
-            "safe_zone_calibration_position_tolerance_mm",
-            "safe_zone_calibration_heading_tolerance_rad",
-            "safe_zone_calibration_speed_m_s",
-            "safe_zone_calibration_angular_kp_rad_s",
-            "safe_zone_calibration_max_angular_velocity_rad_s",
-            "safe_zone_calibration_timeout_s",
-            "isolated_green_clearance_mm",
-            "front_grab_block_forward_mm",
             "startup_turn_angle_rad",
+            "startup_turn_settle_time_s",
             "startup_forward_distance_m",
             "startup_forward_speed_m_s",
-            "startup_motion_phase_timeout_s",
+            "startup_forward_settle_time_s",
+            "startup_straight_pid_integral_limit",
+            "startup_straight_pid_max_angular_velocity_rad_s",
+            "cluster_group_ground_mm",
+            "cluster_breakup_standoff_mm",
+            "cluster_approach_speed_m_s",
+            "cluster_align_tolerance_rad",
+            "cluster_align_hold_ms",
+            "cluster_align_kp_rad_s",
+            "cluster_align_max_angular_velocity_rad_s",
+            "cluster_relocate_distance_m",
+            "cluster_relocate_speed_m_s",
+            "cluster_search_sweep_angle_rad",
+            "opportunistic_single_green_clearance_mm",
+            "opportunistic_single_green_realign_standoff_mm",
+            "breakup_forward_distance_m",
+            "breakup_forward_speed_m_s",
+            "breakup_backward_distance_m",
+            "breakup_backward_speed_m_s",
+            "spin_angle_rad",
+            "green_path_half_width_mm",
+            "green_max_age_ms",
+            "green_align_hold_ms",
+            "green_alignment_tolerance_mm",
+            "green_alignment_kp_rad_s",
+            "green_alignment_max_angular_velocity_rad_s",
+            "green_approach_speed_m_s",
+            "green_grab_offset_mm",
+            "green_preclose_recheck_range_mm",
+            "green_preclose_recheck_hold_ms",
+            "transport_rotate_angular_velocity_rad_s",
+            "transport_align_tolerance_mm",
+            "safe_zone_grab_to_d1_speed_m_s",
+            "safe_zone_d1_to_d2_speed_m_s",
+            "safe_zone_d2_to_final_speed_m_s",
+            "breakup_settle_time_s",
+            "breakup_field_half_extent_mm",
+            "breakup_gripper_offset_mm",
+            "safe_zone_fallback_heading_tolerance_rad",
+            "safe_zone_fallback_heading_kp_rad_s",
+            "safe_zone_fallback_max_angular_velocity_rad_s",
+            "safe_zone_calibration_start_offset_mm",
+            "safe_zone_open_offset_mm",
+            "safe_zone_calibration_stop_speed_threshold_m_s",
+            "safe_zone_calibration_stop_confirm_time_s",
+            "safe_zone_exit_distance_m",
+            "safe_zone_exit_turn_angle_rad",
+            "return_backup_speed_m_s",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive.")
+        if self.safe_zone_d2_to_final_max_wheel_acceleration_m_s2 is not None:
+            acceleration = self.safe_zone_d2_to_final_max_wheel_acceleration_m_s2
+            if (
+                isinstance(acceleration, bool)
+                or not isinstance(acceleration, (int, float))
+                or not math.isfinite(float(acceleration))
+                or float(acceleration) <= 0.0
+            ):
+                raise ValueError(
+                    "safe_zone_d2_to_final_max_wheel_acceleration_m_s2 must be "
+                    "finite and positive, or None."
+                )
         if (
             not math.isfinite(float(self.action_settle_time_s))
             or float(self.action_settle_time_s) < 0.0
         ):
-            raise ValueError("action_settle_time_s must be finite and non-negative.")
-        if not isinstance(self.startup_maneuver_enabled, bool):
-            raise ValueError("startup_maneuver_enabled must be a boolean.")
-        if not isinstance(self.front_grab_enabled, bool):
-            raise ValueError("front_grab_enabled must be a boolean.")
-        if not isinstance(self.safe_zone_calibration_enabled, bool):
-            raise ValueError("safe_zone_calibration_enabled must be a boolean.")
-        startup_turn_velocity = float(self.startup_turn_angular_velocity_rad_s)
-        if not math.isfinite(startup_turn_velocity) or abs(startup_turn_velocity) < 0.001:
             raise ValueError(
-                "startup_turn_angular_velocity_rad_s must be a finite angular "
-                f"velocity with |value| >= 0.001, got {self.startup_turn_angular_velocity_rad_s!r}."
+                "action_settle_time_s must be finite and non-negative."
+            )
+        if self.breakup_gripper_offset_mm >= self.breakup_field_half_extent_mm:
+            raise ValueError(
+                "breakup_gripper_offset_mm must be smaller than "
+                "breakup_field_half_extent_mm."
+            )
+        if (
+            isinstance(self.green_preclose_max_carried_blocks, bool)
+            or not isinstance(self.green_preclose_max_carried_blocks, int)
+            or self.green_preclose_max_carried_blocks <= 0
+        ):
+            raise ValueError(
+                "green_preclose_max_carried_blocks must be a positive integer, "
+                f"got {self.green_preclose_max_carried_blocks!r}."
+            )
+        for name in (
+            "startup_turn_angular_velocity_rad_s",
+            "cluster_search_angular_velocity_rad_s",
+            "close_gripper_spin_angular_velocity_rad_s",
+        ):
+            value = float(getattr(self, name))
+            if abs(value) < 0.001:
+                raise ValueError(f"{name} must have |value| >= 0.001 rad/s.")
+        for name in (
+            "startup_straight_pid_kp_rad_s_per_m_s",
+            "startup_straight_pid_ki_rad_s_per_m",
+            "startup_straight_pid_kd_rad_s_per_m_s2",
+            "startup_straight_pid_deadband_m_s",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative.")
+        for name in (
+            "safe_zone_d2_braking_overrun_x_mm",
+            "safe_zone_d2_braking_overrun_y_mm",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite.")
+        if (
+            not math.isfinite(float(self.safe_zone_d2_to_final_braking_overrun_mm))
+            or self.safe_zone_d2_to_final_braking_overrun_mm < 0.0
+        ):
+            raise ValueError(
+                "safe_zone_d2_to_final_braking_overrun_mm must be finite and "
+                "non-negative."
             )
         if self.startup_turn_angle_rad >= 2.0 * math.pi:
             raise ValueError("startup_turn_angle_rad must be smaller than 2*pi.")
-        scan_velocity = float(self.scan_angular_velocity_rad_s)
-        if not math.isfinite(scan_velocity) or abs(scan_velocity) < 0.001:
+        if self.spin_angle_rad > 2.0 * math.pi:
+            raise ValueError("spin_angle_rad must be <= 2*pi.")
+        if self.cluster_search_sweep_angle_rad > 2.0 * math.pi:
+            raise ValueError("cluster_search_sweep_angle_rad must be <= 2*pi.")
+        if self.safe_zone_exit_turn_angle_rad > math.pi:
+            raise ValueError("safe_zone_exit_turn_angle_rad must be <= pi.")
+        for name in (
+            "startup_straight_pid_kp_rad_s_per_m_s",
+            "startup_straight_pid_ki_rad_s_per_m",
+            "startup_straight_pid_kd_rad_s_per_m_s2",
+            "startup_straight_pid_integral_limit",
+            "startup_straight_pid_deadband_m_s",
+        ):
+            if float(getattr(self, name)) < 0.0:
+                raise ValueError(f"{name} must be non-negative.")
+        if self.cluster_align_tolerance_rad >= math.pi:
+            raise ValueError("cluster_align_tolerance_rad must be less than pi.")
+        if (
+            self.opportunistic_single_green_realign_standoff_mm
+            <= self.green_grab_offset_mm
+        ):
             raise ValueError(
-                "scan_angular_velocity_rad_s must be a finite angular velocity "
-                f"with |value| >= 0.001 rad/s (positive means left turn), "
-                f"got {self.scan_angular_velocity_rad_s!r}."
+                "opportunistic_single_green_realign_standoff_mm must be greater "
+                "than green_grab_offset_mm."
             )
         for name in (
-            "delivery_confirm_frames",
-            "disengage_confirm_frames",
-            "max_breakup_attempts_per_delivery",
-            "max_breakup_attempts_total",
-            "breakup_settle_confirm_frames",
+            "cluster_min_detections",
+            "required_transports",
         ):
             value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+            ):
                 raise ValueError(f"{name} must be a positive integer.")
-        if self.max_heading_uncertainty_rad >= math.pi:
-            raise ValueError("max_heading_uncertainty_rad must be less than pi.")
-        if self.navigation_heading_tolerance_rad >= math.pi:
-            raise ValueError(
-                "navigation_heading_tolerance_rad must be less than pi."
-            )
-        if self.navigation_position_tolerance_mm >= self.prepush_offset_mm:
-            raise ValueError(
-                "navigation_position_tolerance_mm must be smaller than "
-                "prepush_offset_mm."
-            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1005,6 +1104,9 @@ class MotionRuntimeConfig:
     max_angular_velocity_rad_s: float
     max_wheel_velocity_m_s: float
     max_wheel_acceleration_m_s2: float
+    min_wheel_velocity_m_s: float
+    left_wheel_speed_weight: float
+    right_wheel_speed_weight: float
     max_remote_command_valid_for_ms: int
     synchronization_timeout_s: float
     stall_guard_enabled: bool
@@ -1038,6 +1140,9 @@ class MotionRuntimeConfig:
                 max_wheel_acceleration_m_s2=(
                     self.max_wheel_acceleration_m_s2
                 ),
+                min_wheel_velocity_m_s=self.min_wheel_velocity_m_s,
+                left_wheel_speed_weight=self.left_wheel_speed_weight,
+                right_wheel_speed_weight=self.right_wheel_speed_weight,
                 max_remote_command_valid_for_ms=(
                     self.max_remote_command_valid_for_ms
                 ),
@@ -1221,7 +1326,7 @@ class AppConfig:
     uart: UartConfig
     remote: RemoteConfig
     motion: MotionRuntimeConfig
-    simulation_20_point: Simulation20PointRuntimeConfig
+    match: MatchRuntimeConfig
     tracking: TrackingConfig
     world: WorldRuntimeConfig
     mission: MissionConfig
@@ -1375,18 +1480,31 @@ class AppConfig:
             fusion=fusion,
         )
 
-    def build_simulation_20_point_sequence(self) -> Simulation20PointSequence:
-        """按本配置装配受限 20 分模拟赛纯逻辑流程。"""
+    def build_match_sequence(self) -> MatchSequence:
+        """按本配置装配 正式动作策略纯逻辑流程。"""
 
-        if not self.simulation_20_point.enabled:
+        if not self.match.enabled:
             raise RuntimeError(
-                "simulation_20_point.enabled must be true to build the flow."
+                "match.enabled must be true to build the flow."
             )
-        from rescue_vision.app.simulation_20_point import (
-            Simulation20PointSequence,
+        from rescue_vision.app.match import MatchSequence
+
+        return MatchSequence.from_app_config(self)
+
+    def build_grab_transport_sequence(
+        self,
+    ) -> GrabTransportSequence:
+        """装配不含解团的 正式流程 绿色夹取—运输测试流程。"""
+
+        if not self.match.enabled:
+            raise RuntimeError(
+                "match.enabled must be true to build the flow."
+            )
+        from rescue_vision.app.grab_transport import (
+            GrabTransportSequence,
         )
 
-        return Simulation20PointSequence.from_app_config(self)
+        return GrabTransportSequence.from_app_config(self)
 
 
 def load_runtime_config(path: str | Path) -> AppConfig:
@@ -1405,7 +1523,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "uart",
             "remote",
             "motion",
-            "simulation_20_point",
+            "match",
             "tracking",
             "world",
             "mission",
@@ -1648,6 +1766,9 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "max_angular_velocity_rad_s",
             "max_wheel_velocity_m_s",
             "max_wheel_acceleration_m_s2",
+            "min_wheel_velocity_m_s",
+            "left_wheel_speed_weight",
+            "right_wheel_speed_weight",
             "max_remote_command_valid_for_ms",
             "synchronization_timeout_s",
             "stall_guard",
@@ -1711,7 +1832,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     if stall_guard_timeout_ms > 5_000:
         raise ValueError("motion.stall_guard.timeout_ms must be <= 5000.")
     stall_guard_min_command_speed_m_s = _finite_float(
-        stall_guard_raw.get("min_command_speed_m_s", 0.01),
+        stall_guard_raw.get("min_command_speed_m_s", 0.02),
         "motion.stall_guard.min_command_speed_m_s",
         minimum=0.001,
     )
@@ -2005,6 +2126,22 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "post_breakup_retreat_enabled", True
         ),
     )
+    max_wheel_velocity_m_s = _finite_float(
+        motion_raw.get("max_wheel_velocity_m_s", 0.30),
+        "motion.max_wheel_velocity_m_s",
+        minimum=0.001,
+    )
+    min_wheel_velocity_m_s = _finite_float(
+        motion_raw.get("min_wheel_velocity_m_s", 0.02),
+        "motion.min_wheel_velocity_m_s",
+        minimum=0.001,
+    )
+    if min_wheel_velocity_m_s > max_wheel_velocity_m_s:
+        raise ValueError(
+            "motion.min_wheel_velocity_m_s must not exceed "
+            "motion.max_wheel_velocity_m_s, got "
+            f"{min_wheel_velocity_m_s!r} > {max_wheel_velocity_m_s!r}."
+        )
     motion = MotionRuntimeConfig(
         enabled=motion_enabled,
         wheel_track_m=wheel_track_m,
@@ -2018,14 +2155,21 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "motion.max_angular_velocity_rad_s",
             minimum=0.001,
         ),
-        max_wheel_velocity_m_s=_finite_float(
-            motion_raw.get("max_wheel_velocity_m_s", 0.30),
-            "motion.max_wheel_velocity_m_s",
-            minimum=0.001,
-        ),
+        max_wheel_velocity_m_s=max_wheel_velocity_m_s,
         max_wheel_acceleration_m_s2=_finite_float(
             motion_raw.get("max_wheel_acceleration_m_s2", 0.50),
             "motion.max_wheel_acceleration_m_s2",
+            minimum=0.001,
+        ),
+        min_wheel_velocity_m_s=min_wheel_velocity_m_s,
+        left_wheel_speed_weight=_finite_float(
+            motion_raw.get("left_wheel_speed_weight", 1.0),
+            "motion.left_wheel_speed_weight",
+            minimum=0.001,
+        ),
+        right_wheel_speed_weight=_finite_float(
+            motion_raw.get("right_wheel_speed_weight", 1.0),
+            "motion.right_wheel_speed_weight",
             minimum=0.001,
         ),
         max_remote_command_valid_for_ms=max_remote_validity,
@@ -2068,266 +2212,391 @@ def load_runtime_config(path: str | Path) -> AppConfig:
                     "motion.max_angular_velocity_rad_s."
                 )
 
-    simulation_raw = _mapping(
-        root.get("simulation_20_point", {}),
-        "simulation_20_point",
+    match_raw = _mapping(
+        root.get("match", {}),
+        "match",
     )
-    simulation_keys = {
-        "enabled",
-        "target_delivery_count",
-        "prepush_offset_mm",
+    match_keys = {
         "robot_footprint_radius_mm",
-        "target_half_extent_mm",
         "safety_margin_mm",
-        "delivery_inset_mm",
-        "max_position_uncertainty_mm",
-        "max_heading_uncertainty_rad",
-        "target_max_age_ms",
-        "scan_min_heading_span_rad",
-        "scan_angular_velocity_rad_s",
-        "navigation_speed_m_s",
-        "navigation_angular_kp_rad_s",
-        "navigation_max_angular_velocity_rad_s",
-        "navigation_position_tolerance_mm",
-        "navigation_heading_tolerance_rad",
-        "approach_speed_m_s",
-        "alignment_kp_rad_s",
-        "alignment_max_angular_velocity_rad_s",
-        "engage_distance_mm",
-        "engage_lateral_tolerance_mm",
-        "contact_corridor_length_mm",
-        "push_speed_m_s",
-        "push_angular_kp_rad_s",
-        "push_max_angular_velocity_rad_s",
-        "retreat_speed_m_s",
-        "retreat_distance_m",
-        "retreat_clear_distance_mm",
-        "delivery_confirm_frames",
-        "disengage_confirm_frames",
-        "max_breakup_attempts_per_delivery",
-        "max_breakup_attempts_total",
-        "breakup_settle_confirm_frames",
-        "min_green_clearance_mm",
-        "corridor_sample_step_mm",
-        "completed_target_exclusion_mm",
-        "first_breakup_distance_m",
-        "safe_zone_calibration_enabled",
-        "safe_zone_calibration_distance_mm",
-        "safe_zone_calibration_position_tolerance_mm",
-        "safe_zone_calibration_heading_tolerance_rad",
-        "safe_zone_calibration_speed_m_s",
-        "safe_zone_calibration_angular_kp_rad_s",
-        "safe_zone_calibration_max_angular_velocity_rad_s",
-        "safe_zone_calibration_timeout_s",
-        "front_grab_enabled",
-        "isolated_green_clearance_mm",
-        "front_grab_block_forward_mm",
-        "startup_maneuver_enabled",
+        "enabled",
         "startup_turn_angle_rad",
         "startup_turn_angular_velocity_rad_s",
+        "startup_turn_settle_time_s",
         "startup_forward_distance_m",
         "startup_forward_speed_m_s",
-        "startup_motion_phase_timeout_s",
+        "startup_forward_settle_time_s",
+        "startup_straight_pid_kp_rad_s_per_m_s",
+        "startup_straight_pid_ki_rad_s_per_m",
+        "startup_straight_pid_kd_rad_s_per_m_s2",
+        "startup_straight_pid_integral_limit",
+        "startup_straight_pid_deadband_m_s",
+        "startup_straight_pid_max_angular_velocity_rad_s",
+        "cluster_search_angular_velocity_rad_s",
+        "cluster_search_sweep_angle_rad",
+        "cluster_min_detections",
+        "cluster_group_ground_mm",
+        "cluster_breakup_standoff_mm",
+        "cluster_approach_speed_m_s",
+        "cluster_align_tolerance_rad",
+        "cluster_align_hold_ms",
+        "cluster_align_kp_rad_s",
+        "cluster_align_max_angular_velocity_rad_s",
+        "cluster_relocate_distance_m",
+        "cluster_relocate_speed_m_s",
+        "opportunistic_single_green_enabled",
+        "opportunistic_single_green_clearance_mm",
+        "opportunistic_single_green_realign_standoff_mm",
+        "breakup_forward_distance_m",
+        "breakup_forward_speed_m_s",
+        "breakup_backward_distance_m",
+        "breakup_backward_speed_m_s",
+        "close_gripper_spin_angular_velocity_rad_s",
+        "spin_angle_rad",
+        "green_path_half_width_mm",
+        "green_max_age_ms",
+        "green_align_hold_ms",
+        "green_alignment_tolerance_mm",
+        "green_alignment_kp_rad_s",
+        "green_alignment_max_angular_velocity_rad_s",
+        "green_approach_speed_m_s",
+        "green_grab_offset_mm",
+        "green_preclose_recheck_range_mm",
+        "green_preclose_recheck_hold_ms",
+        "green_preclose_max_carried_blocks",
+        "transport_rotate_angular_velocity_rad_s",
+        "transport_align_tolerance_mm",
+        "safe_zone_grab_to_d1_speed_m_s",
+        "safe_zone_d1_to_d2_speed_m_s",
+        "safe_zone_d2_to_final_speed_m_s",
+        "safe_zone_d2_to_final_max_wheel_acceleration_m_s2",
+        "breakup_settle_time_s",
         "action_settle_time_s",
+        "breakup_field_half_extent_mm",
+        "breakup_gripper_offset_mm",
+        "safe_zone_fallback_target_field_mm",
+        "safe_zone_fallback_heading_tolerance_rad",
+        "safe_zone_fallback_heading_kp_rad_s",
+        "safe_zone_fallback_max_angular_velocity_rad_s",
+        "safe_zone_calibration_start_offset_mm",
+        "safe_zone_open_offset_mm",
+        "safe_zone_d2_braking_overrun_x_mm",
+        "safe_zone_d2_braking_overrun_y_mm",
+        "safe_zone_d2_to_final_braking_overrun_mm",
+        "safe_zone_calibration_stop_speed_threshold_m_s",
+        "safe_zone_calibration_stop_confirm_time_s",
+        "safe_zone_exit_distance_m",
+        "safe_zone_exit_turn_angle_rad",
+        "required_transports",
+        "return_backup_speed_m_s",
     }
-    _reject_unknown(simulation_raw, simulation_keys, "simulation_20_point")
-    simulation_enabled = simulation_raw.get("enabled", False)
-    if not isinstance(simulation_enabled, bool):
-        raise ValueError("simulation_20_point.enabled must be a boolean.")
+    _reject_unknown(match_raw, match_keys, "match")
+    match_enabled = match_raw.get("enabled", False)
+    if not isinstance(match_enabled, bool):
+        raise ValueError("match.enabled must be a boolean.")
+    opportunistic_single_green_enabled = match_raw.get(
+        "opportunistic_single_green_enabled", False
+    )
+    if not isinstance(opportunistic_single_green_enabled, bool):
+        raise ValueError(
+            "match.opportunistic_single_green_enabled must be "
+            "a boolean."
+        )
 
-    def simulation_float(name: str, default: float) -> float:
+    def match_float(name: str, default: float) -> float:
         return _finite_float(
-            simulation_raw.get(name, default),
-            f"simulation_20_point.{name}",
+            match_raw.get(name, default),
+            f"match.{name}",
             minimum=0.001,
         )
 
-    simulation_20_point = Simulation20PointRuntimeConfig(
-        enabled=simulation_enabled,
-        target_delivery_count=_positive_int(
-            simulation_raw.get("target_delivery_count", 4),
-            "simulation_20_point.target_delivery_count",
-        ),
-        prepush_offset_mm=simulation_float("prepush_offset_mm", 180.0),
-        robot_footprint_radius_mm=simulation_float(
-            "robot_footprint_radius_mm", 160.0
-        ),
-        target_half_extent_mm=simulation_float("target_half_extent_mm", 25.0),
-        safety_margin_mm=simulation_float("safety_margin_mm", 80.0),
-        delivery_inset_mm=simulation_float("delivery_inset_mm", 35.0),
-        max_position_uncertainty_mm=simulation_float(
-            "max_position_uncertainty_mm", 120.0
-        ),
-        max_heading_uncertainty_rad=simulation_float(
-            "max_heading_uncertainty_rad", 0.20
-        ),
-        target_max_age_ms=simulation_float("target_max_age_ms", 250.0),
-        scan_min_heading_span_rad=simulation_float(
-            "scan_min_heading_span_rad", 2.0 * math.pi
-        ),
-        scan_angular_velocity_rad_s=_signed_angular_velocity(
-            simulation_raw.get("scan_angular_velocity_rad_s", 0.30),
-            "simulation_20_point.scan_angular_velocity_rad_s",
-        ),
-        navigation_speed_m_s=simulation_float("navigation_speed_m_s", 0.12),
-        navigation_angular_kp_rad_s=simulation_float(
-            "navigation_angular_kp_rad_s", 1.0
-        ),
-        navigation_max_angular_velocity_rad_s=simulation_float(
-            "navigation_max_angular_velocity_rad_s", 0.45
-        ),
-        navigation_position_tolerance_mm=simulation_float(
-            "navigation_position_tolerance_mm", 40.0
-        ),
-        navigation_heading_tolerance_rad=simulation_float(
-            "navigation_heading_tolerance_rad", 0.10
-        ),
-        approach_speed_m_s=simulation_float("approach_speed_m_s", 0.08),
-        alignment_kp_rad_s=simulation_float("alignment_kp_rad_s", 1.2),
-        alignment_max_angular_velocity_rad_s=simulation_float(
-            "alignment_max_angular_velocity_rad_s", 0.35
-        ),
-        engage_distance_mm=simulation_float("engage_distance_mm", 90.0),
-        engage_lateral_tolerance_mm=simulation_float(
-            "engage_lateral_tolerance_mm", 35.0
-        ),
-        contact_corridor_length_mm=simulation_float(
-            "contact_corridor_length_mm", 140.0
-        ),
-        push_speed_m_s=simulation_float("push_speed_m_s", 0.07),
-        push_angular_kp_rad_s=simulation_float("push_angular_kp_rad_s", 0.8),
-        push_max_angular_velocity_rad_s=simulation_float(
-            "push_max_angular_velocity_rad_s", 0.25
-        ),
-        retreat_speed_m_s=simulation_float("retreat_speed_m_s", 0.08),
-        retreat_distance_m=simulation_float("retreat_distance_m", 0.20),
-        retreat_clear_distance_mm=simulation_float(
-            "retreat_clear_distance_mm", 180.0
-        ),
-        delivery_confirm_frames=_positive_int(
-            simulation_raw.get("delivery_confirm_frames", 3),
-            "simulation_20_point.delivery_confirm_frames",
-        ),
-        disengage_confirm_frames=_positive_int(
-            simulation_raw.get("disengage_confirm_frames", 3),
-            "simulation_20_point.disengage_confirm_frames",
-        ),
-        max_breakup_attempts_per_delivery=_positive_int(
-            simulation_raw.get("max_breakup_attempts_per_delivery", 4),
-            "simulation_20_point.max_breakup_attempts_per_delivery",
-        ),
-        max_breakup_attempts_total=_positive_int(
-            simulation_raw.get("max_breakup_attempts_total", 8),
-            "simulation_20_point.max_breakup_attempts_total",
-        ),
-        breakup_settle_confirm_frames=_positive_int(
-            simulation_raw.get("breakup_settle_confirm_frames", 3),
-            "simulation_20_point.breakup_settle_confirm_frames",
-        ),
-        min_green_clearance_mm=simulation_float(
-            "min_green_clearance_mm", 80.0
-        ),
-        corridor_sample_step_mm=simulation_float(
-            "corridor_sample_step_mm", 40.0
-        ),
-        completed_target_exclusion_mm=simulation_float(
-            "completed_target_exclusion_mm", 120.0
-        ),
-        first_breakup_distance_m=simulation_float(
-            "first_breakup_distance_m", 0.5
-        ),
-        safe_zone_calibration_enabled=simulation_raw.get(
-            "safe_zone_calibration_enabled", False
-        ),
-        safe_zone_calibration_distance_mm=simulation_float(
-            "safe_zone_calibration_distance_mm", 300.0
-        ),
-        safe_zone_calibration_position_tolerance_mm=simulation_float(
-            "safe_zone_calibration_position_tolerance_mm", 50.0
-        ),
-        safe_zone_calibration_heading_tolerance_rad=simulation_float(
-            "safe_zone_calibration_heading_tolerance_rad", 0.12
-        ),
-        safe_zone_calibration_speed_m_s=simulation_float(
-            "safe_zone_calibration_speed_m_s", 0.05
-        ),
-        safe_zone_calibration_angular_kp_rad_s=simulation_float(
-            "safe_zone_calibration_angular_kp_rad_s", 1.0
-        ),
-        safe_zone_calibration_max_angular_velocity_rad_s=simulation_float(
-            "safe_zone_calibration_max_angular_velocity_rad_s", 0.35
-        ),
-        safe_zone_calibration_timeout_s=simulation_float(
-            "safe_zone_calibration_timeout_s", 15.0
-        ),
-        front_grab_enabled=simulation_raw.get("front_grab_enabled", False),
-        isolated_green_clearance_mm=simulation_float(
-            "isolated_green_clearance_mm", 200.0
-        ),
-        front_grab_block_forward_mm=simulation_float(
-            "front_grab_block_forward_mm", 65.0
-        ),
-        startup_maneuver_enabled=simulation_raw.get(
-            "startup_maneuver_enabled", False
-        ),
-        startup_turn_angle_rad=simulation_float(
-            "startup_turn_angle_rad", math.radians(40.0)
-        ),
-        startup_turn_angular_velocity_rad_s=_signed_angular_velocity(
-            simulation_raw.get("startup_turn_angular_velocity_rad_s", -0.35),
-            "simulation_20_point.startup_turn_angular_velocity_rad_s",
-        ),
-        startup_forward_distance_m=simulation_float(
-            "startup_forward_distance_m", 1.0
-        ),
-        startup_forward_speed_m_s=simulation_float(
-            "startup_forward_speed_m_s", 0.15
-        ),
-        startup_motion_phase_timeout_s=simulation_float(
-            "startup_motion_phase_timeout_s", 15.0
-        ),
-        action_settle_time_s=_finite_float(
-            simulation_raw.get("action_settle_time_s", 0.0),
-            "simulation_20_point.action_settle_time_s",
+    def match_nonnegative_float(name: str, default: float) -> float:
+        return _finite_float(
+            match_raw.get(name, default),
+            f"match.{name}",
             minimum=0.0,
+        )
+
+    def match_optional_positive_float(
+        name: str,
+    ) -> float | None:
+        value = match_raw.get(name)
+        if value is None:
+            return None
+        return _finite_float(
+            value,
+            f"match.{name}",
+            minimum=0.001,
+        )
+
+    fallback_target_value = match_raw.get(
+        "safe_zone_fallback_target_field_mm", [-165.0, 1440.0]
+    )
+    if (
+        not isinstance(fallback_target_value, list)
+        or len(fallback_target_value) != 2
+    ):
+        raise ValueError(
+            "match.safe_zone_fallback_target_field_mm must be "
+            "[x_mm, y_mm]."
+        )
+    fallback_target_field = FieldPoint(
+        _finite_float(
+            fallback_target_value[0],
+            "match.safe_zone_fallback_target_field_mm[0]",
+            minimum=-float("inf"),
+        ),
+        _finite_float(
+            fallback_target_value[1],
+            "match.safe_zone_fallback_target_field_mm[1]",
+            minimum=-float("inf"),
         ),
     )
-    if simulation_20_point.enabled:
+
+    match = MatchRuntimeConfig(
+        robot_footprint_radius_mm=match_float("robot_footprint_radius_mm", 160.0),
+        safety_margin_mm=match_float("safety_margin_mm", 80.0),
+        enabled=match_enabled,
+        startup_turn_angle_rad=match_float(
+            "startup_turn_angle_rad", math.radians(45.0)
+        ),
+        startup_turn_angular_velocity_rad_s=_signed_angular_velocity(
+            match_raw.get("startup_turn_angular_velocity_rad_s", -0.30),
+            "match.startup_turn_angular_velocity_rad_s",
+        ),
+        startup_turn_settle_time_s=match_float(
+            "startup_turn_settle_time_s", 0.5
+        ),
+        startup_forward_distance_m=match_float(
+            "startup_forward_distance_m", 1.2
+        ),
+        startup_forward_speed_m_s=match_float(
+            "startup_forward_speed_m_s", 0.12
+        ),
+        startup_forward_settle_time_s=match_float(
+            "startup_forward_settle_time_s", 0.5
+        ),
+        startup_straight_pid_kp_rad_s_per_m_s=match_nonnegative_float(
+            "startup_straight_pid_kp_rad_s_per_m_s", 0.0
+        ),
+        startup_straight_pid_ki_rad_s_per_m=match_nonnegative_float(
+            "startup_straight_pid_ki_rad_s_per_m", 0.0
+        ),
+        startup_straight_pid_kd_rad_s_per_m_s2=match_nonnegative_float(
+            "startup_straight_pid_kd_rad_s_per_m_s2", 0.0
+        ),
+        startup_straight_pid_integral_limit=match_float(
+            "startup_straight_pid_integral_limit", 0.10
+        ),
+        startup_straight_pid_deadband_m_s=match_nonnegative_float(
+            "startup_straight_pid_deadband_m_s", 0.0
+        ),
+        startup_straight_pid_max_angular_velocity_rad_s=match_float(
+            "startup_straight_pid_max_angular_velocity_rad_s", 0.12
+        ),
+        cluster_search_angular_velocity_rad_s=_signed_angular_velocity(
+            match_raw.get("cluster_search_angular_velocity_rad_s", -0.30),
+            "match.cluster_search_angular_velocity_rad_s",
+        ),
+        cluster_search_sweep_angle_rad=match_float(
+            "cluster_search_sweep_angle_rad", 2.0 * math.pi
+        ),
+        cluster_min_detections=_positive_int(
+            match_raw.get("cluster_min_detections", 2),
+            "match.cluster_min_detections",
+        ),
+        cluster_group_ground_mm=match_float(
+            "cluster_group_ground_mm", 250.0
+        ),
+        cluster_breakup_standoff_mm=match_float(
+            "cluster_breakup_standoff_mm", 260.0
+        ),
+        cluster_approach_speed_m_s=match_float(
+            "cluster_approach_speed_m_s", 0.12
+        ),
+        cluster_align_tolerance_rad=match_float(
+            "cluster_align_tolerance_rad", 0.10
+        ),
+        cluster_align_hold_ms=match_float(
+            "cluster_align_hold_ms", 500.0
+        ),
+        cluster_align_kp_rad_s=match_float(
+            "cluster_align_kp_rad_s", 1.0
+        ),
+        cluster_align_max_angular_velocity_rad_s=match_float(
+            "cluster_align_max_angular_velocity_rad_s", 0.35
+        ),
+        cluster_relocate_distance_m=match_float(
+            "cluster_relocate_distance_m", 0.30
+        ),
+        cluster_relocate_speed_m_s=match_float(
+            "cluster_relocate_speed_m_s", 0.10
+        ),
+        opportunistic_single_green_enabled=opportunistic_single_green_enabled,
+        opportunistic_single_green_clearance_mm=match_float(
+            "opportunistic_single_green_clearance_mm", 120.0
+        ),
+        opportunistic_single_green_realign_standoff_mm=match_float(
+            "opportunistic_single_green_realign_standoff_mm", 350.0
+        ),
+        breakup_forward_distance_m=match_float(
+            "breakup_forward_distance_m", 0.7
+        ),
+        breakup_forward_speed_m_s=match_float(
+            "breakup_forward_speed_m_s", 0.40
+        ),
+        breakup_backward_distance_m=match_float(
+            "breakup_backward_distance_m", 0.2
+        ),
+        breakup_backward_speed_m_s=match_float(
+            "breakup_backward_speed_m_s", 0.08
+        ),
+        close_gripper_spin_angular_velocity_rad_s=_signed_angular_velocity(
+            match_raw.get("close_gripper_spin_angular_velocity_rad_s", -0.30),
+            "match.close_gripper_spin_angular_velocity_rad_s",
+        ),
+        spin_angle_rad=match_float("spin_angle_rad", 2.0 * math.pi),
+        green_path_half_width_mm=match_float(
+            "green_path_half_width_mm", 50.0
+        ),
+        green_max_age_ms=match_float("green_max_age_ms", 500.0),
+        green_align_hold_ms=match_float("green_align_hold_ms", 500.0),
+        green_alignment_tolerance_mm=match_float(
+            "green_alignment_tolerance_mm", 10.0
+        ),
+        green_alignment_kp_rad_s=match_float(
+            "green_alignment_kp_rad_s", 1.0
+        ),
+        green_alignment_max_angular_velocity_rad_s=match_float(
+            "green_alignment_max_angular_velocity_rad_s", 0.35
+        ),
+        green_approach_speed_m_s=match_float(
+            "green_approach_speed_m_s", 0.08
+        ),
+        green_grab_offset_mm=match_float("green_grab_offset_mm", 60.0),
+        green_preclose_recheck_range_mm=match_float(
+            "green_preclose_recheck_range_mm", 200.0
+        ),
+        green_preclose_recheck_hold_ms=match_float(
+            "green_preclose_recheck_hold_ms", 500.0
+        ),
+        green_preclose_max_carried_blocks=_positive_int(
+            match_raw.get("green_preclose_max_carried_blocks", 2),
+            "match.green_preclose_max_carried_blocks",
+        ),
+        transport_rotate_angular_velocity_rad_s=match_float(
+            "transport_rotate_angular_velocity_rad_s", 0.30
+        ),
+        transport_align_tolerance_mm=match_float(
+            "transport_align_tolerance_mm", 30.0
+        ),
+        safe_zone_grab_to_d1_speed_m_s=match_float(
+            "safe_zone_grab_to_d1_speed_m_s", 0.08
+        ),
+        safe_zone_d1_to_d2_speed_m_s=match_float(
+            "safe_zone_d1_to_d2_speed_m_s", 0.08
+        ),
+        safe_zone_d2_to_final_speed_m_s=match_float(
+            "safe_zone_d2_to_final_speed_m_s", 0.08
+        ),
+        safe_zone_d2_to_final_max_wheel_acceleration_m_s2=(
+            match_optional_positive_float(
+                "safe_zone_d2_to_final_max_wheel_acceleration_m_s2"
+            )
+        ),
+        breakup_settle_time_s=match_float(
+            "breakup_settle_time_s", 0.5
+        ),
+        action_settle_time_s=match_nonnegative_float(
+            "action_settle_time_s", 0.0
+        ),
+        breakup_field_half_extent_mm=match_float(
+            "breakup_field_half_extent_mm", 1500.0
+        ),
+        breakup_gripper_offset_mm=match_float(
+            "breakup_gripper_offset_mm", 200.0
+        ),
+        safe_zone_fallback_target_field=fallback_target_field,
+        safe_zone_fallback_heading_tolerance_rad=match_float(
+            "safe_zone_fallback_heading_tolerance_rad", 0.20
+        ),
+        safe_zone_fallback_heading_kp_rad_s=match_float(
+            "safe_zone_fallback_heading_kp_rad_s", 1.0
+        ),
+        safe_zone_fallback_max_angular_velocity_rad_s=match_float(
+            "safe_zone_fallback_max_angular_velocity_rad_s", 0.30
+        ),
+        safe_zone_calibration_start_offset_mm=match_float(
+            "safe_zone_calibration_start_offset_mm", 500.0
+        ),
+        safe_zone_open_offset_mm=match_float(
+            "safe_zone_open_offset_mm", 137.0
+        ),
+        safe_zone_d2_braking_overrun_x_mm=_finite_float(
+            match_raw.get("safe_zone_d2_braking_overrun_x_mm", 0.0),
+            "match.safe_zone_d2_braking_overrun_x_mm",
+            minimum=-float("inf"),
+        ),
+        safe_zone_d2_braking_overrun_y_mm=_finite_float(
+            match_raw.get("safe_zone_d2_braking_overrun_y_mm", 0.0),
+            "match.safe_zone_d2_braking_overrun_y_mm",
+            minimum=-float("inf"),
+        ),
+        safe_zone_d2_to_final_braking_overrun_mm=_finite_float(
+            match_raw.get("safe_zone_d2_to_final_braking_overrun_mm", 0.0),
+            "match.safe_zone_d2_to_final_braking_overrun_mm",
+            minimum=0.0,
+        ),
+        safe_zone_calibration_stop_speed_threshold_m_s=match_float(
+            "safe_zone_calibration_stop_speed_threshold_m_s", 0.02
+        ),
+        safe_zone_calibration_stop_confirm_time_s=match_float(
+            "safe_zone_calibration_stop_confirm_time_s", 0.30
+        ),
+        safe_zone_exit_distance_m=match_float(
+            "safe_zone_exit_distance_m", 0.30
+        ),
+        safe_zone_exit_turn_angle_rad=match_float(
+            "safe_zone_exit_turn_angle_rad", math.pi
+        ),
+        required_transports=_positive_int(
+            match_raw.get("required_transports", 4),
+            "match.required_transports",
+        ),
+        return_backup_speed_m_s=match_float(
+            "return_backup_speed_m_s", 0.08
+        ),
+    )
+    if match.enabled:
         for name in (
-            "navigation_speed_m_s",
-            "approach_speed_m_s",
-            "push_speed_m_s",
-            "retreat_speed_m_s",
             "startup_forward_speed_m_s",
-            "safe_zone_calibration_speed_m_s",
+            "breakup_forward_speed_m_s",
+            "breakup_backward_speed_m_s",
+            "cluster_approach_speed_m_s",
+            "cluster_relocate_speed_m_s",
+            "green_approach_speed_m_s",
+            "safe_zone_grab_to_d1_speed_m_s",
+            "safe_zone_d1_to_d2_speed_m_s",
+            "safe_zone_d2_to_final_speed_m_s",
         ):
-            if getattr(simulation_20_point, name) > motion.max_linear_velocity_m_s:
+            if getattr(match, name) > motion.max_linear_velocity_m_s:
                 raise ValueError(
-                    f"simulation_20_point.{name} exceeds "
+                    f"match.{name} exceeds "
                     "motion.max_linear_velocity_m_s."
                 )
-        if simulation_20_point.startup_maneuver_enabled:
-            if (
-                abs(simulation_20_point.startup_turn_angular_velocity_rad_s)
-                > motion.max_angular_velocity_rad_s
-            ):
-                raise ValueError(
-                    "simulation_20_point.startup_turn_angular_velocity_rad_s "
-                    "exceeds motion.max_angular_velocity_rad_s."
-                )
         for name in (
-            "scan_angular_velocity_rad_s",
-            "navigation_max_angular_velocity_rad_s",
-            "alignment_max_angular_velocity_rad_s",
-            "push_max_angular_velocity_rad_s",
-            "safe_zone_calibration_max_angular_velocity_rad_s",
+            "startup_turn_angular_velocity_rad_s",
+            "cluster_search_angular_velocity_rad_s",
+            "close_gripper_spin_angular_velocity_rad_s",
+            "startup_straight_pid_max_angular_velocity_rad_s",
+            "cluster_align_max_angular_velocity_rad_s",
+            "green_alignment_max_angular_velocity_rad_s",
+            "transport_rotate_angular_velocity_rad_s",
+            "safe_zone_fallback_max_angular_velocity_rad_s",
         ):
-            if (
-                getattr(simulation_20_point, name)
-                > motion.max_angular_velocity_rad_s
-            ):
+            if abs(getattr(match, name)) > motion.max_angular_velocity_rad_s:
                 raise ValueError(
-                    f"simulation_20_point.{name} exceeds "
+                    f"match.{name} exceeds "
                     "motion.max_angular_velocity_rad_s."
                 )
 
@@ -3794,32 +4063,36 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         raise ValueError(
             "Enabled motion.cluster_breakup requires Hailo and ground mapping."
         )
-    if simulation_20_point.enabled:
-        if world.team_color is TeamColor.UNKNOWN:
+    if match.enabled:
+        if not motion.enabled or not motion.odometry.enabled:
             raise ValueError(
-                "Enabled simulation_20_point requires world.team_color to "
-                "be red or blue."
+                "Enabled match requires motion and "
+                "motion.odometry."
             )
-        if not cluster_breakup.enabled:
+        if not motion.gripper.enabled:
             raise ValueError(
-                "Enabled simulation_20_point requires "
-                "motion.cluster_breakup.enabled=true."
-            )
-        if not localization.fusion.enabled:
-            raise ValueError(
-                "Enabled simulation_20_point requires "
-                "localization.fusion.enabled=true."
+                "Enabled match requires motion.gripper.enabled=true."
             )
         if not hailo.enabled or not geometry.ground_mapping_enabled:
             raise ValueError(
-                "Enabled simulation_20_point requires Hailo and ground mapping."
+                "Enabled match requires Hailo and ground mapping."
+            )
+        initial = localization.fusion.initial_pose
+        if not (
+            math.isclose(initial.position.x, 1350.0, abs_tol=1e-6)
+            and math.isclose(initial.position.y, 1350.0, abs_tol=1e-6)
+            and math.isclose(initial.heading_rad, -math.pi / 2.0, abs_tol=1e-6)
+        ):
+            raise ValueError(
+                "Enabled match requires initial pose "
+                "[1350 mm, 1350 mm, -90 deg]."
             )
         if remote.enabled and (
             remote.role is not RemoteRole.SERVER
             or remote.access_mode is not RemoteAccessMode.OBSERVE_ONLY
         ):
             raise ValueError(
-                "simulation_20_point remote access must be a server in "
+                "match remote access must be a server in "
                 "observe_only mode."
             )
 
@@ -3831,7 +4104,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         uart,
         remote,
         motion,
-        simulation_20_point,
+        match,
         tracking,
         world,
         mission,

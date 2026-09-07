@@ -58,8 +58,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/runtime.simulation-20min.yaml"),
-        help="Runtime YAML path (default: configs/runtime.simulation-20min.yaml).",
+        default=Path("configs/runtime.match.yaml"),
+        help="Runtime YAML path (default: configs/runtime.match.yaml).",
     )
     parser.add_argument(
         "--speed-m-s",

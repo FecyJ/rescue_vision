@@ -89,8 +89,8 @@ fusion.inject_disturbance(
 )
 ```
 
-量级来自 20 分应用的 `simulation_20_point` 配置（配置校验强制分别小于应用
-位姿门限），历史为空时静默忽略。读取锚健康量判断定位是否明显偏离：
+量级由正式流程或调用方的融合配置注入（配置校验强制分别小于应用位姿门限），历史为空时
+静默忽略。读取锚健康量判断定位是否明显偏离：
 
 ```python
 health = fusion.visual_anchor_health()

@@ -18,3 +18,7 @@ configs/runtime.yaml
 docs/reviews
 
 data/
+
+dsh-anchored-standard/
+.zcode/
+logs/

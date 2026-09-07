@@ -23,8 +23,9 @@
   窗口），`Esc`/`q` 退出，`空格`停车；`X` 切换夹爪运输姿态。
 - `imu_rotation_monitor.py`：按配置低速原地旋转，周期打印 STM32 原始传感器系
   `gyro_z`、编码器和状态位；只发送轮速心跳，`Ctrl+C` 或异常时柔和停车。
-- `imu_static_calibration.py`：车辆静止时被动收集有效 IMU 样本，输出传感器坐标系
-  陀螺零偏、噪声、温度和可复制的配置片段；不发送任何运动命令。
+- `imu_static_calibration.py`：收集静止有效 IMU 样本，输出传感器坐标系陀螺零偏、
+  噪声、温度和 `sensor_to_robot_rotation` 矩阵；可在物理急停和全程监督下直接
+  控制正/反原地旋转，用编码器角度复核 `gyro_z_sign`，不需要先另存运动 JSONL。
 - `safe_zone_straight_diagnostic.py`：只执行配置中的 `LEAVE_START` 越障直行段，
   实时打印轮速目标/实际值、ODOMETRY_IMU 序号与双时钟间隔、编码器、IMU、UART
   队列和 STM32 状态；发现连续 overrun 时停车。
@@ -169,7 +170,7 @@ STM32 采样时间和编码器计数：
 ```bash
 PYTHONPATH=src .venv/bin/python \
   manual_tests/motion_sample_overrun.py \
-  --config configs/runtime.simulation-20min.yaml \
+  --config configs/runtime.match.yaml \
   --speed-m-s 0.05 \
   --duration-seconds 5 \
   --supervised-physical-stop-ready
@@ -185,11 +186,11 @@ PYTHONPATH=src .venv/bin/python \
 排除串口接线、波特率、非法帧或多个进程同时读取串口后，必须复位或重新上电
 STM32，再重新运行检查。
 
-## IMU 静止零偏标定
+## IMU 零偏、安装矩阵与自转复核
 
-车辆必须断开驱动动作并保持完全静止；工具只被动读取 `ODOMETRY_IMU`，不会发送
-轮速、软刹车或其他控制命令。默认预热 5 秒、采样 30 秒，输出原始传感器坐标系
-的陀螺零偏和噪声报告：
+静止阶段车辆必须断开驱动动作并保持完全静止；脚本会先发送安全同步的软刹车，
+默认预热 5 秒、采样 30 秒，输出原始传感器坐标系的陀螺零偏、噪声和由静止重力
+方向求得的安装旋转矩阵。矩阵打印为 `sensor frame → robot frame`，并写入报告：
 
 ```bash
 PYTHONPATH=src .venv/bin/python \
@@ -199,11 +200,29 @@ PYTHONPATH=src .venv/bin/python \
   --stationary-vehicle-confirmed
 ```
 
-将报告中的 `recommended_config.localization.fusion.imu_calibration` 人工复核后
-复制到运行配置；它只标定静止零偏和噪声，不会推导安装旋转、动态比例/交叉轴或
-`gyro_z_sign`。这些仍需结合已知姿态和低速正反原地旋转复核。温漂补偿按需求保持
-关闭（温度系数为零）；静态零偏和正反转动态复核通过后，当前
-`localization.fusion.enabled` 已开启。
+如需脚本直接控制正、反各一整圈并用编码器角度复核极性，必须架空轮或确认可立即
+触发物理急停、人员全程监督，然后显式增加：
+
+```bash
+PYTHONPATH=src .venv/bin/python \
+  manual_tests/imu_static_calibration.py \
+  --config configs/runtime.yaml \
+  --output /tmp/imu_calibration.json \
+  --rotation-angle-deg 360 \
+  --rotation-direction both \
+  --rotation-angular-velocity-rad-s 0.20 \
+  --stationary-vehicle-confirmed
+```
+
+脚本会在每个方向达到配置编码器角度后停车，并打印每一方向的编码器角度、陀螺
+积分角度、比例诊断和合并后的 `gyro_z_sign`。如果比例偏离 1，只作为动态量程/比例
+复核结果，不会擅自把不完整的单轴结果写入三轴 `gyro_cross_axis_scale`。
+
+静止重力只能确定安装矩阵的横滚/俯仰，绕竖直轴的偏航在单一姿态中不可观测；脚本
+会明确打印这一状态，并采用最小旋转。若安装同时改变了平面偏航，需要再提供已知的
+机器人轴向基准后补充矩阵，不能只凭这次静止采样覆盖配置。温漂补偿按需求保持关闭
+（温度系数为零）。将报告中的 `recommended_config` 人工复核后复制到实际运行配置，
+再用独立低速正反转确认。
 
 ## 越障安全区直行诊断
 
@@ -219,7 +238,7 @@ PYTHONPATH=src .venv/bin/python \
 ```bash
 PYTHONPATH=src .venv/bin/python \
   manual_tests/safe_zone_straight_diagnostic.py \
-  --config configs/runtime.simulation-20min.yaml \
+  --config configs/runtime.match.yaml \
   --supervised-physical-stop-ready
 ```
 

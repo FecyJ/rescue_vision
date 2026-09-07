@@ -74,9 +74,12 @@ class MotionLimits:
     max_wheel_velocity_m_s: float
     max_wheel_acceleration_m_s2: float
     max_remote_command_valid_for_ms: int
+    min_wheel_velocity_m_s: float = 0.02
+    left_wheel_speed_weight: float = 1.0
+    right_wheel_speed_weight: float = 1.0
     stall_guard_enabled: bool = True
     stall_guard_timeout_ms: int = 300
-    stall_guard_min_command_speed_m_s: float = 0.01
+    stall_guard_min_command_speed_m_s: float = 0.02
     stall_guard_stationary_encoder_delta_count: int = 0
 
     def __post_init__(self) -> None:
@@ -86,6 +89,9 @@ class MotionLimits:
             "max_angular_velocity_rad_s",
             "max_wheel_velocity_m_s",
             "max_wheel_acceleration_m_s2",
+            "min_wheel_velocity_m_s",
+            "left_wheel_speed_weight",
+            "right_wheel_speed_weight",
         ):
             object.__setattr__(
                 self,
@@ -125,6 +131,12 @@ class MotionLimits:
                 "stall_guard_min_command_speed_m_s must not exceed "
                 "max_wheel_velocity_m_s."
             )
+        if self.min_wheel_velocity_m_s > self.max_wheel_velocity_m_s:
+            raise ValueError(
+                "min_wheel_velocity_m_s must not exceed max_wheel_velocity_m_s, "
+                f"got {self.min_wheel_velocity_m_s!r} > "
+                f"{self.max_wheel_velocity_m_s!r}."
+            )
         if (
             isinstance(self.stall_guard_stationary_encoder_delta_count, bool)
             or not isinstance(
@@ -163,6 +175,9 @@ class MotionController:
         self._monotonic_ns = monotonic_ns
         self._target_wheel_speeds_m_s = (0.0, 0.0)
         self._commanded_wheel_speeds_m_s = (0.0, 0.0)
+        self._wheel_acceleration_limit_m_s2 = (
+            limits.max_wheel_acceleration_m_s2
+        )
         self._last_sent_wheel_speeds_mm_s = (0, 0)
         self._last_acceleration_update_ns = self._now()
         self._last_wheel_command_ns = self._last_acceleration_update_ns
@@ -192,6 +207,33 @@ class MotionController:
         """返回加速度限制后最近下发的左右轮速度。"""
 
         return self._commanded_wheel_speeds_m_s
+
+    @property
+    def wheel_acceleration_limit_m_s2(self) -> float:
+        """返回当前生效的单轮最大加速度，单位 m/s²。"""
+
+        return self._wheel_acceleration_limit_m_s2
+
+    def set_wheel_acceleration_limit_m_s2(
+        self,
+        acceleration_m_s2: float | None,
+    ) -> None:
+        """设置临时单轮加速度上限；传入 ``None`` 恢复全局配置值。
+
+        临时值可以独立于 ``MotionLimits`` 的全局基准。该方法只改变后续
+        ``update()`` 的速度斜坡，不会立即发送轮速或改变当前目标速度。
+        """
+
+        if acceleration_m_s2 is None:
+            self._wheel_acceleration_limit_m_s2 = (
+                self.limits.max_wheel_acceleration_m_s2
+            )
+            return
+        acceleration = _positive_finite(
+            acceleration_m_s2,
+            "acceleration_m_s2",
+        )
+        self._wheel_acceleration_limit_m_s2 = acceleration
 
     @property
     def gripper_target_angles_deg(self) -> tuple[float, float] | None:
@@ -309,8 +351,12 @@ class MotionController:
     ) -> None:
         """设置左右轮目标速度；实际下发由 :meth:`update` 渐进逼近。"""
 
-        left = _finite(left_m_s, "left_m_s")
-        right = _finite(right_m_s, "right_m_s")
+        left = self._apply_minimum_wheel_velocity(
+            _finite(left_m_s, "left_m_s")
+        )
+        right = self._apply_minimum_wheel_velocity(
+            _finite(right_m_s, "right_m_s")
+        )
         maximum = self.limits.max_wheel_velocity_m_s
         if abs(left) > maximum or abs(right) > maximum:
             raise ValueError(
@@ -362,7 +408,7 @@ class MotionController:
                 "Active motion update gap exceeded 200 ms; "
                 f"soft brake was sent after {gap_ms:.3f} ms."
             )
-        maximum_delta = self.limits.max_wheel_acceleration_m_s2 * elapsed_s
+        maximum_delta = self._wheel_acceleration_limit_m_s2 * elapsed_s
         previous_left, previous_right = self._commanded_wheel_speeds_m_s
         target_left, target_right = self._target_wheel_speeds_m_s
         next_left = _move_toward(previous_left, target_left, maximum_delta)
@@ -410,11 +456,8 @@ class MotionController:
             linear_velocity_m_s,
             angular_velocity_rad_s,
         )
-        half_track = self.limits.wheel_track_m / 2.0
-        self.set_wheel_speeds(
-            linear - angular * half_track,
-            linear + angular * half_track,
-        )
+        left, right = self._twist_to_wheel_speeds(linear, angular)
+        self.set_wheel_speeds(left, right)
 
     def drive_wheel_limited(
         self,
@@ -431,9 +474,7 @@ class MotionController:
             linear_velocity_m_s,
             angular_velocity_rad_s,
         )
-        half_track = self.limits.wheel_track_m / 2.0
-        left = linear - angular * half_track
-        right = linear + angular * half_track
+        left, right = self._twist_to_wheel_speeds(linear, angular)
         peak_wheel_speed = max(abs(left), abs(right))
         maximum = self.limits.max_wheel_velocity_m_s
         if peak_wheel_speed > maximum:
@@ -464,6 +505,38 @@ class MotionController:
                 f"{self.limits.max_angular_velocity_rad_s}: {angular}."
             )
         return linear, angular
+
+    def _twist_to_wheel_speeds(
+        self,
+        linear: float,
+        angular: float,
+    ) -> tuple[float, float]:
+        """差速换算左右轮速度，并施加单轮权重补偿机械重心偏移。
+
+        默认权重均为 ``1.0``，等价于标准差速。车辆重心偏离两轮连线的
+        中点时，同一指令下左右轮的接地载荷与摩擦不同，直线行驶会朝一侧
+        偏转；通过把左右轮速度乘以不同的权重（如偏左时左轮略快），可
+        在开环指令上抵消该偏差。
+        """
+
+        half_track = self.limits.wheel_track_m / 2.0
+        left = (
+            linear - angular * half_track
+        ) * self.limits.left_wheel_speed_weight
+        right = (
+            linear + angular * half_track
+        ) * self.limits.right_wheel_speed_weight
+        return left, right
+
+    def _apply_minimum_wheel_velocity(self, speed_m_s: float) -> float:
+        """将非零轮速目标抬到减速电机可持续工作的最低速度。"""
+
+        if speed_m_s == 0.0:
+            return 0.0
+        return math.copysign(
+            max(abs(speed_m_s), self.limits.min_wheel_velocity_m_s),
+            speed_m_s,
+        )
 
     def forward(self, speed_m_s: float) -> None:
         """以非负速度直行前进。"""

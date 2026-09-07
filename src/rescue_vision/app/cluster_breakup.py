@@ -36,10 +36,12 @@ from rescue_vision.communication import (
     VideoFrameMode,
     VideoModeCommand,
 )
+from rescue_vision.geometry.types import GroundPoint
 from rescue_vision.localization import (
     FusedPoseEstimate,
     OdometryCalibration,
     OdometryImuFusion,
+    VisualAnchorHealth,
 )
 from rescue_vision.motion import (
     CarCommandReply,
@@ -1009,10 +1011,67 @@ class BreakupDecision:
 
 
 @dataclass(frozen=True, slots=True)
+class TargetedClusterMeasurement:
+    """一次带身份目标团的实时机器人地面测量。
+
+    该类型只用于重复解团：上层以 ``FieldPoint`` 锁定目标团，再把本帧重新
+    识别到的同一批成员转换为机器人地面测量。没有测量时，定向解团实例只
+    搜索等待，绝不回退到画面中的其它目标团。
+    """
+
+    frame_sequence: int
+    member_track_ids: tuple[int, ...]
+    green_track_ids: tuple[int, ...]
+    center_ground: GroundPoint
+    nearest_forward_distance_mm: float
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.frame_sequence, bool)
+            or not isinstance(self.frame_sequence, int)
+            or self.frame_sequence < 0
+        ):
+            raise ValueError("frame_sequence must be a non-negative integer.")
+        if len(self.member_track_ids) < 2 or len(set(self.member_track_ids)) != len(
+            self.member_track_ids
+        ):
+            raise ValueError(
+                "member_track_ids must contain at least two unique track IDs."
+            )
+        if any(
+            isinstance(track_id, bool)
+            or not isinstance(track_id, int)
+            or track_id <= 0
+            for track_id in self.member_track_ids
+        ):
+            raise ValueError("member_track_ids must contain positive integers.")
+        if not self.green_track_ids or not set(self.green_track_ids).issubset(
+            self.member_track_ids
+        ):
+            raise ValueError(
+                "green_track_ids must be a non-empty subset of member_track_ids."
+            )
+        if not isinstance(self.center_ground, GroundPoint):
+            raise ValueError("center_ground must be a GroundPoint.")
+        if not (
+            math.isfinite(self.center_ground.x)
+            and math.isfinite(self.center_ground.y)
+        ):
+            raise ValueError("center_ground must be finite.")
+        nearest = float(self.nearest_forward_distance_mm)
+        if not math.isfinite(nearest) or nearest <= 0.0:
+            raise ValueError(
+                "nearest_forward_distance_mm must be finite and positive."
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class _ClusterView:
     horizontal_error_ratio: float
     raw_horizontal_error_ratio: float
     nearest_forward_distance_mm: float | None
+    center_tolerance_ratio: float
+    frame_sequence: int
 
 
 class EncoderTravelTracker:
@@ -1120,8 +1179,8 @@ class EncoderTravelTracker:
             self._previous = message
             self._consecutive_overrun_samples = 1 if is_overrun else 0
             return self._distance_m
-        if message.received_timestamp_ns <= previous.received_timestamp_ns:
-            raise RuntimeError("Odometry receive timestamps must increase.")
+        if message.sample_timestamp_us <= previous.sample_timestamp_us:
+            raise RuntimeError("Odometry sample timestamps must increase.")
         left_delta = message.left_encoder_count - previous.left_encoder_count
         right_delta = message.right_encoder_count - previous.right_encoder_count
         scale = 2.0 * math.pi / self._calibration.encoder_counts_per_revolution
@@ -1130,9 +1189,9 @@ class EncoderTravelTracker:
             right_delta * self._calibration.right_wheel_radius_mm * scale / 1000.0
         )
         dt_s = (
-            message.received_timestamp_ns - previous.received_timestamp_ns
-        ) / 1_000_000_000.0
-        # 留出量化和接收抖动余量，但拒绝计数跳变驱动固定距离状态提前结束。
+            message.sample_timestamp_us - previous.sample_timestamp_us
+        ) / 1_000_000.0
+        # 采样时间不受 UART 批量接收影响；保留原有量化余量和计数跳变检查。
         if max(abs(left_m), abs(right_m)) > self._maximum * dt_s * 2.0 + 0.005:
             raise RuntimeError("Encoder delta exceeds the configured wheel speed bound.")
         self._previous = message
@@ -1224,6 +1283,51 @@ class OdometryFusionPump:
         self._require_started()
         self._raise_worker_error()
         return self._fusion.latest_estimate(timestamp_ns)
+
+    def pose_at(self, timestamp_ns: int) -> FusedPoseEstimate:
+        """返回历史时间点的融合位姿，供相机观测做时间对齐。"""
+
+        self._require_started()
+        self._raise_worker_error()
+        pose_at = getattr(self._fusion, "pose_at", None)
+        if not callable(pose_at):
+            raise RuntimeError("fusion does not provide pose_at().")
+        estimate = pose_at(timestamp_ns)
+        if not isinstance(estimate, FusedPoseEstimate):
+            raise RuntimeError("fusion pose_at() returned an invalid estimate.")
+        return estimate
+
+    def inject_disturbance(
+        self,
+        position_uncertainty_mm: float,
+        heading_uncertainty_rad: float,
+    ) -> None:
+        """转发一次扰动协方差注入；下层融合器不提供该方法是装配错误。"""
+
+        self._require_started()
+        self._raise_worker_error()
+        inject = getattr(self._fusion, "inject_disturbance", None)
+        if not callable(inject):
+            raise RuntimeError("fusion does not provide inject_disturbance().")
+        inject(
+            position_uncertainty_mm=position_uncertainty_mm,
+            heading_uncertainty_rad=heading_uncertainty_rad,
+        )
+
+    def visual_anchor_health(self) -> VisualAnchorHealth | None:
+        """转发视觉锚健康快照；测试替身不提供该诊断时返回 None。"""
+
+        self._require_started()
+        self._raise_worker_error()
+        read = getattr(self._fusion, "visual_anchor_health", None)
+        if not callable(read):
+            return None
+        value = read()
+        if not isinstance(value, VisualAnchorHealth):
+            raise RuntimeError(
+                "fusion visual_anchor_health() returned an invalid value."
+            )
+        return value
 
     @property
     def continuity_loss_reason(self) -> str | None:
@@ -1326,7 +1430,12 @@ def _rotation_direction_name(angular_velocity_rad_s: float) -> str:
 
 
 class ClusterBreakupSequence:
-    """从出发区到解团并找到第一枚绿色目标的确定性流程。"""
+    """从出发区到解团并找到第一枚绿色目标的确定性流程。
+
+    默认模式从当前 ``PerceptionSnapshot`` 按像素框寻找首次目标团。定向模式
+    只接受调用方传入的 ``TargetedClusterMeasurement``，供上层按身份锁定的
+    FieldPoint 目标团重新测量；测量缺失时不会回退到其它图像目标。
+    """
 
     def __init__(
         self,
@@ -1335,6 +1444,8 @@ class ClusterBreakupSequence:
         gripper_full_travel_time_s: float,
         skip_departure: bool = False,
         breakup_distance_m: float | None = None,
+        targeted_cluster_mode: bool = False,
+        targeted_center_tolerance_rad: float | None = None,
     ) -> None:
         if not isinstance(config, ClusterBreakupRuntimeConfig):
             raise TypeError("config must be a ClusterBreakupRuntimeConfig.")
@@ -1351,6 +1462,24 @@ class ClusterBreakupSequence:
             )
         if not isinstance(skip_departure, bool):
             raise TypeError("skip_departure must be a boolean.")
+        if not isinstance(targeted_cluster_mode, bool):
+            raise TypeError("targeted_cluster_mode must be a boolean.")
+        if targeted_cluster_mode:
+            if (
+                targeted_center_tolerance_rad is None
+                or isinstance(targeted_center_tolerance_rad, bool)
+                or not isinstance(targeted_center_tolerance_rad, (int, float))
+                or not math.isfinite(float(targeted_center_tolerance_rad))
+                or not 0.0 < float(targeted_center_tolerance_rad) < math.pi
+            ):
+                raise ValueError(
+                    "targeted_center_tolerance_rad must be finite and in (0, pi) "
+                    "for targeted cluster mode."
+                )
+        elif targeted_center_tolerance_rad is not None:
+            raise ValueError(
+                "targeted_center_tolerance_rad is only valid in targeted cluster mode."
+            )
         if breakup_distance_m is not None and (
             isinstance(breakup_distance_m, bool)
             or not isinstance(breakup_distance_m, (int, float))
@@ -1363,6 +1492,8 @@ class ClusterBreakupSequence:
         self.config = config
         self._gripper_full_travel_time_s = float(gripper_full_travel_time_s)
         self._skip_departure = skip_departure
+        self._targeted_cluster_mode = targeted_cluster_mode
+        self._targeted_center_tolerance_rad = targeted_center_tolerance_rad
         self._breakup_distance_m = (
             config.breakup_distance_m
             if breakup_distance_m is None
@@ -1380,6 +1511,7 @@ class ClusterBreakupSequence:
         self._center_turn_sign: int | None = None
         self._center_reverse_candidate_sign: int | None = None
         self._center_reverse_candidate_frames = 0
+        self._approach_travel_distance_m: float | None = None
         self._green_frames = 0
 
     @property
@@ -1387,6 +1519,15 @@ class ClusterBreakupSequence:
         """当前实例 BREAKUP_PUSH 使用的编码器定距，单位 m。"""
 
         return self._breakup_distance_m
+
+    @property
+    def approach_locked(self) -> bool:
+        """目标团已完成初始对准并锁定接近定距。"""
+
+        return (
+            self.state is BreakupState.APPROACH_CLUSTER
+            and self._approach_travel_distance_m is not None
+        )
 
     @property
     def _search_direction_name(self) -> str:
@@ -1400,8 +1541,19 @@ class ClusterBreakupSequence:
         timestamp_ns: int,
         cumulative_distance_m: float | None,
         perception: PerceptionSnapshot | None,
+        targeted_cluster: TargetedClusterMeasurement | None = None,
     ) -> BreakupDecision:
         self._validate_inputs(timestamp_ns, cumulative_distance_m, perception)
+        if targeted_cluster is not None and not isinstance(
+            targeted_cluster, TargetedClusterMeasurement
+        ):
+            raise TypeError(
+                "targeted_cluster must be a TargetedClusterMeasurement or None."
+            )
+        if not self._targeted_cluster_mode and targeted_cluster is not None:
+            raise ValueError(
+                "targeted_cluster is only accepted by a targeted cluster sequence."
+            )
         if self._state_started_ns is None:
             self._state_started_ns = timestamp_ns
         self._last_timestamp_ns = timestamp_ns
@@ -1459,8 +1611,9 @@ class ClusterBreakupSequence:
         if self.state is BreakupState.SEARCH_CLUSTER:
             if self._elapsed_s(timestamp_ns) >= self.config.search_timeout_s:
                 return self._fault(timestamp_ns, "cluster_search_timeout")
-            cluster = self._cluster_view(
+            cluster = self._active_cluster_view(
                 perception,
+                targeted_cluster,
                 minimum_count=self.config.cluster_min_detections,
             )
             if cluster is not None:
@@ -1478,8 +1631,12 @@ class ClusterBreakupSequence:
                 f"search_cluster_{self._search_direction_name}",
             )
 
-        if self.state in {BreakupState.CENTER_CLUSTER, BreakupState.APPROACH_CLUSTER}:
-            cluster = self._cluster_view(perception, minimum_count=1)
+        if self.state is BreakupState.CENTER_CLUSTER:
+            cluster = self._active_cluster_view(
+                perception,
+                targeted_cluster,
+                minimum_count=1,
+            )
             if cluster is None:
                 if self._last_cluster_seen_ns is None:
                     self._last_cluster_seen_ns = timestamp_ns
@@ -1488,46 +1645,28 @@ class ClusterBreakupSequence:
                     return self._fault(timestamp_ns, "cluster_lost")
                 return self._decision(timestamp_ns, 0.0, 0.0, "cluster_temporarily_lost")
             self._last_cluster_seen_ns = timestamp_ns
-
-            if self.state is BreakupState.CENTER_CLUSTER:
-                if self._is_new_frame(perception):
-                    if abs(cluster.horizontal_error_ratio) <= self.config.center_tolerance_ratio:
-                        self._centered_frames += 1
-                    else:
-                        self._centered_frames = 0
-                if self._centered_frames >= self.config.center_confirm_frames:
-                    self._transition(
-                        BreakupState.APPROACH_CLUSTER,
-                        timestamp_ns,
-                        cumulative_distance_m,
-                    )
+            if self._is_new_cluster_frame(cluster.frame_sequence):
+                if (
+                    abs(cluster.horizontal_error_ratio)
+                    <= cluster.center_tolerance_ratio
+                ):
+                    self._centered_frames += 1
                 else:
-                    return self._centering_decision(timestamp_ns, cluster)
-
-            assert self.state is BreakupState.APPROACH_CLUSTER
-            if cluster.nearest_forward_distance_mm is None:
-                return self._decision(timestamp_ns, 0.0, 0.0, "cluster_distance_missing")
-            if cluster.nearest_forward_distance_mm <= self.config.gripper_open_distance_mm:
-                self._transition(
-                    BreakupState.BREAKUP_PUSH,
-                    timestamp_ns,
-                    cumulative_distance_m,
-                )
-                return self._decision(
-                    timestamp_ns,
-                    self.config.breakup_speed_m_s,
-                    0.0,
-                    "closed_gripper_and_breakup_push",
-                )
-            angular = self._centering_angular(
-                cluster.horizontal_error_ratio,
-                cluster.raw_horizontal_error_ratio,
-            )
-            return self._decision(
+                    self._centered_frames = 0
+            if self._centered_frames < self.config.center_confirm_frames:
+                return self._centering_decision(timestamp_ns, cluster)
+            self._transition(
+                BreakupState.APPROACH_CLUSTER,
                 timestamp_ns,
-                self.config.approach_speed_m_s,
-                angular,
-                "approach_centered_cluster",
+                cumulative_distance_m,
+            )
+
+        if self.state is BreakupState.APPROACH_CLUSTER:
+            return self._approach_decision(
+                timestamp_ns,
+                cumulative_distance_m,
+                perception,
+                targeted_cluster,
             )
 
         if self.state is BreakupState.BREAKUP_PUSH:
@@ -1689,6 +1828,84 @@ class ClusterBreakupSequence:
 
         return self._decision(timestamp_ns, 0.0, 0.0, self.state.value)
 
+    def _approach_decision(
+        self,
+        timestamp_ns: int,
+        cumulative_distance_m: float | None,
+        perception: PerceptionSnapshot | None,
+        targeted_cluster: TargetedClusterMeasurement | None,
+    ) -> BreakupDecision:
+        if self._motion_timed_out(timestamp_ns):
+            return self._fault(timestamp_ns, "cluster_approach_timeout")
+
+        # 初始对准只在 CENTER_CLUSTER 完成。进入接近后锁定当时的 K0 距离，
+        # 用编码器完成剩余路程，避免再次用目标框横向误差修正或等待每一帧视觉。
+        # 这样视觉处理出现短时延迟时仍保持直行，但目标距离必须先取得一次有效值。
+        if self._approach_travel_distance_m is None:
+            cluster = self._active_cluster_view(
+                perception,
+                targeted_cluster,
+                minimum_count=1,
+            )
+            if cluster is None:
+                if self._last_cluster_seen_ns is None:
+                    self._last_cluster_seen_ns = timestamp_ns
+                lost_ms = (timestamp_ns - self._last_cluster_seen_ns) / 1_000_000.0
+                if lost_ms >= self.config.target_loss_timeout_ms:
+                    return self._fault(timestamp_ns, "cluster_lost")
+                return self._decision(timestamp_ns, 0.0, 0.0, "cluster_temporarily_lost")
+            self._last_cluster_seen_ns = timestamp_ns
+            if cluster.nearest_forward_distance_mm is None:
+                return self._decision(timestamp_ns, 0.0, 0.0, "cluster_distance_missing")
+            approach_distance_mm = (
+                cluster.nearest_forward_distance_mm
+                - self.config.gripper_open_distance_mm
+            )
+            if approach_distance_mm <= 0.0:
+                self._transition(
+                    BreakupState.BREAKUP_PUSH,
+                    timestamp_ns,
+                    cumulative_distance_m,
+                )
+                return self._decision(
+                    timestamp_ns,
+                    self.config.breakup_speed_m_s,
+                    0.0,
+                    "closed_gripper_and_breakup_push",
+                )
+            self._approach_travel_distance_m = approach_distance_mm / 1000.0
+
+        if self._state_distance_m is None:
+            if cumulative_distance_m is None:
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    0.0,
+                    "approach_waiting_for_odometry",
+                )
+            self._state_distance_m = cumulative_distance_m
+        if self._reached_distance(
+            cumulative_distance_m,
+            self._approach_travel_distance_m,
+        ):
+            self._transition(
+                BreakupState.BREAKUP_PUSH,
+                timestamp_ns,
+                cumulative_distance_m,
+            )
+            return self._decision(
+                timestamp_ns,
+                self.config.breakup_speed_m_s,
+                0.0,
+                "approach_locked_distance_reached_breakup_push",
+            )
+        return self._decision(
+            timestamp_ns,
+            self.config.approach_speed_m_s,
+            0.0,
+            "approach_cluster_locked_heading",
+        )
+
     def _decision(
         self,
         timestamp_ns: int,
@@ -1717,6 +1934,7 @@ class ClusterBreakupSequence:
             self._centering_angular(
                 cluster.horizontal_error_ratio,
                 cluster.raw_horizontal_error_ratio,
+                tolerance_ratio=cluster.center_tolerance_ratio,
             ),
             "center_cluster",
         )
@@ -1725,6 +1943,8 @@ class ClusterBreakupSequence:
         self,
         horizontal_error_ratio: float,
         raw_horizontal_error_ratio: float | None = None,
+        *,
+        tolerance_ratio: float | None = None,
     ) -> float:
         # 图像右侧为正误差；机器人需右转，项目角速度右转为负。
         raw_error = (
@@ -1732,7 +1952,11 @@ class ClusterBreakupSequence:
             if raw_horizontal_error_ratio is None
             else raw_horizontal_error_ratio
         )
-        tolerance = self.config.center_tolerance_ratio
+        tolerance = (
+            self.config.center_tolerance_ratio
+            if tolerance_ratio is None
+            else float(tolerance_ratio)
+        )
         reversal_limit = tolerance + self.config.center_reverse_deadband_ratio
         if abs(horizontal_error_ratio) <= tolerance and abs(raw_error) <= tolerance:
             self._center_reverse_candidate_sign = None
@@ -1818,6 +2042,47 @@ class ClusterBreakupSequence:
             nearest_forward_distance_mm=(
                 min(forward_distances) if forward_distances else None
             ),
+            center_tolerance_ratio=self.config.center_tolerance_ratio,
+            frame_sequence=perception.frame_sequence,
+        )
+
+    def _active_cluster_view(
+        self,
+        perception: PerceptionSnapshot | None,
+        targeted_cluster: TargetedClusterMeasurement | None,
+        *,
+        minimum_count: int,
+    ) -> _ClusterView | None:
+        if not self._targeted_cluster_mode:
+            return self._cluster_view(perception, minimum_count=minimum_count)
+        if targeted_cluster is None:
+            return None
+        assert self._targeted_center_tolerance_rad is not None
+        # Targeted mode uses a robot-ground bearing. Positive GroundPoint.y is
+        # left, while the existing centering controller expects positive error
+        # on the right, so the sign is inverted here.
+        raw_error = -math.atan2(
+            targeted_cluster.center_ground.y,
+            targeted_cluster.center_ground.x,
+        )
+        if self._last_center_filter_frame_sequence != targeted_cluster.frame_sequence:
+            alpha = self.config.center_error_filter_alpha
+            if self._filtered_center_error_ratio is None:
+                self._filtered_center_error_ratio = raw_error
+            else:
+                self._filtered_center_error_ratio += alpha * (
+                    raw_error - self._filtered_center_error_ratio
+                )
+            self._last_center_filter_frame_sequence = targeted_cluster.frame_sequence
+        assert self._filtered_center_error_ratio is not None
+        return _ClusterView(
+            horizontal_error_ratio=self._filtered_center_error_ratio,
+            raw_horizontal_error_ratio=raw_error,
+            nearest_forward_distance_mm=(
+                targeted_cluster.nearest_forward_distance_mm
+            ),
+            center_tolerance_ratio=self._targeted_center_tolerance_rad,
+            frame_sequence=targeted_cluster.frame_sequence,
         )
 
     def _largest_observation_group(
@@ -1873,6 +2138,12 @@ class ClusterBreakupSequence:
         self._last_frame_sequence = perception.frame_sequence
         return True
 
+    def _is_new_cluster_frame(self, frame_sequence: int) -> bool:
+        if frame_sequence == self._last_frame_sequence:
+            return False
+        self._last_frame_sequence = frame_sequence
+        return True
+
     def _transition(
         self,
         state: BreakupState,
@@ -1884,12 +2155,16 @@ class ClusterBreakupSequence:
         self._state_distance_m = distance_m
         if state is BreakupState.CENTER_CLUSTER:
             self._centered_frames = 0
+            self._approach_travel_distance_m = None
         if state is BreakupState.SEARCH_CLUSTER:
             self._filtered_center_error_ratio = None
             self._last_center_filter_frame_sequence = None
             self._center_turn_sign = None
             self._center_reverse_candidate_sign = None
             self._center_reverse_candidate_frames = 0
+            self._approach_travel_distance_m = None
+        if state is BreakupState.BREAKUP_PUSH:
+            self._approach_travel_distance_m = None
         if state is BreakupState.SCAN_GREEN:
             self._green_frames = 0
 

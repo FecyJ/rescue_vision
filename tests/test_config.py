@@ -93,6 +93,7 @@ motion:
   max_angular_velocity_rad_s: 1.0
   max_wheel_velocity_m_s: 0.30
   max_wheel_acceleration_m_s2: 0.50
+  min_wheel_velocity_m_s: 0.02
   max_remote_command_valid_for_ms: 500
   synchronization_timeout_s: 1.0
   gripper:
@@ -924,10 +925,13 @@ def test_motion_config_builds_controller_without_opening_uart(tmp_path) -> None:
     assert controller is not None
     assert controller.limits.wheel_track_m == pytest.approx(0.2)
     assert controller.limits.max_wheel_acceleration_m_s2 == pytest.approx(0.5)
+    assert controller.limits.min_wheel_velocity_m_s == pytest.approx(0.02)
+    assert controller.limits.left_wheel_speed_weight == pytest.approx(1.0)
+    assert controller.limits.right_wheel_speed_weight == pytest.approx(1.0)
     assert controller.limits.stall_guard_enabled is True
     assert controller.limits.stall_guard_timeout_ms == 300
     assert controller.limits.stall_guard_min_command_speed_m_s == pytest.approx(
-        0.01
+        0.02
     )
     assert controller.limits.stall_guard_stationary_encoder_delta_count == 0
     assert config.motion.synchronization_timeout_s == pytest.approx(1.0)
@@ -994,6 +998,54 @@ def test_motion_acceleration_limit_must_be_positive(tmp_path) -> None:
     )
 
     with pytest.raises(ValueError, match="max_wheel_acceleration_m_s2"):
+        load_runtime_config(path)
+
+
+def test_motion_min_wheel_velocity_must_not_exceed_max(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text().replace(
+            "  max_wheel_velocity_m_s: 0.30",
+            "  max_wheel_velocity_m_s: 0.01",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="min_wheel_velocity_m_s"):
+        load_runtime_config(path)
+
+
+def test_motion_wheel_speed_weights_are_parsed(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text()
+        .replace(
+            "  max_wheel_acceleration_m_s2: 0.50",
+            "  max_wheel_acceleration_m_s2: 0.50\n"
+            "  left_wheel_speed_weight: 1.05\n"
+            "  right_wheel_speed_weight: 0.95",
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(path)
+
+    assert config.motion.left_wheel_speed_weight == pytest.approx(1.05)
+    assert config.motion.right_wheel_speed_weight == pytest.approx(0.95)
+
+
+def test_motion_wheel_speed_weight_must_be_positive(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text().replace(
+            "  max_wheel_acceleration_m_s2: 0.50",
+            "  max_wheel_acceleration_m_s2: 0.50\n"
+            "  left_wheel_speed_weight: 0.0",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="motion.left_wheel_speed_weight"):
         load_runtime_config(path)
 
 

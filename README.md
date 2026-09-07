@@ -2,7 +2,7 @@
 
 2027 工创赛“智能救援”赛项的上位机视觉工程，目标平台为 Raspberry Pi 5、Hailo-8L 和 Camera Module 3 NoIR Wide。
 
-当前已完成相机、标定与地面几何、严格配置、录制回放、数据集工具、离线评测、COBS/CRC16 UART 帧通道及 STM32 二进制协议树莓派端、直接 TCP 远程消息通道、差速与双舵机夹爪控制、受监督手动驾驶采集入口、YOLO Pose v3 六类三关键点解析与同帧分流、中心十字/安全区视觉定位消费、编码器/IMU 二维连续融合、连续场地图远程发布，以及可用合成事件运行的目标跟踪、最小世界模型、规则状态机和受限四绿色物资 20 分模拟赛初版编排入口；尚未完成正式 v3 模型资产、实测安全区地标、远场地面标定、完整区域/对手感知、现场接触/交付证据、固件失联看门狗闭环和正式比赛应用。这不是可直接参赛的完整程序。
+当前已完成相机、标定与地面几何、严格配置、录制回放、数据集工具、离线评测、COBS/CRC16 UART 帧通道及 STM32 二进制协议树莓派端、直接 TCP 远程消息通道、差速与双舵机夹爪控制、受监督手动驾驶采集入口、YOLO Pose v3 六类三关键点解析与同帧分流、中心十字/安全区视觉定位消费、编码器/IMU 二维连续融合、连续场地图远程发布、目标跟踪、最小世界模型、规则状态机和正式流程。尚未完成正式 v3 模型资产、实测安全区地标、远场地面标定、完整区域/对手感知、现场接触/交付证据、固件失联看门狗闭环和整车比赛验收。这不是可直接参赛的完整程序。
 
 ## 快速上手
 
@@ -43,7 +43,8 @@ python -m pytest
 | 对接 STM32、编码器或 IMU | [树莓派与单片机通信协议 v3](docs/树莓派与单片机通信协议v3.md) |
 | 开发新模块 | [项目结构](docs/项目结构.md) → [后续优先级](docs/后续优先级.md) |
 | 理解比赛类别和安全规则 | [赛题约束与视觉需求](docs/赛题约束与视觉需求.md) |
-| 实现单车 20 分模拟赛闭环 | [20 分模拟赛流程设计](docs/20分模拟赛流程设计.md) |
+| 实现和联调正式流程 | [正式流程设计](docs/正式流程设计.md) |
+| 查看可复用但尚未接入的目标记忆模块 | [项目结构](docs/项目结构.md) |
 | 查数据或评测 JSONL 格式 | [数据集与评测 schema](docs/数据集与评测.md) |
 | 修改仓库 | [AGENTS.md](AGENTS.md) |
 
@@ -57,9 +58,9 @@ python -m pytest
 | [`calibration`](src/rescue_vision/calibration/README.md) | 已实现 | 棋盘/ChArUco 采集、三模型内参比较和固定机器人多位置地面映射 |
 | [`geometry`](src/rescue_vision/geometry/README.md) | 已实现 | 去畸变、显式坐标类型、地面/三维点投影与 BEV 转换 |
 | [`config`](src/rescue_vision/config/README.md) | 已实现 | 安全默认配置、静态场地、UART/远程/motion/夹爪机械标定/几何/模型和感知算法装配 |
-| [`communication`](src/rescue_vision/communication/README.md) | 已实现基础设施 | COBS UART 帧、直接 TCP 远程消息、raw/perception/BEV 图传、轻量动态地图 JSON、运动/夹爪/采集严格 schema 和有界队列；20 分模拟赛 observe_only 发布器已接入，正式比赛发布器待验收 |
+| [`communication`](src/rescue_vision/communication/README.md) | 已实现基础设施 | COBS UART 帧、直接 TCP 远程消息、raw/perception/BEV 图传、轻量动态地图 JSON、运动/夹爪/采集严格 schema 和有界队列；正式流程观察发布器待真车验收 |
 | [`motion`](src/rescue_vision/motion/README.md) | 已实现基础设施 | STM32 v3 固定二进制协议、序号安全同步、差速运动、持续扳机双舵机夹爪、单轮加速度限制和远程超时保护；真车联调与 IMU 标定待验收 |
-| [`app`](src/rescue_vision/app/README.md) | 已实现受限初版 | 受监督驾驶/采集、固定出发解团试验、四绿色物资 20 分模拟赛软件流程、每次解团后的己方安全区校准动作、像素居中抓取绿色物资试验、编码器+IMU航位推算和不阻塞 observe_only 图传/`map/state` 位姿发布；真车门禁与正式比赛能力待验收 |
+| [`app`](src/rescue_vision/app/README.md) | 已实现受限初版 | 正式流程、夹取—运输联调、受监督驾驶/采集、固定解团试验、像素居中抓取试验、编码器+IMU航位推算和不阻塞 observe_only 图传/`map/state` 位姿发布；真车门禁与正式比赛能力待验收 |
 | [`data`](src/rescue_vision/data/README.md) | 已实现 | 记录检查、清单生成和按会话防泄漏划分 |
 | [`evaluation`](src/rescue_vision/evaluation/README.md) | 已实现 | 分类、地面误差、时延和失败样例报告 |
 | [`perception`](src/rescue_vision/perception/README.md) | 已实现基础设施 | v3 六类/[3,3] Hailo 解析、任务目标与场地特征同帧分流、ROI HSV、中心十字局部轴线精修和统一可视化；正式模型资产与现场性能待验证 |
@@ -67,9 +68,21 @@ python -m pytest
 | [`tracking`](src/rescue_vision/tracking/README.md) | 已实现纯逻辑 | 时间关联、轨迹确认、短时遮挡、衰减和删除 |
 | [`world`](src/rescue_vision/world/README.md) | 已实现纯逻辑 | 固定物理地图、红蓝任务区域派生、动态目标、危险状态、对手占据和不确定性 |
 | [`mission`](src/rescue_vision/mission/README.md) | 已实现纯逻辑 | 首次/容量/伤员/危险规则、安全降级和抽象动作 |
-| 定位至比赛应用主链路 | 受限初版 | 20 分流程已接入跟踪、世界模型、规则状态机、受限导航、几何接触/交付证据和运动意图；真实区域/接触传感器、真车参数与正式比赛扩展待完成 |
+| 定位至比赛应用主链路 | 受限初版 | 正式流程已接入跟踪、规则状态机、相对运动意图和 d1 安全区视觉纠偏；真实区域/接触证据、真车参数与整车验收待完成 |
 
 各包常用 API、命令和实际对接示例见 [`src/rescue_vision/README.md`](src/rescue_vision/README.md)。
+
+正式入口使用相对视觉坐标、陀螺仪航向和编码器定距。每次交付退出后先整圈扫描可夹取绿色物资；搜索态可按配置直接抓取通过单物块净空和前进走廊门禁的绿色目标，否则选择完整目标团。绿色目标到达 `green_grab_offset_mm` 后保持局部张爪停车复核相邻绿块，给 tracker 留出确认时间并可按 `green_preclose_max_carried_blocks` 上限循环重新对准纳入；无候选或达到上限后才闭爪。解团和绿色接近都检查双方安全区、车体包络和场地边界，门禁失败会停车并寻找下一候选。夹取后沿补偿后的 d1 直线到达安全区，d1 停稳后使用 K0/K1/K2 与静态地标拟合并覆盖车辆场地位姿，再沿校正位姿完成 d2、末段推进、释放和退出。详见[正式流程设计](docs/正式流程设计.md)。
+
+另有独立的夹取—运输联调入口：车辆从 `FieldPoint(0,0)`、`+90°` 出发，直接搜索满足单物块净空门禁的绿色物资；它不会进入解团状态，搜索到目标后复用正式流程的对准、定距夹取、安全区视觉纠偏和退出流程：
+
+```bash
+rescue-vision-grab-transport \
+  --config configs/runtime.match.yaml \
+  --supervised-physical-stop-ready \
+  --local-preview \
+  --log-dir logs
+```
 
 ## 核心数据流
 
@@ -109,15 +122,16 @@ OdometryImu → OdometryImuFusion → FieldPose2D
 FieldPose2D → RemoteLocalizationPublisher → observation/map/state
               （独立低频 JSON 旁路）
 
-PerceptionSnapshot + FieldPose2D → Simulation20PointSequence
-                                  → 单目标推送/交付证据 → MotionController
+PerceptionSnapshot + relative heading/distance ───────→ MatchSequence
+                                                       → 运动/夹爪意图 → MotionController
 ```
 
 - 像素必须区分 `RawPixel` 与 `UndistortedPixel`；地面点使用 `GroundPoint`，单位 mm。
 - `CameraModel` 是去畸变唯一权威；`GroundProjector` 是去畸变像素与机器人地面/三维投影的唯一权威。
 - 实时路径只处理最新帧；录像、显示和日志使用有界旁路。
 - 危险目标允许 `unknown`/疑似危险，不得用总体指标掩盖危险类漏检。
-- 规则状态机只消费显式世界、接触、交付和安全证据；20 分初版提供保守几何证据适配，真实接触传感器和现场交付验收尚未完成。
+- 规则状态机只消费显式世界、接触、交付和安全证据；正式流程的几何门禁和 d1 视觉纠偏仍需真实接触、地标和现场验收。
+- `scan_target_memory.py` 与 `field_target_cluster.py` 是可复用纯逻辑模块，当前不接入正式流程，也不包含采集时刻位姿对齐或记忆目标接管。
 - 场地特征观测契约只输出去畸变像素和可选机器人地面观测；检测实现不得在定位
   完成前伪造 `FieldPoint` 或直接修改世界模型。传统全图 OpenCV 场地检测与局部
   场界已删除；仅允许在模型 bbox 内进行中心十字轴线精修。
@@ -215,7 +229,8 @@ GroundPoint ── 中心十字绝对观测 + 编码器/IMU 连续融合 ──>
 | `rescue-vision-manual-capture` | 受监督手动驾驶与车载运动采集 |
 | `rescue-vision-cluster-breakup` | 固定出发姿态的受监督解团与绿色扫描试验 |
 | `rescue-vision-green-grab` | 识别绿色物资、开夹爪像素居中接近并合爪的简化试验入口 |
-| `rescue-vision-simulation-20-point` | 受限四绿色物资 20 分模拟赛初版入口 |
+| `rescue-vision-match` | 正式流程入口；支持本地图像预览、observe-only perception JPEG、D2 遥测和按时间命名的流程日志 |
+| `rescue-vision-grab-transport` | 夹取—运输联调入口；从场地 `(0,0,+90°)` 直接搜索可夹取绿色物资，不执行解团，复用正式流程的夹取、视觉纠偏、运输和退出流程 |
 | `rescue-vision-split` | 按 `recording_id` 整组划分 |
 | `rescue-vision-evaluate` | 生成离线评测报告 |
 

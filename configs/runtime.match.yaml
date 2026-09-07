@@ -1,0 +1,262 @@
+# 正式流程：搜索态可机会抓取单个绿色物资，解团后按前进走廊阻挡选择绿色物资。
+
+camera:
+  backend: rpicam_vid
+  image_size: [2304, 1296]
+  fps: 20
+  lens_position: 0.9687536954879761
+
+geometry:
+  intrinsics_enabled: true
+  intrinsics_path: ../src/rescue_vision/calibration/output/intrinsics_20260723_154106/selected_calibration.json
+  ground_mapping_enabled: true
+  ground_mapping_path: ../src/rescue_vision/calibration/output/ground_mapping_debug_near_field_20260823_092445_925685/ground_mapping_debug_near_field.json
+
+processing:
+  max_observation_age_ms: 500.0
+
+perception:
+  safe_zone_color:
+    enabled: true
+    red_hsv_ranges:
+      - lower: [0, 100, 35]
+        upper: [10, 255, 255]
+      - lower: [170, 100, 35]
+        upper: [179, 255, 255]
+    blue_hsv_ranges:
+      - lower: [90, 70, 35]
+        upper: [120, 255, 255]
+    min_fraction: 0.08
+    min_margin: 0.03
+
+uart:
+  enabled: true
+  device: /dev/serial0
+  read_timeout_ms: 100.0
+  write_timeout_ms: 100.0
+  receive_queue_capacity: 256
+
+remote:
+  enabled: false
+  role: server
+  host: 0.0.0.0
+  port: 8765
+  access_mode: observe_only
+
+motion:
+  enabled: true
+  wheel_track_m: 0.235
+  max_linear_velocity_m_s: 0.60
+  max_angular_velocity_rad_s: 1.0
+  max_wheel_velocity_m_s: 0.50
+  max_wheel_acceleration_m_s2: 1.0
+  # 减速电机的非零单轮最低目标速度；低于该值的轮速会提升到该值。
+  min_wheel_velocity_m_s: 0.02
+  left_wheel_speed_weight: 1.0
+  right_wheel_speed_weight: 1.0
+  max_remote_command_valid_for_ms: 500
+  synchronization_timeout_s: 1.0
+  stall_guard:
+    enabled: true
+    timeout_ms: 300
+    min_command_speed_m_s: 0.02
+    stationary_encoder_delta_count: 0
+  gripper:
+    enabled: true
+    open_left_angle_deg: 0
+    open_right_angle_deg: 180
+    closed_left_angle_deg: 80
+    closed_right_angle_deg: 100
+    transport_left_angle_deg: 63
+    transport_right_angle_deg: 117
+    full_travel_time_s: 1.0
+    angle_sum_deg: 180.0
+  odometry:
+    enabled: true
+    encoder_counts_per_revolution: 836
+    left_wheel_radius_mm: 33.0
+    right_wheel_radius_mm: 33.0
+    gyro_z_sign: -1
+    max_consecutive_overrun_samples: 1
+  cluster_breakup:
+    enabled: false
+
+world:
+  team_color: red
+  static_map:
+    # 沿用 runtime.example.yaml 的命题示意图启动区域，非现场测量真值。
+    # 解团门禁在彩色区域外再加车体半径和安全余量；现场变化只改静态地图。
+    regions:
+      - region_id: field
+        kind: field
+        polygon_field_mm:
+          - [-1500.0, -1500.0]
+          - [1500.0, -1500.0]
+          - [1500.0, 1500.0]
+          - [-1500.0, 1500.0]
+      - region_id: red-material
+        kind: red_material
+        polygon_field_mm: [[-300.0, 1200.0], [0.0, 1200.0], [0.0, 1500.0], [-300.0, 1500.0]]
+      - region_id: red-injured
+        kind: red_injured
+        polygon_field_mm: [[0.0, 1200.0], [300.0, 1200.0], [300.0, 1500.0], [0.0, 1500.0]]
+      - region_id: blue-injured
+        kind: blue_injured
+        polygon_field_mm: [[-300.0, -1500.0], [0.0, -1500.0], [0.0, -1200.0], [-300.0, -1200.0]]
+      - region_id: blue-material
+        kind: blue_material
+        polygon_field_mm: [[0.0, -1500.0], [300.0, -1500.0], [300.0, -1200.0], [0.0, -1200.0]]
+    safe_zone_landmarks:
+      - color: red
+        ground_anchor_field_mm: [0.0, 1137.0]
+        near_field_corners_mm: [[-330.0, 1137.0], [330.0, 1137.0]]
+        measured: true
+        usable: true
+      - color: blue
+        ground_anchor_field_mm: [0.0, -1137.0]
+        near_field_corners_mm: [[330.0, -1137.0], [-330.0, -1137.0]]
+        measured: true
+        usable: true
+
+match:
+  robot_footprint_radius_mm: 160.0
+  safety_margin_mm: 10.0
+  enabled: true
+  # 启动右转角，单位 rad；角速度符号决定右转方向。
+  startup_turn_angle_rad: 0.5
+  startup_turn_angular_velocity_rad_s: -0.30
+  startup_turn_settle_time_s: 0.3
+  # 启动直行距离和速度，单位 m、m/s。
+  startup_forward_distance_m: 1.5
+  startup_forward_speed_m_s: 0.12
+  startup_forward_settle_time_s: 0.3
+  # 启动直行的左右轮速 PID；现场先调 P，I/D 通常保持 0。
+  startup_straight_pid_kp_rad_s_per_m_s: 1.5
+  startup_straight_pid_ki_rad_s_per_m: 0.0
+  startup_straight_pid_kd_rad_s_per_m_s2: 0.0
+  startup_straight_pid_integral_limit: 0.10
+  startup_straight_pid_deadband_m_s: 0.012
+  startup_straight_pid_max_angular_velocity_rad_s: 0.08
+  # 目标团搜索原地转速和单方向扫描跨度，单位 rad/s、rad。
+  cluster_search_angular_velocity_rad_s: -0.30
+  cluster_search_sweep_angle_rad: 6.283185307179586
+  cluster_min_detections: 2
+  cluster_group_ground_mm: 100.0
+  # 目标团最前方物块到夹爪的解团前停车距离，单位 mm；接近速度单位 m/s。
+  cluster_breakup_standoff_mm: 260.0
+  cluster_approach_speed_m_s: 0.12
+  # 团对准角度和丢帧保持门限；保持时间单位 ms。
+  cluster_align_tolerance_rad: 0.05
+  # 解团对准时短暂丢失当前团观测只零速等待，不沿旧中心继续旋转；等待窗口 2 s。
+  cluster_align_hold_ms: 2000.0
+  cluster_align_kp_rad_s: 1.0
+  cluster_align_max_angular_velocity_rad_s: 0.35
+  # 搜索目标团时，可靠的单个绿色普通物资可抢占解团流程；先停车取 10 帧均值。
+  opportunistic_single_green_enabled: true
+  # 目标中心周围该半径内不能有其它新鲜轨迹，单位 mm；需结合现场误差复核。
+  opportunistic_single_green_clearance_mm: 120.0
+  # 所有绿色远目标先接近到距目标约 450 mm，再停车重新旋转对准，随后完成最终抓取。
+  opportunistic_single_green_realign_standoff_mm: 450.0
+  # 解团前推/后退的距离和速度，单位 m、m/s。
+  breakup_forward_distance_m: 0.5
+  breakup_forward_speed_m_s: 0.40
+  breakup_backward_distance_m: 0.2
+  breakup_backward_speed_m_s: 0.08
+  # 合爪后原地扫描一整圈，单位 rad/s、rad。
+  close_gripper_spin_angular_velocity_rad_s: -0.30
+  spin_angle_rad: 6.283185307179586
+  # 目标对齐坐标系中前进走廊的横向阻挡半宽，单位 mm。
+  green_path_half_width_mm: 50.0
+  # 绿色目标允许的最大观测年龄，单位 ms。
+  green_max_age_ms: 1000.0
+  # 绿色目标对准阶段的失鲜保持窗口，单位 ms。
+  green_align_hold_ms: 1500.0
+  # 绿色目标横向对准容差，单位 mm；其余对准参数单位为 rad/s。
+  green_alignment_tolerance_mm: 10.0
+  green_alignment_kp_rad_s: 1.0
+  green_alignment_max_angular_velocity_rad_s: 0.20
+  green_approach_speed_m_s: 0.08
+  # 目标物块被抓取后相对机器人中心的距离，单位 mm。
+  green_grab_offset_mm: 175
+  # 到达抓取偏移后，以车体原点为中心复核绿色物块的半径，单位 mm；不要求在车前。
+  green_preclose_recheck_range_mm: 300.0
+  # 到位停车后保持局部张爪并等待新鲜绿块确认的时间，单位 ms。
+  green_preclose_recheck_hold_ms: 500.0
+  # 本次闭爪最多携带的绿色物块总数；2 表示最多复核并收入 1 个额外物块。
+  green_preclose_max_carried_blocks: 2
+  # 安全区扫描/地标搜索原地转速，单位 rad/s。
+  transport_rotate_angular_velocity_rad_s: 0.30
+  transport_align_tolerance_mm: 30.0
+  # 夹取后→d1 的推进速度，单位 m/s。
+  safe_zone_grab_to_d1_speed_m_s: 0.2
+  # d1→d2 的推进速度，单位 m/s。
+  safe_zone_d1_to_d2_speed_m_s: 0.1
+  # d2 张爪、转向、闭爪后到安全区末端的推进速度，单位 m/s。
+  safe_zone_d2_to_final_speed_m_s: 0.35
+  # d2→安全区末端的临时单轮最大加速度，单位 m/s²；允许独立高于 motion 全局基准，
+  # 现场按刹车距离实测调整。
+  safe_zone_d2_to_final_max_wheel_acceleration_m_s2: 4.0
+  # 安全区路线推进终点 FieldPoint：[x_mm, y_mm]；同时定义 d1/d2 基准坐标。
+  safe_zone_fallback_target_field_mm: [-135.0, 1115.0]
+  # 安全区路线航向保持参数；角度单位 rad，角速度单位 rad/s。
+  safe_zone_fallback_heading_tolerance_rad: 0.02
+  safe_zone_fallback_heading_kp_rad_s: 1.0
+  safe_zone_fallback_max_angular_velocity_rad_s: 0.30
+  # 闭爪状态开始 K0/K1/K2 视觉校正前的 y 偏移 d1，单位 mm。
+  safe_zone_calibration_start_offset_mm: 700.0
+  # 视觉校正后到 d2 点的 y 偏移，单位 mm；d2 后张爪、转向、闭爪推进，末端停稳后再次张爪。
+  safe_zone_open_offset_mm: 300.0
+  # 夹取后→d1、d1→d2 直线段软刹车后的场地坐标过冲分量，单位 mm；有符号。
+  # 正值表示刹车后仍向 FieldPoint 的 +x/+y 方向移动，策略会将对应停车目标
+  # 向负方向提前。
+  safe_zone_d2_braking_overrun_x_mm: 20.0
+  safe_zone_d2_braking_overrun_y_mm: 0.0
+  # d2 闭爪推进后末段的固定刹车过冲提前量，正值在配置终点 y 前停车，单位 mm。
+  safe_zone_d2_to_final_braking_overrun_mm: 110.0
+  # d1 处和 90° 校准后均要求左右轮速低于阈值并连续确认后再继续。
+  safe_zone_calibration_stop_speed_threshold_m_s: 0.02
+  safe_zone_calibration_stop_confirm_time_s: 0.3
+  # 到达末段终点后停稳并倒车退出的距离，单位 m。
+  safe_zone_exit_distance_m: 0.30
+  # 退出安全区后的顺时针原地转角，单位 rad。
+  safe_zone_exit_turn_angle_rad: 1.5708
+  # 解团前停车后的稳定等待时间，单位 s。
+  breakup_settle_time_s: 0.3
+  # 每个转向/直行动作切换前保持零速，避免加速度限制下残余运动串入下一动作。
+  action_settle_time_s: 0.3
+  # 地图物理边界为 ±1500 mm；夹爪偏移 200 mm 后，解团中点允许范围为 ±1300 mm。
+  breakup_field_half_extent_mm: 1500.0
+  breakup_gripper_offset_mm: 200.0
+  # 每轮交付次数；达到后结束流程。
+  required_transports: 8
+  # 退出安全区后的倒车速度，单位 m/s。
+  return_backup_speed_m_s: 0.08
+
+localization:
+  enabled: false
+  fusion:
+    enabled: false
+    initial_pose:
+      x_mm: 1350.0
+      y_mm: 1350.0
+      heading_deg: -90.0
+      position_uncertainty_mm: 50.0
+      heading_uncertainty_deg: 5.0
+      confidence: 0.8
+
+hailo:
+  enabled: true
+  hef_path: ../../hailo-models/simreal_v1/rpi_bundle/model.hef
+  postprocess_onnx_path: ../../hailo-models/simreal_v1/rpi_bundle/postprocess.onnx
+  output_mapping_path: ../../hailo-models/simreal_v1/rpi_bundle/onnx_split_config.json
+  raw_classes:
+    - green_supply
+    - black_core
+    - orange_injured
+    - blue_danger
+    - center_cross
+    - safe_zone
+  backend_score_threshold: 0.01
+  max_detections: 100
+
+# 复用现有车体包络/安全余量配置，供解团/夹取接近的双方安全区路径检查。

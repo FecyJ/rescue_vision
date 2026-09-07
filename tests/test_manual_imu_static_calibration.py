@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import pytest
 
-from manual_tests.imu_static_calibration import StaticImuCalibration
+from manual_tests.imu_static_calibration import (
+    RotationObservation,
+    RotationPhase,
+    StaticImuCalibration,
+    analyze_rotation_phase,
+    combine_rotation_reports,
+    _matrix_vector,
+    sensor_to_robot_rotation_from_gravity,
+)
 from rescue_vision.motion import OdometryImu, SensorFlags
 
 
@@ -55,6 +63,65 @@ def test_static_calibration_accumulates_bias_noise_and_recommendation() -> None:
     assert recommended["localization"]["fusion"]["imu_calibration"][
         "reference_temperature_c"
     ] == pytest.approx(25.0)
+    rotation = recommended["localization"]["fusion"]["imu_calibration"][
+        "sensor_to_robot_rotation"
+    ]
+    mapped = _matrix_vector(
+        tuple(tuple(float(value) for value in row) for row in rotation),
+        (10.0, -20.0, 9_807.0),
+    )
+    assert mapped[0] == pytest.approx(0.0, abs=1e-5)
+    assert mapped[1] == pytest.approx(0.0, abs=1e-5)
+    assert mapped[2] == pytest.approx(
+        (10.0**2 + 20.0**2 + 9_807.0**2) ** 0.5,
+        rel=1e-9,
+    )
+
+
+def test_gravity_rotation_rejects_zero_vector_and_aligns_tilt() -> None:
+    with pytest.raises(ValueError, match="norm"):
+        sensor_to_robot_rotation_from_gravity((0.0, 0.0, 0.0))
+
+    rotation = sensor_to_robot_rotation_from_gravity((0.0, -1.0, 1.0))
+    mapped = _matrix_vector(rotation, (0.0, -1.0, 1.0))
+    assert mapped[0] == pytest.approx(0.0, abs=1e-12)
+    assert mapped[1] == pytest.approx(0.0, abs=1e-12)
+    assert mapped[2] == pytest.approx(2.0**0.5)
+
+
+def test_active_rotation_compares_integrated_gyro_with_encoder_angle() -> None:
+    phase = RotationPhase(
+        direction=1,
+        baseline_left_count=0,
+        baseline_right_count=0,
+        baseline_sample_timestamp_us=0,
+        encoder_counts_per_revolution=100,
+        left_wheel_radius_m=0.1,
+        right_wheel_radius_m=0.1,
+        wheel_track_m=0.5,
+        observations=[
+            RotationObservation(100_000, 0.0, (0.0, 0.0, 0.5)),
+            RotationObservation(200_000, 0.05, (0.0, 0.0, 0.5)),
+        ],
+    )
+
+    result = analyze_rotation_phase(
+        phase,
+        sensor_to_robot_rotation=(
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, 1.0),
+        ),
+        gyro_bias_rad_s_sensor_frame=(0.0, 0.0, 0.0),
+    )
+
+    assert result["gyro_integrated_yaw_rad"] == pytest.approx(0.05)
+    assert result["encoder_yaw_rad"] == pytest.approx(0.05)
+    assert result["gyro_to_encoder_scale"] == pytest.approx(1.0)
+    assert result["gyro_z_sign"] == 1
+    combined = combine_rotation_reports([result])
+    assert combined["gyro_z_sign"] == 1
+    assert combined["sign_consistent"] is True
 
 
 def test_static_calibration_rejects_bad_quality_and_motion() -> None:

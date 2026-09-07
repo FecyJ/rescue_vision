@@ -15,6 +15,7 @@ from rescue_vision.app.cluster_breakup import (
     OdometryFusionPump,
     RemotePerceptionPublisher,
     RemotePerceptionTransport,
+    TargetedClusterMeasurement,
     RemoteLocalizationPublisher,
     _submit_breakup_odometry,
     build_cluster_observation_status,
@@ -35,7 +36,11 @@ from rescue_vision.communication import (
 from rescue_vision.geometry.types import FieldPoint
 from rescue_vision.geometry.types import GroundPoint, UndistortedPixel
 from rescue_vision.localization import OdometryCalibration
-from rescue_vision.localization import FieldPose2D, FusedPoseEstimate
+from rescue_vision.localization import (
+    FieldPose2D,
+    FusedPoseEstimate,
+    VisualAnchorHealth,
+)
 from rescue_vision.motion import OdometryImu, SensorFlags
 from rescue_vision.perception import (
     ClassProbabilities,
@@ -86,6 +91,55 @@ def test_breakup_distance_override_is_kept_on_the_initial_instance() -> None:
     )
 
     assert sequence.breakup_distance_m == pytest.approx(0.5)
+
+
+def test_targeted_breakup_ignores_unlocked_image_clusters() -> None:
+    sequence = ClusterBreakupSequence(
+        breakup_config(cluster_min_detections=5, center_confirm_frames=1),
+        gripper_full_travel_time_s=1.0,
+        skip_departure=True,
+        targeted_cluster_mode=True,
+        targeted_center_tolerance_rad=0.1,
+    )
+    sequence.step(timestamp_ns=0, cumulative_distance_m=0.0, perception=None)
+
+    unrelated = sequence.step(
+        timestamp_ns=100_000_000,
+        cumulative_distance_m=0.0,
+        perception=cluster_snapshot(1, distance_mm=500.0),
+    )
+    assert unrelated.state is BreakupState.SEARCH_CLUSTER
+
+    locked = TargetedClusterMeasurement(
+        frame_sequence=2,
+        member_track_ids=(11, 12),
+        green_track_ids=(11,),
+        center_ground=GroundPoint(500.0, 100.0),
+        nearest_forward_distance_mm=480.0,
+    )
+    centered = sequence.step(
+        timestamp_ns=200_000_000,
+        cumulative_distance_m=0.0,
+        perception=cluster_snapshot(2, distance_mm=500.0),
+        targeted_cluster=locked,
+    )
+    assert centered.state is BreakupState.CENTER_CLUSTER
+    assert centered.angular_velocity_rad_s > 0.0
+
+    aligned = sequence.step(
+        timestamp_ns=300_000_000,
+        cumulative_distance_m=0.0,
+        perception=cluster_snapshot(3, distance_mm=500.0),
+        targeted_cluster=TargetedClusterMeasurement(
+            frame_sequence=3,
+            member_track_ids=(11, 12),
+            green_track_ids=(11,),
+            center_ground=GroundPoint(500.0, 0.0),
+            nearest_forward_distance_mm=480.0,
+        ),
+    )
+    assert aligned.state is BreakupState.APPROACH_CLUSTER
+    assert aligned.linear_velocity_m_s == pytest.approx(0.1)
 
 
 def observation(
@@ -218,11 +272,24 @@ def test_breakup_sequence_reaches_scan_green_then_stops_on_green() -> None:
     )
     assert centered_2.state is BreakupState.APPROACH_CLUSTER
     assert centered_2.linear_velocity_m_s == 0.1
+    assert centered_2.angular_velocity_rad_s == 0.0
+    assert sequence.approach_locked
 
-    pushing = sequence.step(
+    approaching = sequence.step(
         timestamp_ns=1_400_000_000,
         cumulative_distance_m=0.55,
-        perception=cluster_snapshot(14, distance_mm=240.0),
+        # 接近阶段不再读取目标框横向误差，甚至不需要继续提供视觉快照。
+        perception=None,
+    )
+    assert approaching.state is BreakupState.APPROACH_CLUSTER
+    assert approaching.gripper_posture is GripperPosture.CLOSED
+    assert approaching.linear_velocity_m_s == 0.1
+    assert approaching.angular_velocity_rad_s == 0.0
+
+    pushing = sequence.step(
+        timestamp_ns=1_500_000_000,
+        cumulative_distance_m=0.75,
+        perception=None,
     )
     assert pushing.state is BreakupState.BREAKUP_PUSH
     assert pushing.gripper_posture is GripperPosture.CLOSED
@@ -230,7 +297,7 @@ def test_breakup_sequence_reaches_scan_green_then_stops_on_green() -> None:
 
     releasing = sequence.step(
         timestamp_ns=2_000_000_000,
-        cumulative_distance_m=0.75,
+        cumulative_distance_m=0.95,
         perception=None,
     )
     assert releasing.state is BreakupState.BREAKUP_RELEASE
@@ -239,7 +306,7 @@ def test_breakup_sequence_reaches_scan_green_then_stops_on_green() -> None:
 
     holding_open = sequence.step(
         timestamp_ns=2_500_000_000,
-        cumulative_distance_m=0.75,
+        cumulative_distance_m=0.95,
         perception=None,
     )
     assert holding_open.state is BreakupState.BREAKUP_RELEASE
@@ -248,7 +315,7 @@ def test_breakup_sequence_reaches_scan_green_then_stops_on_green() -> None:
 
     open_retreating = sequence.step(
         timestamp_ns=3_000_000_000,
-        cumulative_distance_m=0.75,
+        cumulative_distance_m=0.95,
         perception=None,
     )
     assert open_retreating.state is BreakupState.BREAKUP_OPEN_RETREAT
@@ -257,7 +324,7 @@ def test_breakup_sequence_reaches_scan_green_then_stops_on_green() -> None:
 
     open_retreating_done = sequence.step(
         timestamp_ns=3_500_000_000,
-        cumulative_distance_m=0.65,
+        cumulative_distance_m=0.85,
         perception=None,
     )
     assert open_retreating_done.state is BreakupState.BREAKUP_CLOSE
@@ -266,7 +333,7 @@ def test_breakup_sequence_reaches_scan_green_then_stops_on_green() -> None:
 
     closing = sequence.step(
         timestamp_ns=4_000_000_000,
-        cumulative_distance_m=0.65,
+        cumulative_distance_m=0.85,
         perception=None,
     )
     assert closing.state is BreakupState.BREAKUP_CLOSE
@@ -275,7 +342,7 @@ def test_breakup_sequence_reaches_scan_green_then_stops_on_green() -> None:
 
     retreating = sequence.step(
         timestamp_ns=4_500_000_000,
-        cumulative_distance_m=0.65,
+        cumulative_distance_m=0.85,
         perception=None,
     )
     assert retreating.state is BreakupState.RETREAT
@@ -284,7 +351,7 @@ def test_breakup_sequence_reaches_scan_green_then_stops_on_green() -> None:
 
     scanning = sequence.step(
         timestamp_ns=5_000_000_000,
-        cumulative_distance_m=0.55,
+        cumulative_distance_m=0.75,
         perception=None,
     )
     assert scanning.state is BreakupState.SCAN_GREEN
@@ -302,7 +369,7 @@ def test_breakup_sequence_reaches_scan_green_then_stops_on_green() -> None:
     )
     assert sequence.step(
         timestamp_ns=5_100_000_000,
-        cumulative_distance_m=0.65,
+        cumulative_distance_m=0.75,
         perception=green_1,
     ).state is BreakupState.SCAN_GREEN
     green_2 = snapshot(
@@ -316,7 +383,7 @@ def test_breakup_sequence_reaches_scan_green_then_stops_on_green() -> None:
     )
     found = sequence.step(
         timestamp_ns=5_200_000_000,
-        cumulative_distance_m=0.65,
+        cumulative_distance_m=0.75,
         perception=green_2,
     )
     assert found.state is BreakupState.GREEN_FOUND
@@ -363,6 +430,25 @@ def test_encoder_travel_tracker_uses_effective_wheel_calibration() -> None:
     assert np.isclose(tracker.right_distance_m, 0.1)
     assert not tracker.forward_sign_mismatch()
     assert "encoder_counts=(100,100)" in tracker.diagnostic()
+
+
+def test_encoder_travel_tracker_uses_sample_time_for_batched_uart() -> None:
+    from dataclasses import replace
+
+    radius_mm = 1000.0 / (2.0 * np.pi)
+    tracker = EncoderTravelTracker(
+        OdometryCalibration(1000, radius_mm, radius_mm), max_wheel_velocity_m_s=0.5,
+    )
+    tracker.submit(odometry(1_000_000_000, 0))
+    # 20 ms 内真实前进 8 mm，但主机两帧在 1 us 内批量解码。
+    second = replace(odometry(1_020_000_000, 8), received_timestamp_ns=1_000_001_000)
+    assert tracker.submit(second) == pytest.approx(0.008)
+    # 接收等待再久也不能掩盖真实采样周期内的计数跳变。
+    jumped = replace(odometry(1_040_000_000, 100), received_timestamp_ns=3_000_000_000)
+    with pytest.raises(RuntimeError, match="wheel speed bound"):
+        tracker.submit(jumped)
+    with pytest.raises(RuntimeError, match="sample timestamps"):
+        tracker.submit(replace(second, received_timestamp_ns=4_000_000_000))
 
 
 def test_encoder_travel_tracker_accepts_one_overrun_and_rebases_after_clean_sample() -> None:
@@ -608,6 +694,113 @@ def test_odometry_fusion_startup_wait_services_callback() -> None:
         pump.stop()
 
 
+def test_odometry_fusion_pump_exposes_capture_aligned_pose() -> None:
+    estimate = FusedPoseEstimate(
+        pose=FieldPose2D(FieldPoint(10.0, 20.0), 0.3),
+        estimate_timestamp_ns=123,
+        position_uncertainty_mm=5.0,
+        heading_uncertainty_rad=0.01,
+        confidence=0.9,
+        anchor_source="test",
+        quality=frozenset(),
+    )
+
+    class _HistoricalFusion:
+        def submit_odometry(self, _message: OdometryImu) -> None:
+            pass
+
+        def latest_estimate(self, _timestamp_ns: int) -> FusedPoseEstimate:
+            return estimate
+
+        def pose_at(self, timestamp_ns: int) -> FusedPoseEstimate:
+            assert timestamp_ns == 123
+            return estimate
+
+    pump = OdometryFusionPump(_HistoricalFusion())
+    pump.start()
+    try:
+        assert pump.pose_at(123) is estimate
+    finally:
+        pump.stop()
+
+
+def test_pump_forwards_inject_disturbance_and_requires_the_method() -> None:
+    class _InjectingFusion:
+        def __init__(self) -> None:
+            self.calls: list[tuple[float, float]] = []
+
+        def submit_odometry(self, _message: OdometryImu) -> None:
+            pass
+
+        def latest_estimate(self, _timestamp_ns: int) -> FusedPoseEstimate:
+            raise AssertionError("not used")
+
+        def inject_disturbance(
+            self, *, position_uncertainty_mm: float, heading_uncertainty_rad: float
+        ) -> None:
+            self.calls.append((position_uncertainty_mm, heading_uncertainty_rad))
+
+    class _PlainFusion:
+        def submit_odometry(self, _message: OdometryImu) -> None:
+            pass
+
+        def latest_estimate(self, _timestamp_ns: int) -> FusedPoseEstimate:
+            raise AssertionError("not used")
+
+    injecting = _InjectingFusion()
+    pump = OdometryFusionPump(injecting)  # type: ignore[arg-type]
+    pump.start()
+    try:
+        pump.inject_disturbance(150.0, 0.08)
+        pump.inject_disturbance(50.0, 0.01)
+    finally:
+        pump.stop()
+    assert injecting.calls == [(150.0, 0.08), (50.0, 0.01)]
+
+    missing = OdometryFusionPump(_PlainFusion())  # type: ignore[arg-type]
+    missing.start()
+    try:
+        with pytest.raises(RuntimeError, match="inject_disturbance"):
+            missing.inject_disturbance(150.0, 0.08)
+    finally:
+        missing.stop()
+
+
+def test_pump_visual_anchor_health_forwards_or_returns_none() -> None:
+    health = VisualAnchorHealth(123, 2, "innovation_gate")
+
+    class _HealthFusion:
+        def submit_odometry(self, _message: OdometryImu) -> None:
+            pass
+
+        def latest_estimate(self, _timestamp_ns: int) -> FusedPoseEstimate:
+            raise AssertionError("not used")
+
+        def visual_anchor_health(self) -> VisualAnchorHealth:
+            return health
+
+    class _PlainFusion:
+        def submit_odometry(self, _message: OdometryImu) -> None:
+            pass
+
+        def latest_estimate(self, _timestamp_ns: int) -> FusedPoseEstimate:
+            raise AssertionError("not used")
+
+    provided = OdometryFusionPump(_HealthFusion())  # type: ignore[arg-type]
+    provided.start()
+    try:
+        assert provided.visual_anchor_health() is health
+    finally:
+        provided.stop()
+
+    absent = OdometryFusionPump(_PlainFusion())  # type: ignore[arg-type]
+    absent.start()
+    try:
+        assert absent.visual_anchor_health() is None
+    finally:
+        absent.stop()
+
+
 def test_breakup_search_accepts_negative_rightward_velocity() -> None:
     sequence = ClusterBreakupSequence(
         breakup_config(search_angular_velocity_rad_s=-0.4),
@@ -724,24 +917,24 @@ def test_breakup_scan_green_follows_signed_velocity() -> None:
         timestamp_ns=2_000_000_000, cumulative_distance_m=0.75, perception=None
     )
     sequence.step(
-        timestamp_ns=2_500_000_000, cumulative_distance_m=0.75, perception=None
+        timestamp_ns=2_500_000_000, cumulative_distance_m=0.95, perception=None
     )
     sequence.step(
-        timestamp_ns=3_000_000_000, cumulative_distance_m=0.75, perception=None
+        timestamp_ns=3_500_000_000, cumulative_distance_m=0.95, perception=None
     )
     sequence.step(
-        timestamp_ns=3_500_000_000, cumulative_distance_m=0.65, perception=None
+        timestamp_ns=4_000_000_000, cumulative_distance_m=0.85, perception=None
     )
     sequence.step(
-        timestamp_ns=4_000_000_000, cumulative_distance_m=0.65, perception=None
+        timestamp_ns=4_500_000_000, cumulative_distance_m=0.85, perception=None
     )
     sequence.step(
-        timestamp_ns=4_500_000_000, cumulative_distance_m=0.65, perception=None
+        timestamp_ns=5_500_000_000, cumulative_distance_m=0.85, perception=None
     )
 
     scanning = sequence.step(
-        timestamp_ns=5_000_000_000,
-        cumulative_distance_m=0.55,
+        timestamp_ns=6_000_000_000,
+        cumulative_distance_m=0.75,
         perception=None,
     )
     assert scanning.state is BreakupState.SCAN_GREEN
@@ -749,8 +942,8 @@ def test_breakup_scan_green_follows_signed_velocity() -> None:
     assert scanning.reason == "retreat_complete_close_gripper_scan_green"
 
     still_scanning = sequence.step(
-        timestamp_ns=5_050_000_000,
-        cumulative_distance_m=0.55,
+        timestamp_ns=6_050_000_000,
+        cumulative_distance_m=0.75,
         perception=None,
     )
     assert still_scanning.state is BreakupState.SCAN_GREEN

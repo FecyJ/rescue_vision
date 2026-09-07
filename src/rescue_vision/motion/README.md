@@ -19,11 +19,12 @@
 
 | 入口 | 输入 | 输出或语义 |
 | --- | --- | --- |
-| `MotionLimits` | 轮距、车体/车轮速度与单轮加速度上限、远程有效期上限 | 创建时严格校验 |
+| `MotionLimits` | 轮距、车体/车轮速度上下限与单轮加速度上限、左右轮速度权重、远程有效期上限 | 创建时严格校验 |
 | `MotionController` | UART 帧通道、`MotionLimits` | STM32 运动控制器 |
 | `MotionController.drive()` | 前进速度 m/s、逆时针角速度 rad/s | 差速换算后设置左右轮目标 |
 | `drive_wheel_limited()` | 分别合法的车体线速度和角速度 | 必要时同比缩放并返回实际 twist，使单轮不超限 |
-| `set_wheel_speeds()` | 左右轮速度 m/s | 绕过车体 twist 换算，仍执行轮速限幅校验 |
+| `set_wheel_speeds()` | 左右轮速度 m/s | 绕过车体 twist 换算；非零目标会提升到 `min_wheel_velocity_m_s`，仍执行轮速限幅校验 |
+| `set_wheel_acceleration_limit_m_s2()` | 临时单轮最大加速度 m/s² 或 `None` | 限制后续速度斜坡；`None` 恢复 `motion.max_wheel_acceleration_m_s2`，临时值可超过全局基准 |
 | `update()` | 可选本机单调时间 ns | 按单轮最大加速度推进，并至少 20 Hz 刷新轮速；返回是否发送 |
 | `MotionControlTimingError` | 活动控制更新间隔超过 200 ms | 先发送柔和停车，再终止当前控制链路 |
 | `MotionStallError` | 有效编码器在持续轮速命令下不变化 | 先发送柔和停车，再终止当前控制链路 |
@@ -49,23 +50,45 @@
 | `RemoteGripperExecutor.check_timeout()` / `stop()` | 可选本机单调时间 ns | 超时或退出时停止推进，保留当前角度 |
 | `run_remote_motion()` | 远程接收器、执行器、退出回调 | 持续收命令、排空回传、分派其他 control，并在退出时停车 |
 | `ManualMotionLogWriter` | recording 内的 `motion.jsonl` | 顺序写入运动/夹爪命令、编码器/IMU、系统状态、回复和停车事件 |
+| `D2TelemetryLogger` | D2→安全区末端 JSONL 路径、`OdometryCalibration` | 每个 `ODOMETRY_IMU` 样本计算左右轮编码器速度并异步写入；只在正式流程打开 D2 阶段时输出 |
 | `ManualMotionLogWriter.record_gripper()` | `ExecutedRemoteGripper` | 记录扳机状态及 applied/stopped/expired 结果 |
 | `record_gripper_timeout()` | 命令 ID、单调时间 ns | 记录持续夹爪命令到期停止 |
 | `inspect_manual_motion_log()` | `motion.jsonl` 路径 | 严格校验 schema、事件序号和时间范围摘要 |
+
+### D2 高频遥测
+
+`D2TelemetryLogger` 由正式流程车端入口装配。它在 D2 到达后、物块
+到达配置安全区终点时停止，逐个接收 `ODOMETRY_IMU`（协议目标为 100 Hz/10 ms），
+并写入独立的 `d2_safe_zone_telemetry_*.jsonl`。左右轮编码器速度使用相邻累计计数
+和 STM32 `sample_timestamp_us` 计算；UART 批量接收造成的主机时间间隔不会被当作
+采样周期。每条记录还保留三轴原始传感器值、温度、状态位、当前动作子阶段和目标/
+实际下发轮速，并带有从 `sequence.start()` 起算的 `process_timestamp_ms`。文件写入在有界后台队列中进行，队列满时保留最新数据并累计
+`dropped_records`；控制循环不等待文件 I/O。`sample_overrun`、无效编码器或无有效
+前一帧时，派生编码器速度为 `null`，但原始遥测仍会记录。
 
 机器人坐标系原点为两驱动轮接地点连线的中点，沿用项目约定：`x` 向前、`y`
 向左、`z` 向上。左右轮速度正值均表示前进；车体角速度逆时针为正：
 
 ```text
-left  = linear - angular × wheel_track / 2
-right = linear + angular × wheel_track / 2
+left  = (linear - angular × wheel_track / 2) × left_wheel_speed_weight
+right = (linear + angular × wheel_track / 2) × right_wheel_speed_weight
 ```
+
+`left_wheel_speed_weight` / `right_wheel_speed_weight` 默认均为 `1.0`，即标准
+差速。车辆重心偏离两轮连线中点时，同一指令下左右轮接地载荷不同，直线行驶会
+朝一侧偏转；把两侧权重设成不同值（偏左时左轮略快）可在开环指令上抵消该偏差。
+这两个权重在 `drive()` 与 `drive_wheel_limited()` 中统一生效，`drive_wheel_limited()`
+的单轮超限缩放也基于加权后的轮速计算。
 
 底层 `drive()` 的超限命令会被拒绝，不会静默截断。手动遥控执行器使用
 `drive_wheel_limited()`：当线速度和角速度分别合法、但二者合成使外侧轮超限
 时，会同比缩放两个分量以保持曲率，并在执行结果和运动日志中记录实际 twist。
-合法轮速目标则由 `max_wheel_acceleration_m_s2` 限制每个轮子的速度变化率；
-这同时限制直线加速和转向跳变。`target_heading` 在定位或 IMU 尚未提供其显式
+每个非零轮速目标都会先按 `min_wheel_velocity_m_s` 抬升，精确的零目标仍保持为零；
+起停过渡和最终轮速仍由 `max_wheel_acceleration_m_s2` 限制。这个最低值是减速
+电机可持续工作的目标速度，不应用于柔和停车的零目标。`drive_wheel_limited()`
+返回的 twist 仍表示车体侧请求（以及必要的最高轮速缩放），单轮最低值可能使
+实际左右轮相对该 twist 产生最小速度量化偏差。
+速度变化率限制同时作用于直线加速和转向跳变。`target_heading` 在定位或 IMU 尚未提供其显式
 参考系前也会被拒绝并停车。
 
 ## 1. 从运行配置装配
@@ -162,7 +185,7 @@ controller.update()
 stall_guard:
   enabled: true
   timeout_ms: 300
-  min_command_speed_m_s: 0.01
+  min_command_speed_m_s: 0.02
   stationary_encoder_delta_count: 0
 ```
 

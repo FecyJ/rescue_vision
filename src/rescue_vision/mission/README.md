@@ -11,7 +11,7 @@
 | `MissionStateMachine.step()` | 消费同一时刻的世界、转运、交付和安全证据 |
 | `MissionStateMachine.reset()` | 仅在未开始或已经终止时清空本轮状态 |
 | `replay_mission()` / `MissionReplayStep` | 从空状态确定性重放完整合成或记录事件 |
-| `TransportStatus` | 当前持续接触/推动的稳定 track ID 集合 |
+| `TransportStatus` | 当前持续接触/推动的稳定 track ID 集合；可显式标记 `grabbed` 的赛外夹取转运 |
 | `DeliveryEvidence` | 带唯一 ID、目的区域和完全进入标记的一次性交付证据 |
 | `SafetySignals` | 运动、对手接触、失控、事故、非法载运等非视觉事实 |
 | `MissionDecision` | 复合状态、抽象动作、目标 ID 和终止原因 |
@@ -46,6 +46,7 @@ from rescue_vision.mission import SafetySignals, TransportStatus
 transport = TransportStatus(
     engaged_track_ids=engaged_track_ids,
     contact_started_ns=contact_started_ns,
+    grabbed=False,  # 正常推送；正面抓取实验才由上游显式置为 True
 )
 safety = SafetySignals(
     last_motion_timestamp_ns=last_motion_timestamp_ns,
@@ -100,6 +101,11 @@ evidence = DeliveryEvidence(
 
 `track_ids` 必须来自 `WorldSnapshot`。当前仍在接触时，交付集合必须与
 `TransportStatus.engaged_track_ids` 一致；不一致会进入安全保持。
+
+正面抓取实验可由上游显式设置 `TransportStatus.grabbed=True`；这表示单个已知绿色
+物资已在夹爪内，目标暂时被遮挡时不要求它继续出现在 `WorldSnapshot`。状态机不会从
+夹爪角度或检测框自行推断该字段；正式流程默认关闭这条路径，正式使用前仍需确认
+规则不禁止抓取/承载。
 
 ## 5. 离线事件回放
 
