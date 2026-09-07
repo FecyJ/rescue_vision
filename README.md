@@ -60,10 +60,10 @@ python -m pytest
 | [`config`](src/rescue_vision/config/README.md) | 已实现 | 安全默认配置、静态场地、UART/远程/motion/夹爪机械标定/几何/模型和感知算法装配 |
 | [`communication`](src/rescue_vision/communication/README.md) | 已实现基础设施 | COBS UART 帧、直接 TCP 远程消息、raw/perception/BEV 图传、轻量动态地图 JSON、运动/夹爪/采集严格 schema 和有界队列；正式流程观察发布器待真车验收 |
 | [`motion`](src/rescue_vision/motion/README.md) | 已实现基础设施 | STM32 v3 固定二进制协议、序号安全同步、差速运动、持续扳机双舵机夹爪、单轮加速度限制和远程超时保护；真车联调与 IMU 标定待验收 |
-| [`app`](src/rescue_vision/app/README.md) | 已实现受限初版 | 正式流程、夹取—运输联调、受监督驾驶/采集、固定解团试验、像素居中抓取试验、编码器+IMU航位推算和不阻塞 observe_only 图传/`map/state` 位姿发布；真车门禁与正式比赛能力待验收 |
+| [`app`](src/rescue_vision/app/README.md) | 已实现受限初版 | 正式流程、夹取—运输联调、受监督驾驶/采集、固定解团试验、像素居中抓取试验、独立夹爪宽度估计、编码器+IMU航位推算和不阻塞 observe_only 图传/`map/state` 位姿发布；真车门禁与正式比赛能力待验收 |
 | [`data`](src/rescue_vision/data/README.md) | 已实现 | 记录检查、清单生成和按会话防泄漏划分 |
 | [`evaluation`](src/rescue_vision/evaluation/README.md) | 已实现 | 分类、地面误差、时延和失败样例报告 |
-| [`perception`](src/rescue_vision/perception/README.md) | 已实现基础设施 | v3 六类/[3,3] Hailo 解析、任务目标与场地特征同帧分流、ROI HSV、中心十字局部轴线精修和统一可视化；正式模型资产与现场性能待验证 |
+| [`perception`](src/rescue_vision/perception/README.md) | 已实现基础设施 | v3 六类/[3,3] Hailo 解析、任务目标与场地特征同帧分流、ROI HSV、中心十字局部轴线精修、独立夹爪宽度估计和统一可视化；正式模型资产与现场性能待验证 |
 | [`localization`](src/rescue_vision/localization/README.md) | 已实现融合基础 | 中心十字四向/位置观测、安全区身份与角点排列枚举、单帧去重、编码器/IMU EKF 与延迟纠偏；实测安全区地标和远场精度待验证 |
 | [`tracking`](src/rescue_vision/tracking/README.md) | 已实现纯逻辑 | 时间关联、轨迹确认、短时遮挡、衰减和删除 |
 | [`world`](src/rescue_vision/world/README.md) | 已实现纯逻辑 | 固定物理地图、红蓝任务区域派生、动态目标、危险状态、对手占据和不确定性 |
@@ -229,6 +229,7 @@ GroundPoint ── 中心十字绝对观测 + 编码器/IMU 连续融合 ──>
 | `rescue-vision-manual-capture` | 受监督手动驾驶与车载运动采集 |
 | `rescue-vision-cluster-breakup` | 固定出发姿态的受监督解团与绿色扫描试验 |
 | `rescue-vision-green-grab` | 识别绿色物资、开夹爪像素居中接近并合爪的简化试验入口 |
+| `rescue-vision-gripper-width` | 独立每秒测量地面居中物块宽度，并按 `宽度+4 mm` 修改双舵机角度 |
 | `rescue-vision-match` | 正式流程入口；支持本地图像预览、observe-only perception JPEG、D2 遥测和按时间命名的流程日志 |
 | `rescue-vision-grab-transport` | 夹取—运输联调入口；从场地 `(0,0,+90°)` 直接搜索可夹取绿色物资，不执行解团，复用正式流程的夹取、视觉纠偏、运输和退出流程 |
 | `rescue-vision-split` | 按 `recording_id` 整组划分 |

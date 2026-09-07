@@ -44,6 +44,7 @@
 | `RemoteMotionExecutor.execute()` | `ReceivedRemoteMessage` | 校验远程运动消息后执行 |
 | `RemoteMotionExecutor.check_timeout()` | 可选本机单调时间 ns | 到期时停车，返回是否触发 |
 | `GripperCalibration` | 左右开/闭端点、单物块运输半开姿态、角度和与固定速度全行程时间 | 严格验证安全范围、三组姿态角度和及运输姿态位于开闭端点之间 |
+| `GripperKinematics` | 夹爪转轴/末端几何和对称开口宽度 | 在安全舵机行程内把 `opening_width_mm` 反解为左右绝对舵机角度 |
 | `transport_angles_deg` | 无 | 返回 `(left, right)` 单物块运输半开姿态；未配置时为 `None` |
 | `RemoteGripperExecutor.execute()` | `ReceivedRemoteMessage` | 接受一帧持续夹爪扳机状态 |
 | `RemoteGripperExecutor.update()` | 可选本机单调时间 ns | 按按压方向以配置速度渐进下发舵机目标 |
@@ -51,6 +52,13 @@
 | `run_remote_motion()` | 远程接收器、执行器、退出回调 | 持续收命令、排空回传、分派其他 control，并在退出时停车 |
 | `ManualMotionLogWriter` | recording 内的 `motion.jsonl` | 顺序写入运动/夹爪命令、编码器/IMU、系统状态、回复和停车事件 |
 | `D2TelemetryLogger` | D2→安全区末端 JSONL 路径、`OdometryCalibration` | 每个 `ODOMETRY_IMU` 样本计算左右轮编码器速度并异步写入；只在正式流程打开 D2 阶段时输出 |
+
+`GripperKinematics` 使用机器人地面坐标系中的固定结构尺寸：左转轴为
+`(52.5, 75)`、右转轴为 `(52.5, -75)`，两侧末端向量分别为 `(105, -75)` 和
+`(105, 75)`。相对关闭角为 0°，左右向外打开均为正角；独立
+`rescue-vision-gripper-width` 程序将测得的 `width_mm + clearance_mm` 反解为
+`(closed_left - θ, closed_right + θ)`，并通过 `MotionController.set_gripper_angles()`
+下发。正式比赛流程不自动调用该测试程序。
 | `ManualMotionLogWriter.record_gripper()` | `ExecutedRemoteGripper` | 记录扳机状态及 applied/stopped/expired 结果 |
 | `record_gripper_timeout()` | 命令 ID、单调时间 ns | 记录持续夹爪命令到期停止 |
 | `inspect_manual_motion_log()` | `motion.jsonl` 路径 | 严格校验 schema、事件序号和时间范围摘要 |

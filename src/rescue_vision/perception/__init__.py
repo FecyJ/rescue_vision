@@ -9,6 +9,12 @@ from rescue_vision.perception.detector import (
     StaleObservationError,
     TargetPoseDetector,
 )
+from rescue_vision.perception.gripper_width import (
+    GripperWidthEstimatorConfig,
+    GripperWidthMeasurement,
+    average_gripper_width_measurements,
+    estimate_gripper_width,
+)
 from rescue_vision.perception.field_feature_types import (
     CenterCrossObservation,
     CenterCrossConfirmation,
@@ -76,6 +82,8 @@ __all__ = [
     "InferenceBackend",
     "GroundGeometryMethod",
     "GroundGeometryQuality",
+    "GripperWidthEstimatorConfig",
+    "GripperWidthMeasurement",
     "LineSegmentObservation",
     "RealtimeFieldFeatureResult",
     "RealtimeTargetGroundGeometryResult",
@@ -104,6 +112,8 @@ __all__ = [
     "TargetObservation",
     "TargetPoseDetector",
     "UndistortedBoundingBox",
+    "estimate_gripper_width",
+    "average_gripper_width_measurements",
     "PerceptionFrameRenderer",
     "PerceptionSnapshot",
     "render_target_observations",

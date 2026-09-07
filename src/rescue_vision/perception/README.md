@@ -17,10 +17,23 @@
 | `CenterCrossObservation` | bbox、K0、可选局部双轴精修 |
 | `SafeZoneObservation` | bbox、K0、图像左 K1、图像右 K2及身份状态 |
 | `PerceptionFrameRenderer` / `PerceptionSnapshot` | 丢旧保新的后台推理、先发布结构化快照，再由独立旁路生成叠加图 |
+| `GripperWidthEstimatorConfig` / `estimate_gripper_width` | 对满足中心 `y` 门限的目标，将颜色掩码投影到地面并估计横向宽度 |
+| `average_gripper_width_measurements` | 忽略目标丢失帧，对连续采样窗口内的有效宽度做平均 |
 
 `TargetGroundGeometryEstimator` 是旧接触锚点实验链路，不属于 v3 主链路；本次
 迁移未修改它。跟踪和任务流程直接消费 `TargetObservation.ground_point`，其
 语义现为目标接触底面的几何中心。
+
+## 独立夹爪宽度估计
+
+`estimate_gripper_width()` 只消费已有的 `TargetObservation` 和同一
+`GroundProjector`。目标地面中心满足严格开区间
+`-center_y_half_range_mm < ground_point.y < center_y_half_range_mm`，且 ROI
+颜色分割为 `accepted` 时，颜色掩码前景像素会按像素中心投影到机器人地面系。
+机器人左侧边界取 `y` 最大值，右侧边界取 `y` 最小值，结果同时提供
+`width_mm` 和 `opening_width_mm = width_mm + clearance_mm`。纯估计函数不负责舵机或
+UART；独立的 `rescue-vision-gripper-width` 入口每秒消费这个结果并执行夹爪角度反解。
+物块顶部与地面不共面造成的误差仍需现场标定验证。
 
 ## 配置与装配
 

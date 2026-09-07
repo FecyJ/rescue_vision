@@ -50,6 +50,7 @@ from rescue_vision.motion.d2_safe_zone_telemetry import (
     MATCH_D2_TELEMETRY_STAGE,
     D2TelemetryLogger,
 )
+from rescue_vision.motion.gripper_kinematics import GripperKinematics
 
 __all__ = [
     "CarCommandReply",
@@ -71,6 +72,7 @@ __all__ = [
     "MATCH_D2_TELEMETRY_DEFAULT_QUEUE_CAPACITY",
     "MATCH_D2_TELEMETRY_STAGE",
     "D2TelemetryLogger",
+    "GripperKinematics",
     "MessageType",
     "OdometryImu",
     "ParsedCarMessage",

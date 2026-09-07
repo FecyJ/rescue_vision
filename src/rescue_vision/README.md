@@ -58,6 +58,7 @@ rescue-vision-grab-transport \
 | `app/session_log.py` | 有界日志旁路和标准流恢复 |
 | `app/grab_transport.py` | 不解团的夹取—运输联调 |
 | `app/cluster_breakup.py` | 赛外固定解团试验 |
+| `app/gripper_width.py` | 独立每秒按地面物块宽度控制双舵机夹爪的测试入口 |
 | `app/scan_target_memory.py` | 可复用目标短时记忆，尚未接入正式流程 |
 | `app/field_target_cluster.py` | 可复用带身份场地聚类，尚未接入正式流程 |
 | `config/runtime.py` | 严格 YAML schema、校验和对象装配 |
@@ -65,6 +66,7 @@ rescue-vision-grab-transport \
 | `localization/` | 安全区/中心十字视觉锚点和编码器/IMU 融合 |
 | `mission/` | 比赛规则和交付/安全证据状态机 |
 | `motion/` | 差速、夹爪、STM32 协议和 D2 遥测 |
+| `perception/gripper_width.py` | 颜色掩码地面投影、左右 `y` 极值和目标开口宽度 |
 
 坐标调用链固定为 `RawPixel → UndistortedPixel → GroundPoint ↔ BevPixel`；完整物理
 外参用于离地 `RobotPoint3D` 和安全区视觉纠偏。`FieldPoint` 只表示场地全局坐标，
