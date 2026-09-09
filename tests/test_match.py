@@ -3126,55 +3126,67 @@ def test_exits_safe_zone_before_rearming_cluster_search() -> None:
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
     )
-    assert exit_stopped.reason == "safe_zone_exit_vehicle_stopped_start_turn_away"
+    assert exit_stopped.reason == "safe_zone_exit_stopped_start_visual_calibration"
+    assert exit_stopped.state is MatchState.TRANSPORT_RELEASE
+    assert exit_stopped.gripper_posture is GripperPosture.OPEN
     assert sequence._tracker.tracks != ()
 
-    turning_away = sequence.step(
+    corrected_pose = FieldPose2D(FieldPoint(-165.0, 800.0), math.pi / 2.0)
+    keypoints_seen = sequence.step(
         1_920_000_026,
-        perception=safe_zone_targets(10, 1_920_000_025),
+        perception=safe_zone_snapshot_for_pose(11, 1_920_000_026, corrected_pose),
         heading_rad=math.pi / 2.0,
         cumulative_distance_m=-0.20,
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
     )
-    assert turning_away.state is MatchState.RETURN_BACKUP
-    assert turning_away.reason == "safe_zone_exit_turn_away_from_safe_zone"
+    assert keypoints_seen.reason == "safe_zone_keypoints_seen_stop_before_calibration"
+    assert keypoints_seen.gripper_posture is GripperPosture.OPEN
 
-    heading_reached = sequence.step(
+    calibration_stop_waiting = sequence.step(
         1_920_000_027,
-        perception=safe_zone_targets(11, 1_920_000_027),
-        heading_rad=0.0,
+        perception=safe_zone_snapshot_for_pose(12, 1_920_000_027, corrected_pose),
+        heading_rad=math.pi / 2.0,
         cumulative_distance_m=-0.20,
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
     )
-    assert heading_reached.reason == "safe_zone_exit_heading_reached_wait_for_stop"
+    assert calibration_stop_waiting.reason == "safe_zone_waiting_for_vehicle_stop_after_keypoints"
 
-    turn_stop_waiting = sequence.step(
-        1_920_000_028,
-        perception=safe_zone_targets(12, 1_920_000_028),
-        heading_rad=0.0,
+    calibration_started = sequence.step(
+        2_220_000_028,
+        perception=safe_zone_snapshot_for_pose(13, 2_220_000_028, corrected_pose),
+        heading_rad=math.pi / 2.0,
         cumulative_distance_m=-0.20,
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
     )
-    assert turn_stop_waiting.reason == "safe_zone_waiting_for_vehicle_stop_after_turn_away"
+    assert calibration_started.reason == "safe_zone_keypoints_stopped_start_calibration"
 
-    turned = sequence.step(
-        2_220_000_029,
-        perception=safe_zone_targets(13, 2_220_000_029),
-        heading_rad=0.0,
-        cumulative_distance_m=-0.20,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert turned.reason == "safe_zone_exit_stopped_waiting_for_new_perception"
+    calibrated = None
+    for frame in range(14, 19):
+        calibrated = sequence.step(
+            2_220_000_015 + frame,
+            perception=safe_zone_snapshot_for_pose(
+                frame,
+                2_220_000_015 + frame,
+                corrected_pose,
+            ),
+            heading_rad=math.pi / 2.0,
+            cumulative_distance_m=-0.20,
+            left_speed_feedback_m_s=0.0,
+            right_speed_feedback_m_s=0.0,
+        )
+    assert calibrated is not None
+    assert calibrated.reason == "safe_zone_exit_visual_calibrated_waiting_for_new_perception"
+    assert calibrated.state is MatchState.RETURN_BACKUP
+    assert calibrated.gripper_posture is GripperPosture.OPEN
     assert sequence._tracker.tracks == ()
 
     same_frame = sequence.step(
-        2_220_000_030,
-        perception=safe_zone_targets(13, 2_220_000_029),
-        heading_rad=0.0,
+        2_220_000_034,
+        perception=safe_zone_snapshot_for_pose(18, 2_220_000_033, corrected_pose),
+        heading_rad=math.pi / 2.0,
         cumulative_distance_m=-0.20,
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
@@ -3182,11 +3194,11 @@ def test_exits_safe_zone_before_rearming_cluster_search() -> None:
     assert same_frame.state is MatchState.RETURN_BACKUP
     assert same_frame.reason == "safe_zone_exit_waiting_for_new_perception"
 
-    fresh_frame = snapshot(14, 2_220_000_031)
+    fresh_frame = snapshot(19, 2_220_000_035)
     search_started = sequence.step(
-        2_220_000_031,
+        2_220_000_035,
         perception=fresh_frame,
-        heading_rad=0.0,
+        heading_rad=math.pi / 2.0,
         cumulative_distance_m=-0.20,
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
@@ -3195,9 +3207,9 @@ def test_exits_safe_zone_before_rearming_cluster_search() -> None:
     assert search_started.reason == "safe_zone_exit_complete_start_search"
 
     search = sequence.step(
-        2_220_000_032,
+        2_220_000_036,
         perception=fresh_frame,
-        heading_rad=0.0,
+        heading_rad=math.pi / 2.0,
         cumulative_distance_m=-0.20,
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
