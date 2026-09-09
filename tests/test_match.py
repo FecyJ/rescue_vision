@@ -885,7 +885,7 @@ def test_rejected_safe_zone_calibration_restarts_turning_search() -> None:
     )
 
     assert sequence._safe_zone_phase == "searching_safe_zone_keypoints"
-    assert decision.reason == "safe_zone_visual_calibration_rejected_rotate_for_keypoints"
+    assert decision.reason == "safe_zone_center_full_bbox_before_keypoints"
     assert decision.linear_velocity_m_s == 0.0
     assert decision.angular_velocity_rad_s > 0.0
     assert sequence._safe_zone_key_samples == []
