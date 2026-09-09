@@ -50,6 +50,14 @@ from rescue_vision.app.match import (
 from rescue_vision.app.grab_transport import (
     GrabTransportSequence,
 )
+from rescue_vision.app.match_cc import MatchCCSequence
+from rescue_vision.app.motion_sequence import (
+    MotionSequencePhase,
+    MotionSequencePlan,
+    MotionSequenceResult,
+    MotionSequenceRunner,
+    MotionSequenceStatus,
+)
 
 __all__ = [
     "MapRobotPose",
@@ -90,4 +98,10 @@ __all__ = [
     "MatchStartArea",
     "configure_match_start_area",
     "GrabTransportSequence",
+    "MatchCCSequence",
+    "MotionSequencePhase",
+    "MotionSequencePlan",
+    "MotionSequenceResult",
+    "MotionSequenceRunner",
+    "MotionSequenceStatus",
 ]
