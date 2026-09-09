@@ -60,15 +60,20 @@ grab_transport = config.build_grab_transport_sequence()
 唯一确认窗口由 `confirmation_frames` 和 `alignment_timeout_ms` 共同限制，计时从 settle 完成后的 observation window 打开开始；
 单橙色计划还受配置项 `orange_isolation_radius_mm` 的硬门禁：只有当前帧有地面位置且落入半径的其它目标才拒绝；缺少 K0 的目标不作无条件推定。
 
-安全区运输参数分为夹取→d1、d1→d2、d2→末段三段。d1 停稳后，流程使用安全区
-K0/K1/K2 和静态地标拟合 `FieldPose2D` 并覆盖当前航位；`safe_zone_d2_braking_overrun_*`
+`cluster_search_empty_angular_velocity_rad_s` 是只有蓝色/未知或无任务目标时的同向快速扫描
+速度，必须不慢于 `cluster_search_angular_velocity_rad_s`。安全区运输参数分为夹取→d1、
+d1→d2、d2→末段三段；若夹取位置沿己方 y 方向已越过 d1，则跳过回到 d1 的直线段。
+纠偏搜索使用 `safe_zone_key_search_angular_velocity_rad_s`，并由
+`safe_zone_bbox_edge_margin_px` 要求完整 bbox 离开图像边缘后才采集 K0/K1/K2；角点和静态
+地标拟合 `FieldPose2D` 后覆盖当前航位。`safe_zone_d2_braking_overrun_*`
 和 `safe_zone_d2_to_final_braking_overrun_mm` 只补偿预计刹车过冲。绿/黑物资末段使用
 `safe_zone_d2_to_final_speed_m_s` 与 `safe_zone_d2_to_final_braking_overrun_mm`；单个橙色
 伤员使用独立的 `safe_zone_orange_d2_to_final_speed_m_s` 与
 `safe_zone_orange_d2_to_final_braking_overrun_mm`。解团阶段可用
 `breakup_max_wheel_acceleration_m_s2` 覆盖 `motion.max_wheel_acceleration_m_s2`，设为
-`null` 时继承全局值。视觉纠偏当前只消费 d1 停稳阶段的当前观测，不接入采集时刻位姿对齐
-或跨帧目标记忆。
+`null` 时继承全局值。释放并直线倒车退出后会再次执行同一视觉纠偏，再用新帧直接开始
+搜索，不做固定退出转向。视觉纠偏只消费停稳阶段的当前观测，不接入采集时刻位姿对齐或
+跨帧目标记忆。
 绿/黑物资路线终点由 `safe_zone_fallback_target_field_mm` 配置，单个橙色
 伤员由 `safe_zone_injured_target_field_mm` 配置；两者都是 `FieldPoint`，单位 mm。
 
