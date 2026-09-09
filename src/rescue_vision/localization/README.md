@@ -57,7 +57,11 @@ for message in motion_controller.drain_messages():
 感知后台完成同帧快照后提交场地结果：
 
 ```python
-snapshot = perception_renderer.latest_snapshot()
+import time
+
+snapshot = perception_renderer.latest_fresh_snapshot(
+    time.monotonic_ns(), config.processing.max_observation_age_ms
+)
 if visual is not None and snapshot is not None and snapshot.field_features is not None:
     visual.submit(snapshot.field_features)
 ```

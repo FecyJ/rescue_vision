@@ -6,7 +6,7 @@
 
 | 入口 | 用途 | 关键行为 |
 | --- | --- | --- |
-| `CameraFrame` | 一帧 BGR 图、序号、采集时间和元数据 | `image_bgr` 只读；时间单位为 ns |
+| `CameraFrame` | 一帧 BGR 图、序号、采集时间和元数据 | `image_bgr` 只读；时间单位为 ns；`timestamp_source` 声明时钟来源 |
 | `FrameSource` | 相机与离线源共同协议 | `read(timeout)` 交付一帧 |
 | `Picamera2Source` | 正式采集首选真机源 | 保存曝光、增益、焦点等逐帧元数据 |
 | `RpicamSource` | `rpicam-vid` 低开销真机源 | 不承诺完整传感器元数据 |
@@ -57,6 +57,14 @@ with source:
 
 两个真机源都会在后台持续排空输入，只向调用方交付最新完整帧。处理速度不足
 时可能跳过旧序号，但不会积累越来越陈旧的帧。
+
+`CameraFrame.timestamp_ns` 已统一映射到应用的 `CLOCK_MONOTONIC` 时间域。
+`Picamera2Source` 优先使用 `SensorTimestamp`（传感器首行开始输出的时刻），并
+在 `metadata["timestamp_source"]` 写入 `sensor_start_of_frame_monotonic`；缺失或
+时钟域不可信时回退到 `host_frame_received_monotonic`。`RpicamSource` 使用 stdout
+首批帧字节到达时刻，标记为 `host_frame_first_byte_monotonic`，它是延迟测量代理，
+不是曝光真值。两种源都会保留 `frame_received_timestamp_ns`，用于拆分传输/解码
+和推理等待时间。
 
 ## 3. 判断帧是否过期
 

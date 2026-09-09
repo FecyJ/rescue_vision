@@ -22,8 +22,8 @@
 | `MotionLimits` | 轮距、车体/车轮速度上下限与单轮加速度上限、左右轮速度权重、远程有效期上限 | 创建时严格校验 |
 | `MotionController` | UART 帧通道、`MotionLimits` | STM32 运动控制器 |
 | `MotionController.drive()` | 前进速度 m/s、逆时针角速度 rad/s | 差速换算后设置左右轮目标 |
-| `drive_wheel_limited()` | 分别合法的车体线速度和角速度 | 必要时同比缩放并返回实际 twist，使单轮不超限 |
-| `set_wheel_speeds()` | 左右轮速度 m/s | 绕过车体 twist 换算；非零目标会提升到 `min_wheel_velocity_m_s`，仍执行轮速限幅校验 |
+| `drive_wheel_limited()` | 分别合法的车体线速度和角速度，可选单次 `min_wheel_velocity_m_s` | 必要时同比缩放并返回实际 twist，使单轮不超限；单次下限缺省使用 `MotionLimits` 全局值 |
+| `set_wheel_speeds()` | 左右轮速度 m/s，可选单次 `min_wheel_velocity_m_s` | 绕过车体 twist 换算；非零目标会提升到单次下限或全局 `min_wheel_velocity_m_s`，仍执行轮速限幅校验 |
 | `set_wheel_acceleration_limit_m_s2()` | 临时单轮最大加速度 m/s² 或 `None` | 限制后续速度斜坡；`None` 恢复 `motion.max_wheel_acceleration_m_s2`，临时值可超过全局基准 |
 | `update()` | 可选本机单调时间 ns | 按单轮最大加速度推进，并至少 20 Hz 刷新轮速；返回是否发送 |
 | `MotionControlTimingError` | 活动控制更新间隔超过 200 ms | 先发送柔和停车，再终止当前控制链路 |
@@ -44,7 +44,7 @@
 | `RemoteMotionExecutor.execute()` | `ReceivedRemoteMessage` | 校验远程运动消息后执行 |
 | `RemoteMotionExecutor.check_timeout()` | 可选本机单调时间 ns | 到期时停车，返回是否触发 |
 | `GripperCalibration` | 左右开/闭端点、单物块运输半开姿态、角度和与固定速度全行程时间 | 严格验证安全范围、三组姿态角度和及运输姿态位于开闭端点之间 |
-| `GripperKinematics` | 夹爪转轴/末端几何和对称开口宽度 | 在安全舵机行程内把 `opening_width_mm` 反解为左右绝对舵机角度 |
+| `GripperKinematics` | 夹爪转轴/末端几何和左右边界开口 | 在安全舵机行程内分别反解左右末端位置为绝对舵机角度，也保留对称开口反解 |
 | `transport_angles_deg` | 无 | 返回 `(left, right)` 单物块运输半开姿态；未配置时为 `None` |
 | `RemoteGripperExecutor.execute()` | `ReceivedRemoteMessage` | 接受一帧持续夹爪扳机状态 |
 | `RemoteGripperExecutor.update()` | 可选本机单调时间 ns | 按按压方向以配置速度渐进下发舵机目标 |
@@ -56,9 +56,9 @@
 `GripperKinematics` 使用机器人地面坐标系中的固定结构尺寸：左转轴为
 `(52.5, 75)`、右转轴为 `(52.5, -75)`，两侧末端向量分别为 `(105, -75)` 和
 `(105, 75)`。相对关闭角为 0°，左右向外打开均为正角；独立
-`rescue-vision-gripper-width` 程序将测得的 `width_mm + clearance_mm` 反解为
-`(closed_left - θ, closed_right + θ)`，并通过 `MotionController.set_gripper_angles()`
-下发。正式比赛流程不自动调用该测试程序。
+`rescue-vision-gripper-width` 程序将整组地面包络的左右边界分别反解为左右舵机绝对角度，
+并通过 `MotionController.set_gripper_angles()` 下发；对称开口场景仍可使用统一相对角度
+反解。正式比赛流程不自动调用该测试程序。
 | `ManualMotionLogWriter.record_gripper()` | `ExecutedRemoteGripper` | 记录扳机状态及 applied/stopped/expired 结果 |
 | `record_gripper_timeout()` | 命令 ID、单调时间 ns | 记录持续夹爪命令到期停止 |
 | `inspect_manual_motion_log()` | `motion.jsonl` 路径 | 严格校验 schema、事件序号和时间范围摘要 |
@@ -91,8 +91,10 @@ right = (linear + angular × wheel_track / 2) × right_wheel_speed_weight
 底层 `drive()` 的超限命令会被拒绝，不会静默截断。手动遥控执行器使用
 `drive_wheel_limited()`：当线速度和角速度分别合法、但二者合成使外侧轮超限
 时，会同比缩放两个分量以保持曲率，并在执行结果和运动日志中记录实际 twist。
-每个非零轮速目标都会先按 `min_wheel_velocity_m_s` 抬升，精确的零目标仍保持为零；
-起停过渡和最终轮速仍由 `max_wheel_acceleration_m_s2` 限制。这个最低值是减速
+每个非零轮速目标都会先按单次指定的 `min_wheel_velocity_m_s` 抬升；未指定时使用
+`MotionLimits.min_wheel_velocity_m_s`，精确的零目标仍保持为零。单次参数允许显式传入
+`0` 以取消该次非零轮速抬升；上层精细闭环可以通过单次参数使用独立下限，但普通运动仍使用全局值。起停过渡和最终轮速仍由
+`max_wheel_acceleration_m_s2` 限制。这个最低值是减速
 电机可持续工作的目标速度，不应用于柔和停车的零目标。`drive_wheel_limited()`
 返回的 twist 仍表示车体侧请求（以及必要的最高轮速缩放），单轮最低值可能使
 实际左右轮相对该 twist 产生最小速度量化偏差。

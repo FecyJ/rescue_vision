@@ -417,7 +417,7 @@ def main() -> None:
                 )
 
             now_ns = monotonic_ns()
-            age_ms = (now_ns - frame.timestamp_ns) / 1_000_000.0
+            age_ms = detection_result.timing.capture_to_result_ms
             if detection_result.stale_dropped:
                 status = (
                     "POSE STALE dropped: "

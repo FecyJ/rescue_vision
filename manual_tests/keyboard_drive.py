@@ -562,7 +562,8 @@ def _run_hardware(
     renderer = PerceptionFrameRenderer(
         lambda: config.build_target_pose_detector(
             ground_projector=pipeline.ground_projector
-        )
+        ),
+        render_enabled=display,
     )
     camera_pump = CameraPerceptionPump(pipeline.source, pipeline.prepare, renderer)
 
@@ -707,15 +708,10 @@ def _run_hardware(
                                 )
                     camera_pump.check_health()
 
-                    candidate = renderer.latest_snapshot()
-                    if candidate is not None:
-                        latest_snapshot = candidate
-                    if latest_snapshot is not None:
-                        age_ms = (
-                            now_ns - latest_snapshot.capture_timestamp_ns
-                        ) / 1_000_000.0
-                        if age_ms > config.processing.max_observation_age_ms:
-                            latest_snapshot = None
+                    latest_snapshot = renderer.latest_fresh_snapshot(
+                        now_ns,
+                        config.processing.max_observation_age_ms,
+                    )
 
                     active_keys = drive_state.active_keys(now_ns)
                     linear, angular = compute_twist(

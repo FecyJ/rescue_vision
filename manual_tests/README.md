@@ -21,6 +21,10 @@
 - `keyboard_drive.py`：终端键盘操控前进/后退/转弯，相机与 Hailo Pose 模型
   结果经独立旁路线程回传（终端打印类别/置信度/地面点，可选 `--display`
   窗口），`Esc`/`q` 退出，`空格`停车；`X` 切换夹爪运输姿态。
+- `rescue-vision-motion-sequence`：受监督 TUI 定距动作试验；用 `--distance-m` 配置目标距离
+  （默认 1.5 m），输入 `a1`、`a2`，程序自动计算峰值速度、加速时间和减速时间并控制车辆前进。默认只打开 UART
+  和底盘，增加 `--local-preview` 可同时启动相机/Hailo 本地识别窗口；不采用 `motion` 的速度/加速度上限，
+  但仍受协议可编码范围约束，运行中按 `q`/`Esc` 软刹车。
 - `imu_rotation_monitor.py`：按配置低速原地旋转，周期打印 STM32 原始传感器系
   `gyro_z`、编码器和状态位；只发送轮速心跳，`Ctrl+C` 或异常时柔和停车。
 - `imu_static_calibration.py`：收集静止有效 IMU 样本，输出传感器坐标系陀螺零偏、
@@ -458,3 +462,75 @@ rescue-vision-cluster-breakup \
 中心距离不足则核对减速带卡阻、轮半径、每圈计数和阶段超时，不要直接扩大超时。
 若 `motor_output=false`，继续查看 `stop_reason`、`watchdog` 和 `estop`；先修复
 固件使能、急停复位或命令拒绝原因，不得通过伪造里程或跳过定距门禁继续流程。
+
+
+## 正式流程近场接管验收（未验证）
+
+运行 `rescue-vision-match` 时，确认搜索态先按固定
+`motion.gripper.transport_*` 开口检查前向扫掠走廊。目标从远场进入 `near_field_grasp.max_range_mm` 后状态变为
+`transport_near_field_grasp`，且交接阶段保持 `TRANSPORT`，不先发全开口。首趟只摆放一个
+绿色物资，随后分别摆放绿黑混合组、单橙色伤员和蓝色危险阻挡物，核对首趟单绿、后续绿黑最多 3 个、
+橙色只能单独抓取。橙色抓取后核对路线终点为 `match.safe_zone_injured_target_field_mm`，
+绿黑仍使用 `match.safe_zone_fallback_target_field_mm`；确认伤员进入己方伤员区而不是物资区。同时核对
+动态开爪角度、编码器定距、静态安全区/场界门禁、软刹车和会话 ID 日志。开爪后不应因
+单帧漏检或 `rx_degraded` 自行停车；里程计缺失、明确路径阻挡或急停必须停车并按日志原因
+恢复/重选。抓取完成仍记录 `capture_confirmed=False`，真实接触与交付需另行人工验收。
+
+`rescue-vision-grab-transport` 仍是单绿联调入口，不用它验证橙色正式流程。
+
+## 多目标近场收拢验收（未验证）
+
+在物理急停与全程监督条件下运行 `rescue-vision-gripper-width --config
+configs/runtime.match.yaml --supervised-physical-stop-ready --local-preview --once
+--log-dir logs/near_field`。
+参数及动作契约以 [app README](../src/rescue_vision/app/README.md) 为权威。
+
+1. 架空或固定底盘，测量左右安全开闭端点、实际最大开口、夹臂厚度/轮廓、夹爪前端
+   参考线和目标结束位置，复核 `target_final_x_mm`、`corridor_start_x_mm` 与横向余量；
+   检查合爪方向。先单绿、单黑、单橙，再并排绿绿、黑黑、绿黑及三物资，记录计划跨度、开口、
+   实际开口、最远 K0、橙色纵向包络最近端/跨度、行程和最终留存数量。
+2. 在矩形前进走廊内外、开口两侧及目标组之间摆放蓝色危险块，危险类单列报告；
+   再检查橙色与绿黑同组、橙色多目标、未知/颜色冲突和缺失 K0。以监督停止避免实际
+   危险转运，确认橙色只形成单目标计划，记录误纳入和漏检，不能只报告总体成功率。
+3. 测试走廊内额外绿黑被纳入后总数不超过 3；测试 4 个、最大开口边界、纵向间距较大、
+   掩码投影受顶部影响、强阴影和短暂遮挡。确认危险记忆未因一帧消失而清空。
+4. 验证对准允许范围、滞回、唯一确认窗口的 `confirmation_frames` 和总预算
+   `alignment_timeout_ms`（超时应带原因回到搜索）。同一帧重复提交不得增加确认进度；快控制/慢感知、
+   短暂漏帧和一次规划旁路异常不得把已取得的确认永久清零。若出现新的明确危险或不合法组合，
+   旧确认必须失效。在橙色目标周围 50 mm 内摆放有可靠 K0 的其它物块，确认橙色计划被硬拒绝；另测缺少地面位置的目标，确认它不会被无依据当作禁区阻挡。再验证静止规划阶段的危险/未知目标拒绝、编码器
+   中断/停滞、相机/规划旁路失效和 GUI 关闭。张爪后运动模糊或新 `unknown` 不应单独
+   重检并打断已冻结的前进计划；单独注入 `rx_degraded` 不应停止动作，明确急停应停止
+   底盘。检查退出条件、恢复所需新帧及夹爪最后角度。
+5. 确认 `--once` 完成退出、普通模式合爪后保持而不掉头/重新抓取，退出释放 UART、
+   相机与线程。记录 `capture_confirmed=False`，通过独立人工观察记录真实收拢结果。
+6. 在目标 Raspberry Pi/Hailo 上让 perception 持续运行，记录日志中的
+   `perception_timing`：采集→提交、队列等待、推理、后处理、采集→结果和渲染的
+   P50/P95，以及 `submitted/processed/replaced/stale_dropped`。近场每秒状态日志还应核对
+   `session`、`confirmation`、`plan_age_ms` 和 `preparation_age_ms`，确认未把两种年龄混写。
+   同时记录采集→计划→
+   运动命令端到端年龄、设备温度、内存和控制循环间隔；分别核验有/无预览、日志
+   阻塞及最密集目标布局。这些现场指标仍为**未验证**，不得仅凭
+   `processing.max_observation_age_ms` 配置值宣称已满足延迟要求。
+
+当前 4 mm 总开口余量、`target_final_x_mm`、`corridor_start_x_mm`、10 mm 横向走廊余量
+和推进行程均为试验初值；上述项目及整车真实净空、抓取效果、危险类指标、目标硬件性能
+均未验证。合成 pytest 仅证明逻辑，不可替代这些记录。
+
+### 延迟几何开爪回归（真机未验证）
+
+使用 `configs/runtime.match.yaml`，对孤立单绿完成对准和停车。记录真实
+`plan_age_ms`、`preparation_age_ms`、`stationary_since_ms`、`motion_age_ms` 和
+`gyro_z_rad_s`：在300～450 ms视觉延迟、有效静止遥测持续更新时，应完成确认并出现
+`open_group_width`，随后定距前进、合爪并进入原d1运输。分别开/关预览和详细日志测量
+端到端P50/P95，不把合成延迟回归当作实车性能结果。
+拍摄后移动底盘、断开遥测或重放数秒旧计划，均不得依据旧几何开爪；重新停稳并得到
+新计划后应恢复。危险进入走廊和伤员混运仍应拒绝，危险类单列。
+
+### 1930日志的选目标/循环对准回归（真机未验证）
+
+首次交付后放置近场单橙、其侧后方绿块、远方黑块及黑块路径中的蓝块。橙块实际
+夹爪扫掠与绿块包络分离时，应选择近橙、完成必要对准并进入确认；不得重复
+`near_field_group_preview` → `green_collecting_10_point_reference` → 路径拒绝的循环。
+将邻居移入橙块扫掠、移到橙块正后方贴邻或替换为蓝色/未知，应拒绝橙块，危险类单列。
+测量搜索至开爪时间、无动作时间、重复选中同一不可执行目标次数及端到端观测年龄。
+日志K0布局的合成回归不能证明现场像素包络或真实夹获率。

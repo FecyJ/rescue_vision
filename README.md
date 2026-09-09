@@ -60,7 +60,7 @@ python -m pytest
 | [`config`](src/rescue_vision/config/README.md) | 已实现 | 安全默认配置、静态场地、UART/远程/motion/夹爪机械标定/几何/模型和感知算法装配 |
 | [`communication`](src/rescue_vision/communication/README.md) | 已实现基础设施 | COBS UART 帧、直接 TCP 远程消息、raw/perception/BEV 图传、轻量动态地图 JSON、运动/夹爪/采集严格 schema 和有界队列；正式流程观察发布器待真车验收 |
 | [`motion`](src/rescue_vision/motion/README.md) | 已实现基础设施 | STM32 v3 固定二进制协议、序号安全同步、差速运动、持续扳机双舵机夹爪、单轮加速度限制和远程超时保护；真车联调与 IMU 标定待验收 |
-| [`app`](src/rescue_vision/app/README.md) | 已实现受限初版 | 正式流程、夹取—运输联调、受监督驾驶/采集、固定解团试验、像素居中抓取试验、独立夹爪宽度估计、编码器+IMU航位推算和不阻塞 observe_only 图传/`map/state` 位姿发布；真车门禁与正式比赛能力待验收 |
+| [`app`](src/rescue_vision/app/README.md) | 已实现受限初版 | 正式流程（含近场宽度抓取）、末端张爪推送—运输联调、受监督驾驶/采集、固定解团试验、像素居中抓取试验、独立绿黑多目标/单橙色近场收拢试验、编码器+IMU航位推算和不阻塞 observe_only 图传/`map/state` 位姿发布；真车门禁与正式比赛能力待验收 |
 | [`data`](src/rescue_vision/data/README.md) | 已实现 | 记录检查、清单生成和按会话防泄漏划分 |
 | [`evaluation`](src/rescue_vision/evaluation/README.md) | 已实现 | 分类、地面误差、时延和失败样例报告 |
 | [`perception`](src/rescue_vision/perception/README.md) | 已实现基础设施 | v3 六类/[3,3] Hailo 解析、任务目标与场地特征同帧分流、ROI HSV、中心十字局部轴线精修、独立夹爪宽度估计和统一可视化；正式模型资产与现场性能待验证 |
@@ -72,9 +72,9 @@ python -m pytest
 
 各包常用 API、命令和实际对接示例见 [`src/rescue_vision/README.md`](src/rescue_vision/README.md)。
 
-正式入口使用相对视觉坐标、陀螺仪航向和编码器定距。每次交付退出后先整圈扫描可夹取绿色物资；搜索态可按配置直接抓取通过单物块净空和前进走廊门禁的绿色目标，否则选择完整目标团。绿色目标到达 `green_grab_offset_mm` 后保持局部张爪停车复核相邻绿块，给 tracker 留出确认时间并可按 `green_preclose_max_carried_blocks` 上限循环重新对准纳入；无候选或达到上限后才闭爪。解团和绿色接近都检查双方安全区、车体包络和场地边界，门禁失败会停车并寻找下一候选。夹取后沿补偿后的 d1 直线到达安全区，d1 停稳后使用 K0/K1/K2 与静态地标拟合并覆盖车辆场地位姿，再沿校正位姿完成 d2、末段推进、释放和退出。详见[正式流程设计](docs/正式流程设计.md)。
+正式入口使用相对视觉坐标、陀螺仪航向和编码器定距。每次交付退出后先整圈扫描可夹取目标；首轮只选择最近的单个绿色，一般阶段统一检查候选接近路径，优先近场、再按类别规则分值和距离选择入口，支持绿/黑物资组或单个橙色伤员。若首轮最近绿块的前进走廊存在蓝、橙、黑或未知目标，直接规划解团，不改选更远绿块。固定走廊外的合法目标先进入近场预览并旋转对准，找不到安全预览才继续解团。远场目标接近到 `near_field_grasp.max_range_mm` 前保持闭爪；到达近场后由近场宽度抓取模块负责选组、必要对准、按实际映射动态开爪、定距前进和闭爪。首次单绿近场只继续规划远场已经对准的绿块，不允许邻近绿块接管；一般阶段保留绿黑 1～3 个组合及单橙方案，橙色只形成单目标方案。停车后使用一个有界确认窗口：同一目标 ID 的不同有效帧按 `near_field_grasp.confirmation_frames` 计数，同帧不重复计数，确认成功后以真实编码器/IMU连续静止证据校验停车后采集的当前几何，不再因正常处理延迟超过150 ms就拒绝开爪；仍受观测失联上限、准备结果年龄和尝试总预算限制。短暂漏检不清空已取得进度；明确危险或不合法几何使确认失效，只有真实走廊阻挡才进入解团。首次交付后允许绿色/黑色 1～3 个，或单独转运 1 个橙色伤员；当前帧有可靠地面点且确实进入近场走廊的危险、未知和不确定目标才作为障碍，橙色隔离区内的普通物资只有在完整包络证明位于侧后方且扫掠外时才可放行；蓝色、未知和包络侵入仍拒绝。其它目标缺少 K0 不会被无条件推定在走廊或橙色禁区内。抓取后按本趟类别选择己方物资区或伤员区航点，沿 d1/d2 路线完成视觉校正、推进、释放和退出。普通动作继续使用 `motion.min_wheel_velocity_m_s`，绿色/近场精对准使用独立的 `match.green_alignment_min_wheel_velocity_m_s`。详见[正式流程设计](docs/正式流程设计.md)。
 
-另有独立的夹取—运输联调入口：车辆从 `FieldPoint(0,0)`、`+90°` 出发，直接搜索满足单物块净空门禁的绿色物资；它不会进入解团状态，搜索到目标后复用正式流程的对准、定距夹取、安全区视觉纠偏和退出流程：
+另有独立的末端张爪推送—运输联调入口：车辆从 `FieldPoint(0,0)`、`+90°` 出发，直接搜索固定 `TRANSPORT` 走廊内的单个绿色 K0；它不会进入解团状态，按正式流程夹取并运输，只有末端推进时保持夹爪张开推入安全区再退出：
 
 ```bash
 rescue-vision-grab-transport \
@@ -124,6 +124,9 @@ FieldPose2D → RemoteLocalizationPublisher → observation/map/state
 
 PerceptionSnapshot + relative heading/distance ───────→ MatchSequence
                                                        → 运动/夹爪意图 → MotionController
+
+PerceptionSnapshot + near-field session request ──────→ bounded GraspPreparationWorker
+                                                       → dynamic grasp plan/angles → MatchSequence
 ```
 
 - 像素必须区分 `RawPixel` 与 `UndistortedPixel`；地面点使用 `GroundPoint`，单位 mm。
@@ -229,9 +232,11 @@ GroundPoint ── 中心十字绝对观测 + 编码器/IMU 连续融合 ──>
 | `rescue-vision-manual-capture` | 受监督手动驾驶与车载运动采集 |
 | `rescue-vision-cluster-breakup` | 固定出发姿态的受监督解团与绿色扫描试验 |
 | `rescue-vision-green-grab` | 识别绿色物资、开夹爪像素居中接近并合爪的简化试验入口 |
-| `rescue-vision-gripper-width` | 独立每秒测量地面居中物块宽度，并按 `宽度+4 mm` 修改双舵机角度 |
-| `rescue-vision-match` | 正式流程入口；支持本地图像预览、observe-only perception JPEG、D2 遥测和按时间命名的流程日志 |
-| `rescue-vision-grab-transport` | 夹取—运输联调入口；从场地 `(0,0,+90°)` 直接搜索可夹取绿色物资，不执行解团，复用正式流程的夹取、视觉纠偏、运输和退出流程 |
+| `rescue-vision-gripper-width` | 自动选择 1～3 个绿黑物资或单个橙色目标，对准、按几何收拢并合爪保持；不掉头 |
+| `rescue-vision-motion-sequence` | TUI 输入 `a1 a2`，通过 `--distance-m` 配置距离并自动计算速度；默认前进 1.5 m |
+| `rescue-vision-match` | 正式流程入口；支持 `--start-area 2/3`、本地图像预览、observe-only perception JPEG、D2 遥测和按时间命名的流程日志 |
+| `rescue-vision-match-cc` | CC 独立流程入口；使用 `configs/runtime.cc.yaml`，执行稳健解团、单块分级搜索和正式安全区运输 |
+| `rescue-vision-grab-transport` | 末端张爪推送—运输联调入口；从场地 `(0,0,+90°)` 直接搜索绿色物资，按正式流程夹取运输，末端保持张开推入并退出，不执行解团 |
 | `rescue-vision-split` | 按 `recording_id` 整组划分 |
 | `rescue-vision-evaluate` | 生成离线评测报告 |
 

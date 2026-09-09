@@ -205,7 +205,6 @@ def main() -> None:
                 frame,
                 undistorted_bgr,
             )
-            result_timestamp_ns = monotonic_ns()
             processed_frames += 1
 
             field_features = detection_result.field_features
@@ -271,7 +270,7 @@ def main() -> None:
                 flush=True,
             )
 
-            age_ms = (result_timestamp_ns - frame.timestamp_ns) / 1_000_000.0
+            age_ms = detection_result.timing.capture_to_result_ms
             undistort_ms = (
                 undistort_finished_ns - undistort_started_ns
             ) / 1_000_000.0
