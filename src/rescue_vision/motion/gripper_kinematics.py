@@ -1,4 +1,4 @@
-"""双舵机对称夹爪的平面运动学。"""
+"""双舵机夹爪的平面运动学。"""
 
 from __future__ import annotations
 
@@ -33,6 +33,9 @@ class GripperKinematics:
 
     * 左转轴 ``(52.5, 75)``，末端向量 ``(105, -75)``；
     * 右转轴 ``(52.5, -75)``，末端向量 ``(105, 75)``。
+
+    对称开口仍可使用 ``servo_angles_for_opening()``；需要分别贴合左右
+    目标边界时使用 ``servo_angles_for_edge_positions()``。
     """
 
     pivot_x_mm: float = 52.5
@@ -197,3 +200,121 @@ class GripperKinematics:
             closed_left - relative_angle,
             closed_right + relative_angle,
         )
+
+    def servo_angles_for_edge_positions(
+        self,
+        left_tip_y_mm: float,
+        right_tip_y_mm: float,
+        *,
+        open_left_angle_deg: float,
+        open_right_angle_deg: float,
+        closed_left_angle_deg: float,
+        closed_right_angle_deg: float,
+    ) -> tuple[float, float]:
+        """把左右夹爪末端的独立 ``y`` 位置反解为绝对舵机角度。
+
+        左末端只能从闭合位置 ``y=0`` 向机器人左侧增大，右末端只能向
+        机器人右侧减小。因此调用方应传入 ``left_tip_y_mm >= 0`` 和
+        ``right_tip_y_mm <= 0``。两侧允许使用不同的相对开角。
+        """
+
+        left_tip_y = _finite(left_tip_y_mm, "left_tip_y_mm")
+        right_tip_y = _finite(right_tip_y_mm, "right_tip_y_mm")
+        if left_tip_y < right_tip_y:
+            raise ValueError(
+                "left_tip_y_mm must be greater than or equal to right_tip_y_mm, "
+                f"got {left_tip_y_mm} < {right_tip_y_mm}."
+            )
+        if left_tip_y < -1e-9:
+            raise ValueError(
+                "left_tip_y_mm must be non-negative for outward opening, "
+                f"got {left_tip_y_mm}."
+            )
+        if right_tip_y > 1e-9:
+            raise ValueError(
+                "right_tip_y_mm must be non-positive for outward opening, "
+                f"got {right_tip_y_mm}."
+            )
+
+        open_left = _servo_angle(open_left_angle_deg, "open_left_angle_deg")
+        open_right = _servo_angle(open_right_angle_deg, "open_right_angle_deg")
+        closed_left = _servo_angle(
+            closed_left_angle_deg,
+            "closed_left_angle_deg",
+        )
+        closed_right = _servo_angle(
+            closed_right_angle_deg,
+            "closed_right_angle_deg",
+        )
+        left_travel = closed_left - open_left
+        right_travel = open_right - closed_right
+        if not 0.0 < left_travel <= 90.0:
+            raise ValueError(
+                "left servo outward travel must be in (0, 90], "
+                f"got {left_travel}."
+            )
+        if not 0.0 < right_travel <= 90.0:
+            raise ValueError(
+                "right servo outward travel must be in (0, 90], "
+                f"got {right_travel}."
+            )
+
+        left_relative = self._relative_angle_for_left_tip_y(
+            left_tip_y,
+            left_travel,
+        )
+        right_relative = self._relative_angle_for_right_tip_y(
+            right_tip_y,
+            right_travel,
+        )
+        return (
+            closed_left - left_relative,
+            closed_right + right_relative,
+        )
+
+    def _relative_angle_for_left_tip_y(
+        self,
+        target_y_mm: float,
+        max_relative_angle_deg: float,
+    ) -> float:
+        maximum_y = self.left_tip_position(max_relative_angle_deg).y
+        if target_y_mm > maximum_y + 1e-9:
+            raise ValueError(
+                "left_tip_y_mm exceeds the configured gripper geometry: "
+                f"requested={target_y_mm:.3f} mm, maximum={maximum_y:.3f} mm."
+            )
+        if target_y_mm <= 1e-9:
+            return 0.0
+        lower = 0.0
+        upper = max_relative_angle_deg
+        for _ in range(60):
+            middle = 0.5 * (lower + upper)
+            if self.left_tip_position(middle).y < target_y_mm:
+                lower = middle
+            else:
+                upper = middle
+        return 0.5 * (lower + upper)
+
+    def _relative_angle_for_right_tip_y(
+        self,
+        target_y_mm: float,
+        max_relative_angle_deg: float,
+    ) -> float:
+        target_opening = -target_y_mm
+        maximum_opening = -self.right_tip_position(max_relative_angle_deg).y
+        if target_opening > maximum_opening + 1e-9:
+            raise ValueError(
+                "right_tip_y_mm exceeds the configured gripper geometry: "
+                f"requested={target_opening:.3f} mm, maximum={maximum_opening:.3f} mm."
+            )
+        if target_opening <= 1e-9:
+            return 0.0
+        lower = 0.0
+        upper = max_relative_angle_deg
+        for _ in range(60):
+            middle = 0.5 * (lower + upper)
+            if -self.right_tip_position(middle).y < target_opening:
+                lower = middle
+            else:
+                upper = middle
+        return 0.5 * (lower + upper)

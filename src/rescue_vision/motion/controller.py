@@ -348,14 +348,21 @@ class MotionController:
         self,
         left_m_s: float,
         right_m_s: float,
+        *,
+        min_wheel_velocity_m_s: float | None = None,
     ) -> None:
         """设置左右轮目标速度；实际下发由 :meth:`update` 渐进逼近。"""
 
+        minimum = self._resolve_minimum_wheel_velocity(
+            min_wheel_velocity_m_s
+        )
         left = self._apply_minimum_wheel_velocity(
-            _finite(left_m_s, "left_m_s")
+            _finite(left_m_s, "left_m_s"),
+            minimum,
         )
         right = self._apply_minimum_wheel_velocity(
-            _finite(right_m_s, "right_m_s")
+            _finite(right_m_s, "right_m_s"),
+            minimum,
         )
         maximum = self.limits.max_wheel_velocity_m_s
         if abs(left) > maximum or abs(right) > maximum:
@@ -463,6 +470,8 @@ class MotionController:
         self,
         linear_velocity_m_s: float,
         angular_velocity_rad_s: float,
+        *,
+        min_wheel_velocity_m_s: float | None = None,
     ) -> tuple[float, float]:
         """按比例缩放合法 twist，使差速合成不超过单轮硬上限。
 
@@ -484,7 +493,11 @@ class MotionController:
             angular *= scale
             left *= scale
             right *= scale
-        self.set_wheel_speeds(left, right)
+        self.set_wheel_speeds(
+            left,
+            right,
+            min_wheel_velocity_m_s=min_wheel_velocity_m_s,
+        )
         return linear, angular
 
     def _validate_twist(
@@ -528,13 +541,42 @@ class MotionController:
         ) * self.limits.right_wheel_speed_weight
         return left, right
 
-    def _apply_minimum_wheel_velocity(self, speed_m_s: float) -> float:
+    def _resolve_minimum_wheel_velocity(
+        self,
+        minimum_m_s: float | None,
+    ) -> float:
+        if minimum_m_s is None:
+            return self.limits.min_wheel_velocity_m_s
+        if (
+            isinstance(minimum_m_s, bool)
+            or not isinstance(minimum_m_s, (int, float))
+            or not math.isfinite(float(minimum_m_s))
+            or float(minimum_m_s) < 0.0
+        ):
+            raise ValueError(
+                "min_wheel_velocity_m_s must be finite and non-negative, "
+                f"got {minimum_m_s!r}."
+            )
+        minimum = float(minimum_m_s)
+        if minimum > self.limits.max_wheel_velocity_m_s:
+            raise ValueError(
+                "min_wheel_velocity_m_s must not exceed "
+                "max_wheel_velocity_m_s, got "
+                f"{minimum!r} > {self.limits.max_wheel_velocity_m_s!r}."
+            )
+        return minimum
+
+    @staticmethod
+    def _apply_minimum_wheel_velocity(
+        speed_m_s: float,
+        minimum_m_s: float,
+    ) -> float:
         """将非零轮速目标抬到减速电机可持续工作的最低速度。"""
 
         if speed_m_s == 0.0:
             return 0.0
         return math.copysign(
-            max(abs(speed_m_s), self.limits.min_wheel_velocity_m_s),
+            max(abs(speed_m_s), minimum_m_s),
             speed_m_s,
         )
 

@@ -5,14 +5,15 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from rescue_vision.app.gripper_width import _fit_preview_image, _front_measurement
+from rescue_vision.app.gripper_width import (
+    _fit_preview_image,
+)
 from rescue_vision.geometry.ground_projector import GroundProjector
 from rescue_vision.geometry.types import GroundPoint, UndistortedPixel
 from rescue_vision.perception import (
     ClassProbabilities,
     ColorSegmentationStatus,
     GripperWidthEstimatorConfig,
-    PerceptionSnapshot,
     RoiColorSegmentation,
     TargetClass,
     TargetObservation,
@@ -24,7 +25,7 @@ from rescue_vision.perception import (
 
 def _observation(
     *,
-    center_x_mm: float = 300.0,
+    center_x_mm: float = 230.0,
     center_y_mm: float = 0.0,
     target_class: TargetClass = TargetClass.GREEN_SUPPLY,
     status: ColorSegmentationStatus = ColorSegmentationStatus.ACCEPTED,
@@ -89,10 +90,29 @@ def test_estimator_projects_mask_and_adds_clearance() -> None:
     # Pixel centers have v values 20.5, 21.5 and 22.5 for the mask above.
     assert measurement.left_y_mm == pytest.approx(22.5)
     assert measurement.right_y_mm == pytest.approx(20.5)
+    assert measurement.center_x_mm == pytest.approx(230.0)
+    assert measurement.front_x_mm == pytest.approx(237.5)
+    assert measurement.center_to_front_mm == pytest.approx(7.5)
+    assert measurement.forward_distance_mm == pytest.approx(237.5)
     assert measurement.width_mm == pytest.approx(2.0)
     assert measurement.opening_width_mm == pytest.approx(6.0)
     assert measurement.left_edge_pixel == UndistortedPixel(11.5, 22.5)
     assert measurement.right_edge_pixel == UndistortedPixel(11.5, 20.5)
+
+
+def test_estimator_keeps_extrema_from_disconnected_mask_components() -> None:
+    mask = np.zeros((4, 4), dtype=np.uint8)
+    mask[0, 0] = 255
+    mask[3, 3] = 255
+    measurement = estimate_gripper_width(
+        _observation(mask=mask),
+        GroundProjector(np.eye(3)),
+    )
+
+    assert measurement is not None
+    assert measurement.left_y_mm == pytest.approx(23.5)
+    assert measurement.right_y_mm == pytest.approx(20.5)
+    assert measurement.front_x_mm == pytest.approx(238.5)
 
 
 @pytest.mark.parametrize("center_y_mm", [-5.0, 5.0, 8.0])
@@ -145,34 +165,6 @@ def test_estimator_returns_none_without_ground_center() -> None:
     assert estimate_gripper_width(observation, GroundProjector(np.eye(3))) is None
 
 
-def test_front_measurement_considers_all_classes_and_selects_nearest() -> None:
-    snapshot = PerceptionSnapshot(
-        frame_sequence=10,
-        capture_timestamp_ns=2_000,
-        result_timestamp_ns=2_001,
-        observations=(
-            _observation(
-                center_x_mm=320.0,
-                target_class=TargetClass.GREEN_SUPPLY,
-            ),
-            _observation(
-                center_x_mm=280.0,
-                target_class=TargetClass.BLUE_DANGER,
-            ),
-        ),
-        field_features=None,
-    )
-
-    measurement = _front_measurement(
-        snapshot,
-        ground_projector=GroundProjector(np.eye(3)),
-        config=GripperWidthEstimatorConfig(),
-    )
-
-    assert measurement is not None
-    assert measurement.target_class is TargetClass.BLUE_DANGER
-
-
 def test_average_uses_only_valid_measurements() -> None:
     first = estimate_gripper_width(
         _observation(),
@@ -197,6 +189,10 @@ def test_average_uses_only_valid_measurements() -> None:
     )
 
     assert averaged.frame_sequence == 10
+    assert averaged.center_x_mm == pytest.approx(230.0)
+    assert averaged.front_x_mm == pytest.approx(237.5)
+    assert averaged.center_to_front_mm == pytest.approx(7.5)
+    assert averaged.forward_distance_mm == pytest.approx(237.5)
     assert averaged.center_y_mm == pytest.approx(1.0)
     assert averaged.left_y_mm == pytest.approx(23.5)
     assert averaged.right_y_mm == pytest.approx(20.0)

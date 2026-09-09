@@ -139,6 +139,37 @@ def test_tracker_uses_iou_without_ground_mapping() -> None:
     assert second[0].track_id == first[0].track_id
 
 
+def test_same_frame_near_identical_detection_is_deduplicated() -> None:
+    tracker = MultiTargetTracker(config(confirmation_hits=1))
+    duplicate = observation(
+        1_000_000_000,
+        confidence=0.7,
+        ground_point=GroundPoint(506.0, 4.0),
+        box=UndistortedBoundingBox(11.0, 10.0, 31.0, 40.0),
+    )
+    tracks = tracker.update(
+        1_000_000_000,
+        [observation(1_000_000_000, confidence=0.9), duplicate],
+    )
+    assert len(tracks) == 1
+    assert tracks[0].confidence == pytest.approx(0.9)
+
+
+def test_nearby_distinct_blocks_are_not_deduplicated() -> None:
+    tracker = MultiTargetTracker(config(confirmation_hits=1))
+    tracks = tracker.update(
+        1_000_000_000,
+        [
+            observation(1_000_000_000),
+            observation(
+                1_000_000_000,
+                ground_point=GroundPoint(525.0, 0.0),
+            ),
+        ],
+    )
+    assert len(tracks) == 2
+
+
 def test_incompatible_classes_and_distant_targets_get_new_ids() -> None:
     tracker = MultiTargetTracker(config(confirmation_hits=1))
     first_id = tracker.update(
@@ -196,6 +227,49 @@ def test_unknown_can_associate_with_known_track_without_erasing_history() -> Non
     )[0]
     assert updated.track_id == track_id
     assert updated.class_probabilities.green_supply > 0.0
+
+
+def test_soft_class_association_keeps_spatial_identity() -> None:
+    tracker = MultiTargetTracker(config(confirmation_hits=1))
+    tracker.enable_soft_class_association()
+    first = tracker.update(
+        1_000_000_000,
+        [
+            observation(
+                1_000_000_000,
+                ground_point=GroundPoint(500.0, -30.0),
+                box=UndistortedBoundingBox(10.0, 10.0, 30.0, 40.0),
+            ),
+            observation(
+                1_000_000_000,
+                ground_point=GroundPoint(500.0, 30.0),
+                box=UndistortedBoundingBox(70.0, 10.0, 90.0, 40.0),
+            ),
+        ],
+    )
+    ids_by_y = {round(item.ground_point.y): item.track_id for item in first}
+
+    second = tracker.update(
+        1_050_000_000,
+        [
+            observation(
+                1_050_000_000,
+                target_class=TargetClass.BLACK_CORE,
+                ground_point=GroundPoint(501.0, 30.0),
+                box=UndistortedBoundingBox(70.0, 10.0, 90.0, 40.0),
+                sequence=1,
+            ),
+            observation(
+                1_050_000_000,
+                ground_point=GroundPoint(499.0, -30.0),
+                box=UndistortedBoundingBox(10.0, 10.0, 30.0, 40.0),
+                sequence=1,
+            ),
+        ],
+    )
+    assert {
+        round(item.ground_point.y): item.track_id for item in second
+    } == ids_by_y
 
 
 def test_tracker_rejects_mixed_or_backwards_timestamps() -> None:

@@ -12,6 +12,8 @@ from rescue_vision.perception.detector import (
 from rescue_vision.perception.gripper_width import (
     GripperWidthEstimatorConfig,
     GripperWidthMeasurement,
+    TargetGroundEnvelope,
+    measure_target_envelope,
     average_gripper_width_measurements,
     estimate_gripper_width,
 )
@@ -47,6 +49,7 @@ from rescue_vision.perception.visualization import (
     PerceptionFrameRenderer,
     render_target_observations,
 )
+from rescue_vision.perception.timing import PerceptionTiming
 from rescue_vision.perception.types import (
     COLOR_TARGET_CLASSES,
     ClassProbabilities,
@@ -84,6 +87,8 @@ __all__ = [
     "GroundGeometryQuality",
     "GripperWidthEstimatorConfig",
     "GripperWidthMeasurement",
+    "TargetGroundEnvelope",
+    "measure_target_envelope",
     "LineSegmentObservation",
     "RealtimeFieldFeatureResult",
     "RealtimeTargetGroundGeometryResult",
@@ -115,6 +120,7 @@ __all__ = [
     "estimate_gripper_width",
     "average_gripper_width_measurements",
     "PerceptionFrameRenderer",
+    "PerceptionTiming",
     "PerceptionSnapshot",
     "render_target_observations",
 ]

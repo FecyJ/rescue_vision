@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import Event, Lock, Thread
 from time import monotonic_ns
 
@@ -14,6 +14,11 @@ from rescue_vision.camera.frame import CameraFrame
 from rescue_vision.perception.detector import TargetPoseDetector
 from rescue_vision.perception.field_feature_types import FieldFeatureDetectionResult, SafeZoneColor
 from rescue_vision.perception.types import TargetClass, TargetObservation
+from rescue_vision.perception.timing import (
+    PerceptionTiming,
+    is_observation_fresh,
+    observation_age_ns,
+)
 
 
 _TARGET_COLORS: dict[TargetClass, tuple[int, int, int]] = {
@@ -40,6 +45,36 @@ class PerceptionSnapshot:
     observations: tuple[TargetObservation, ...]
     field_features: FieldFeatureDetectionResult | None
     dropped_stale_age_ms: float | None = None
+    timing: PerceptionTiming | None = None
+
+    def __post_init__(self) -> None:
+        if self.timing is None:
+            object.__setattr__(
+                self,
+                "timing",
+                PerceptionTiming(
+                    self.capture_timestamp_ns,
+                    None,
+                    self.capture_timestamp_ns,
+                    self.capture_timestamp_ns,
+                    self.result_timestamp_ns,
+                ),
+            )
+        elif self.timing.result_timestamp_ns != self.result_timestamp_ns:
+            raise ValueError("snapshot timing result timestamp does not match snapshot.")
+
+    def age_ns(self, now_ns: int) -> int | None:
+        return observation_age_ns(self.capture_timestamp_ns, now_ns)
+
+    def is_fresh(self, now_ns: int, max_age_ms: float) -> bool:
+        return (
+            self.dropped_stale_age_ms is None
+            and is_observation_fresh(
+                self.capture_timestamp_ns,
+                now_ns,
+                max_age_ms,
+            )
+        )
 
 
 def _target_color(target_class: TargetClass) -> tuple[int, int, int]:
@@ -256,14 +291,23 @@ class PerceptionFrameRenderer:
     def __init__(
         self,
         detector_factory: Callable[[], TargetPoseDetector | None],
+        *,
+        render_enabled: bool = True,
+        report_timing: bool = True,
     ) -> None:
         if not callable(detector_factory):
             raise TypeError("detector_factory must be callable.")
         self._detector_factory = detector_factory
+        if not isinstance(render_enabled, bool):
+            raise TypeError("render_enabled must be a boolean.")
+        if not isinstance(report_timing, bool):
+            raise TypeError("report_timing must be a boolean.")
+        self._render_enabled = render_enabled
+        self._report_timing = report_timing
         self._condition = Event()
         self._render_condition = Event()
         self._lock = Lock()
-        self._pending_frame: CameraFrame | None = None
+        self._pending_frame: tuple[CameraFrame, int] | None = None
         self._pending_render: tuple[CameraFrame, PerceptionSnapshot] | None = None
         self._latest_frame: CameraFrame | None = None
         self._latest_snapshot: PerceptionSnapshot | None = None
@@ -272,10 +316,16 @@ class PerceptionFrameRenderer:
         self._stop_event = Event()
         self._thread: Thread | None = None
         self._render_thread: Thread | None = None
+        self._metrics_thread: Thread | None = None
         self._started = False
         self._render_ms_total = 0.0
         self._render_ms_max = 0.0
         self._render_frame_count = 0
+        self._metrics: dict[str, list[float]] = {}
+        self._submitted_count = 0
+        self._processed_count = 0
+        self._replaced_count = 0
+        self._stale_dropped_count = 0
 
     @property
     def started(self) -> bool:
@@ -297,6 +347,11 @@ class PerceptionFrameRenderer:
             self._render_ms_total = 0.0
             self._render_ms_max = 0.0
             self._render_frame_count = 0
+            self._metrics = {}
+            self._submitted_count = 0
+            self._processed_count = 0
+            self._replaced_count = 0
+            self._stale_dropped_count = 0
         detector: TargetPoseDetector | None = None
         try:
             detector = self._detector_factory()
@@ -311,14 +366,22 @@ class PerceptionFrameRenderer:
                 name="rescue-perception-video",
                 daemon=True,
             )
-            self._render_thread = Thread(
-                target=self._render_worker_loop,
-                name="rescue-perception-render",
+            if self._render_enabled:
+                self._render_thread = Thread(
+                    target=self._render_worker_loop,
+                    name="rescue-perception-render",
+                    daemon=True,
+                )
+            self._metrics_thread = Thread(
+                target=self._metrics_worker_loop,
+                name="rescue-perception-metrics",
                 daemon=True,
             )
             self._started = True
             self._thread.start()
-            self._render_thread.start()
+            if self._render_thread is not None:
+                self._render_thread.start()
+            self._metrics_thread.start()
         except BaseException as start_error:
             self._started = False
             self._thread = None
@@ -339,7 +402,10 @@ class PerceptionFrameRenderer:
         self._require_started()
         self._raise_worker_error()
         with self._lock:
-            self._pending_frame = frame
+            if self._pending_frame is not None:
+                self._replaced_count += 1
+            self._pending_frame = (frame, max(frame.timestamp_ns, monotonic_ns()))
+            self._submitted_count += 1
         self._condition.set()
 
     def latest(self) -> CameraFrame | None:
@@ -355,6 +421,18 @@ class PerceptionFrameRenderer:
         self._raise_worker_error()
         with self._lock:
             return self._latest_snapshot
+
+    def latest_fresh_snapshot(
+        self,
+        now_ns: int,
+        max_age_ms: float,
+    ) -> PerceptionSnapshot | None:
+        """返回当前可用快照；过期、未来或检测器丢弃结果统一返回 None。"""
+
+        snapshot = self.latest_snapshot()
+        if snapshot is None or not snapshot.is_fresh(now_ns, max_age_ms):
+            return None
+        return snapshot
 
     def clear_latest(self) -> None:
         """丢弃模式切换前的结果和待处理帧，不影响 detector 生命周期。"""
@@ -387,8 +465,14 @@ class PerceptionFrameRenderer:
             render_thread.join(timeout=5.0)
         if render_thread is not None and render_thread.is_alive():
             raise RuntimeError("PerceptionFrameRenderer render worker did not stop.")
+        metrics_thread = self._metrics_thread
+        if metrics_thread is not None:
+            metrics_thread.join(timeout=5.0)
+        if metrics_thread is not None and metrics_thread.is_alive():
+            raise RuntimeError("PerceptionFrameRenderer metrics worker did not stop.")
         self._thread = None
         self._render_thread = None
+        self._metrics_thread = None
         self._started = False
         self._condition.clear()
         self._render_condition.clear()
@@ -412,92 +496,51 @@ class PerceptionFrameRenderer:
                     "Perception video mode detector was not initialized."
                 )
             return
-        frame_count = 0
-        detect_ms_total = 0.0
-        detect_ms_max = 0.0
-        age_ms_total = 0.0
-        age_ms_max = 0.0
-        stale_dropped_count = 0
-        next_report_ns = monotonic_ns() + _TIMING_REPORT_INTERVAL_NS
         try:
             while not self._stop_event.is_set():
                 self._condition.wait(timeout=0.05)
                 self._condition.clear()
                 while not self._stop_event.is_set():
                     with self._lock:
-                        frame = self._pending_frame
+                        pending = self._pending_frame
                         self._pending_frame = None
-                    if frame is None:
+                    if pending is None:
                         break
-                    detect_start_ns = monotonic_ns()
+                    frame, submitted_timestamp_ns = pending
                     result = detector.detect_realtime(
                         frame,
                         frame.image_bgr,
-                        result_timestamp_ns=max(
-                            monotonic_ns(),
-                            frame.timestamp_ns,
-                        ),
                     )
-                    detect_ms = (monotonic_ns() - detect_start_ns) / 1_000_000.0
-                    completed_ns = max(
-                        (item.result_timestamp_ns for item in result.observations),
-                        default=(
-                            result.field_features.result_timestamp_ns
-                            if result.field_features is not None
-                            else monotonic_ns()
-                        ),
+                    timing = replace(
+                        result.timing,
+                        submitted_timestamp_ns=submitted_timestamp_ns,
                     )
                     snapshot = PerceptionSnapshot(
                         frame_sequence=frame.sequence,
                         capture_timestamp_ns=frame.timestamp_ns,
-                        result_timestamp_ns=completed_ns,
+                        result_timestamp_ns=timing.result_timestamp_ns,
                         observations=result.observations,
                         field_features=result.field_features,
                         dropped_stale_age_ms=result.dropped_stale_age_ms,
+                        timing=timing,
                     )
                     with self._lock:
                         self._latest_snapshot = snapshot
-                        self._pending_render = (frame, snapshot)
-                    self._render_condition.set()
-                    frame_count += 1
-                    detect_ms_total += detect_ms
-                    detect_ms_max = max(detect_ms_max, detect_ms)
-                    # Measure freshness at the point the control snapshot is
-                    # published; rendering is an independent observer path.
-                    age_ms = (monotonic_ns() - frame.timestamp_ns) / 1_000_000.0
-                    age_ms_total += age_ms
-                    age_ms_max = max(age_ms_max, age_ms)
-                    if result.stale_dropped:
-                        stale_dropped_count += 1
-                    now_ns = monotonic_ns()
-                    if now_ns >= next_report_ns:
-                        with self._lock:
-                            render_frame_count = self._render_frame_count
-                            render_ms_total = self._render_ms_total
-                            render_ms_max = self._render_ms_max
-                            self._render_frame_count = 0
-                            self._render_ms_total = 0.0
-                            self._render_ms_max = 0.0
-                        if frame_count:
-                            print(
-                                "perception_timing=(frames="
-                                f"{frame_count},"
-                                f"detect_ms_avg={detect_ms_total / frame_count:.1f},"
-                                f"detect_ms_max={detect_ms_max:.1f},"
-                                f"render_ms_avg={render_ms_total / max(1, render_frame_count):.1f},"
-                                f"render_ms_max={render_ms_max:.1f},"
-                                f"age_ms_avg={age_ms_total / frame_count:.1f},"
-                                f"age_ms_max={age_ms_max:.1f},"
-                                f"stale_dropped={stale_dropped_count})",
-                                flush=True,
-                            )
-                        frame_count = 0
-                        detect_ms_total = 0.0
-                        detect_ms_max = 0.0
-                        age_ms_total = 0.0
-                        age_ms_max = 0.0
-                        stale_dropped_count = 0
-                        next_report_ns = now_ns + _TIMING_REPORT_INTERVAL_NS
+                        self._processed_count += 1
+                        self._stale_dropped_count += int(result.stale_dropped)
+                        for name, value_ns in (
+                            ("capture_to_submit_ms", timing.capture_to_submit_ns),
+                            ("queue_wait_ms", timing.queue_wait_ns),
+                            ("inference_ms", timing.inference_ns),
+                            ("postprocess_ms", timing.postprocess_ns),
+                            ("capture_to_result_ms", timing.capture_to_result_ns),
+                        ):
+                            if value_ns is not None:
+                                self._metrics.setdefault(name, []).append(value_ns / 1_000_000.0)
+                        if self._render_enabled:
+                            self._pending_render = (frame, snapshot)
+                    if self._render_enabled:
+                        self._render_condition.set()
         except BaseException as error:
             with self._lock:
                 self._worker_error = error
@@ -549,7 +592,39 @@ class PerceptionFrameRenderer:
                         self._render_frame_count += 1
                         self._render_ms_total += render_ms
                         self._render_ms_max = max(self._render_ms_max, render_ms)
+                        self._metrics.setdefault("render_ms", []).append(render_ms)
         except BaseException as error:
             with self._lock:
                 self._worker_error = error
             self._stop_event.set()
+
+    def _metrics_worker_loop(self) -> None:
+        while not self._stop_event.wait(_TIMING_REPORT_INTERVAL_NS / 1_000_000_000.0):
+            with self._lock:
+                metrics = self._metrics
+                self._metrics = {}
+                submitted = self._submitted_count
+                processed = self._processed_count
+                replaced = self._replaced_count
+                stale = self._stale_dropped_count
+                self._submitted_count = 0
+                self._processed_count = 0
+                self._replaced_count = 0
+                self._stale_dropped_count = 0
+            if not self._report_timing or (not processed and not submitted):
+                continue
+            fields = [
+                f"submitted={submitted}",
+                f"processed={processed}",
+                f"replaced={replaced}",
+                f"stale_dropped={stale}",
+            ]
+            for name, values in sorted(metrics.items()):
+                if not values:
+                    continue
+                values.sort()
+                p50 = values[(len(values) - 1) * 50 // 100]
+                p95 = values[(len(values) - 1) * 95 // 100]
+                fields.append(f"{name}_p50={p50:.1f}")
+                fields.append(f"{name}_p95={p95:.1f}")
+            print("perception_timing=(" + ",".join(fields) + ")", flush=True)

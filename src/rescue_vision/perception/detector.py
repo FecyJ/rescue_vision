@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
+from collections.abc import Callable
 from time import monotonic_ns
 
 import cv2
@@ -13,7 +14,7 @@ from rescue_vision.camera.frame import CameraFrame
 from rescue_vision.geometry.ground_projector import GroundProjector
 from rescue_vision.geometry.types import GroundPoint, UndistortedPixel
 from rescue_vision.perception.backend import InferenceBackend
-from rescue_vision.perception.color_segmentation import segment_roi_colors
+from rescue_vision.perception.color_segmentation import segment_bgr_roi_colors
 from rescue_vision.perception.field_feature_types import (
     CenterCrossConfirmation,
     CenterCrossObservation,
@@ -37,6 +38,7 @@ from rescue_vision.perception.types import (
     TargetClass,
     TargetObservation,
 )
+from rescue_vision.perception.timing import PerceptionTiming
 
 
 # 当前相机/模型地面投影实测的统一前向偏差；目标和场地关键点共用同一修正。
@@ -53,9 +55,16 @@ def _correct_model_ground_point(point: GroundPoint) -> GroundPoint:
 class StaleObservationError(ValueError):
     """推理完成时，输入帧已经超过允许的观测年龄。"""
 
-    def __init__(self, age_ms: float, max_age_ms: float) -> None:
+    def __init__(
+        self,
+        age_ms: float,
+        max_age_ms: float,
+        *,
+        timing: PerceptionTiming | None = None,
+    ) -> None:
         self.age_ms = float(age_ms)
         self.max_age_ms = float(max_age_ms)
+        self.timing = timing
         super().__init__(
             f"Frame observation age {self.age_ms:.3f} ms exceeds "
             f"{self.max_age_ms:.3f} ms."
@@ -66,9 +75,26 @@ class StaleObservationError(ValueError):
 class RealtimeDetectionResult:
     """实时检测结果；过期观测只记录丢弃原因，不向下游泄漏。"""
 
+    frame_sequence: int
     observations: tuple[TargetObservation, ...]
     field_features: FieldFeatureDetectionResult | None
+    timing: PerceptionTiming
     dropped_stale_age_ms: float | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.frame_sequence, bool)
+            or not isinstance(self.frame_sequence, int)
+            or self.frame_sequence < 0
+        ):
+            raise ValueError("frame_sequence must be a non-negative integer.")
+        if not isinstance(self.timing, PerceptionTiming):
+            raise TypeError("timing must be a PerceptionTiming value.")
+        if self.dropped_stale_age_ms is not None and (
+            not math.isfinite(float(self.dropped_stale_age_ms))
+            or self.dropped_stale_age_ms < 0.0
+        ):
+            raise ValueError("dropped_stale_age_ms must be finite and non-negative.")
 
     @property
     def stale_dropped(self) -> bool:
@@ -93,6 +119,7 @@ class PoseDetectionResult:
 
     observations: tuple[TargetObservation, ...]
     field_features: FieldFeatureDetectionResult
+    timing: PerceptionTiming
 
     def __iter__(self):
         return iter(self.observations)
@@ -167,12 +194,18 @@ class TargetPoseDetector:
         ground_projector: GroundProjector | None = None,
         center_cross_refinement: CenterCrossRefinementConfig | None = None,
         safe_zone_color: SafeZoneColorConfig | None = None,
+        unknown_override_confidence_threshold: float = 0.8,
+        clock_ns: Callable[[], int] = monotonic_ns,
     ) -> None:
         self._backend = backend
         self._closed = False
         try:
             self._detection_threshold = self._threshold(
                 detection_threshold, "detection_threshold"
+            )
+            self._unknown_override_confidence_threshold = self._threshold(
+                unknown_override_confidence_threshold,
+                "unknown_override_confidence_threshold",
             )
             self._k0_threshold = self._threshold(
                 k0_threshold, "k0_threshold"
@@ -196,6 +229,9 @@ class TargetPoseDetector:
                 center_cross_refinement or CenterCrossRefinementConfig()
             )
             self._safe_zone_color = safe_zone_color or SafeZoneColorConfig()
+            if not callable(clock_ns):
+                raise TypeError("clock_ns must be callable.")
+            self._clock_ns = clock_ns
         except BaseException:
             try:
                 self.close()
@@ -217,6 +253,7 @@ class TargetPoseDetector:
         *,
         result_timestamp_ns: int | None = None,
     ) -> PoseDetectionResult:
+        processing_started_ns = max(frame.timestamp_ns, self._clock_ns())
         if (
             undistorted_image_bgr.ndim != 3
             or undistorted_image_bgr.shape[2] != 3
@@ -239,6 +276,7 @@ class TargetPoseDetector:
 
         inference_image_bgr = undistorted_image_bgr
         detections = self._backend.infer(inference_image_bgr)
+        inference_completed_ns = max(frame.timestamp_ns, self._clock_ns())
         candidate_detections: list[ModelDetection] = []
         for detection in detections:
             if detection.confidence < self._detection_threshold:
@@ -255,34 +293,34 @@ class TargetPoseDetector:
                     )
             candidate_detections.append(detection)
 
-        image_hsv = (
-            cv2.cvtColor(undistorted_image_bgr, cv2.COLOR_BGR2HSV)
-            if any(item.model_class in {
-                PoseModelClass.GREEN_SUPPLY,
-                PoseModelClass.BLACK_CORE,
-                PoseModelClass.ORANGE_INJURED,
-                PoseModelClass.BLUE_DANGER,
-            } for item in candidate_detections)
-            else None
-        )
         processed: list[_ProcessedDetection] = []
         for detection in candidate_detections:
             if detection.model_class not in POSE_MODEL_CLASSES[:4]:
                 continue
-            assert image_hsv is not None
             quality: set[ObservationQuality] = set()
             model_target_class = COLOR_TARGET_CLASSES[detection.model_class_id]
-            color_segmentation, probabilities = segment_roi_colors(
-                image_hsv,
+            color_segmentation, probabilities = segment_bgr_roi_colors(
+                undistorted_image_bgr,
                 detection.box,
                 self._color_classifier,
             )
             if color_segmentation.status is ColorSegmentationStatus.INSUFFICIENT:
-                target_class = TargetClass.UNKNOWN
                 quality.add(ObservationQuality.COLOR_EVIDENCE_INSUFFICIENT)
             elif color_segmentation.status is ColorSegmentationStatus.AMBIGUOUS:
-                target_class = TargetClass.UNKNOWN
                 quality.add(ObservationQuality.COLOR_EVIDENCE_AMBIGUOUS)
+            if color_segmentation.status is not ColorSegmentationStatus.ACCEPTED:
+                if (
+                    detection.confidence
+                    > self._unknown_override_confidence_threshold
+                ):
+                    target_class = model_target_class
+                    probabilities = ClassProbabilities.from_top_class(
+                        model_target_class,
+                        1.0,
+                    )
+                    quality.add(ObservationQuality.HIGH_CONFIDENCE_COLOR_OVERRIDE)
+                else:
+                    target_class = TargetClass.UNKNOWN
             else:
                 target_class = color_segmentation.candidate_class
                 if (
@@ -324,8 +362,18 @@ class TargetPoseDetector:
                 )
             )
 
+        # Field-feature refinement and safe-zone colour classification are part
+        # of the observation latency, so finish them before taking the result
+        # timestamp.
+        provisional_timestamp_ns = max(frame.timestamp_ns, self._clock_ns())
+        field_features = self._build_field_features(
+            frame,
+            undistorted_image_bgr,
+            candidate_detections,
+            provisional_timestamp_ns,
+        )
         completed_timestamp_ns = (
-            monotonic_ns() if result_timestamp_ns is None else result_timestamp_ns
+            self._clock_ns() if result_timestamp_ns is None else result_timestamp_ns
         )
         if completed_timestamp_ns < frame.timestamp_ns:
             raise ValueError(
@@ -333,9 +381,30 @@ class TargetPoseDetector:
             )
         age_ms = (completed_timestamp_ns - frame.timestamp_ns) / 1_000_000.0
         if age_ms > self._max_observation_age_ms:
+            timing = self._timing(
+                frame,
+                processing_started_ns,
+                inference_completed_ns,
+                completed_timestamp_ns,
+                result_timestamp_ns,
+            )
             raise StaleObservationError(
                 age_ms,
                 self._max_observation_age_ms,
+                timing=timing,
+            )
+
+        timing = self._timing(
+            frame,
+            processing_started_ns,
+            inference_completed_ns,
+            completed_timestamp_ns,
+            result_timestamp_ns,
+        )
+        if field_features.result_timestamp_ns != completed_timestamp_ns:
+            field_features = replace(
+                field_features,
+                result_timestamp_ns=completed_timestamp_ns,
             )
 
         observations = tuple(
@@ -357,13 +426,28 @@ class TargetPoseDetector:
             )
             for item in processed
         )
-        field_features = self._build_field_features(
-            frame,
-            undistorted_image_bgr,
-            candidate_detections,
-            completed_timestamp_ns,
+        return PoseDetectionResult(observations, field_features, timing)
+
+    def _timing(
+        self,
+        frame: CameraFrame,
+        processing_started_ns: int,
+        inference_completed_ns: int,
+        completed_timestamp_ns: int,
+        override_timestamp_ns: int | None,
+    ) -> PerceptionTiming:
+        # Existing offline fixtures may provide a synthetic completion time;
+        # keep their contract valid while production uses the real clock.
+        if override_timestamp_ns is not None:
+            processing_started_ns = frame.timestamp_ns
+            inference_completed_ns = frame.timestamp_ns
+        return PerceptionTiming(
+            capture_timestamp_ns=frame.timestamp_ns,
+            submitted_timestamp_ns=None,
+            processing_started_timestamp_ns=processing_started_ns,
+            inference_completed_timestamp_ns=inference_completed_ns,
+            result_timestamp_ns=completed_timestamp_ns,
         )
-        return PoseDetectionResult(observations, field_features)
 
     def _field_keypoint(self, detection: ModelDetection, index: int) -> FieldPoseKeypoint:
         keypoint = detection.keypoints[index]
@@ -550,14 +634,20 @@ class TargetPoseDetector:
                 result_timestamp_ns=result_timestamp_ns,
             )
         except StaleObservationError as exc:
+            if exc.timing is None:
+                raise RuntimeError("stale observation did not include timing") from exc
             return RealtimeDetectionResult(
+                frame_sequence=frame.sequence,
                 observations=(),
                 field_features=None,
+                timing=exc.timing,
                 dropped_stale_age_ms=exc.age_ms,
             )
         return RealtimeDetectionResult(
+            frame_sequence=frame.sequence,
             observations=detection_result.observations,
             field_features=detection_result.field_features,
+            timing=detection_result.timing,
         )
 
     def close(self) -> None:

@@ -1,206 +1,167 @@
-"""每秒按视觉宽度调整双舵机夹爪的独立测试程序。"""
-
+"""受监督近场多物资收拢入口；相机、规划与显示均为有界旁路。"""
 from __future__ import annotations
 
 import argparse
-import signal
-import time
+from collections import deque
 from pathlib import Path
+import signal
+from threading import Event, Thread
+import time
 
 import cv2
 import numpy as np
 
-from rescue_vision.app.cluster_breakup import CameraPerceptionPump
+from rescue_vision.app.cluster_breakup import CameraPerceptionPump, EncoderTravelTracker
+from rescue_vision.app.gripper_width_sequence import (
+    GraspPreparationWorker,
+    GraspPreparation,
+    GraspPreparationSession,
+    GripperWidthPickupSequence,
+    GripperWidthPickupState,
+)
+from rescue_vision.app.near_field_grasp import (
+    GraspTargetTracker,
+    NearFieldGraspSelector,
+)
 from rescue_vision.config import load_runtime_config
-from rescue_vision.geometry.ground_projector import GroundProjector
+from rescue_vision.app.session_log import _begin_time_named_log, _end_time_named_log
 from rescue_vision.motion import (
-    CarCommandReply,
-    CarSystemStatus,
-    CommandResult,
-    GripperKinematics,
-    MotionSynchronizationError,
+    CarCommandReply, CarSystemStatus, CommandResult, GripperKinematics,
+    MotionSynchronizationError, OdometryImu,
 )
-from rescue_vision.perception import (
-    GripperWidthEstimatorConfig,
-    GripperWidthMeasurement,
-    PerceptionFrameRenderer,
-    PerceptionSnapshot,
-    TargetObservation,
-    average_gripper_width_measurements,
-    estimate_gripper_width,
-)
+from rescue_vision.perception import PerceptionFrameRenderer
 
-
-_MEASUREMENT_INTERVAL_NS = 1_000_000_000
 _PREFLIGHT_RETRY_WINDOW_NS = 5_000_000_000
 _PREVIEW_WINDOW_NAME = "gripper-width"
 _MAX_PREVIEW_WIDTH = 1280
 _MAX_PREVIEW_HEIGHT = 720
 
 
-def _front_measurement(
-    snapshot: PerceptionSnapshot,
-    *,
-    ground_projector: GroundProjector,
-    config: GripperWidthEstimatorConfig,
-) -> GripperWidthMeasurement | None:
-    candidates: list[tuple[float, GripperWidthMeasurement]] = []
-    for observation in snapshot.observations:
-        measurement = estimate_gripper_width(
-            observation,
-            ground_projector,
-            config,
+def _age_ms_text(age_ns: int | None, *, digits: int = 3) -> str:
+    if age_ns is None:
+        return "none"
+    return f"{age_ns / 1_000_000.0:.{digits}f}"
+
+
+class _PreparationWorker:
+    """正式与独立入口共用近场准备 worker，独立入口额外提供预览。"""
+
+    def __init__(self, session, selector, renderer, local_preview):
+        self._worker = GraspPreparationWorker(
+            session,
+            selector,
+            diagnostics_callback=self._emit_diagnostics,
         )
-        if measurement is not None:
-            ground_point = observation.ground_point
-            assert ground_point is not None
-            candidates.append((ground_point.x, measurement))
-    if not candidates:
-        return None
-    # x 向车辆前方增大，最小 x 是当前横向居中候选中离车最近的物块。
-    return min(candidates, key=lambda item: item[0])[1]
+        self.renderer = renderer
+        self.selector = selector
+        self.local_preview = local_preview
+        self.exit_requested = False
+        self._preview_error: str | None = None
+        self._preview_stop = Event()
+        self._preview_thread: Thread | None = None
 
+    def _emit_diagnostics(self, diagnostics) -> None:
+        for diagnostic in diagnostics:
+            self.log(diagnostic.as_log_line())
 
-def _front_observation(
-    snapshot: PerceptionSnapshot,
-) -> TargetObservation | None:
-    """返回快照中最前方的目标，不应用横向中心门限。"""
+    @property
+    def error(self):
+        return self._worker.error or self._preview_error
 
-    candidates = [
-        observation
-        for observation in snapshot.observations
-        if observation.ground_point is not None
-    ]
-    if not candidates:
-        return None
-    return min(
-        candidates,
-        key=lambda observation: observation.ground_point.x
-        if observation.ground_point is not None
-        else float("inf"),
-    )
+    def __enter__(self):
+        self._worker.__enter__()
+        if self.local_preview:
+            self._preview_thread = Thread(
+                target=self._preview_loop, name="near-field-preview", daemon=True
+            )
+            self._preview_thread.start()
+        return self
 
+    def __exit__(self, *_args):
+        self._preview_stop.set()
+        if self._preview_thread is not None:
+            self._preview_thread.join()
+        self._worker.__exit__()
 
-def _front_object_text(
-    observation: TargetObservation | None,
-    *,
-    center_y_half_range_mm: float,
-) -> str:
-    if observation is None or observation.ground_point is None:
-        return "front_object=none"
-    center_y = observation.ground_point.y
-    center_gate = (
-        "inside"
-        if -center_y_half_range_mm < center_y < center_y_half_range_mm
-        else "outside"
-    )
-    return (
-        "front_object=("
-        f"class={observation.target_class.value},"
-        f"frame={observation.frame_sequence},"
-        f"x_mm={observation.ground_point.x:+.2f},"
-        f"y_mm={center_y:+.2f},"
-        f"center_gate={center_gate})"
-    )
-
-
-def _print_cycle_result(
-    *,
-    samples_valid: int,
-    sample_frames: int,
-    measurement: GripperWidthMeasurement | None,
-    servo_angles_deg: tuple[float, float] | None,
-    front_observation: TargetObservation | None,
-    center_y_half_range_mm: float,
-    command: str,
-    reason: str | None = None,
-) -> None:
-    def value_or_none(value: float | None) -> str:
-        return "none" if value is None else f"{value:.2f}"
-
-    line = (
-        f"samples_valid={samples_valid}/{sample_frames} "
-        f"center_y_mm={value_or_none(None if measurement is None else measurement.center_y_mm)} "
-        f"width_mm={value_or_none(None if measurement is None else measurement.width_mm)} "
-        f"opening_target_mm={value_or_none(None if measurement is None else measurement.opening_width_mm)} "
-        f"left_angle_deg={value_or_none(None if servo_angles_deg is None else servo_angles_deg[0])} "
-        f"right_angle_deg={value_or_none(None if servo_angles_deg is None else servo_angles_deg[1])} "
-        f"{_front_object_text(front_observation, center_y_half_range_mm=center_y_half_range_mm)} "
-        f"command={command}"
-    )
-    if reason is not None:
-        line += f" reason={reason}"
-    print(line, flush=True)
-
-
-def _draw_measurements(
-    image_bgr: np.ndarray,
-    measurement: GripperWidthMeasurement | None,
-    *,
-    servo_angles_deg: tuple[float, float] | None = None,
-) -> np.ndarray:
-    preview = np.ascontiguousarray(image_bgr).copy()
-    if measurement is None:
-        cv2.putText(
-            preview,
-            "measurement=none",
-            (16, 34),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
+    def submit(self, snapshot, locked_ids):
+        self._worker.submit(
+            snapshot,
+            session_id=0,
+            policy=self.selector.default_policy,
+            locked_ids=locked_ids,
         )
+
+    def log(self, text: str, *, flush: bool = True) -> None:
+        print(text, flush=flush)
+
+    def latest(self) -> GraspPreparation | None:
+        return self._worker.latest(0)
+
+    def _preview_loop(self) -> None:
+        window_created = False
+        try:
+            try:
+                cv2.namedWindow(_PREVIEW_WINDOW_NAME, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(
+                    _PREVIEW_WINDOW_NAME, _MAX_PREVIEW_WIDTH, _MAX_PREVIEW_HEIGHT
+                )
+                window_created = True
+            except Exception as exc:
+                self._preview_error = f"preview:{type(exc).__name__}:{exc}"
+                return
+            while not self._preview_stop.is_set():
+                rendered = self.renderer.latest()
+                if rendered is not None:
+                    cv2.imshow(
+                        _PREVIEW_WINDOW_NAME,
+                        _fit_preview_image(
+                            _draw_plan(rendered.image_bgr, self.latest(), self.selector)
+                        ),
+                    )
+                if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                    self.exit_requested = True
+                self._preview_stop.wait(0.03)
+        except Exception as exc:
+            self._preview_error = f"preview:{type(exc).__name__}:{exc}"
+        finally:
+            if window_created:
+                cv2.destroyAllWindows()
+
+
+def _draw_plan(image, prep, selector):
+    preview = image.copy()
+    if prep is None:
         return preview
-    left = (
-        round(measurement.left_edge_pixel.u),
-        round(measurement.left_edge_pixel.v),
-    )
-    right = (
-        round(measurement.right_edge_pixel.u),
-        round(measurement.right_edge_pixel.v),
-    )
-    cv2.drawMarker(
-        preview,
-        left,
-        (0, 255, 255),
-        cv2.MARKER_TRIANGLE_UP,
-        18,
-        2,
-    )
-    cv2.drawMarker(
-        preview,
-        right,
-        (255, 255, 0),
-        cv2.MARKER_TRIANGLE_DOWN,
-        18,
-        2,
-    )
-    cv2.line(preview, left, right, (255, 255, 255), 2, cv2.LINE_AA)
-    lines = [
-        f"{measurement.target_class.value} frame={measurement.frame_sequence}",
-        f"center_y={measurement.center_y_mm:+.1f} mm",
-        f"left_y={measurement.left_y_mm:+.1f} mm  "
-        f"right_y={measurement.right_y_mm:+.1f} mm",
-        f"width={measurement.width_mm:.1f} mm  "
-        f"open_target={measurement.opening_width_mm:.1f} mm",
-    ]
-    if servo_angles_deg is not None:
+    plan = prep.selection.plan
+    ids = () if plan is None else plan.member_ids
+    for target in prep.targets:
+        box = target.observation.box
+        color = (0, 255, 0) if target.track_id in ids else (0, 0, 255) if not target.selectable else (0, 220, 255)
+        cv2.rectangle(preview, (round(box.x_min), round(box.y_min)), (round(box.x_max), round(box.y_max)), color, 2)
+        cv2.putText(preview, f"id={target.track_id}", (round(box.x_min), max(15, round(box.y_min)-5)), cv2.FONT_HERSHEY_SIMPLEX, .6, color, 2)
+    lines = [f"capture_ns={prep.capture_timestamp_ns} capture=unconfirmed"]
+    if plan is not None:
+        for region in plan.regions:
+            try:
+                pixels = selector.region_pixels(region)
+                if all(np.isfinite(v) and abs(v) < 1e7 for p in pixels for v in (p.u, p.v)):
+                    cv2.polylines(preview, [np.asarray([(round(p.u), round(p.v)) for p in pixels], np.int32)], True, (255, 255, 0), 1)
+            except ValueError:
+                pass
+        score = plan.score
+        lines += [f"ids={ids} width={plan.width_mm:.1f} open={plan.opening_width_mm:.1f}/{plan.maximum_opening_mm:.1f} mm",
+                  f"forward={plan.forward_distance_mm:.1f} mm score={score.total:.3f}",
+                  f"points={score.rule_points:.0f} orange={score.orange_priority:.0f} count={score.count:.2f}",
+                  f"clearance={score.clearance:.2f} distance={score.distance:.2f} alignment={score.alignment:.2f}"]
+    if prep.ready:
+        lines.append(",".join(prep.selection.rejections)[:110] or "ready")
+    else:
         lines.append(
-            f"servo_left={servo_angles_deg[0]:.1f} deg  "
-            f"servo_right={servo_angles_deg[1]:.1f} deg"
+            f"confirmation={prep.confirmation_count}/{prep.confirmation_required} "
+            f"{','.join(prep.selection.rejections)[:90]}"
         )
-    for index, text in enumerate(lines):
-        cv2.putText(
-            preview,
-            text,
-            (16, 34 + index * 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
+    for index, line in enumerate(lines):
+        cv2.putText(preview, line, (16, 30 + index * 28), cv2.FONT_HERSHEY_SIMPLEX, .65, (255, 255, 255), 2)
     return preview
 
 
@@ -222,14 +183,10 @@ def _fit_preview_image(image_bgr: np.ndarray) -> np.ndarray:
     )
 
 
-def _run(
+def _run_session(
     config_path: Path,
     *,
     supervised_stop_ready: bool,
-    sample_frames: int,
-    center_y_half_range_mm: float,
-    clearance_mm: float,
-    min_mask_pixels: int,
     local_preview: bool,
     once: bool,
 ) -> None:
@@ -237,15 +194,7 @@ def _run(
     from rescue_vision.app.manual_capture import build_camera_pipeline
 
     runtime_config = load_runtime_config(config_path)
-    if (
-        isinstance(sample_frames, bool)
-        or not isinstance(sample_frames, int)
-        or sample_frames <= 0
-    ):
-        raise ValueError(
-            "sample_frames must be a positive integer, "
-            f"got {sample_frames!r}."
-        )
+    grasp_config = runtime_config.near_field_grasp
     if not supervised_stop_ready:
         raise RuntimeError(
             "A physical emergency stop and continuous supervision are required "
@@ -277,16 +226,25 @@ def _run(
     controller = runtime_config.motion.build_controller(channel)
     if controller is None:
         raise RuntimeError("gripper-width control requires an enabled controller.")
-
-    estimator_config = GripperWidthEstimatorConfig(
-        center_y_half_range_mm=center_y_half_range_mm,
-        clearance_mm=clearance_mm,
-        min_mask_pixels=min_mask_pixels,
+    odometry_calibration = runtime_config.motion.odometry.build_calibration()
+    if odometry_calibration is None:
+        raise RuntimeError(
+            "gripper-width pickup requires motion.odometry calibration."
+        )
+    if runtime_config.motion.wheel_track_m is None:
+        raise RuntimeError("gripper-width pickup requires motion.wheel_track_m.")
+    encoder_tracker = EncoderTravelTracker(
+        odometry_calibration,
+        max_wheel_velocity_m_s=runtime_config.motion.max_wheel_velocity_m_s,
+        max_consecutive_overrun_samples=(
+            runtime_config.motion.odometry.max_consecutive_overrun_samples
+        ),
     )
     renderer = PerceptionFrameRenderer(
         lambda: runtime_config.build_target_pose_detector(
             ground_projector=pipeline.ground_projector,
-        )
+        ),
+        render_enabled=local_preview,
     )
     camera_pump = CameraPerceptionPump(
         pipeline.source,
@@ -294,6 +252,33 @@ def _run(
         renderer,
     )
     kinematics = GripperKinematics()
+    selector = NearFieldGraspSelector(grasp_config, pipeline.ground_projector, kinematics,
+        open_servo_angles_deg=(gripper.open_left_angle_deg, gripper.open_right_angle_deg),
+        closed_servo_angles_deg=(gripper.closed_left_angle_deg, gripper.closed_right_angle_deg))
+    target_tracker = GraspTargetTracker(runtime_config.tracking.build_tracker(), pipeline.ground_projector, grasp_config,
+        max_relative_speed_mm_s=runtime_config.motion.max_wheel_velocity_m_s * 1000
+        + runtime_config.match.green_alignment_max_angular_velocity_rad_s * grasp_config.max_range_mm)
+    session = GraspPreparationSession(target_tracker, selector)
+    pickup_sequence = GripperWidthPickupSequence(
+        gripper_full_travel_time_s=gripper.full_travel_time_s,
+        forward_speed_m_s=runtime_config.match.green_approach_speed_m_s,
+        closed_servo_angles_deg=(gripper.closed_left_angle_deg, gripper.closed_right_angle_deg),
+        max_observation_age_ms=runtime_config.processing.max_observation_age_ms,
+        alignment_kp_rad_s=runtime_config.match.green_alignment_kp_rad_s,
+        alignment_max_angular_velocity_rad_s=runtime_config.match.green_alignment_max_angular_velocity_rad_s,
+            alignment_min_wheel_velocity_m_s=(
+                runtime_config.match.green_alignment_min_wheel_velocity_m_s
+            ),
+            alignment_timeout_ms=grasp_config.alignment_timeout_ms,
+            grasp_commit_max_observation_age_ms=(
+                grasp_config.grasp_commit_max_observation_age_ms
+            ),
+            stationary_max_gyro_rad_s=grasp_config.stationary_max_gyro_rad_s,
+            fine_alignment_zone_rad=grasp_config.fine_alignment_zone_rad,
+            fine_alignment_min_wheel_velocity_m_s=(
+                grasp_config.fine_alignment_min_wheel_velocity_m_s
+            ),
+        )
 
     stop_requested = False
     latest_status: CarSystemStatus | None = None
@@ -307,9 +292,21 @@ def _run(
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
     camera_start_thread = None
-    latest_measurement: GripperWidthMeasurement | None = None
-    latest_servo_angles: tuple[float, float] | None = None
-    preview_window_created = False
+    worker = None
+    last_odometry_ns = -1
+    odometry_history: deque[tuple[int, float | None]] = deque(maxlen=1024)
+
+    def record_odometry(message: OdometryImu) -> None:
+        """保存编码器累计距离，并使用 UART 接收时刻做同钟对齐。"""
+        nonlocal last_odometry_ns
+        pickup_sequence.observe_motion(message)
+        encoder_tracker.submit(message)
+        received_timestamp_ns = getattr(message, "received_timestamp_ns", None)
+        if isinstance(received_timestamp_ns, bool) or not isinstance(received_timestamp_ns, int) or received_timestamp_ns < 0:
+            received_timestamp_ns = time.monotonic_ns()
+        last_odometry_ns = received_timestamp_ns
+        odometry_history.append((received_timestamp_ns, encoder_tracker.distance_m))
+
     try:
         with channel:
             try:
@@ -317,8 +314,10 @@ def _run(
                 camera_start_thread = camera_pump.start_in_background()
 
                 def handle_sync_message(message: object) -> None:
-                    nonlocal latest_status
-                    if isinstance(message, CarSystemStatus):
+                    nonlocal latest_status, last_odometry_ns
+                    if isinstance(message, OdometryImu):
+                        record_odometry(message)
+                    elif isinstance(message, CarSystemStatus):
                         latest_status = message
                         if message.emergency_stop_latched:
                             raise RuntimeError(
@@ -348,10 +347,12 @@ def _run(
                         time.sleep(0.02)
 
                 def service_uart_during_startup() -> None:
-                    nonlocal latest_status
+                    nonlocal latest_status, last_odometry_ns
                     controller.update(now_ns=time.monotonic_ns())
                     for message in controller.drain_messages():
-                        if isinstance(message, CarSystemStatus):
+                        if isinstance(message, OdometryImu):
+                            record_odometry(message)
+                        elif isinstance(message, CarSystemStatus):
                             latest_status = message
                             if message.emergency_stop_latched:
                                 raise RuntimeError(
@@ -363,26 +364,19 @@ def _run(
                     on_wait=service_uart_during_startup,
                 )
                 controller.query_state()
-                if local_preview:
-                    cv2.namedWindow(_PREVIEW_WINDOW_NAME, cv2.WINDOW_NORMAL)
-                    cv2.resizeWindow(
-                        _PREVIEW_WINDOW_NAME,
-                        _MAX_PREVIEW_WIDTH,
-                        _MAX_PREVIEW_HEIGHT,
-                    )
-                    preview_window_created = True
-                next_measurement_ns = time.monotonic_ns()
-                sampling_active = False
-                sample_frame_count = 0
-                sample_measurements: list[GripperWidthMeasurement] = []
-                sample_last_sequence: int | None = None
-                last_snapshot_sequence: int | None = None
-                sample_front_observation: TargetObservation | None = None
+                worker = _PreparationWorker(session, selector, renderer, local_preview)
+                worker.__enter__()
+                last_pickup_state = None
+                last_pickup_reason = None
+                last_diagnostic = None
+                last_report_ns = 0
                 while not stop_requested:
                     now_ns = time.monotonic_ns()
                     controller.update(now_ns=now_ns)
                     for message in controller.drain_messages():
-                        if isinstance(message, CarSystemStatus):
+                        if isinstance(message, OdometryImu):
+                            record_odometry(message)
+                        elif isinstance(message, CarSystemStatus):
                             latest_status = message
                             if message.emergency_stop_latched:
                                 raise RuntimeError("STM32 emergency stop is latched.")
@@ -403,7 +397,7 @@ def _run(
                                 )
                         elif isinstance(message, CarCommandReply):
                             if message.command_type.name == "SET_GRIPPER":
-                                print(
+                                worker.log(
                                     "command_reply=set_gripper "
                                     f"sequence={message.command_sequence} "
                                     f"result={message.result.name.lower()}",
@@ -416,215 +410,165 @@ def _run(
                                     f"{message.result.name.lower()}."
                                 )
 
-                    camera_pump.check_health()
-                    if not sampling_active and now_ns >= next_measurement_ns:
-                        sampling_active = True
-                        sample_frame_count = 0
-                        sample_measurements = []
-                        sample_last_sequence = None
-                        sample_front_observation = None
-                        print(
-                            f"sampling=start target_frames={sample_frames}",
-                            flush=True,
-                        )
-
-                    snapshot = renderer.latest_snapshot()
+                    try:
+                        camera_pump.check_health()
+                    except Exception as exc:
+                        diagnostic = f"perception:{type(exc).__name__}:{exc}"
+                        if diagnostic != last_diagnostic:
+                            worker.log(diagnostic, flush=True)
+                            last_diagnostic = diagnostic
+                    if worker.error is not None and worker.error != last_diagnostic:
+                        worker.log(f"sidecar_error={worker.error}", flush=True)
+                        last_diagnostic = worker.error
+                    snapshot = renderer.latest_fresh_snapshot(
+                        now_ns,
+                        runtime_config.processing.max_observation_age_ms,
+                    )
+                    # 进入动作后冻结静止阶段形成的计划；避免运动模糊触发
+                    # 走廊重检，也避免规划线程继续消耗实时链路预算。
                     if (
-                        sampling_active
-                        and snapshot is not None
-                        and snapshot.frame_sequence != last_snapshot_sequence
+                        snapshot is not None
+                        and pickup_sequence.active_plan is None
                     ):
-                        if (
-                            sample_last_sequence is not None
-                            and snapshot.frame_sequence != sample_last_sequence + 1
-                        ):
-                            print(
-                                "sampling=sequence_gap "
-                                f"previous={sample_last_sequence} "
-                                f"current={snapshot.frame_sequence} "
-                                "action=keep_window",
-                                flush=True,
+                        capture_distance = next((distance for stamp, distance in reversed(odometry_history)
+                                                 if stamp <= snapshot.capture_timestamp_ns), None)
+                        if capture_distance is not None:
+                            worker.submit(
+                                snapshot,
+                                pickup_sequence.locked_ids,
                             )
-                        sample_last_sequence = snapshot.frame_sequence
-                        last_snapshot_sequence = snapshot.frame_sequence
-                        sample_frame_count += 1
-                        front_observation = _front_observation(snapshot)
-                        if front_observation is not None:
-                            sample_front_observation = front_observation
-                        frame_measurement: GripperWidthMeasurement | None = None
-                        age_ms = (
-                            now_ns - snapshot.capture_timestamp_ns
-                        ) / 1_000_000.0
+                    preparation = worker.latest()
+                    distance = encoder_tracker.distance_m if latest_status is not None and latest_status.gripper_output_available and now_ns - last_odometry_ns <= runtime_config.processing.max_observation_age_ms * 1e6 else None
+                    now_ns = time.monotonic_ns()
+                    decision = pickup_sequence.step(now_ns, preparation, cumulative_distance_m=distance)
+                    if decision.soft_brake:
+                        # 对准中丢失目标时会在多个控制周期保持等待；只在
+                        # 首次进入该停车原因时发送软刹车，避免反复刷 UART。
                         if (
-                            snapshot.dropped_stale_age_ms is None
-                            and 0.0 <= age_ms
-                            <= runtime_config.processing.max_observation_age_ms
+                            decision.state is not last_pickup_state
+                            or decision.reason != last_pickup_reason
                         ):
-                            try:
-                                frame_measurement = _front_measurement(
-                                    snapshot,
-                                    ground_projector=pipeline.ground_projector,
-                                    config=estimator_config,
-                                )
-                            except ValueError as exc:
-                                print(
-                                    "sample=ignored "
-                                    f"frame={snapshot.frame_sequence} "
-                                    f"reason=invalid_ground_width_measurement:{exc}",
-                                    flush=True,
-                                )
-                        if frame_measurement is not None:
-                            sample_measurements.append(frame_measurement)
-                            latest_measurement = frame_measurement
-                        print(
-                            f"sample_frame={sample_frame_count}/{sample_frames} "
-                            f"frame={snapshot.frame_sequence} "
-                            f"measurement={'valid' if frame_measurement is not None else 'lost_or_invalid'} "
-                            f"{_front_object_text(front_observation, center_y_half_range_mm=center_y_half_range_mm)}",
+                            controller.soft_brake()
+                    else:
+                        controller.drive_wheel_limited(
+                            decision.linear_velocity_m_s,
+                            decision.angular_velocity_rad_s,
+                            min_wheel_velocity_m_s=(
+                                decision.min_wheel_velocity_m_s
+                            ),
+                        )
+                    if decision.gripper_angles_deg is not None:
+                        controller.set_gripper_angles(*decision.gripper_angles_deg)
+                        worker.log(
+                            f"command=set_gripper reason={decision.reason} "
+                            f"left_angle_deg={decision.gripper_angles_deg[0]:.2f} "
+                            f"right_angle_deg={decision.gripper_angles_deg[1]:.2f}",
                             flush=True,
                         )
-
-                        if sample_frame_count >= sample_frames:
-                            measurement = (
-                                average_gripper_width_measurements(
-                                    sample_measurements,
-                                    clearance_mm=estimator_config.clearance_mm,
-                                )
-                                if sample_measurements
-                                else None
-                            )
-                            latest_measurement = measurement
-                            servo_angles: tuple[float, float] | None = None
-                            command = "skipped"
-                            reason: str | None = None
-                            if measurement is None:
-                                reason = "no_fresh_centered_measurable_target"
-                            else:
-                                try:
-                                    servo_angles = kinematics.servo_angles_for_opening(
-                                        measurement.opening_width_mm,
-                                        open_left_angle_deg=gripper.open_left_angle_deg,
-                                        open_right_angle_deg=gripper.open_right_angle_deg,
-                                        closed_left_angle_deg=gripper.closed_left_angle_deg,
-                                        closed_right_angle_deg=gripper.closed_right_angle_deg,
-                                    )
-                                except ValueError as exc:
-                                    reason = f"angle_conversion:{exc}"
-                                else:
-                                    if (
-                                        latest_status is None
-                                        or not latest_status.gripper_output_available
-                                    ):
-                                        reason = "gripper_status_unavailable"
-                                    else:
-                                        assert servo_angles is not None
-                                        controller.set_gripper_angles(*servo_angles)
-                                        latest_servo_angles = servo_angles
-                                        command = "set_gripper"
-                            _print_cycle_result(
-                                samples_valid=len(sample_measurements),
-                                sample_frames=sample_frames,
-                                measurement=measurement,
-                                servo_angles_deg=servo_angles,
-                                front_observation=sample_front_observation,
-                                center_y_half_range_mm=center_y_half_range_mm,
-                                command=command,
-                                reason=reason,
-                            )
-                            sampling_active = False
-                            while next_measurement_ns <= now_ns:
-                                next_measurement_ns += _MEASUREMENT_INTERVAL_NS
-                            if once and command == "set_gripper":
-                                break
-
-                    if local_preview:
-                        rendered = renderer.latest()
-                        if rendered is not None:
-                            preview = _draw_measurements(
-                                rendered.image_bgr,
-                                latest_measurement,
-                                servo_angles_deg=latest_servo_angles,
-                            )
-                            cv2.imshow(
-                                _PREVIEW_WINDOW_NAME,
-                                _fit_preview_image(preview),
-                            )
-                            key = cv2.waitKey(1) & 0xFF
-                            if key in (ord("q"), 27):
-                                stop_requested = True
+                    if decision.state is not last_pickup_state or decision.reason != last_pickup_reason or now_ns - last_report_ns >= 1_000_000_000:
+                        plan_age = (
+                            None
+                            if preparation is None
+                            else preparation.plan_age_ns(now_ns)
+                        )
+                        preparation_age = (
+                            None
+                            if preparation is None
+                            else preparation.preparation_age_ns(now_ns)
+                        )
+                        worker.log(f"pickup_state={decision.state.value} reason={decision.reason} distance_m={distance} rx_degraded={None if latest_status is None else getattr(latest_status, 'rx_degraded', None)} "
+                              f"plan_age_ms={_age_ms_text(plan_age)} "
+                              f"preparation_age_ms={_age_ms_text(preparation_age)} "
+                              f"confirmation={None if preparation is None else preparation.confirmation_progress} "
+                              f"{pickup_sequence.motion_diagnostic(now_ns)}" if preparation is not None else
+                              f"pickup_state={decision.state.value} reason={decision.reason} observation=none", flush=True)
+                        if preparation is not None:
+                            plan = preparation.selection.plan
+                            worker.log(f"selection={None if plan is None else plan.member_ids} "
+                                  f"score={None if plan is None else plan.score} rejections={preparation.selection.rejections}", flush=True)
+                        last_report_ns = now_ns
+                    if decision.state is GripperWidthPickupState.OPENING and last_pickup_state is not GripperWidthPickupState.OPENING:
+                        plan_age = (
+                            None
+                            if preparation is None
+                            else preparation.plan_age_ns(now_ns)
+                        )
+                        preparation_age = (
+                            None
+                            if preparation is None
+                            else preparation.preparation_age_ns(now_ns)
+                        )
+                        worker.log(
+                            "near_field_grasp_commit="
+                            f"session=0 plan_age_ms={_age_ms_text(plan_age)} "
+                            f"preparation_age_ms={_age_ms_text(preparation_age)} "
+                            f"confirmation={None if preparation is None else preparation.confirmation_progress} "
+                            f"ids={None if pickup_sequence.active_plan is None else pickup_sequence.active_plan.member_ids}",
+                            flush=True,
+                        )
+                    if decision.state is GripperWidthPickupState.COMPLETE and last_pickup_state is not GripperWidthPickupState.COMPLETE:
+                        worker.log(f"pickup_result={pickup_sequence.result}", flush=True)
+                    last_pickup_state, last_pickup_reason = decision.state, decision.reason
+                    if worker.exit_requested or once and decision.state is GripperWidthPickupState.COMPLETE:
+                        break
                     time.sleep(0.005)
             finally:
-                # 此程序不驱动车轮，但发送软刹车确保离开时没有残留运动目标。
+                # 确保退出时底盘没有残留运动目标；夹爪角度保持最后一次显式命令。
                 controller.soft_brake()
     finally:
         try:
-            if camera_start_thread is not None:
-                camera_pump.stop()
+            if worker is not None:
+                worker.__exit__()
         finally:
-            if local_preview and preview_window_created:
-                cv2.destroyAllWindows()
-            signal.signal(signal.SIGINT, previous_sigint)
-            signal.signal(signal.SIGTERM, previous_sigterm)
+            try:
+                if camera_start_thread is not None:
+                    camera_pump.stop()
+            finally:
+                signal.signal(signal.SIGINT, previous_sigint)
+                signal.signal(signal.SIGTERM, previous_sigterm)
+
+
+def _run(
+    config_path: Path,
+    *,
+    supervised_stop_ready: bool,
+    local_preview: bool,
+    once: bool,
+    log_dir: Path | None = None,
+) -> None:
+    """运行近场收拢，并可选地把完整终端输出 tee 到日志目录。"""
+
+    log_stream, original_stdout, original_stderr = _begin_time_named_log(
+        log_dir,
+        file_prefix="gripper_width_",
+    )
+    try:
+        _run_session(
+            config_path,
+            supervised_stop_ready=supervised_stop_ready,
+            local_preview=local_preview,
+            once=once,
+        )
+    finally:
+        _end_time_named_log(log_stream, original_stdout, original_stderr)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Measure the nearest centered object's ground-projected width "
-            "every second and set symmetric gripper servo angles."
-        )
-    )
+    parser = argparse.ArgumentParser(description="Select 1-3 green/black supplies or one orange target, align, gather and close; no turn or transport.")
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--supervised-physical-stop-ready", action="store_true", help="Confirm physical emergency stop and continuous supervision.")
+    parser.add_argument("--local-preview", action="store_true")
+    parser.add_argument("--once", action="store_true", help="Exit after one gathering action; capture remains unconfirmed.")
     parser.add_argument(
-        "--supervised-physical-stop-ready",
-        action="store_true",
-        help="Confirm physical emergency stop and continuous supervision.",
-    )
-    parser.add_argument(
-        "--sample-frames",
-        type=int,
-        default=5,
-        help="Number of consecutive snapshots per measurement (default: 5).",
-    )
-    parser.add_argument(
-        "--center-y-half-range-mm",
-        type=float,
-        default=5.0,
-        help="Strict center gate is -N < ground y < N (default: 5).",
-    )
-    parser.add_argument(
-        "--clearance-mm",
-        type=float,
-        default=4.0,
-        help="Opening margin added to measured width (default: 4).",
-    )
-    parser.add_argument(
-        "--min-mask-pixels",
-        type=int,
-        default=1,
-        help="Minimum accepted color-mask pixels (default: 1).",
-    )
-    parser.add_argument(
-        "--local-preview",
-        action="store_true",
-        help="Show the latest perception image and measured edge markers.",
-    )
-    parser.add_argument(
-        "--once",
-        action="store_true",
-        help="Exit after the first valid centered measurement.",
+        "--log-dir",
+        type=Path,
+        default=Path("logs"),
+        help="Directory for the time-named gripper-width log (default: logs).",
     )
     args = parser.parse_args()
-    _run(
-        args.config.expanduser().resolve(),
-        supervised_stop_ready=args.supervised_physical_stop_ready,
-        sample_frames=args.sample_frames,
-        center_y_half_range_mm=args.center_y_half_range_mm,
-        clearance_mm=args.clearance_mm,
-        min_mask_pixels=args.min_mask_pixels,
-        local_preview=args.local_preview,
-        once=args.once,
-    )
+    _run(args.config.expanduser().resolve(), supervised_stop_ready=args.supervised_physical_stop_ready,
+         local_preview=args.local_preview, once=args.once,
+         log_dir=args.log_dir.expanduser().resolve())
 
 
 if __name__ == "__main__":

@@ -196,14 +196,21 @@ class Picamera2Source:
                         dtype=np.uint8,
                     ).copy()
                     raw_metadata = request.get_metadata()
-                    timestamp_ns = time.monotonic_ns()
+                    received_timestamp_ns = time.monotonic_ns()
                 finally:
                     request.release()
+                timestamp_ns, timestamp_source = self._capture_timestamp(
+                    raw_metadata,
+                    received_timestamp_ns,
+                )
+                metadata = self._normalize_metadata(raw_metadata)
+                metadata["frame_received_timestamp_ns"] = received_timestamp_ns
+                metadata["timestamp_source"] = timestamp_source
                 frame = CameraFrame(
                     sequence=sequence,
                     timestamp_ns=timestamp_ns,
                     image_bgr=image_bgr,
-                    metadata=self._normalize_metadata(raw_metadata),
+                    metadata=metadata,
                 )
                 with self._condition:
                     self._latest_frame = frame
@@ -214,6 +221,34 @@ class Picamera2Source:
                 if self._running:
                     self._reader_error = error
                 self._condition.notify_all()
+
+    @staticmethod
+    def _capture_timestamp(
+        metadata: Mapping[str, Any],
+        received_timestamp_ns: int,
+    ) -> tuple[int, str]:
+        """将 libcamera 的 BOOTTIME 传感器时刻映射到 MONOTONIC。
+
+        不兼容或缺失的传感器时刻显式回退到主机接收时刻，避免将不同
+        clock domain 直接相减后产生未来帧。
+        """
+
+        sensor_timestamp = metadata.get("SensorTimestamp")
+        if isinstance(sensor_timestamp, bool) or not isinstance(sensor_timestamp, int):
+            return received_timestamp_ns, "host_frame_received_monotonic"
+        if sensor_timestamp <= 0 or not hasattr(time, "CLOCK_BOOTTIME"):
+            return received_timestamp_ns, "host_frame_received_monotonic"
+        boot_now_ns = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+        monotonic_now_ns = time.monotonic_ns()
+        offset_ns = boot_now_ns - monotonic_now_ns
+        mapped_timestamp_ns = sensor_timestamp - offset_ns
+        # 真实请求只能比接收时刻略早；这也拒绝合成测试值和错误时钟域。
+        if (
+            mapped_timestamp_ns <= received_timestamp_ns - 10_000_000_000
+            or mapped_timestamp_ns > received_timestamp_ns
+        ):
+            return received_timestamp_ns, "host_frame_received_monotonic"
+        return mapped_timestamp_ns, "sensor_start_of_frame_monotonic"
 
     def _normalize_metadata(
         self,

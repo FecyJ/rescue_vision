@@ -366,6 +366,34 @@ def test_nonzero_wheel_targets_are_raised_to_motor_minimum() -> None:
     assert controller.target_wheel_speeds_m_s == (0.0, 0.0)
 
 
+def test_per_command_minimum_wheel_velocity_overrides_global_floor() -> None:
+    channel = FakeCarChannel()
+    controller = MotionController(channel, limits())
+
+    controller.drive_wheel_limited(
+        0.0,
+        0.05,
+        min_wheel_velocity_m_s=0.01,
+    )
+    assert controller.target_wheel_speeds_m_s == pytest.approx(
+        (-0.01, 0.01)
+    )
+
+    controller.drive_wheel_limited(0.0, 0.05)
+    assert controller.target_wheel_speeds_m_s == pytest.approx(
+        (-0.02, 0.02)
+    )
+
+    controller.drive_wheel_limited(
+        0.0,
+        0.05,
+        min_wheel_velocity_m_s=0.0,
+    )
+    assert controller.target_wheel_speeds_m_s == pytest.approx(
+        (-0.005, 0.005)
+    )
+
+
 def test_drive_applies_per_wheel_speed_weights() -> None:
     channel = FakeCarChannel()
     clock = FakeClock()

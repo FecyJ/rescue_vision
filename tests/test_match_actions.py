@@ -101,7 +101,7 @@ def safe_zone_snapshot(
     k0: GroundPoint,
     k1: GroundPoint,
 ) -> PerceptionSnapshot:
-    box = UndistortedBoundingBox(10.0, 10.0, 100.0, 100.0)
+    box = UndistortedBoundingBox(10.0, 10.0, 90.0, 90.0)
 
     def keypoint(ground: GroundPoint) -> FieldPoseKeypoint:
         return FieldPoseKeypoint(UndistortedPixel(50.0, 50.0), ground, 0.9)
@@ -460,8 +460,9 @@ def test_hardware_entry_reaches_control_without_building_fusion(monkeypatch) -> 
     monkeypatch.setattr(cluster_breakup, "CameraPerceptionPump", lambda *args: camera)
     renderer = MagicMock()
     renderer.latest_snapshot.return_value = snapshot(1, 10)
+    renderer.latest_fresh_snapshot.return_value = snapshot(1, 10)
     renderer.latest.return_value = None
-    monkeypatch.setattr(perception_module, "PerceptionFrameRenderer", lambda factory: renderer)
+    monkeypatch.setattr(perception_module, "PerceptionFrameRenderer", lambda factory, **kwargs: renderer)
     received = []
 
     def finish(self, timestamp_ns, **kwargs):

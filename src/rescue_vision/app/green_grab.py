@@ -410,7 +410,8 @@ def _run_hardware(
     renderer = PerceptionFrameRenderer(
         lambda: config.build_target_pose_detector(
             ground_projector=pipeline.ground_projector
-        )
+        ),
+        render_enabled=False,
     )
     camera_pump = CameraPerceptionPump(pipeline.source, pipeline.prepare, renderer)
     sequence = GreenGrabSequence(
@@ -483,7 +484,10 @@ def _run_hardware(
                     for message in controller.drain_messages():
                         consume(message)
                     camera_pump.check_health()
-                    latest_snapshot = renderer.latest_snapshot()
+                    latest_snapshot = renderer.latest_fresh_snapshot(
+                        time.monotonic_ns(),
+                        config.processing.max_observation_age_ms,
+                    )
                     time.sleep(0.005)
                 if latest_snapshot is None:
                     raise RuntimeError("No fresh perception snapshot before start.")
@@ -524,15 +528,10 @@ def _run_hardware(
                                     f"tx_degraded={message.tx_degraded}."
                                 )
                     camera_pump.check_health()
-                    candidate = renderer.latest_snapshot()
-                    if candidate is not None:
-                        latest_snapshot = candidate
-                    if latest_snapshot is not None:
-                        age_ms = (
-                            now_ns - latest_snapshot.capture_timestamp_ns
-                        ) / 1_000_000.0
-                        if age_ms > config.processing.max_observation_age_ms:
-                            latest_snapshot = None
+                    latest_snapshot = renderer.latest_fresh_snapshot(
+                        now_ns,
+                        config.processing.max_observation_age_ms,
+                    )
                     green = find_green_target(latest_snapshot)
                     decision = sequence.step(now_ns, green)
                     if decision.gripper_posture is not last_posture:

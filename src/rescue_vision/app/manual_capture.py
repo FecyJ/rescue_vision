@@ -788,6 +788,7 @@ class ManualCaptureRuntime:
         stop_requested: Callable[[], bool],
         safety_mode: VehicleSafetyMode,
         synchronization_timeout_s: float = 1.0,
+        max_observation_age_ms: float = 150.0,
         sequence_counters: RemoteObservationSequences | None = None,
     ) -> None:
         self.connection = connection
@@ -804,6 +805,7 @@ class ManualCaptureRuntime:
         self.map_team_color = map_team_color
         self.odometry_imu_fusion = odometry_imu_fusion
         self.visual_localization = visual_localization
+        self.max_observation_age_ms = float(max_observation_age_ms)
         self.stop_requested = stop_requested
         self.synchronization_timeout_s = synchronization_timeout_s
         self.sequence_counters = (
@@ -962,7 +964,10 @@ class ManualCaptureRuntime:
             self._service_motion_safety()
         now_ns = time.monotonic_ns()
         if self.visual_localization is not None and self.perception_renderer is not None:
-            snapshot = self.perception_renderer.latest_snapshot()
+            snapshot = self.perception_renderer.latest_fresh_snapshot(
+                now_ns,
+                self.max_observation_age_ms,
+            )
             if snapshot is not None and snapshot.field_features is not None:
                 self.visual_localization.submit(snapshot.field_features)
         if self.latest_frame is not None and now_ns >= self.next_video_ns:
@@ -1305,6 +1310,7 @@ def run_manual_capture_session(
     stop_requested: Callable[[], bool] = lambda: False,
     safety_mode: VehicleSafetyMode = VehicleSafetyMode.UNAVAILABLE,
     synchronization_timeout_s: float = 1.0,
+    max_observation_age_ms: float = 150.0,
     sequence_counters: RemoteObservationSequences | None = None,
 ) -> None:
     runtime = ManualCaptureRuntime(
@@ -1325,6 +1331,7 @@ def run_manual_capture_session(
         stop_requested=stop_requested,
         safety_mode=safety_mode,
         synchronization_timeout_s=synchronization_timeout_s,
+        max_observation_age_ms=max_observation_age_ms,
         sequence_counters=sequence_counters,
     )
     try:
@@ -1669,6 +1676,9 @@ def main() -> None:
                                 ),
                                 synchronization_timeout_s=(
                                     config.motion.synchronization_timeout_s
+                                ),
+                                max_observation_age_ms=(
+                                    config.processing.max_observation_age_ms
                                 ),
                                 sequence_counters=sequence_counters,
                             )

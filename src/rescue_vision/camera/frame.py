@@ -12,7 +12,13 @@ MetadataValue: TypeAlias = str | int | float | bool | None
 
 @dataclass(frozen=True, slots=True)
 class CameraFrame:
-    """一帧 BGR 图像及其应用侧单调时钟时间。"""
+    """一帧 BGR 图像及映射到应用单调时钟的最佳采集时刻。
+
+    ``timestamp_ns`` 的具体来源由 ``metadata['timestamp_source']`` 声明。
+    真机源优先使用传感器起始曝光时间；不提供传感器时刻的源使用尽量早的
+    主机接收时间。所有来源都必须和 ``time.monotonic_ns()`` 处于同一时钟域，
+    这样下游可以安全计算观测年龄。
+    """
 
     sequence: int
     timestamp_ns: int

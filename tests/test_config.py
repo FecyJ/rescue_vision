@@ -615,6 +615,7 @@ def test_color_classifier_config_is_loaded_from_perception(tmp_path) -> None:
 
     assert config.perception.detection_threshold == pytest.approx(0.25)
     assert config.perception.k0_threshold == pytest.approx(0.5)
+    assert config.perception.unknown_override_confidence_threshold == pytest.approx(0.8)
     classifier = config.perception.color_classifier
     assert classifier.green_supply[0].lower == (35, 70, 71)
     assert len(classifier.orange_injured) == 2
@@ -814,6 +815,7 @@ def test_perception_supports_partial_nested_overrides(tmp_path) -> None:
         "  lens_position: 1.0\n"
         "perception:\n"
         "  detection_threshold: 0.4\n"
+        "  unknown_override_confidence_threshold: 0.9\n"
         "  color_classifier:\n"
         "    min_color_fraction: 0.22\n",
         encoding="utf-8",
@@ -823,6 +825,7 @@ def test_perception_supports_partial_nested_overrides(tmp_path) -> None:
 
     assert config.perception.detection_threshold == pytest.approx(0.4)
     assert config.perception.k0_threshold == pytest.approx(0.5)
+    assert config.perception.unknown_override_confidence_threshold == pytest.approx(0.9)
     assert config.perception.color_classifier.min_color_fraction == pytest.approx(0.22)
     assert config.perception.color_classifier.morphology_kernel_size == 3
 
@@ -1237,4 +1240,40 @@ def test_p1_config_rejects_invalid_values(
     path = tmp_path / "runtime.yaml"
     path.write_text(config_text().replace(old, new), encoding="utf-8")
     with pytest.raises(ValueError, match=message):
+        load_runtime_config(path)
+
+
+def test_near_field_grasp_config_weights_and_strict_keys(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(config_text(extra="near_field_grasp:\n  orange_priority_weight: 0.7\n  target_final_x_mm: 105\n"), encoding="utf-8")
+    config = load_runtime_config(path)
+    assert config.near_field_grasp.orange_priority_weight == 0.7
+    assert config.near_field_grasp.target_final_x_mm == 105
+    assert config.near_field_grasp.orange_target_final_x_mm == 210
+    assert config.near_field_grasp.max_targets == 3
+    path.write_text(config_text(extra="near_field_grasp:\n  typo_weight: 1\n"), encoding="utf-8")
+    with pytest.raises(ValueError, match="Unknown keys"):
+        load_runtime_config(path)
+
+
+@pytest.mark.parametrize(
+    "removed_key",
+    (
+        "opportunistic_single_green_realign_standoff_mm",
+        "green_grab_offset_mm",
+        "green_preclose_recheck_range_mm",
+        "green_preclose_recheck_hold_ms",
+        "green_preclose_max_carried_blocks",
+    ),
+)
+def test_removed_match_near_field_keys_are_rejected(tmp_path, removed_key) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text().replace(
+            "tracking:\n",
+            f"match:\n  {removed_key}: 1\ntracking:\n",
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Unknown keys"):
         load_runtime_config(path)

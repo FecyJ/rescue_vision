@@ -102,7 +102,11 @@ def detector(
     projector: GroundProjector | None = None,
     classifier: HsvColorClassifierConfig | None = None,
     safe_zone_color: SafeZoneColorConfig | None = None,
+    clock_ns=None,
 ) -> TargetPoseDetector:
+    kwargs = {}
+    if clock_ns is not None:
+        kwargs["clock_ns"] = clock_ns
     return TargetPoseDetector(
         FakeInferenceBackend(batches),
         detection_threshold=0.25,
@@ -111,6 +115,7 @@ def detector(
         max_observation_age_ms=150.0,
         ground_projector=projector,
         safe_zone_color=safe_zone_color,
+        **kwargs,
     )
 
 
@@ -246,6 +251,59 @@ def test_insufficient_color_and_k0_degrade_conservatively() -> None:
             ObservationQuality.K0_UNAVAILABLE,
         }
     )
+
+
+def test_high_confidence_model_class_overrides_rejected_color() -> None:
+    image = image_with_regions()
+    observation = detector([[detection(confidence=0.81)]]).detect(
+        frame(image),
+        image,
+        result_timestamp_ns=1_010_000_000,
+    )[0]
+
+    assert observation.model_target_class is TargetClass.GREEN_SUPPLY
+    assert observation.target_class is TargetClass.GREEN_SUPPLY
+    assert observation.class_probabilities.green_supply == pytest.approx(1.0)
+    assert observation.class_probabilities.unknown == pytest.approx(0.0)
+    assert observation.color_segmentation.status is ColorSegmentationStatus.INSUFFICIENT
+    assert observation.quality == frozenset(
+        {
+            ObservationQuality.COLOR_EVIDENCE_INSUFFICIENT,
+            ObservationQuality.HIGH_CONFIDENCE_COLOR_OVERRIDE,
+        }
+    )
+
+
+def test_high_confidence_model_class_overrides_ambiguous_color() -> None:
+    box = UndistortedBoundingBox(0.0, 0.0, 16.0, 12.0)
+    hsv = np.full((12, 16, 3), (95, 150, 200), dtype=np.uint8)
+    hsv[:, :8] = (60, 255, 200)
+    image = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    observation = detector(
+        [[detection(confidence=0.81, box=box)]],
+        classifier=color_config(open_iterations=0, close_iterations=0),
+    ).detect(
+        frame(image),
+        image,
+        result_timestamp_ns=1_010_000_000,
+    )[0]
+
+    assert observation.target_class is TargetClass.GREEN_SUPPLY
+    assert observation.class_probabilities.unknown == pytest.approx(0.0)
+    assert observation.color_segmentation.status is ColorSegmentationStatus.AMBIGUOUS
+    assert ObservationQuality.HIGH_CONFIDENCE_COLOR_OVERRIDE in observation.quality
+
+
+def test_high_confidence_override_threshold_is_strict() -> None:
+    image = image_with_regions()
+    observation = detector([[detection(confidence=0.8)]]).detect(
+        frame(image),
+        image,
+        result_timestamp_ns=1_010_000_000,
+    )[0]
+
+    assert observation.target_class is TargetClass.UNKNOWN
+    assert ObservationQuality.HIGH_CONFIDENCE_COLOR_OVERRIDE not in observation.quality
 
 
 def test_low_coverage_keeps_candidate_roi_mask_for_diagnostics() -> None:
@@ -421,6 +479,34 @@ def test_realtime_detector_returns_current_observations() -> None:
     assert result.dropped_stale_age_ms is None
 
 
+def test_detector_timing_is_taken_after_all_postprocessing() -> None:
+    image = image_with_regions()
+    ticks = iter((1_000_000_010, 1_000_000_020, 1_000_000_030, 1_000_000_040))
+    result = detector(
+        [[detection(class_id=4)]],
+        clock_ns=lambda: next(ticks),
+    ).detect(CameraFrame(7, 1_000_000_000, image), image)
+
+    assert result.timing.result_timestamp_ns == 1_000_000_040
+    assert result.field_features.result_timestamp_ns == 1_000_000_040
+    assert result.timing.inference_completed_timestamp_ns == 1_000_000_020
+    assert result.timing.postprocess_ns == 20
+
+
+def test_realtime_detector_drops_when_postprocessing_makes_result_stale() -> None:
+    image = image_with_regions()
+    ticks = iter((1_000_000_010, 1_000_000_020, 1_000_000_030, 1_200_000_000))
+    result = detector(
+        [[detection()]],
+        clock_ns=lambda: next(ticks),
+    ).detect_realtime(CameraFrame(7, 1_000_000_000, image), image)
+
+    assert result.frame_sequence == 7
+    assert result.stale_dropped
+    assert result.timing.result_timestamp_ns == 1_200_000_000
+    assert result.dropped_stale_age_ms == pytest.approx(200.0)
+
+
 def test_realtime_detector_preserves_non_stale_errors() -> None:
     image = image_with_regions()
     with pytest.raises(ValueError, match="uint8"):
@@ -528,6 +614,46 @@ def test_perception_frame_renderer_initializes_detector_during_start() -> None:
     renderer.start()
     try:
         assert len(calls) == 1
+    finally:
+        renderer.stop()
+
+
+def test_perception_snapshot_freshness_rejects_future_and_stale_results() -> None:
+    image = image_with_regions()
+    observation_result = detector([[detection()]]).detect(
+        CameraFrame(7, 1_000_000_000, image),
+        image,
+        result_timestamp_ns=1_010_000_000,
+    )
+    snapshot = visualization.PerceptionSnapshot(
+        7,
+        1_000_000_000,
+        1_010_000_000,
+        observation_result.observations,
+        observation_result.field_features,
+        timing=observation_result.timing,
+    )
+    assert snapshot.is_fresh(1_100_000_000, 150.0)
+    assert not snapshot.is_fresh(999_000_000, 150.0)
+    assert not snapshot.is_fresh(1_151_000_000, 150.0)
+
+
+def test_perception_frame_renderer_can_disable_render_side_path() -> None:
+    image = image_with_regions()
+    renderer = PerceptionFrameRenderer(
+        lambda: detector([[detection()]]),
+        render_enabled=False,
+    )
+    renderer.start()
+    try:
+        renderer.submit(CameraFrame(7, time.monotonic_ns() - 1_000_000, image))
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if renderer.latest_snapshot() is not None:
+                break
+            time.sleep(0.001)
+        assert renderer.latest_snapshot() is not None
+        assert renderer.latest() is None
     finally:
         renderer.stop()
 

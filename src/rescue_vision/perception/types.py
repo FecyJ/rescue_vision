@@ -41,6 +41,7 @@ class ObservationQuality(str, Enum):
 
     COLOR_EVIDENCE_INSUFFICIENT = "color_evidence_insufficient"
     COLOR_EVIDENCE_AMBIGUOUS = "color_evidence_ambiguous"
+    HIGH_CONFIDENCE_COLOR_OVERRIDE = "high_confidence_color_override"
     POSE_COLOR_CONFLICT = "pose_color_conflict"
     K0_UNAVAILABLE = "k0_unavailable"
 
@@ -519,9 +520,13 @@ class TargetObservation:
                 raise ValueError(
                     "accepted color candidate must equal target_class."
                 )
-        elif self.target_class is not TargetClass.UNKNOWN:
+        elif (
+            self.target_class is not TargetClass.UNKNOWN
+            and ObservationQuality.HIGH_CONFIDENCE_COLOR_OVERRIDE not in self.quality
+        ):
             raise ValueError(
-                "rejected color segmentation requires target_class unknown."
+                "rejected color segmentation requires target_class unknown or "
+                "a high-confidence color override."
             )
         _probability(self.k0_confidence, "k0_confidence")
         if self.k0 is not None:

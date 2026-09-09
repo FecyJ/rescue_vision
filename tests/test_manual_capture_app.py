@@ -246,6 +246,9 @@ class FakePerceptionRenderer:
     def latest(self) -> CameraFrame | None:
         return self.latest_frame
 
+    def latest_fresh_snapshot(self, now_ns: int, max_age_ms: float):
+        return None
+
     def clear_latest(self) -> None:
         self.latest_frame = None
 

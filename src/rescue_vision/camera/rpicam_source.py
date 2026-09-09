@@ -197,7 +197,7 @@ class RpicamSource:
         return CameraFrame(
             sequence=sequence,
 
-            # 这是后台线程收到完整帧的单调时钟时间，
+            # 这是后台线程收到首批帧字节的单调时钟时间，
             # 不是传感器曝光开始时间。
             timestamp_ns=timestamp_ns,
 
@@ -206,6 +206,8 @@ class RpicamSource:
                 "source": "rpicam-vid",
                 "configured_fps": self.fps,
                 "lens_position": self.lens_position,
+                "timestamp_source": "host_frame_first_byte_monotonic",
+                "frame_received_timestamp_ns": time.monotonic_ns(),
             },
         )
 
@@ -262,12 +264,12 @@ class RpicamSource:
 
         try:
             while self._running:
-                frame = self._read_exact(
+                frame_with_timestamp = self._read_exact(
                     self._process.stdout,
                     self.frame_size,
                 )
 
-                if frame is None:
+                if frame_with_timestamp is None:
                     return_code = self._process.poll()
 
                     raise RuntimeError(
@@ -275,12 +277,14 @@ class RpicamSource:
                         f"returncode={return_code}"
                     )
 
+                frame, first_byte_timestamp_ns = frame_with_timestamp
+
                 with self._condition:
                     # 直接覆盖旧帧，不让视觉延迟积累。
                     # _read_exact 每帧分配新 bytearray；read() 离开锁后
                     # 依赖该缓冲不再被后台线程修改，不能改成复用缓冲。
                     self._latest_yuv = frame
-                    self._latest_timestamp_ns = time.monotonic_ns()
+                    self._latest_timestamp_ns = first_byte_timestamp_ns
                     self._latest_sequence = sequence
                     self._condition.notify_all()
 
@@ -297,7 +301,7 @@ class RpicamSource:
     def _read_exact(
         stream,
         size: int,
-    ) -> bytearray | None:
+    ) -> tuple[bytearray, int] | None:
         """
         从 stdout 恰好读取一帧。
 
@@ -307,6 +311,7 @@ class RpicamSource:
         buffer = bytearray(size)
         view = memoryview(buffer)
         offset = 0
+        first_byte_timestamp_ns: int | None = None
 
         while offset < size:
             count = stream.readinto(view[offset:])
@@ -314,9 +319,12 @@ class RpicamSource:
             if not count:
                 return None
 
+            if first_byte_timestamp_ns is None:
+                first_byte_timestamp_ns = time.monotonic_ns()
             offset += count
 
-        return buffer
+        assert first_byte_timestamp_ns is not None
+        return buffer, first_byte_timestamp_ns
 
     def __enter__(self) -> RpicamSource:
         self.start()

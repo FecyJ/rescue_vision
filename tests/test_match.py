@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import replace
+from enum import Enum
 
 import numpy as np
 import pytest
@@ -11,6 +13,8 @@ from rescue_vision.app import (
     MatchSequence,
     MatchState,
     MatchPreflight,
+    MatchStartArea,
+    configure_match_start_area,
 )
 from rescue_vision.config import MatchRuntimeConfig, load_runtime_config
 from rescue_vision.geometry.types import FieldPoint, GroundPoint, UndistortedPixel
@@ -102,7 +106,7 @@ def safe_zone_snapshot(
     box: UndistortedBoundingBox | None = None,
     image_size: tuple[int, int] = (100, 100),
 ) -> PerceptionSnapshot:
-    box = box or UndistortedBoundingBox(10.0, 10.0, 100.0, 100.0)
+    box = box or UndistortedBoundingBox(10.0, 10.0, 90.0, 90.0)
 
     def keypoint(ground: GroundPoint | None) -> FieldPoseKeypoint:
         if ground is None:
@@ -241,6 +245,9 @@ def runtime_config(**overrides: object) -> MatchRuntimeConfig:
         "enabled": True,
         "green_grab_offset_mm": 150.0,
         "safe_zone_fallback_target_field": FieldPoint(-165.0, 1137.0),
+        # Most state-transition tests focus on the following action; the
+        # production match YAML explicitly exercises the three-frame gate.
+        "green_alignment_stable_frames": 1,
     }
     values.update(overrides)
     return MatchRuntimeConfig(**values)  # type: ignore[arg-type]
@@ -249,6 +256,7 @@ def runtime_config(**overrides: object) -> MatchRuntimeConfig:
 def make_sequence(
     *, config: MatchRuntimeConfig | None = None,
     initial_field_position: FieldPoint | None = FieldPoint(0.0, 0.0),
+    team_color: TeamColor = TeamColor.RED,
 ) -> MatchSequence:
     runtime = config or runtime_config()
     return MatchSequence(
@@ -264,7 +272,7 @@ def make_sequence(
             )
         ),
         gripper_full_travel_time_s=1.0,
-        team_color=TeamColor.RED,
+        team_color=team_color,
         safe_zone_corner_localizer=SafeZoneCornerLocalizer(make_static_map()),
         static_map=make_static_map(),
         initial_field_position=initial_field_position,
@@ -282,6 +290,207 @@ def start_sequence(sequence: MatchSequence) -> None:
     sequence.state = MatchState.CHECK_ISOLATED_GREEN
 
 
+def test_start_area_3_mirrors_match_pose_route_and_team_color() -> None:
+    area_2 = load_runtime_config("configs/runtime.match.yaml")
+    area_3 = configure_match_start_area(area_2, MatchStartArea.AREA_3)
+
+    assert area_3.world.team_color is TeamColor.BLUE
+    assert area_3.localization.fusion.initial_pose.position == FieldPoint(
+        -1350.0, -1350.0
+    )
+    assert area_3.localization.fusion.initial_pose.heading_rad == pytest.approx(
+        math.pi / 2.0
+    )
+    assert area_3.match.safe_zone_fallback_target_field == FieldPoint(
+        135.0, -1115.0
+    )
+    assert area_3.match.safe_zone_injured_target_field == FieldPoint(
+        -135.0, -1115.0
+    )
+    assert area_3.match.safe_zone_d2_braking_overrun_x_mm == pytest.approx(-20.0)
+    assert area_3.world.static_map is area_2.world.static_map
+
+    sequence = MatchSequence.from_app_config(area_2, start_area=3)
+    assert sequence._team_color is TeamColor.BLUE
+    assert sequence.estimated_field_position == FieldPoint(-1350.0, -1350.0)
+    assert sequence._safe_zone_transport_endpoint() == FieldPoint(135.0, -1115.0)
+
+
+def test_blue_start_area_uses_negative_y_safe_zone_route() -> None:
+    sequence = make_sequence(
+        config=runtime_config(
+            safe_zone_fallback_target_field=FieldPoint(135.0, -1115.0),
+            safe_zone_injured_target_field=FieldPoint(-135.0, -1115.0),
+            safe_zone_calibration_start_offset_mm=700.0,
+            safe_zone_open_offset_mm=300.0,
+            safe_zone_d2_to_final_braking_overrun_mm=25.0,
+            safe_zone_d2_braking_overrun_x_mm=-20.0,
+        ),
+        initial_field_position=FieldPoint(0.0, -700.0),
+        team_color=TeamColor.BLUE,
+    )
+
+    assert sequence._safe_zone_d1_target() == FieldPoint(155.0, -415.0)
+    assert sequence._safe_zone_d2_target() == FieldPoint(155.0, -815.0)
+    assert sequence._safe_zone_final_target_y_mm() == pytest.approx(-1090.0)
+
+    start_sequence(sequence)
+    sequence.state = MatchState.TRANSPORT_RELEASE
+    sequence._safe_zone_phase = "stopping_before_calibration"
+    sequence.step(
+        10,
+        perception=None,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    rotating = sequence.step(
+        300_000_010,
+        perception=None,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    assert rotating.reason == "safe_zone_no_bbox_rotate_toward_minus_90"
+    assert rotating.angular_velocity_rad_s < 0.0
+
+    sequence.state = MatchState.TRANSPORT_ALIGN_RED_ZONE
+    sequence._safe_zone_phase = "align_y_at_d2"
+    turn_to_blue_zone = sequence.step(
+        300_000_011,
+        perception=None,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+    )
+    assert turn_to_blue_zone.reason == "safe_zone_d2_turn_to_minus_90"
+    assert turn_to_blue_zone.angular_velocity_rad_s < 0.0
+
+
+@pytest.mark.parametrize(
+    ("team_color", "endpoint", "position"),
+    [
+        (TeamColor.RED, FieldPoint(-165.0, 1137.0), FieldPoint(80.0, 700.0)),
+        (TeamColor.BLUE, FieldPoint(165.0, -1137.0), FieldPoint(-80.0, -700.0)),
+    ],
+)
+def test_transport_already_beyond_d1_calibrates_in_place(
+    team_color: TeamColor,
+    endpoint: FieldPoint,
+    position: FieldPoint,
+) -> None:
+    sequence = make_sequence(
+        config=runtime_config(
+            safe_zone_fallback_target_field=endpoint,
+            safe_zone_calibration_start_offset_mm=500.0,
+        ),
+        initial_field_position=position,
+        team_color=team_color,
+    )
+    start_sequence(sequence)
+
+    decision = sequence._start_safe_zone_transport(
+        10,
+        transport_opened=False,
+        posture=GripperPosture.CLOSED,
+        reason="would_start_d1_line",
+    )
+
+    assert decision.reason == "gripper_closed_already_beyond_d1_start_calibration"
+    assert decision.state is MatchState.TRANSPORT_RELEASE
+    assert decision.linear_velocity_m_s == 0.0
+    assert sequence.safe_zone_route_phase == "stopping_before_calibration"
+
+
+def test_cluster_search_uses_fast_speed_until_collectible_information_appears() -> None:
+    sequence = make_sequence(
+        config=runtime_config(
+            cluster_search_angular_velocity_rad_s=-0.2,
+            cluster_search_empty_angular_velocity_rad_s=-0.6,
+            cluster_min_detections=2,
+        )
+    )
+    start_sequence(sequence)
+    sequence.state = MatchState.SEARCH_CLUSTER
+    sequence._breakup_only = True
+    sequence._green_first_scan_active = False
+
+    empty = sequence.step(
+        10,
+        perception=snapshot(1, 10),
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+    )
+    blue_only = sequence.step(
+        20,
+        perception=snapshot(
+            2,
+            20,
+            observation(
+                2,
+                20,
+                GroundPoint(500.0, 0.0),
+                target_class=TargetClass.BLUE_DANGER,
+            ),
+        ),
+        heading_rad=-0.01,
+        cumulative_distance_m=0.0,
+    )
+    orange_seen = sequence.step(
+        30,
+        perception=snapshot(
+            3,
+            30,
+            observation(
+                3,
+                30,
+                GroundPoint(500.0, 0.0),
+                target_class=TargetClass.ORANGE_INJURED,
+            ),
+        ),
+        heading_rad=-0.02,
+        cumulative_distance_m=0.0,
+    )
+
+    assert empty.angular_velocity_rad_s == pytest.approx(-0.6)
+    assert blue_only.angular_velocity_rad_s == pytest.approx(-0.6)
+    assert orange_seen.angular_velocity_rad_s == pytest.approx(-0.2)
+
+def test_match_cli_passes_selected_start_area(monkeypatch) -> None:
+    from rescue_vision.app import match as match_module
+    import rescue_vision.app.match_runtime as match_runtime
+
+    received: dict[str, object] = {}
+    monkeypatch.setattr(
+        match_runtime,
+        "_run_hardware",
+        lambda *args, **kwargs: received.update(kwargs),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "rescue-vision-match",
+            "--config",
+            "configs/runtime.match.yaml",
+            "--start-area",
+            "3",
+        ],
+    )
+
+    match_module.main()
+
+    assert received["start_area"] is MatchStartArea.AREA_3
+
+
+def test_start_area_parser_accepts_equivalent_enum_instance() -> None:
+    class OtherModuleStartArea(Enum):
+        AREA_3 = "3"
+
+    assert MatchStartArea.parse(OtherModuleStartArea.AREA_3) is MatchStartArea.AREA_3
+
+
 def test_config_uses_configured_gripper_and_transport_values() -> None:
     config = load_runtime_config("configs/runtime.match.yaml")
 
@@ -292,29 +501,24 @@ def test_config_uses_configured_gripper_and_transport_values() -> None:
         + config.motion.gripper.transport_right_angle_deg
         == 180.0
     )
-    assert config.match.green_grab_offset_mm == pytest.approx(175.0)
-    assert (
-        config.match.green_preclose_recheck_range_mm
-        == pytest.approx(300.0)
-    )
-    assert config.match.green_preclose_max_carried_blocks == 2
+    assert config.near_field_grasp.max_range_mm == pytest.approx(450.0)
+    assert config.near_field_grasp.max_targets == 3
     assert config.match.opportunistic_single_green_enabled
     assert (
         config.match.opportunistic_single_green_clearance_mm
         == pytest.approx(120.0)
     )
-    assert (
-        config.match.opportunistic_single_green_realign_standoff_mm
-        == pytest.approx(450.0)
-    )
     assert config.match.safe_zone_grab_to_d1_speed_m_s == pytest.approx(
-        0.2
+        0.3
     )
     assert config.match.safe_zone_d1_to_d2_speed_m_s == pytest.approx(
-        0.1
+        0.3
     )
     assert config.match.safe_zone_d2_to_final_speed_m_s == pytest.approx(
-        0.35
+        0.4
+    )
+    assert config.match.safe_zone_orange_d2_to_final_speed_m_s == pytest.approx(
+        0.45
     )
     assert (
         config.match.safe_zone_d2_to_final_max_wheel_acceleration_m_s2
@@ -322,20 +526,46 @@ def test_config_uses_configured_gripper_and_transport_values() -> None:
     )
     assert (
         config.match.safe_zone_d2_to_final_braking_overrun_mm
-        == pytest.approx(110.0)
+        == pytest.approx(70.0)
     )
+    assert (
+        config.match.safe_zone_orange_d2_to_final_braking_overrun_mm
+        == pytest.approx(80.0)
+    )
+    assert config.match.breakup_max_wheel_acceleration_m_s2 == pytest.approx(4.0)
     assert config.match.startup_turn_settle_time_s == pytest.approx(
-        0.3
+        0.1
     )
     assert config.match.startup_forward_settle_time_s == pytest.approx(
-        0.3
+        0.1
     )
-    assert config.match.breakup_settle_time_s == pytest.approx(0.3)
-    assert config.match.green_alignment_tolerance_mm == pytest.approx(
-        10.0
+    assert config.match.breakup_settle_time_s == pytest.approx(0.1)
+    assert config.match.green_alignment_tolerance_mm == pytest.approx(20.0)
+    assert config.match.green_alignment_hysteresis_mm == pytest.approx(5.0)
+    assert config.match.green_alignment_timeout_ms == pytest.approx(4000.0)
+    assert config.match.green_alignment_stable_frames == 3
+    assert config.match.green_alignment_min_wheel_velocity_m_s == pytest.approx(
+        0.01
+    )
+    assert config.near_field_grasp.center_tolerance_mm == pytest.approx(20.0)
+    assert config.near_field_grasp.alignment_hysteresis_mm == pytest.approx(10.0)
+    assert config.near_field_grasp.alignment_timeout_ms == pytest.approx(6000.0)
+    assert config.near_field_grasp.grasp_commit_max_observation_age_ms == pytest.approx(
+        150.0
+    )
+    assert config.near_field_grasp.confirmation_frames == 3
+    assert config.near_field_grasp.fine_alignment_zone_rad == pytest.approx(0.08)
+    assert config.near_field_grasp.fine_alignment_min_wheel_velocity_m_s == pytest.approx(
+        0.0
+    )
+    assert config.near_field_grasp.orange_isolation_radius_mm == pytest.approx(
+        100.0
     )
     assert config.match.safe_zone_fallback_target_field == FieldPoint(
         -135.0, 1115.0
+    )
+    assert config.match.safe_zone_injured_target_field == FieldPoint(
+        135.0, 1115.0
     )
     assert config.match.safe_zone_calibration_start_offset_mm == 700.0
     assert config.match.safe_zone_open_offset_mm == 300.0
@@ -355,17 +585,17 @@ def test_config_uses_configured_gripper_and_transport_values() -> None:
         config.match.safe_zone_calibration_stop_confirm_time_s
         == pytest.approx(0.3)
     )
-    assert config.match.action_settle_time_s == pytest.approx(0.3)
+    assert config.match.action_settle_time_s == pytest.approx(0.1)
     assert config.match.breakup_field_half_extent_mm == pytest.approx(
         1500.0
     )
     assert config.match.breakup_gripper_offset_mm == pytest.approx(
         200.0
     )
-    assert config.match.safe_zone_exit_distance_m == pytest.approx(0.30)
-    assert config.match.safe_zone_exit_turn_angle_rad == pytest.approx(
-        1.5708
-    )
+    assert config.match.safe_zone_exit_distance_m == pytest.approx(0.5)
+    assert config.match.cluster_search_empty_angular_velocity_rad_s == pytest.approx(-0.6)
+    assert config.match.safe_zone_key_search_angular_velocity_rad_s == pytest.approx(0.8)
+    assert config.match.safe_zone_bbox_edge_margin_px == pytest.approx(12.0)
     assert isinstance(
         MatchSequence.from_app_config(config),
         MatchSequence,
@@ -407,31 +637,35 @@ def test_d2_acceleration_limit_is_active_only_for_d2_route(
     assert sequence.safe_zone_motion_acceleration_limit_m_s2 is None
 
 
-def test_exit_turn_uses_configured_clockwise_angle() -> None:
+@pytest.mark.parametrize(
+    "state",
+    [
+        MatchState.ALIGN_CLUSTER_ONCE,
+        MatchState.APPROACH_CLUSTER,
+        MatchState.BREAKUP_SETTLE,
+        MatchState.BREAKUP_FORWARD,
+        MatchState.OPEN_GRIPPER_SETTLE,
+        MatchState.BREAKUP_BACKWARD,
+        MatchState.CLOSE_GRIPPER_SETTLE,
+        MatchState.CLOSE_GRIPPER_SPIN,
+        MatchState.CHECK_ISOLATED_GREEN,
+        MatchState.RELOCATE_FORWARD,
+    ],
+)
+def test_breakup_acceleration_limit_is_active_for_breakup_states(
+    state: MatchState,
+) -> None:
     sequence = make_sequence(
-        config=runtime_config(safe_zone_exit_turn_angle_rad=math.pi / 2.0)
+        config=runtime_config(breakup_max_wheel_acceleration_m_s2=0.12)
     )
-    start_sequence(sequence)
-    sequence.state = MatchState.RETURN_BACKUP
-    sequence._return_phase = "turn_away"
-    sequence._safe_zone_exit_heading_rad = 0.0
+    sequence.state = state
 
-    turning = sequence.step(
-        10,
-        perception=None,
-        heading_rad=math.pi / 2.0,
-        cumulative_distance_m=0.0,
-    )
-    assert turning.reason == "safe_zone_exit_turn_away_from_safe_zone"
-    assert turning.angular_velocity_rad_s < 0.0
+    assert sequence.breakup_motion_acceleration_limit_m_s2 == pytest.approx(0.12)
+    assert sequence.motion_acceleration_limit_m_s2 == pytest.approx(0.12)
 
-    reached = sequence.step(
-        20,
-        perception=None,
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-    )
-    assert reached.reason == "safe_zone_exit_heading_reached_wait_for_stop"
+    sequence.state = MatchState.SEARCH_CLUSTER
+    assert sequence.breakup_motion_acceleration_limit_m_s2 is None
+    assert sequence.motion_acceleration_limit_m_s2 is None
 
 
 def test_uses_configured_transport_endpoint_for_d1_and_d2() -> None:
@@ -543,7 +777,7 @@ def test_d1_bbox_search_rotates_until_keypoints_are_visible() -> None:
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
     )
-    assert search_started.reason == "safe_zone_bbox_center_search_for_keypoints"
+    assert search_started.reason == "safe_zone_center_full_bbox_before_keypoints"
     assert search_started.angular_velocity_rad_s > 0.0
 
     rotating = sequence.step(
@@ -554,7 +788,7 @@ def test_d1_bbox_search_rotates_until_keypoints_are_visible() -> None:
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
     )
-    assert rotating.reason == "safe_zone_bbox_center_search_for_keypoints"
+    assert rotating.reason == "safe_zone_center_full_bbox_before_keypoints"
     assert rotating.linear_velocity_m_s == 0.0
     assert rotating.angular_velocity_rad_s > 0.0
 
@@ -566,7 +800,7 @@ def test_d1_bbox_search_rotates_until_keypoints_are_visible() -> None:
             GroundPoint(400.0, 0.0),
             GroundPoint(350.0, 50.0),
             GroundPoint(350.0, -50.0),
-            box=bbox,
+            box=UndistortedBoundingBox(10.0, 10.0, 90.0, 90.0),
         ),
         heading_rad=0.0,
         cumulative_distance_m=0.0,
@@ -620,7 +854,7 @@ def test_collecting_partial_keypoints_restarts_bbox_search() -> None:
     )
 
     assert sequence._safe_zone_phase == "searching_safe_zone_keypoints"
-    assert decision.reason == "safe_zone_bbox_center_search_for_keypoints"
+    assert decision.reason == "safe_zone_center_full_bbox_before_keypoints"
     assert decision.linear_velocity_m_s == 0.0
     assert decision.angular_velocity_rad_s > 0.0
 
@@ -912,6 +1146,110 @@ def test_green_first_scan_grabs_target_immediately() -> None:
     assert found.state is MatchState.TRANSPORT_ALIGN_GREEN
     assert found.reason == "green_path_clear_opportunistic_single:1"
     assert found.gripper_posture is GripperPosture.TRANSPORT
+
+
+def test_green_alignment_carries_fine_wheel_velocity_floor() -> None:
+    sequence = make_sequence(
+        config=runtime_config(opportunistic_single_green_enabled=False)
+    )
+    start_sequence(sequence)
+    sequence.state = MatchState.TRANSPORT_ALIGN_GREEN
+    sequence._selected_track_id = 1
+
+    decision = None
+    for frame in range(1, 13):
+        timestamp_ns = frame * 10
+        decision = sequence.step(
+            timestamp_ns,
+            perception=snapshot(
+                frame,
+                timestamp_ns,
+                observation(frame, timestamp_ns, GroundPoint(300.0, 100.0)),
+            ),
+            heading_rad=0.0,
+            cumulative_distance_m=0.0,
+        )
+
+    assert decision is not None
+    assert decision.reason == "align_green_relative_y_to_zero"
+    assert decision.min_wheel_velocity_m_s == pytest.approx(0.01)
+
+
+def _seed_green_alignment(sequence: MatchSequence) -> None:
+    sequence.state = MatchState.TRANSPORT_ALIGN_GREEN
+    sequence._selected_track_id = 1
+    sequence._green_reference = GroundPoint(300.0, 0.0)
+    sequence._green_reference_heading_rad = 0.0
+    sequence._green_reference_distance_m = 0.15
+
+
+def test_green_alignment_requires_stable_frames_before_forward() -> None:
+    sequence = make_sequence(
+        config=runtime_config(green_alignment_stable_frames=3)
+    )
+    start_sequence(sequence)
+    _seed_green_alignment(sequence)
+
+    decisions = []
+    for frame in range(1, 4):
+        timestamp_ns = frame + 1
+        decisions.append(
+            sequence.step(
+                timestamp_ns,
+                perception=snapshot(
+                    frame,
+                    timestamp_ns,
+                    observation(frame, timestamp_ns, GroundPoint(300.0, 0.0)),
+                ),
+                heading_rad=0.0,
+                cumulative_distance_m=0.0,
+            )
+        )
+
+    assert [item.state for item in decisions[:2]] == [
+        MatchState.TRANSPORT_ALIGN_GREEN,
+        MatchState.TRANSPORT_ALIGN_GREEN,
+    ]
+    assert decisions[0].reason == "green_alignment_stabilizing"
+    assert decisions[1].reason == "green_alignment_stabilizing"
+    assert decisions[2].state is MatchState.TRANSPORT_APPROACH_GREEN
+
+
+def test_green_alignment_timeout_restarts_search() -> None:
+    sequence = make_sequence(
+        config=runtime_config(
+            green_alignment_stable_frames=3,
+            green_alignment_timeout_ms=0.1,
+        )
+    )
+    start_sequence(sequence)
+    _seed_green_alignment(sequence)
+
+    first = sequence.step(
+        2,
+        perception=snapshot(
+            1,
+            2,
+            observation(1, 2, GroundPoint(300.0, 0.0)),
+        ),
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+    )
+    timed_out = sequence.step(
+        100_003,
+        perception=snapshot(
+            2,
+            100_003,
+            observation(2, 100_003, GroundPoint(300.0, 0.0)),
+        ),
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+    )
+
+    assert first.state is MatchState.TRANSPORT_ALIGN_GREEN
+    assert timed_out.state is MatchState.SEARCH_CLUSTER
+    assert timed_out.reason == "green_alignment_timeout_restart_search"
+    assert timed_out.soft_brake is False
 
 
 def test_far_opportunistic_green_realigns_at_near_standoff() -> None:
@@ -1285,6 +1623,41 @@ def test_final_forward_applies_braking_overrun() -> None:
     assert sequence._transport_forward_distance_m == pytest.approx(0.122)
 
 
+def test_orange_final_forward_uses_dedicated_speed_and_braking_overrun() -> None:
+    sequence = make_sequence(
+        config=runtime_config(
+            safe_zone_d2_to_final_speed_m_s=0.097,
+            safe_zone_orange_d2_to_final_speed_m_s=0.041,
+            safe_zone_d2_to_final_braking_overrun_mm=25.0,
+            safe_zone_orange_d2_to_final_braking_overrun_mm=7.0,
+            safe_zone_injured_target_field=FieldPoint(165.0, 1200.0),
+            safe_zone_fallback_heading_tolerance_rad=0.05,
+        ),
+        initial_field_position=FieldPoint(165.0, 1100.0),
+    )
+    start_sequence(sequence)
+    sequence._transport_target_classes = (TargetClass.ORANGE_INJURED,)
+    sequence.state = MatchState.TRANSPORT_FORWARD
+    sequence._safe_zone_phase = "forward_final_closed"
+    sequence._transport_forward_base_distance_m = 0.0
+    sequence._transport_forward_distance_m = 1.0
+
+    assert sequence._safe_zone_d2_to_final_speed_m_s() == pytest.approx(0.041)
+    assert sequence._safe_zone_final_target_y_mm() == pytest.approx(1193.0)
+    assert sequence._safe_zone_d2_to_final_braking_overrun_mm() == pytest.approx(
+        7.0
+    )
+
+    decision = sequence.step(
+        10,
+        perception=None,
+        heading_rad=math.pi / 2.0,
+        cumulative_distance_m=0.0,
+    )
+
+    assert decision.linear_velocity_m_s == pytest.approx(0.041)
+
+
 def test_d2_opens_before_heading_when_settle_enabled() -> None:
     sequence = make_sequence(
         config=runtime_config(action_settle_time_s=0.5),
@@ -1353,7 +1726,8 @@ def test_d2_opens_before_heading_when_settle_enabled() -> None:
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
     )
-    assert opening_wait.reason == "opening_gripper_at_endpoint_y_minus_d2"
+    assert opening_wait.state is MatchState.TRANSPORT_ALIGN_RED_ZONE
+    assert opening_wait.reason == "gripper_opened_at_d2_start_turn_to_90"
     assert opening_wait.gripper_posture is GripperPosture.OPEN
 
     heading_start = sequence.step(
@@ -1365,7 +1739,7 @@ def test_d2_opens_before_heading_when_settle_enabled() -> None:
         right_speed_feedback_m_s=0.0,
     )
     assert heading_start.state is MatchState.TRANSPORT_ALIGN_RED_ZONE
-    assert heading_start.reason == "gripper_opened_at_d2_start_turn_to_90"
+    assert heading_start.reason == "safe_zone_d2_heading_90_reached_stop_before_forward"
     assert heading_start.gripper_posture is GripperPosture.OPEN
 
 
@@ -2387,8 +2761,8 @@ def test_d1_visual_calibration_uses_compensated_straight_line() -> None:
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
     )
-    assert d2_opening_wait.state is MatchState.TRANSPORT_RELEASE
-    assert d2_opening_wait.reason == "opening_gripper_at_endpoint_y_minus_d2"
+    assert d2_opening_wait.state is MatchState.TRANSPORT_ALIGN_RED_ZONE
+    assert d2_opening_wait.reason == "gripper_opened_at_d2_start_turn_to_90"
     assert d2_opening_wait.gripper_posture is GripperPosture.OPEN
 
     opening_complete = sequence.step(
@@ -2400,7 +2774,7 @@ def test_d1_visual_calibration_uses_compensated_straight_line() -> None:
         right_speed_feedback_m_s=0.0,
     )
     assert opening_complete.state is MatchState.TRANSPORT_ALIGN_RED_ZONE
-    assert opening_complete.reason == "gripper_opened_at_d2_start_turn_to_90"
+    assert opening_complete.reason == "safe_zone_d2_turn_to_90"
     assert opening_complete.gripper_posture is GripperPosture.OPEN
 
     turn_to_90 = sequence.step(
@@ -2512,9 +2886,6 @@ def test_d1_visual_calibration_uses_compensated_straight_line() -> None:
     assert sequence._fallback_field_position.x == pytest.approx(-185.0, abs=0.2)
     assert sequence._fallback_field_position.y == pytest.approx(1137.0, abs=0.2)
     assert sequence.estimated_field_heading_rad == pytest.approx(math.radians(90.0))
-    assert sequence._safe_zone_exit_heading_rad == pytest.approx(
-        normalize_angle(math.radians(90.0) + math.pi)
-    )
 
 
 def test_d2_line_requires_both_coordinate_thresholds() -> None:
@@ -2691,8 +3062,8 @@ def test_exits_safe_zone_before_rearming_cluster_search() -> None:
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
     )
-    assert opening_wait.state is MatchState.TRANSPORT_RELEASE
-    assert opening_wait.reason == "opening_gripper_after_safe_zone_push"
+    assert opening_wait.state is MatchState.RETURN_BACKUP
+    assert opening_wait.reason == "gripper_opened_after_safe_zone_push_start_exit"
 
     opened = sequence.step(
         1_320_000_021,
@@ -2703,7 +3074,7 @@ def test_exits_safe_zone_before_rearming_cluster_search() -> None:
         right_speed_feedback_m_s=0.0,
     )
     assert opened.state is MatchState.RETURN_BACKUP
-    assert opened.reason == "gripper_opened_after_safe_zone_push_start_exit"
+    assert opened.reason == "safe_zone_vehicle_stopped_start_exit"
     assert opened.gripper_posture is GripperPosture.OPEN
 
     exit_started = sequence.step(
@@ -2714,7 +3085,7 @@ def test_exits_safe_zone_before_rearming_cluster_search() -> None:
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
     )
-    assert exit_started.reason == "safe_zone_vehicle_stopped_start_exit"
+    assert exit_started.reason == "safe_zone_exit_reverse_to_field"
 
     reversing = sequence.step(
         1_620_000_022,
@@ -2756,22 +3127,23 @@ def test_exits_safe_zone_before_rearming_cluster_search() -> None:
         right_speed_feedback_m_s=0.0,
     )
     assert exit_stopped.reason == "safe_zone_exit_vehicle_stopped_start_turn_away"
+    assert sequence._tracker.tracks != ()
 
     turning_away = sequence.step(
         1_920_000_026,
-        perception=safe_zone_targets(11, 1_920_000_026),
+        perception=safe_zone_targets(10, 1_920_000_025),
         heading_rad=math.pi / 2.0,
         cumulative_distance_m=-0.20,
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
     )
+    assert turning_away.state is MatchState.RETURN_BACKUP
     assert turning_away.reason == "safe_zone_exit_turn_away_from_safe_zone"
-    assert turning_away.angular_velocity_rad_s < 0.0
 
     heading_reached = sequence.step(
         1_920_000_027,
-        perception=safe_zone_targets(12, 1_920_000_027),
-        heading_rad=-math.pi / 2.0,
+        perception=safe_zone_targets(11, 1_920_000_027),
+        heading_rad=0.0,
         cumulative_distance_m=-0.20,
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
@@ -2780,29 +3152,29 @@ def test_exits_safe_zone_before_rearming_cluster_search() -> None:
 
     turn_stop_waiting = sequence.step(
         1_920_000_028,
-        perception=safe_zone_targets(13, 1_920_000_028),
-        heading_rad=-math.pi / 2.0,
+        perception=safe_zone_targets(12, 1_920_000_028),
+        heading_rad=0.0,
         cumulative_distance_m=-0.20,
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
     )
     assert turn_stop_waiting.reason == "safe_zone_waiting_for_vehicle_stop_after_turn_away"
 
-    exit_cleanup = sequence.step(
+    turned = sequence.step(
         2_220_000_029,
-        perception=safe_zone_targets(14, 2_220_000_029),
-        heading_rad=-math.pi / 2.0,
+        perception=safe_zone_targets(13, 2_220_000_029),
+        heading_rad=0.0,
         cumulative_distance_m=-0.20,
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
     )
-    assert exit_cleanup.reason == "safe_zone_exit_stopped_waiting_for_new_perception"
+    assert turned.reason == "safe_zone_exit_stopped_waiting_for_new_perception"
     assert sequence._tracker.tracks == ()
 
     same_frame = sequence.step(
         2_220_000_030,
-        perception=safe_zone_targets(14, 2_220_000_029),
-        heading_rad=-math.pi / 2.0,
+        perception=safe_zone_targets(13, 2_220_000_029),
+        heading_rad=0.0,
         cumulative_distance_m=-0.20,
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
@@ -2810,11 +3182,11 @@ def test_exits_safe_zone_before_rearming_cluster_search() -> None:
     assert same_frame.state is MatchState.RETURN_BACKUP
     assert same_frame.reason == "safe_zone_exit_waiting_for_new_perception"
 
-    fresh_frame = snapshot(15, 2_220_000_031)
+    fresh_frame = snapshot(14, 2_220_000_031)
     search_started = sequence.step(
         2_220_000_031,
         perception=fresh_frame,
-        heading_rad=-math.pi / 2.0,
+        heading_rad=0.0,
         cumulative_distance_m=-0.20,
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
@@ -2825,7 +3197,7 @@ def test_exits_safe_zone_before_rearming_cluster_search() -> None:
     search = sequence.step(
         2_220_000_032,
         perception=fresh_frame,
-        heading_rad=-math.pi / 2.0,
+        heading_rad=0.0,
         cumulative_distance_m=-0.20,
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
@@ -2912,6 +3284,13 @@ def test_breakup_guard_does_not_block_authorized_delivery() -> None:
 def test_factory_wires_configured_guard_geometry() -> None:
     config = load_runtime_config("configs/runtime.match.yaml")
     sequence = MatchSequence.from_app_config(config)
+    assert sequence._near_field_pickup is not None
+    assert sequence._near_field_pickup.commit_age_ns == 150_000_000
+    assert config.near_field_grasp.confirmation_frames == 3
+    assert sequence._near_field_pickup.fine_alignment_zone_rad == pytest.approx(
+        0.08
+    )
+    assert sequence._near_field_pickup.fine_alignment_min_wheel_velocity_m_s == 0.0
     assert sequence._breakup_static_map is config.world.static_map
     assert sequence._breakup_clearance_mm == pytest.approx(
         config.match.robot_footprint_radius_mm

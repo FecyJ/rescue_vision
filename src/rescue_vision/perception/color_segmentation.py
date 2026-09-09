@@ -171,3 +171,56 @@ def segment_roi_colors(
             unknown=0.0,
         )
     return segmentation, probabilities
+
+
+def segment_bgr_roi_colors(
+    image_bgr: np.ndarray,
+    box: UndistortedBoundingBox,
+    config: HsvColorClassifierConfig,
+) -> tuple[RoiColorSegmentation, ClassProbabilities]:
+    """只把一个检测 ROI 转换到 HSV 后执行颜色分类。
+
+    检测器通常只收到少量目标；避免先把整张高分辨率图像转换成 HSV，
+    同时保留 ``segment_roi_colors`` 的绝对 ROI 坐标和掩码契约。
+    """
+
+    if (
+        image_bgr.dtype != np.uint8
+        or image_bgr.ndim != 3
+        or image_bgr.shape[2] != 3
+    ):
+        raise ValueError(
+            "image_bgr must be a uint8 array with shape (height, width, 3), "
+            f"got dtype={image_bgr.dtype}, shape={image_bgr.shape}."
+        )
+    image_size = (int(image_bgr.shape[1]), int(image_bgr.shape[0]))
+    box.validate_image_size(image_size)
+    x_min = math.floor(box.x_min)
+    y_min = math.floor(box.y_min)
+    x_max = min(image_size[0], math.ceil(box.x_max))
+    y_max = min(image_size[1], math.ceil(box.y_max))
+    roi_bgr = image_bgr[y_min:y_max, x_min:x_max]
+    roi_hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    local_box = UndistortedBoundingBox(
+        0.0,
+        0.0,
+        float(x_max - x_min),
+        float(y_max - y_min),
+    )
+    segmentation, probabilities = segment_roi_colors(roi_hsv, local_box, config)
+    return (
+        RoiColorSegmentation(
+            candidate_class=segmentation.candidate_class,
+            status=segmentation.status,
+            roi_box=UndistortedBoundingBox(
+                float(x_min),
+                float(y_min),
+                float(x_max),
+                float(y_max),
+            ),
+            mask=segmentation.mask,
+            color_fraction=segmentation.color_fraction,
+            dominance=segmentation.dominance,
+        ),
+        probabilities,
+    )

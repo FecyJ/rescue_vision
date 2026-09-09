@@ -21,6 +21,8 @@ from rescue_vision.config.runtime import (
     WorldRuntimeConfig,
     load_runtime_config,
 )
+from rescue_vision.config.near_field_grasp import NearFieldGraspConfig
+from rescue_vision.config.match_cc import MatchCCRuntimeConfig
 
 __all__ = [
     "AppConfig",
@@ -42,4 +44,6 @@ __all__ = [
     "UartConfig",
     "WorldRuntimeConfig",
     "load_runtime_config",
+    "NearFieldGraspConfig",
+    "MatchCCRuntimeConfig",
 ]

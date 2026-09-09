@@ -195,6 +195,45 @@ class MultiTargetTracker:
         self._tracks: dict[int, TrackedTarget] = {}
         self._next_track_id = 1
         self._last_timestamp_ns: int | None = None
+        # 远场任务 tracker 默认把两个已知类别的冲突当成不同目标，避免
+        # 危险类别证据被普通物资历史吞掉。近场停车窗口由上层显式开启软
+        # 类别关联：K0 空间连续性优先，类别只作为很小的二级代价。
+        self._class_mismatch_penalty: float | None = None
+        self._retain_low_confidence_tracks = False
+
+    @property
+    def config(self) -> TrackingConfig:
+        """返回创建 tracker 时使用的生命周期和门限配置。"""
+
+        return self._config
+
+    def enable_soft_class_association(
+        self,
+        *,
+        mismatch_penalty: float = 0.10,
+    ) -> None:
+        """允许近场类别抖动继续沿用同一空间轨迹。
+
+        该设置只影响后续关联，不改变观测中的类别、质量或危险历史；
+        ``GraspTargetTracker`` 仍会对明确危险观测保持不可选状态。
+        """
+
+        if (
+            isinstance(mismatch_penalty, bool)
+            or not isinstance(mismatch_penalty, (int, float))
+            or not math.isfinite(float(mismatch_penalty))
+            or float(mismatch_penalty) < 0.0
+        ):
+            raise ValueError(
+                "mismatch_penalty must be finite and non-negative, "
+                f"got {mismatch_penalty!r}."
+            )
+        self._class_mismatch_penalty = float(mismatch_penalty)
+
+    def enable_low_confidence_retention(self) -> None:
+        """保留近场窗口中的弱观测轨迹，避免障碍 ID 退化为临时编号。"""
+
+        self._retain_low_confidence_tracks = True
 
     @property
     def tracks(self) -> tuple[TrackedTarget, ...]:
@@ -231,6 +270,7 @@ class MultiTargetTracker:
                     f"{observation.capture_timestamp_ns} does not match update "
                     f"timestamp_ns {timestamp_ns}."
                 )
+        observations = self.deduplicate_observations(observations)
 
         decayed = {
             track_id: self._decay(track, timestamp_ns)
@@ -272,6 +312,48 @@ class MultiTargetTracker:
         self._last_timestamp_ns = timestamp_ns
         return self.tracks
 
+    @staticmethod
+    def deduplicate_observations(
+        observations: tuple[TargetObservation, ...],
+    ) -> tuple[TargetObservation, ...]:
+        """压掉同帧同类、同地面点且框高度重叠的重复检测。
+
+        15 mm 小于两个 40 mm 实体可能具有的中心间距；类别或模型证据不同的
+        检测绝不合并，避免把危险冲突证据静默删除。
+        """
+
+        ranked = sorted(
+            enumerate(observations),
+            key=lambda item: (
+                len(item[1].quality),
+                -item[1].detection_confidence,
+                -item[1].k0_confidence,
+                item[0],
+            ),
+        )
+        retained: list[tuple[int, TargetObservation]] = []
+        for index, observation in ranked:
+            duplicate = False
+            for _, accepted in retained:
+                if (
+                    observation.target_class is not accepted.target_class
+                    or observation.model_target_class
+                    is not accepted.model_target_class
+                    or observation.ground_point is None
+                    or accepted.ground_point is None
+                ):
+                    continue
+                distance_mm = math.hypot(
+                    observation.ground_point.x - accepted.ground_point.x,
+                    observation.ground_point.y - accepted.ground_point.y,
+                )
+                if distance_mm <= 15.0 and observation.box.iou(accepted.box) >= 0.7:
+                    duplicate = True
+                    break
+            if not duplicate:
+                retained.append((index, observation))
+        return tuple(observation for _, observation in sorted(retained))
+
     def reset(self) -> None:
         self._tracks.clear()
         self._next_track_id = 1
@@ -282,39 +364,149 @@ class MultiTargetTracker:
         tracks: dict[int, TrackedTarget],
         observations: tuple[TargetObservation, ...],
     ) -> tuple[tuple[int, int], ...]:
-        candidates: list[tuple[float, int, int]] = []
-        for track_id, track in tracks.items():
+        if not tracks or not observations:
+            return ()
+
+        track_items = tuple(sorted(tracks.items()))
+        track_count = len(track_items)
+        observation_count = len(observations)
+        # Add dummy rows/columns so the assignment can leave either side
+        # unmatched.  A valid gated pair is always cheaper than dropping both
+        # endpoints; an invalid pair is much more expensive than doing so.
+        unmatched_cost = 2.0
+        invalid_cost = 8.0
+        size = track_count + observation_count
+        costs = [[0.0 for _ in range(size)] for _ in range(size)]
+        valid_scores: dict[tuple[int, int], float] = {}
+        for track_index, (_, track) in enumerate(track_items):
             for observation_index, observation in enumerate(observations):
                 score = self._association_score(track, observation)
+                costs[track_index][observation_index] = (
+                    invalid_cost if score is None else score
+                )
                 if score is not None:
-                    candidates.append((score, track_id, observation_index))
-        candidates.sort()
+                    valid_scores[(track_index, observation_index)] = score
+            for dummy_column in range(observation_count, size):
+                costs[track_index][dummy_column] = unmatched_cost
+        for dummy_row in range(track_count, size):
+            for observation_index in range(observation_count):
+                costs[dummy_row][observation_index] = unmatched_cost
 
-        used_tracks: set[int] = set()
-        used_observations: set[int] = set()
-        matches: list[tuple[int, int]] = []
-        for _, track_id, observation_index in candidates:
+        assignment = self._minimum_cost_assignment(tuple(tuple(row) for row in costs))
+        matches = [
+            (track_items[track_index][0], observation_index)
+            for track_index, observation_index in enumerate(assignment)
             if (
-                track_id in used_tracks
-                or observation_index in used_observations
-            ):
-                continue
-            used_tracks.add(track_id)
-            used_observations.add(observation_index)
-            matches.append((track_id, observation_index))
-        return tuple(matches)
+                track_index < track_count
+                and observation_index < observation_count
+                and (track_index, observation_index) in valid_scores
+            )
+        ]
+        return tuple(sorted(matches))
+
+    @staticmethod
+    def _minimum_cost_assignment(
+        costs: tuple[tuple[float, ...], ...],
+    ) -> tuple[int, ...]:
+        """返回方阵最小代价分配；列顺序作为完全相等时的稳定 tie-break。"""
+
+        size = len(costs)
+        if size == 0:
+            return ()
+        if any(len(row) != size for row in costs):
+            raise ValueError("costs must be a non-empty square matrix.")
+        # Kuhn-Munkres / Hungarian algorithm, using 1-based work arrays as
+        # customary.  The near-field detector has a small bounded target count,
+        # so the O(n^3) assignment is cheap and avoids greedy ID swaps when two
+        # K0 positions are close.
+        u = [0.0] * (size + 1)
+        v = [0.0] * (size + 1)
+        matched_column_row = [0] * (size + 1)
+        previous_column = [0] * (size + 1)
+        for row in range(1, size + 1):
+            matched_column_row[0] = row
+            current_column = 0
+            minimum = [math.inf] * (size + 1)
+            used = [False] * (size + 1)
+            while True:
+                used[current_column] = True
+                matched_row = matched_column_row[current_column]
+                delta = math.inf
+                next_column = 0
+                for column in range(1, size + 1):
+                    if used[column]:
+                        continue
+                    reduced = (
+                        costs[matched_row - 1][column - 1]
+                        - u[matched_row]
+                        - v[column]
+                    )
+                    if reduced < minimum[column]:
+                        minimum[column] = reduced
+                        previous_column[column] = current_column
+                    if minimum[column] < delta:
+                        delta = minimum[column]
+                        next_column = column
+                if not math.isfinite(delta):
+                    raise RuntimeError("Hungarian assignment has no augmenting path.")
+                for column in range(size + 1):
+                    if used[column]:
+                        u[matched_column_row[column]] += delta
+                        v[column] -= delta
+                    else:
+                        minimum[column] -= delta
+                current_column = next_column
+                if matched_column_row[current_column] == 0:
+                    break
+            while True:
+                prior = previous_column[current_column]
+                matched_column_row[current_column] = matched_column_row[prior]
+                current_column = prior
+                if current_column == 0:
+                    break
+
+        assignment = [-1] * size
+        for column in range(1, size + 1):
+            row = matched_column_row[column]
+            if row != 0:
+                assignment[row - 1] = column - 1
+        if any(column < 0 for column in assignment):
+            raise RuntimeError("Hungarian assignment left a row unmatched.")
+        return tuple(assignment)
 
     def _association_score(
         self,
         track: TrackedTarget,
         observation: TargetObservation,
     ) -> float | None:
-        if (
+        class_mismatch = (
             track.target_class is not TargetClass.UNKNOWN
             and observation.target_class is not TargetClass.UNKNOWN
             and track.target_class is not observation.target_class
+        )
+        if (
+            class_mismatch
+            and self._class_mismatch_penalty is not None
+            and (
+                track.target_class
+                in {TargetClass.ORANGE_INJURED, TargetClass.BLUE_DANGER}
+                or observation.target_class
+                in {TargetClass.ORANGE_INJURED, TargetClass.BLUE_DANGER}
+            )
+        ):
+            # 近场可允许绿/黑物资之间的短暂类别抖动，但伤员和危险目标
+            # 具有不同任务/安全语义，不能仅因空间接近而交换轨迹身份。
+            return None
+        if (
+            class_mismatch
+            and self._class_mismatch_penalty is None
         ):
             return None
+        class_penalty = (
+            0.0
+            if not class_mismatch
+            else self._class_mismatch_penalty
+        )
         iou = track.box.iou(observation.box)
         if track.ground_point is not None and observation.ground_point is not None:
             distance_mm = math.hypot(
@@ -326,10 +518,11 @@ class MultiTargetTracker:
             return (
                 distance_mm / self._config.max_association_ground_mm
                 + 0.25 * (1.0 - iou)
+                + class_penalty
             )
         if iou < self._config.min_association_iou:
             return None
-        return 1.0 - iou
+        return 1.0 - iou + class_penalty
 
     def _decay(
         self,
@@ -427,5 +620,8 @@ class MultiTargetTracker:
     def _keep(self, track: TrackedTarget) -> bool:
         return (
             track.age_since_seen_ms <= self._config.max_coast_ms
-            and track.confidence >= self._config.min_confidence
+            and (
+                self._retain_low_confidence_tracks
+                or track.confidence >= self._config.min_confidence
+            )
         )

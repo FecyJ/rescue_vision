@@ -5,6 +5,7 @@ import threading
 import numpy as np
 import pytest
 
+import rescue_vision.camera.picamera2_source as source_module
 from rescue_vision.camera.picamera2_source import Picamera2Source
 
 
@@ -96,6 +97,8 @@ def test_picamera2_source_returns_latest_frame_with_sensor_metadata() -> None:
         "frame_duration_us": 50000,
         "colour_gain_red": 1.2,
         "colour_gain_blue": 1.7,
+        "timestamp_source": "host_frame_received_monotonic",
+        "frame_received_timestamp_ns": frame.metadata["frame_received_timestamp_ns"],
     }
     with pytest.raises(TimeoutError, match="Picamera2 帧超时"):
         source.read(timeout=0.01)
@@ -116,6 +119,20 @@ def test_picamera2_source_rejects_read_before_start() -> None:
     )
     with pytest.raises(RuntimeError, match="not started"):
         source.read()
+
+
+def test_picamera2_maps_recent_sensor_timestamp_to_monotonic(monkeypatch) -> None:
+    monkeypatch.setattr(source_module.time, "CLOCK_BOOTTIME", 7, raising=False)
+    monkeypatch.setattr(source_module.time, "clock_gettime_ns", lambda _clock: 2_000_000_000)
+    monkeypatch.setattr(source_module.time, "monotonic_ns", lambda: 1_000_000_000)
+
+    timestamp, source = Picamera2Source._capture_timestamp(
+        {"SensorTimestamp": 2_500_000_000},
+        1_600_000_000,
+    )
+
+    assert timestamp == 1_500_000_000
+    assert source == "sensor_start_of_frame_monotonic"
 
 
 def test_picamera2_stop_still_closes_after_stop_timeout(monkeypatch) -> None:

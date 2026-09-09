@@ -104,14 +104,19 @@ class CameraPerceptionPump:
         source: FrameSource,
         prepare: Callable[[CameraFrame], CameraFrame],
         perception: _PerceptionSubmitter,
+        *,
+        report_timing: bool = True,
     ) -> None:
         if not isinstance(source, FrameSource):
             raise TypeError("source must implement FrameSource.")
         if not callable(prepare):
             raise TypeError("prepare must be callable.")
+        if not isinstance(report_timing, bool):
+            raise TypeError("report_timing must be a boolean.")
         self._source = source
         self._prepare = prepare
         self._perception = perception
+        self._report_timing = report_timing
         self._stop_event = Event()
         self._error_lock = Lock()
         self._worker_error: BaseException | None = None
@@ -270,7 +275,7 @@ class CameraPerceptionPump:
                 prepare_ms_total += prepare_ms
                 prepare_ms_max = max(prepare_ms_max, prepare_ms)
                 now_ns = time.monotonic_ns()
-                if now_ns >= next_report_ns:
+                if self._report_timing and now_ns >= next_report_ns:
                     if frame_count:
                         print(
                             "camera_pump_timing=(frames="
@@ -2269,7 +2274,8 @@ def _run_hardware(
     renderer = PerceptionFrameRenderer(
         lambda: config.build_target_pose_detector(
             ground_projector=pipeline.ground_projector
-        )
+        ),
+        render_enabled=config.remote.enabled,
     )
     camera_perception = CameraPerceptionPump(
         pipeline.source,
@@ -2432,20 +2438,17 @@ def _run_hardware(
                             localization_estimate,
                             now_ns,
                         )
-                    candidate = renderer.latest_snapshot()
+                    candidate = renderer.latest_fresh_snapshot(
+                        now_ns,
+                        config.processing.max_observation_age_ms,
+                    )
+                    latest_snapshot = candidate
                     if candidate is not None:
-                        latest_snapshot = candidate
                         if (
                             visual_localization is not None
                             and candidate.field_features is not None
                         ):
                             visual_localization.submit(candidate.field_features)
-                    if latest_snapshot is not None:
-                        age_ms = (
-                            now_ns - latest_snapshot.capture_timestamp_ns
-                        ) / 1_000_000.0
-                        if age_ms > config.processing.max_observation_age_ms:
-                            latest_snapshot = None
                     decision = sequence.step(
                         timestamp_ns=now_ns,
                         cumulative_distance_m=tracker.distance_m,

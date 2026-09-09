@@ -65,6 +65,26 @@ def test_yuv420_rejects_odd_image_dimensions() -> None:
         RpicamSource(image_size=(5, 4))
 
 
+def test_read_exact_uses_first_byte_arrival_time(monkeypatch) -> None:
+    class ChunkedStream:
+        def __init__(self) -> None:
+            self.payload = bytearray(b"abcd")
+
+        def readinto(self, target) -> int:
+            if not self.payload:
+                return 0
+            count = min(2, len(self.payload))
+            target[:count] = self.payload[:count]
+            del self.payload[:count]
+            return count
+
+    timestamps = iter((100, 200))
+    monkeypatch.setattr(source_module.time, "monotonic_ns", lambda: next(timestamps))
+    result = RpicamSource._read_exact(ChunkedStream(), 4)
+
+    assert result == (bytearray(b"abcd"), 100)
+
+
 def test_process_start_failure_leaves_source_stopped(monkeypatch) -> None:
     def fail(*args, **kwargs):
         raise FileNotFoundError("rpicam-vid")
@@ -95,6 +115,8 @@ def test_repeated_start_stop_and_read_timeout(monkeypatch) -> None:
     assert frame.sequence == 0
     assert isinstance(frame.timestamp_ns, int)
     assert frame.image_bgr.shape == (4, 4, 3)
+    assert frame.metadata["timestamp_source"] == "host_frame_first_byte_monotonic"
+    assert isinstance(frame.metadata["frame_received_timestamp_ns"], int)
     with pytest.raises(TimeoutError, match="相机帧超时"):
         camera.read(timeout=0.01)
     camera.stop()

@@ -63,3 +63,23 @@ def test_servo_angle_conversion_rejects_wrong_servo_direction() -> None:
             closed_left_angle_deg=80.0,
             closed_right_angle_deg=100.0,
         )
+
+
+def test_independent_edge_conversion_matches_both_tip_positions() -> None:
+    kinematics = GripperKinematics()
+
+    left, right = kinematics.servo_angles_for_edge_positions(
+        30.0,
+        -20.0,
+        open_left_angle_deg=0.0,
+        open_right_angle_deg=180.0,
+        closed_left_angle_deg=80.0,
+        closed_right_angle_deg=100.0,
+    )
+
+    left_relative = 80.0 - left
+    right_relative = right - 100.0
+    assert kinematics.left_tip_position(left_relative).y == pytest.approx(30.0)
+    assert kinematics.right_tip_position(right_relative).y == pytest.approx(-20.0)
+    assert left != pytest.approx(60.0)
+    assert right != pytest.approx(120.0)
