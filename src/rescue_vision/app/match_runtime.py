@@ -480,7 +480,7 @@ def _run_hardware(
             f"safe_zone_braking_overrun_mm=({config.match.safe_zone_d2_braking_overrun_x_mm:g},"
             f"{config.match.safe_zone_d2_braking_overrun_y_mm:g}) "
             f"action_settle_time_s={config.match.action_settle_time_s:g} "
-            f"green_first_scan_angle_rad={config.match.spin_angle_rad:g} "
+            f"close_gripper_spin_angle_rad={config.match.spin_angle_rad:g} "
             f"breakup_field_half_extent_mm={config.match.breakup_field_half_extent_mm:g} "
             f"breakup_gripper_offset_mm={config.match.breakup_gripper_offset_mm:g}",
             flush=True,

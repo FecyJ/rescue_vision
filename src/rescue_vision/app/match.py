@@ -561,9 +561,6 @@ class MatchSequence:
         self._cluster_reference_field_point: FieldPoint | None = None
         self._cluster_breakup_end_field_point: FieldPoint | None = None
         self._last_cluster_rejection_reason: str | None = None
-        self._green_first_scan_active = False
-        self._green_first_scan_last_heading_rad: float | None = None
-        self._green_first_scan_progress_rad = 0.0
 
     @classmethod
     def from_app_config(
@@ -1744,9 +1741,6 @@ class MatchSequence:
         self._green_preclose_realign_active = False
         self._green_preclose_frame_floor = None
         self._green_preclose_recheck_started_ns = None
-        self._green_first_scan_active = False
-        self._green_first_scan_last_heading_rad = None
-        self._green_first_scan_progress_rad = 0.0
 
     def _begin_safe_zone_scan(self) -> None:
         self._safe_zone_scan_last_heading = None
@@ -2277,7 +2271,10 @@ class MatchSequence:
         self,
         timestamp_ns: int,
     ) -> frozenset[GroundPoint]:
-        """把当前有效团成员中的绿色物资标为候选优先点。"""
+        """仅首轮把规则要求的绿色物资所在团标为优先候选。"""
+
+        if self._transport_count > 0:
+            return frozenset()
 
         return frozenset(
             target.ground_point
@@ -2294,7 +2291,7 @@ class MatchSequence:
         *,
         preferred_points: frozenset[GroundPoint] | None = None,
     ) -> list[GroundPoint] | None:
-        # 先按绿色优先/成员数顺序处理完整连通团；拒绝危险路线后
+        # 首轮按规则所需绿色、其余轮次按成员数处理完整连通团；拒绝危险路线后
         # 继续找下一团，不拆团制造假孤立目标。
         self._last_cluster_rejection_reason = None
         remaining = list(points)
@@ -2444,34 +2441,6 @@ class MatchSequence:
             posture=GripperPosture.TRANSPORT,
         )
 
-    def _begin_green_first_scan(self) -> None:
-        """为本轮搜索启用一次优先绿色目标的整圈扫描。"""
-
-        self._green_first_scan_active = (
-            self.config.opportunistic_single_green_enabled
-        )
-        self._green_first_scan_last_heading_rad = None
-        self._green_first_scan_progress_rad = 0.0
-
-    def _advance_green_first_scan(self, heading_rad: float | None) -> bool:
-        """累计优先扫描的单向航向跨度，完成配置的一圈后返回 True。"""
-
-        if heading_rad is None:
-            return False
-        previous = self._green_first_scan_last_heading_rad
-        self._green_first_scan_last_heading_rad = heading_rad
-        if previous is None:
-            return False
-        self._green_first_scan_progress_rad += self._directional_delta(
-            previous,
-            heading_rad,
-            self._cluster_search_angular_velocity_rad_s,
-        )
-        return (
-            self._green_first_scan_progress_rad
-            >= self.config.spin_angle_rad
-        )
-
     def _begin_action_settle(
         self,
         timestamp_ns: int,
@@ -2603,6 +2572,29 @@ class MatchSequence:
             return self.config.safe_zone_orange_d2_to_final_braking_overrun_mm
         return self.config.safe_zone_d2_to_final_braking_overrun_mm
 
+    def _update_cluster_search_velocity(self) -> None:
+        """按当前帧信息量切换搜索转速，同时保留当前扫描方向。"""
+
+        perception = self._latest_perception
+        has_collectible_information = perception is not None and any(
+            observation.target_class
+            in {
+                TargetClass.GREEN_SUPPLY,
+                TargetClass.BLACK_CORE,
+                TargetClass.ORANGE_INJURED,
+            }
+            for observation in perception.observations
+        )
+        magnitude = abs(
+            self.config.cluster_search_angular_velocity_rad_s
+            if has_collectible_information
+            else self.config.cluster_search_empty_angular_velocity_rad_s
+        )
+        self._cluster_search_angular_velocity_rad_s = math.copysign(
+            magnitude,
+            self._cluster_search_angular_velocity_rad_s,
+        )
+
     def _step_search_cluster(
         self,
         timestamp_ns: int,
@@ -2637,13 +2629,13 @@ class MatchSequence:
             self._path_recovery = False
             self._path_recovery_stopped_ns = None
             self._safe_zone_stop_since_ns = None
+        self._update_cluster_search_velocity()
         # 一般阶段统一比较当前可接近的目标，不让正前方低分远目标
         # 抢占侧方近目标；种子与对准复核使用相同的路径条件。
         if (not self._breakup_only and self.config.opportunistic_single_green_enabled
                 and self._near_field_pickup is not None and self._transport_count > 0):
             target = self._find_approach_seed(timestamp_ns)
             if target is not None:
-                self._green_first_scan_active = False
                 direct = self._transport_group_size(target, timestamp_ns) is not None
                 return self._begin_green_transport(timestamp_ns, target,
                                                    opportunistic=direct, group_preview=not direct)
@@ -2661,34 +2653,6 @@ class MatchSequence:
             # 首轮最近绿块已经被前向走廊中的其它目标挡住时，直接进入
             # 解团规划；不要先尝试更远的绿色候选。
             return self._enter_breakup_only_search(timestamp_ns)
-        if not self._breakup_only and self._green_first_scan_active:
-            target = (self._find_opportunistic_single_green(timestamp_ns)
-                      if self._transport_count == 0 or self._near_field_pickup is None else None)
-            if target is not None:
-                # 扫描中一旦确认可直接夹取的单目标物资，立即抢占解团流程。
-                self._green_first_scan_active = False
-                return self._begin_green_transport(
-                    timestamp_ns,
-                    target,
-                    opportunistic=True,
-                )
-            if heading_rad is None:
-                return self._decision(
-                    timestamp_ns,
-                    0.0,
-                    0.0,
-                    "green_first_scan_waiting_for_heading",
-                )
-            if not self._advance_green_first_scan(heading_rad):
-                return self._decision(
-                    timestamp_ns,
-                    0.0,
-                    self._cluster_search_angular_velocity_rad_s,
-                    "green_first_scan_rotate",
-                )
-            self._green_first_scan_active = False
-            self._green_first_scan_last_heading_rad = None
-            self._green_first_scan_progress_rad = 0.0
         if (not self._breakup_only and self.config.opportunistic_single_green_enabled
                 and (self._transport_count == 0 or self._near_field_pickup is None)):
             target = self._find_opportunistic_single_green(timestamp_ns)
@@ -2714,22 +2678,6 @@ class MatchSequence:
                     else "search_cluster_left"
                 )
             )
-            if self._latest_perception is None or not any(
-                observation.target_class
-                in {
-                    TargetClass.GREEN_SUPPLY,
-                    TargetClass.BLACK_CORE,
-                    TargetClass.ORANGE_INJURED,
-                }
-                for observation in self._latest_perception.observations
-            ):
-                self._cluster_search_angular_velocity_rad_s = (
-                    self.config.cluster_search_empty_angular_velocity_rad_s
-                )
-            else:
-                self._cluster_search_angular_velocity_rad_s = (
-                    self.config.cluster_search_angular_velocity_rad_s
-                )
             return self._decision(
                 timestamp_ns,
                 0.0,
@@ -6244,7 +6192,6 @@ class MatchSequence:
             self._return_phase = "idle"
             self._search_frame_floor = None
             self._begin_cluster_search()
-            self._begin_green_first_scan()
             self.state = MatchState.SEARCH_CLUSTER
             return self._decision(
                 timestamp_ns,

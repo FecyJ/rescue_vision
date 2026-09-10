@@ -414,7 +414,6 @@ def test_cluster_search_uses_fast_speed_until_collectible_information_appears() 
     start_sequence(sequence)
     sequence.state = MatchState.SEARCH_CLUSTER
     sequence._breakup_only = True
-    sequence._green_first_scan_active = False
 
     empty = sequence.step(
         10,
@@ -456,6 +455,12 @@ def test_cluster_search_uses_fast_speed_until_collectible_information_appears() 
     assert empty.angular_velocity_rad_s == pytest.approx(-0.6)
     assert blue_only.angular_velocity_rad_s == pytest.approx(-0.6)
     assert orange_seen.angular_velocity_rad_s == pytest.approx(-0.2)
+    assert (
+        empty.reason
+        == blue_only.reason
+        == orange_seen.reason
+        == "search_cluster_right"
+    )
 
 def test_match_cli_passes_selected_start_area(monkeypatch) -> None:
     from rescue_vision.app import match as match_module
@@ -1041,7 +1046,7 @@ def test_search_preempts_breakup_for_confirmed_single_green() -> None:
     assert found.gripper_posture is GripperPosture.TRANSPORT
 
 
-def test_first_search_skips_pre_breakup_green_sweep() -> None:
+def test_first_search_enters_common_cluster_search() -> None:
     sequence = make_sequence(
         config=runtime_config(
             opportunistic_single_green_enabled=True,
@@ -1066,86 +1071,79 @@ def test_first_search_skips_pre_breakup_green_sweep() -> None:
     assert started_search.state is MatchState.SEARCH_CLUSTER
     assert started_search.reason == "startup_forward_settled_search_cluster"
     assert started_search.angular_velocity_rad_s == pytest.approx(-0.30)
-    assert not sequence._green_first_scan_active
 
 
-def test_green_first_scan_blocks_breakup_until_full_sweep() -> None:
-    sequence = make_sequence(
-        config=runtime_config(
-            opportunistic_single_green_enabled=True,
-            cluster_search_sweep_angle_rad=1.0,
-            spin_angle_rad=math.tau,
-        )
-    )
-    start_sequence(sequence)
-    cluster = [
-        observation(
-            1,
-            10,
-            GroundPoint(600.0, -80.0),
-            target_class=TargetClass.BLUE_DANGER,
-            box_x=10.0,
-        ),
-        observation(
-            1,
-            10,
-            GroundPoint(600.0, 80.0),
-            target_class=TargetClass.BLUE_DANGER,
-            box_x=30.0,
-        ),
-    ]
-    sequence._tracker.update(10, cluster)
-    sequence._tracker.update(
-        20,
-        [
-            observation(
-                2,
-                20,
-                GroundPoint(600.0, -80.0),
-                target_class=TargetClass.BLUE_DANGER,
-                box_x=10.0,
-            ),
-            observation(
-                2,
-                20,
-                GroundPoint(600.0, 80.0),
-                target_class=TargetClass.BLUE_DANGER,
-                box_x=30.0,
-            ),
-        ],
-    )
-    sequence.state = MatchState.SEARCH_CLUSTER
-    sequence._begin_green_first_scan()
-    sequence._latest_heading_rad = 0.0
-
-    rotating = sequence._step_search_cluster(20, 0.0)
-    assert rotating.state is MatchState.SEARCH_CLUSTER
-    assert rotating.reason == "green_first_scan_rotate"
-
-    sequence._green_first_scan_progress_rad = math.tau - 0.05
-    sequence._latest_heading_rad = -0.05
-    after_full_sweep = sequence._step_search_cluster(30, -0.05)
-    assert after_full_sweep.state is MatchState.ALIGN_CLUSTER_ONCE
-    assert after_full_sweep.reason == "cluster_seen_stop_collect_reference"
-
-
-def test_green_first_scan_grabs_target_immediately() -> None:
+def test_common_search_does_not_wait_for_green_full_sweep() -> None:
     sequence = make_sequence(
         config=runtime_config(opportunistic_single_green_enabled=True)
     )
     start_sequence(sequence)
     sequence.state = MatchState.SEARCH_CLUSTER
-    sequence._begin_green_first_scan()
-    green = observation(2, 20, GroundPoint(500.0, 0.0))
-    sequence._tracker.update(10, [observation(1, 10, GroundPoint(500.0, 0.0))])
-    sequence._tracker.update(20, [green])
-    sequence._latest_heading_rad = 0.0
+    first = snapshot(
+        1,
+        10,
+        observation(
+            1,
+            10,
+            GroundPoint(600.0, -60.0),
+            target_class=TargetClass.BLACK_CORE,
+            box_x=10.0,
+        ),
+        observation(
+            1,
+            10,
+            GroundPoint(600.0, 60.0),
+            target_class=TargetClass.BLACK_CORE,
+            box_x=30.0,
+        ),
+    )
+    second = snapshot(
+        2,
+        20,
+        observation(
+            2,
+            20,
+            GroundPoint(600.0, -60.0),
+            target_class=TargetClass.BLACK_CORE,
+            box_x=10.0,
+        ),
+        observation(
+            2,
+            20,
+            GroundPoint(600.0, 60.0),
+            target_class=TargetClass.BLACK_CORE,
+            box_x=30.0,
+        ),
+    )
 
-    found = sequence._step_search_cluster(20, 0.0)
+    sequence.step(
+        10,
+        perception=first,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+    )
+    found = sequence.step(
+        20,
+        perception=second,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+    )
 
-    assert found.state is MatchState.TRANSPORT_ALIGN_GREEN
-    assert found.reason == "green_path_clear_opportunistic_single:1"
-    assert found.gripper_posture is GripperPosture.TRANSPORT
+    assert found.state is MatchState.ALIGN_CLUSTER_ONCE
+    assert found.reason == "cluster_seen_stop_collect_reference"
+
+
+def test_green_cluster_preference_only_applies_to_required_first_delivery() -> None:
+    sequence = make_sequence()
+    green_point = GroundPoint(500.0, 0.0)
+    sequence._tracker.update(10, [observation(1, 10, green_point)])
+    sequence._tracker.update(20, [observation(2, 20, green_point)])
+
+    assert sequence._preferred_cluster_ground_points(20) == frozenset(
+        {green_point}
+    )
+    sequence._transport_count = 1
+    assert sequence._preferred_cluster_ground_points(20) == frozenset()
 
 
 def test_green_alignment_carries_fine_wheel_velocity_floor() -> None:
@@ -3215,8 +3213,10 @@ def test_exits_safe_zone_before_rearming_cluster_search() -> None:
         right_speed_feedback_m_s=0.0,
     )
     assert search.state is MatchState.SEARCH_CLUSTER
-    assert search.reason == "green_first_scan_rotate"
-    assert sequence._green_first_scan_active
+    assert search.reason == "search_cluster_right"
+    assert search.angular_velocity_rad_s == pytest.approx(
+        sequence.config.cluster_search_empty_angular_velocity_rad_s
+    )
     assert sequence._tracker.tracks == ()
 
 
