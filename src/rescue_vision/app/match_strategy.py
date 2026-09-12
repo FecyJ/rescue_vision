@@ -126,108 +126,27 @@ class MatchSequence(_SharedMatchSequence):
         transport_corridor_half_width_mm: float | None = None,
         breakup_target_geometry: TargetGroundGeometryConfig | None = None,
     ) -> None:
-        from rescue_vision.config import MatchRuntimeConfig
+        """共用正式流程的全部状态，只追加策略专用字段。
 
-        if not isinstance(config, MatchRuntimeConfig):
-            raise TypeError("config must be a MatchRuntimeConfig.")
-        if not config.enabled:
-            raise ValueError("MatchSequence requires enabled config.")
-        if not isinstance(tracker, MultiTargetTracker):
-            raise TypeError("tracker must be a MultiTargetTracker.")
-        if near_field_pickup is not None and not isinstance(
-            near_field_pickup, GripperWidthPickupSequence
-        ):
-            raise TypeError(
-                "near_field_pickup must be a GripperWidthPickupSequence or None."
-            )
-        if near_field_grasp_config is not None and not isinstance(
-            near_field_grasp_config, NearFieldGraspConfig
-        ):
-            raise TypeError(
-                "near_field_grasp_config must be a NearFieldGraspConfig or None."
-            )
-        if transport_corridor_half_width_mm is not None:
-            if (
-                isinstance(transport_corridor_half_width_mm, bool)
-                or not isinstance(transport_corridor_half_width_mm, (int, float))
-                or not math.isfinite(float(transport_corridor_half_width_mm))
-                or float(transport_corridor_half_width_mm) <= 0.0
-            ):
-                raise ValueError(
-                    "transport_corridor_half_width_mm must be finite and positive."
-                )
-        if not isinstance(team_color, TeamColor):
-            raise TypeError("team_color must be a TeamColor.")
-        for name, point in (
-            ("initial_field_position", initial_field_position),
-        ):
-            if point is not None and not isinstance(point, FieldPoint):
-                raise TypeError(f"{name} must be a FieldPoint or None.")
-        if (
-            isinstance(gripper_full_travel_time_s, bool)
-            or not isinstance(gripper_full_travel_time_s, (int, float))
-            or not math.isfinite(float(gripper_full_travel_time_s))
-            or float(gripper_full_travel_time_s) <= 0.0
-        ):
-            raise ValueError(
-                "gripper_full_travel_time_s must be finite and positive."
-            )
-        self._breakup_grasp_preparation: GraspPreparation | None = None
-        self._breakup_target_geometry = breakup_target_geometry
-        self._breakup_plan: BreakupPlan | None = None
-        self._breakup_proposal: BreakupPlan | None = None
-        self._breakup_attempts: list[BreakupPlan] = []
-        self._breakup_rejected_grasp_ids: set[int] = set()
-        self._breakup_phase_started_ns: int | None = None
-        self._breakup_stopped_ns: int | None = None
-        self._breakup_reference_frames: set[tuple[int, int]] = set()
-        self._breakup_last_capture_ns = -1
-        self._breakup_actual_forward_mm = 0.0
-        self._breakup_actual_backward_mm = 0.0
-        self._breakup_retreat_mm = 0.0
-        evidence_config = near_field_grasp_config or NearFieldGraspConfig()
-        self._stationary_motion = (near_field_pickup.motion_evidence if near_field_pickup is not None
-                                   else StationaryMotionEvidence(
-                                       max_gap_ns=round(evidence_config.grasp_commit_max_observation_age_ms*1e6),
-                                       max_gyro_rad_s=evidence_config.stationary_max_gyro_rad_s))
-        self._breakup_feedback_since_ns: int | None = None
-        self._breakup_feedback_pose: tuple[float | None, float | None] | None = None
-        self._breakup_anchor: FieldPoint | None = None
-        self._breakup_reference_current = False
-        self._breakup_observation_deadline_ns: int | None = None
-        self._breakup_failed_regions: list[tuple[FieldPoint, ...]] = []
-        self._breakup_search_frame: tuple[int, int] | None = None
-        self._breakup_wait_detail = "not_observing"
-        self.config = config
-        self._tracker = tracker
-        self._team_color = team_color
-        # 正式运输路线沿己方安全区所在的场地 y 方向前进；区域 2/红方为
-        # +y，区域 3/蓝方为 -y。UNKNOWN 仅保留旧纯逻辑调用的 +y 行为，
-        # 正式配置会在启动区域装配时确定颜色。
-        self._safe_zone_forward_y_sign = (
-            -1.0 if team_color is TeamColor.BLUE else 1.0
+        正式流程的状态集合（位姿历史、物理失败记忆、旋转预算、绿色对准
+        预算等）由基类建立；本变体不再复制一份，避免再次出现"变体缺少
+        基类新增状态"的静默 AttributeError。
+        """
+
+        super().__init__(
+            config,
+            tracker=tracker,
+            gripper_full_travel_time_s=gripper_full_travel_time_s,
+            team_color=team_color,
+            initial_field_position=initial_field_position,
+            safe_zone_corner_localizer=safe_zone_corner_localizer,
+            static_map=static_map,
+            breakup_clearance_mm=breakup_clearance_mm,
+            near_field_pickup=near_field_pickup,
+            near_field_grasp_config=near_field_grasp_config,
+            transport_corridor_half_width_mm=transport_corridor_half_width_mm,
+            breakup_target_geometry=breakup_target_geometry,
         )
-        self._gripper_full_travel_time_ns = round(
-            float(gripper_full_travel_time_s) * 1_000_000_000
-        )
-        self._near_field_pickup = near_field_pickup
-        self._near_field_grasp_config = near_field_grasp_config
-        self._transport_corridor_half_width_mm = (
-            float(transport_corridor_half_width_mm)
-            if transport_corridor_half_width_mm is not None
-            else float(config.green_path_half_width_mm)
-        )
-        self._near_field_session_id = 0
-        self.state = MatchState.BOOT
-        self._started = False
-        self._last_timestamp_ns: int | None = None
-        self._last_tracker_frame_sequence: int | None = None
-        self._preview_target_history: dict[
-            tuple[int, int], tuple[TrackedTarget, ...]
-        ] = {}
-        self._startup_turn_last_heading: float | None = None
-        self._startup_turn_progress_rad = 0.0
-        self._startup_forward_base_distance_m: float | None = None
         # 策略专用启动冲刺：第一段为右转/短冲，第二段为左转/长冲。
         self._strategy_startup_leg = 1
         self._strategy_blue_transport = False
@@ -243,167 +162,8 @@ class MatchSequence(_SharedMatchSequence):
         self._strategy_blue_confirmation_last_frame: int | None = None
         self._strategy_blue_confirmation_ids: tuple[int, ...] | None = None
         self._strategy_formal_phase = False
-        self._straight_pid_integral = 0.0
-        self._straight_pid_last_error: float | None = None
-        self._straight_pid_last_timestamp_ns: int | None = None
-        self._cluster_approach_base_distance_m: float | None = None
-        self._cluster_approach_travel_distance_m: float | None = None
-        self._breakup_forward_base_distance_m: float | None = None
-        self._breakup_backward_base_distance_m: float | None = None
-        self._spin_last_heading: float | None = None
-        self._spin_progress_rad = 0.0
-        self._settle_until_ns = 0
-        self._gripper_phase_started_ns: int | None = None
-        self._selected_track_id: int | None = None
-        self._cluster_selected_track_ids: tuple[int, ...] = ()
-        self._selected_green_ground: GroundPoint | None = None
-        self._green_align_lost_since_ns: int | None = None
-        self._green_align_hold_ns = round(
-            float(config.green_align_hold_ms) * 1_000_000
-        )
-        self._green_approach_base_distance_m: float | None = None
-        self._green_approach_distance_m: float | None = None
-        self._transport_forward_base_distance_m: float | None = None
-        self._transport_forward_distance_m: float | None = None
-        self._greedy_active = False
-        self._greedy_started_ns = 0
-        self._greedy_last_heading: float | None = None
-        self._greedy_progress_rad = 0.0
-        self._transport_count = 0
-        self._transport_target_classes: tuple[TargetClass, ...] = ()
-        self._breakup_only = False
-        self._near_field_route = GraspRoute.DECIDING
-        self._near_field_confirmation_started_ns: int | None = None
-        self._near_field_handoff_prior: NearFieldHandoffPrior | None = None
-        self._near_field_last_failure_diagnostic: str | None = None
-        self._near_field_far_reapproach_used = False
-        self._near_field_route_rejections: tuple[str, ...] = ()
-        self._near_field_route_elapsed_ms = 0.0
-        self._near_field_route_candidate_count = 0
-        self._return_backup_base_distance_m: float | None = None
-        self._initial_field_position = initial_field_position
-        self._fallback_field_position = initial_field_position
-        self._fallback_last_distance_m: float | None = None
-        self._safe_zone_scan_last_heading: float | None = None
-        self._safe_zone_scan_progress_rad = 0.0
-        self._cluster_search_angular_velocity_rad_s = (
-            config.cluster_search_angular_velocity_rad_s
-        )
-        self._cluster_search_last_heading: float | None = None
-        self._cluster_search_progress_rad = 0.0
-        self._cluster_align_hold_center: GroundPoint | None = None
-        self._cluster_align_lost_since_ns: int | None = None
-        self._cluster_align_hold_ns = round(
-            float(config.cluster_align_hold_ms) * 1_000_000
-        )
-        self._consecutive_cluster_losses = 0
-        self._relocate_forward_base_distance_m: float | None = None
-        if safe_zone_corner_localizer is not None and not isinstance(
-            safe_zone_corner_localizer,
-            SafeZoneCornerLocalizer,
-        ):
-            raise TypeError(
-                "safe_zone_corner_localizer must be a SafeZoneCornerLocalizer "
-                "or None."
-            )
-        if static_map is not None and not isinstance(static_map, StaticFieldMap):
-            raise TypeError("static_map must be a StaticFieldMap or None.")
-        if isinstance(breakup_clearance_mm, bool):
-            raise ValueError(
-                "breakup_clearance_mm must be a finite nonnegative number."
-            )
-        try:
-            clearance_mm = float(breakup_clearance_mm)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "breakup_clearance_mm must be a finite nonnegative number, "
-                f"got {breakup_clearance_mm!r}."
-            ) from exc
-        if not math.isfinite(clearance_mm) or clearance_mm < 0.0:
-            raise ValueError(
-                "breakup_clearance_mm must be finite and nonnegative, "
-                f"got {breakup_clearance_mm!r}."
-            )
-        self._breakup_static_map = static_map
-        self._breakup_clearance_mm = clearance_mm
-        self._safe_zone_corner_localizer = safe_zone_corner_localizer
-        self._safe_zone_phase = "idle"
-        self._transport_opened = False
-        self._latest_heading_rad: float | None = None
-        self._raw_heading_rad: float | None = None
-        self._heading_offset_rad = 0.0
-        self._latest_perception: PerceptionSnapshot | None = None
-        self._green_reference_samples: list[GroundPoint] = []
-        self._green_reference_last_seen_ns: int | None = None
-        self._green_reference: GroundPoint | None = None
-        self._green_reference_heading_rad: float | None = None
-        self._green_reference_distance_m: float | None = None
-        self._green_alignment_started_ns: int | None = None
-        self._green_alignment_last_frame_sequence: int | None = None
-        self._green_alignment_stable_count = 0
-        self._opportunistic_single_green = False
-        self._near_field_group_preview = False
-        self._green_realign_pending = False
-        self._green_realign_done = False
-        self._green_preclose_consumed_track_ids: set[int] = set()
-        self._green_preclose_carried_count = 0
-        self._green_preclose_realign_active = False
-        self._green_preclose_frame_floor: int | None = None
-        self._green_preclose_recheck_started_ns: int | None = None
-        self._green_preclose_recheck_hold_ns = round(
-            float(config.green_preclose_recheck_hold_ms) * 1_000_000
-        )
-        self._safe_zone_key_samples: list[tuple[GroundPoint, GroundPoint, GroundPoint]] = []
-        self._safe_zone_key_last_frame: int | None = None
-        self._safe_zone_key_reobserve_until_ns: int | None = None
-        self._safe_zone_key_reobserve_frame_floor: int | None = None
-        self._safe_zone_keypoint_scan_until_ns: int | None = None
-        self._safe_zone_keypoint_scan_frame_floor: int | None = None
-        self._safe_zone_keypoint_scan_attempted = False
-        self._safe_zone_keypoint_reverse_base_distance_m: float | None = None
-        self._safe_zone_keypoint_reverse_attempted = False
-        self._safe_zone_calibration_snapshot: PerceptionSnapshot | None = None
-        self._safe_zone_calibration_zone: SafeZoneObservation | None = None
-        self._safe_zone_keys: tuple[GroundPoint, GroundPoint, GroundPoint] | None = None
-        self._safe_zone_calibration_pose: SafeZoneCornerPoseObservation | None = None
-        self._safe_zone_calibration_heading_rad: float | None = None
-        self._safe_zone_calibration_last_failure: str | None = None
-        self._safe_zone_stop_since_ns: int | None = None
-        self._safe_zone_bbox_turn_direction: float | None = None
-        self._safe_zone_bbox_centered = False
-        self._safe_zone_turn_reversal_requested_ns: int | None = None
-        self._safe_zone_turn_reversal_frame_floor: int | None = None
-        self._safe_zone_turn_reversal_stop_confirmed_ns: int | None = None
-        self._safe_zone_turn_reversal_stop_frame_floor: int | None = None
-        self._safe_zone_reacquire_frame_floor: int | None = None
-        self._safe_zone_calibration_after_exit = False
-        self._latest_speed_feedback: tuple[float | None, float | None] = (
-            None,
-            None,
-        )
-        self._path_recovery = False
-        self._path_recovery_stopped_ns: int | None = None
-        self._path_recovery_posture = GripperPosture.CLOSED
-        self._return_phase = "idle"
-        self._safe_zone_exit_base_distance_m: float | None = None
-        self._d1_line_heading_rad: float | None = None
-        self._d1_line_distance_m: float | None = None
-        self._d1_line_start_position: FieldPoint | None = None
-        self._d2_line_heading_rad: float | None = None
-        self._d2_line_distance_m: float | None = None
-        self._d2_line_start_position: FieldPoint | None = None
-        self._latest_cumulative_distance_m: float | None = None
-        self._action_settle_phase: str | None = None
-        self._action_settle_until_ns: int | None = None
-        self._search_frame_floor: int | None = None
-        self._cluster_reference_samples: list[GroundPoint] = []
-        self._cluster_distance_samples_mm: list[float] = []
-        self._cluster_reference: GroundPoint | None = None
-        self._cluster_reference_distance_mm: float | None = None
-        self._cluster_capture_heading_rad: float | None = None
-        self._cluster_reference_field_point: FieldPoint | None = None
-        self._cluster_breakup_end_field_point: FieldPoint | None = None
-        self._last_cluster_rejection_reason: str | None = None
+        # 旧的按区域失败记忆，待改用基类的 _breakup_failed_aims 后删除。
+        self._breakup_failed_regions: list[tuple[FieldPoint, ...]] = []
 
     @classmethod
     def from_app_config(
@@ -853,34 +613,15 @@ class MatchSequence(_SharedMatchSequence):
         return self._decision(timestamp_ns, 0.0, 0.0, "preflight_ready")
 
     def start(self, timestamp_ns: int) -> MatchDecision:
-        self._validate_timestamp(timestamp_ns)
-        if self.state is not MatchState.PREFLIGHT:
-            raise RuntimeError("start() requires a successful PREFLIGHT.")
-        self._started = True
-        self._startup_turn_last_heading = None
-        self._startup_turn_progress_rad = 0.0
+        """重置策略专用状态，再复用正式流程的启动复位。"""
+
         self._strategy_startup_leg = 1
         self._strategy_blue_transport = False
         self._strategy_delivery_slot = self._transport_count
         self._strategy_blue_grasp_phase = "idle"
         self._strategy_blue_preparation_key = None
         self._strategy_formal_phase = False
-        self._reset_straight_pid()
-        self._fallback_field_position = self._initial_field_position
-        self._fallback_last_distance_m = None
-        self._latest_cumulative_distance_m = None
-        if self._near_field_pickup is not None:
-            self._near_field_pickup.reset()
-            self._near_field_session_id = 0
-            self._near_field_handoff_prior = None
-            self._near_field_last_failure_diagnostic = None
-            self._near_field_confirmation_started_ns = None
-            self._near_field_far_reapproach_used = False
-        self._transport_target_classes = ()
-        self._begin_safe_zone_scan()
-        self._begin_cluster_search()
-        self.state = MatchState.STARTUP_TURN_RIGHT
-        return self._decision(timestamp_ns, 0.0, 0.0, "strategy_started")
+        return super().start(timestamp_ns)
 
     def _step_actions(
         self,
@@ -909,6 +650,7 @@ class MatchSequence(_SharedMatchSequence):
         ):
             raise ValueError("cumulative_distance_m must be finite when present.")
         self._update_fallback_field_position(heading_rad, cumulative_distance_m)
+        self._record_pose_history(timestamp_ns, heading_rad, cumulative_distance_m)
         if safety is None:
             safety = SafetySignals.nominal(timestamp_ns)
         if not isinstance(safety, SafetySignals):
