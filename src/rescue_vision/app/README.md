@@ -536,6 +536,32 @@ nb_opening=phase=first_arrived_open_gripper target=(+130,+800)mm \
 区分策略没走到位，还是航位推算本身已经漂移。开场结束后两个属性都返回 `None`，不会在
 解团/运输阶段产生误导读数。
 
+## 蓝色优先策略变体
+
+`MatchStrategySequence`（`app/match_strategy.py`）是 `MatchSequence` 的**子类**，
+入口为 `python -m rescue_vision.app.match_strategy --config configs/runtime.strategy.yaml`
+（当前没有 console script）。它分两个阶段：
+
+- **策略阶段**（`_strategy_formal_phase is False`）：开场两段反向冲刺（右转短冲 →
+  左转长冲，转角与速度来自 `startup_turn_*` / `cluster_relocate_*`），随后**只搜蓝色
+  危险物块**；能直接夹取则单块转运，否则对全蓝目标团执行动态解团。两趟分别放到对面
+  安全区左右 D2 点（`safe_zone_fallback_target_field` / `safe_zone_injured_target_field`），
+  在 D2 释放而不推进到安全区深处。
+- **正式阶段**：第二趟返回结束（共享实现给出 `FINISH_STOP`）时由 `_step_return_backup`
+  拦截并调用 `_begin_formal_match_after_strategy`，恢复己方 y 方向的 D2 端点、重新打开
+  首轮单绿机会、复位旋转预算与解团失败记忆，然后进入正式绿块搜索。
+
+继承与委托的边界：正式阶段通过 `_SharedMatchSequence.<method>(self, ...)` 显式委托回基类，
+策略阶段使用本地实现；`__init__` / `start` 只 `super()` 委托后追加 `_strategy_*` 字段，
+不再复制基类字段清单。策略阶段 `near_field_enabled` 返回 `False` 并临时把
+`_near_field_pickup` 置空（真身存在 `_strategy_saved_near_field_pickup`），蓝色近场计划
+由 `_strategy_blue_grasp_preparation` 在控制线程内直接生成；翻转时恢复。
+
+`_step_align_green` 是唯一按相位显式分派的对准入口：共享实现在 `_near_field_pickup`
+不为 `None` 时会改走 `_step_formal_green_align`，而蓝色运输恰好会重新暴露该序列，
+因此变体在 `_strategy_blue_transport` 期间固定走 `_align_green_legacy`（真机验证过的
+历史对准路径），其余阶段才走共享实现。
+
 ## 可复用但未接入的模块
 
 `scan_target_memory.py` 保存带场地点和老化时间的可靠目标，可在未来正式流程明确采集

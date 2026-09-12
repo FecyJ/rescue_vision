@@ -543,6 +543,41 @@ rescue-vision-match-nb --config configs/runtime.match_nb.yaml \
 5. 人为制造航向不可信（例如临时把 `motion.odometry.gyro_z_sign` 取反）后运行，确认连续
    未对准超过 `nb_opening_align_timeout_s` 时打印
    `nb_opening_align_timeout_stop` 并进入 `terminal_stop`，而不是持续旋转。
+
+## 蓝色优先策略变体验收（未验证）
+
+只搜蓝色危险物块、两趟投放后翻转入正式流程的变体。流程、继承边界和诊断以
+[app README](../src/rescue_vision/app/README.md)、[正式流程设计](../docs/正式流程设计.md)
+为权威，这里只列真机核对项。先在物理急停与全程监督下运行：
+
+```bash
+python -m rescue_vision.app.match_strategy --config configs/runtime.strategy.yaml \
+  --supervised-physical-stop-ready --log-dir logs
+```
+
+**这是 2026-09-12 同步 2047 语义后的首次复跑，策略阶段的解团后退行程、旋转预算、
+安全区排除与确认时序都已改变，不能沿用旧运行结论。**
+
+逐项确认：
+
+1. 开场两段冲刺方向相反（先右后左）、各自转够 `startup_turn_angle_rad`；第二段冲刺
+   距离按 `cluster_relocate_distance_m`。两段都结束后才进入搜索，中途不得提前搜索。
+2. 策略阶段只选蓝色危险物块。场上同时有绿/黑/橙时，车辆不得改抓这些类别；蓝色前进
+   走廊被别的目标占住时应继续搜索，而不是把候选换成非蓝色。
+3. 单个蓝块直取：确认 `transport_align_green` 阶段的对准行为与 2026-09-11 运行一致
+   （变体在蓝色运输期间固定走历史对准路径 `_align_green_legacy`，不走
+   `_step_formal_green_align`）。若对准表现出有界转角预算、路径阻挡改走重选等新行为，
+   说明相位分派失效。
+4. 全蓝目标团解团：核对实际后退距离以“退出实际穿入深度”为准，不再整段抵消接近空程；
+   记录每次解团的穿入深度、后退距离与实际位移，确认没有退得过远。
+5. 两趟分别在对面安全区左、右 D2 点释放（`safe_zone_fallback_target_field` 为 x<0，
+   `safe_zone_injured_target_field` 为 x>0），终点不再向安全区深处二次推进。
+6. **阶段翻转**：第二趟返回结束时打印
+   `strategy_blue_tasks_complete_start_match_green_search`。`logs/strategy/` 的五次
+   2026-09-11 运行从未到达这一步，因此翻转后的正式绿块流程（含首轮单绿机会、旋转预算
+   与解团失败记忆复位）在真机上完全未验证，必须单独作为一次完整验收对待。
+7. 中途人为制造蓝色走廊阻挡与解团失败，确认失败记忆不会因原地转向或新会话被解除，
+   且在有界时间内换目标或换位。
 6. 把 `nb_opening_align_angular_velocity_rad_s` 调到接近
    `2*motion.min_wheel_velocity_m_s/wheel_track_m` 时，确认单轮最低速度抬升导致的
    旋转加速仍在可接受范围。

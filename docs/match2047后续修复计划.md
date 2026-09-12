@@ -27,7 +27,33 @@
 - 文档同步已按当前实现修正中；最终 compileall 和全量 pytest 需以本轮最后一次执行结果更新，
   未执行前不写成已通过。
 
-**仍未完成：**第 7 步解团链路的真机复核、最终全量自动验证和全部真机验收结论。
+### 0.1 蓝色优先策略变体同步（2026-09-12）
+
+`app/match_strategy.py` 是 `app/match.py` 的子类，此前带着 39 处陈旧本地覆盖，没有跟上
+本轮 2047 修复。本轮把它同步到与正式流程同一套语义：
+
+- 删除死代码：19 个方法的失效早副本、6 个死类体、7 个不可达方法（含策略独有的
+  `_single_green_side_neighbor_requires_breakup` / `_transport_adjacent_supply_target`）、
+  与 `match.py` 逐字节相同的 `configure_match_start_area`。
+- `__init__` / `start` 改为 `super()` 委托后只追加 `_strategy_*` 字段；此前变体缺了基类
+  2047 新增的 20 个状态，一旦改为继承就会在这些字段上抛 `AttributeError`。
+- 删除 32 个纯陈旧覆盖改为继承：位姿历史、旋转预算、按瞄准点的失败记忆、解团后退行程、
+  安全区排除、无计划独立计时、绿色可用性里的颜色噪声门禁。
+- 蓝色解团分支改用 `_aim_in_failed_aims` + `_breakup_attempt_is_current`，并补上
+  `non_contact_ids` / `priority_ids` / `rejection_reasons`；删除旧的 `_breakup_failed_regions`。
+- 阶段翻转补 `_reset_rotation_budget()` 与 `_green_target_field_point` 清空。
+- `match.py` 把 `_step_align_green` 的历史路径抽成 `_align_green_legacy`；变体的蓝色运输
+  会重新暴露 `_near_field_pickup`，不按相位区分就会把真机验证过的对准路径换成
+  `_step_formal_green_align`，因此变体在 `_strategy_blue_transport` 期间固定走历史路径。
+- 修掉两处由删除引入的缺陷：`_step_strategy_search_cluster` 仍按旧的单参数签名调用
+  `_advance_cluster_search_sweep`（继承后参数不符会抛 `TypeError`）；蓝色解团分支残留对
+  已删 `_breakup_failed_regions` 的读写。
+- 新增 `tests/test_match_strategy.py`（19 例），覆盖两阶段边界与继承契约，并对上述两处
+  缺陷做过变异验证。`match_strategy.py` 9014 → 5716 行。
+
+**仍未完成：**第 7 步解团链路的真机复核、全部真机验收结论。策略变体的同步只做了
+无硬件验证：策略阶段解团行程、蓝色单块/全蓝团抓取、两趟 D2 投放、翻转后的正式绿块流程
+均未真机复跑，其中翻转后的正式阶段在 `logs/strategy/` 五次历史运行里从未到达过。
 橙色 142 mm 终点仍是待真机校准值；误揽蓝块是否消除未验证。以上已登记到
 `docs/后续优先级.md`。
 
@@ -118,9 +144,18 @@
 结果：**当前轮最小相关集合的通过数将在最后一次验证后记录**（含本轮新增测试）。
 旧的阶段性测试记录不再作为当前状态。
 
+全量验证（2026-09-12，策略变体同步后最后一次执行）：
+
+```bash
+.venv/bin/python -m compileall -q src tests manual_tests   # 通过
+.venv/bin/python -m pytest                                 # 1211 passed
+```
+
+其中 `tests/test_match_strategy.py` 为新增的 19 例。全量通过只覆盖无硬件逻辑，
+不代表真车行为；策略阶段与翻转后的正式阶段仍未真机复跑（见 §0.1）。
+
 测试迁移注意：任务类别当前为四类；颜色证据不足使用 `candidate_class=None`，不是任务 `unknown`。
-蓝块实体进入实际扫掠的回归、危险/旧帧/遥测失效拒绝和带载排除必须保留。最终
-`compileall` 和全量 pytest 尚未执行。
+蓝块实体进入实际扫掠的回归、危险/旧帧/遥测失效拒绝和带载排除必须保留。
 
 ## 5. 下一步执行顺序
 

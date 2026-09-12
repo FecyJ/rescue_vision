@@ -242,6 +242,7 @@ GroundPoint ── 中心十字绝对观测 + 编码器/IMU 连续融合 ──>
 | `rescue-vision-match` | 正式流程入口；支持 `--start-area 2/3`、本地图像预览、observe-only perception JPEG、D2 遥测和按时间命名的流程日志 |
 | `rescue-vision-match-cc` | CC 独立流程入口；使用 `configs/runtime.cc.yaml`，执行稳健解团、单块分级搜索和正式安全区运输 |
 | `rescue-vision-match-nb` | 无解团变体入口；使用 `configs/runtime.match_nb.yaml`，把开场固定启动转向+直行替换为 `match.nb_opening_*` 配置的绝对坐标直线航点（前进→张爪→前进→倒车），每段先原地对准航向再平移、到位后零速停稳，其余复用正式流程 |
+| `python -m rescue_vision.app.match_strategy` | 蓝色优先策略变体入口（尚无 console script）；使用 `configs/runtime.strategy.yaml`，启动两段冲刺后只搜蓝色危险物块，能直接夹取则单块转运、否则对全蓝团解团，两趟分别放到对面安全区左右 D2 点，随后翻转进正式流程复用绿块搜索 |
 | `rescue-vision-grab-transport` | 末端张爪推送—运输联调入口；从场地 `(0,0,+90°)` 直接搜索绿色物资，按正式流程夹取运输，末端保持张开推入并退出，不执行解团 |
 | `rescue-vision-split` | 按 `recording_id` 整组划分 |
 | `rescue-vision-evaluate` | 生成离线评测报告 |
