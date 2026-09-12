@@ -183,7 +183,6 @@ def _blend_probabilities(
         black_core=values[TargetClass.BLACK_CORE],
         orange_injured=values[TargetClass.ORANGE_INJURED],
         blue_danger=values[TargetClass.BLUE_DANGER],
-        unknown=values[TargetClass.UNKNOWN],
     )
 
 
@@ -480,9 +479,7 @@ class MultiTargetTracker:
         observation: TargetObservation,
     ) -> float | None:
         class_mismatch = (
-            track.target_class is not TargetClass.UNKNOWN
-            and observation.target_class is not TargetClass.UNKNOWN
-            and track.target_class is not observation.target_class
+            track.target_class is not observation.target_class
         )
         if (
             class_mismatch

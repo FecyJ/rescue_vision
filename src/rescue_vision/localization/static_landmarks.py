@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from enum import Enum
 from itertools import combinations
 import math
 
@@ -444,6 +445,49 @@ class SafeZoneCornerPoseObservation:
         return f"{self.physical_color.value}_safe_zone_corners"
 
 
+class SafeZoneCornerRejectionReason(str, Enum):
+    """安全区角点定位被拒的原因；用于区分观测年龄门与三点几何门。"""
+
+    OBSERVATION_STALE = "observation_stale"
+    NO_PRIOR_POSE = "no_prior_pose"
+    ENTRANCE_CORNERS_MISSING = "entrance_corners_missing"
+    BASELINE_TOO_SHORT = "baseline_too_short"
+    LANDMARKS_UNUSABLE = "landmarks_unusable"
+    INSUFFICIENT_CORRESPONDENCES = "insufficient_correspondences"
+    GROUND_ANCHOR_MISSING = "ground_anchor_missing"
+    K0_CORNER_DISTANCE_MISMATCH = "k0_corner_distance_mismatch"
+    HEADING_UNDEFINED = "heading_undefined"
+    FIT_RESIDUAL_TOO_LARGE = "fit_residual_too_large"
+    NO_POSE_CANDIDATE = "no_pose_candidate"
+    AMBIGUOUS_POSE_CANDIDATE = "ambiguous_pose_candidate"
+
+
+@dataclass(frozen=True, slots=True)
+class SafeZoneCornerLocalization:
+    """一次安全区角点定位的结果；观测与拒绝原因恰有其一。"""
+
+    observation: SafeZoneCornerPoseObservation | None = None
+    rejection: SafeZoneCornerRejectionReason | None = None
+
+    def __post_init__(self) -> None:
+        if (self.observation is None) == (self.rejection is None):
+            raise ValueError("exactly one of observation and rejection must be set.")
+        if self.observation is not None and not isinstance(
+            self.observation, SafeZoneCornerPoseObservation
+        ):
+            raise TypeError(
+                "observation must be a SafeZoneCornerPoseObservation."
+            )
+        if self.rejection is not None and not isinstance(
+            self.rejection, SafeZoneCornerRejectionReason
+        ):
+            raise TypeError("rejection must be a SafeZoneCornerRejectionReason.")
+
+
+def _rejected(reason: SafeZoneCornerRejectionReason) -> SafeZoneCornerLocalization:
+    return SafeZoneCornerLocalization(rejection=reason)
+
+
 def _point_distance(
     first: GroundPoint | FieldPoint,
     second: GroundPoint | FieldPoint,
@@ -497,7 +541,9 @@ class SafeZoneCornerLocalizer:
         *,
         prior_pose: FieldPose2D | None = None,
         current_timestamp_ns: int | None = None,
-    ) -> SafeZoneCornerPoseObservation | None:
+    ) -> SafeZoneCornerLocalization:
+        """返回观测或拒绝原因；两者恰有其一，调用方必须区分。"""
+
         now = result.result_timestamp_ns if current_timestamp_ns is None else current_timestamp_ns
         if now < result.result_timestamp_ns:
             raise ValueError("current_timestamp_ns must not precede result timestamp.")
@@ -505,15 +551,19 @@ class SafeZoneCornerLocalizer:
             now - result.capture_timestamp_ns
             > round(self.config.max_observation_age_ms * 1_000_000)
         ):
-            return None
+            return _rejected(SafeZoneCornerRejectionReason.OBSERVATION_STALE)
         if prior_pose is None:
             # K1/K2 是图像左右语义；对称近场线在无先验时至少保留 180° 歧义。
-            return None
+            return _rejected(SafeZoneCornerRejectionReason.NO_PRIOR_POSE)
         candidates: list[SafeZoneCornerPoseObservation] = []
+        first_rejection: SafeZoneCornerRejectionReason | None = None
         for zone in result.safe_zones:
             left = zone.image_left_landmark
             right = zone.image_right_landmark
             if left.ground is None and right.ground is None:
+                first_rejection = first_rejection or (
+                    SafeZoneCornerRejectionReason.ENTRANCE_CORNERS_MISSING
+                )
                 continue
             if (
                 left.ground is not None
@@ -521,6 +571,9 @@ class SafeZoneCornerLocalizer:
                 and _point_distance(left.ground, right.ground)
                 < self.config.min_baseline_mm
             ):
+                first_rejection = first_rejection or (
+                    SafeZoneCornerRejectionReason.BASELINE_TOO_SHORT
+                )
                 continue
             colors = (
                 (zone.physical_color,)
@@ -531,6 +584,9 @@ class SafeZoneCornerLocalizer:
                 team_color = TeamColor.RED if color is SafeZoneColor.RED else TeamColor.BLUE
                 landmarks = self._static_map.safe_zone_landmarks_for(team_color)
                 if landmarks is None or not landmarks.measured or not landmarks.usable:
+                    first_rejection = first_rejection or (
+                        SafeZoneCornerRejectionReason.LANDMARKS_UNUSABLE
+                    )
                     continue
                 for swap in (False, True):
                     world_left, world_right = (
@@ -582,6 +638,9 @@ class SafeZoneCornerLocalizer:
                         if ground_point is not None
                     )
                     if len(correspondences) < 2:
+                        first_rejection = first_rejection or (
+                            SafeZoneCornerRejectionReason.INSUFFICIENT_CORRESPONDENCES
+                        )
                         continue
 
                     anchor_entry = next(
@@ -596,6 +655,9 @@ class SafeZoneCornerLocalizer:
                         # Position correction must include K0. K1/K2 alone
                         # may define a line, but cannot pass the requested
                         # K0-to-corner metric consistency check.
+                        first_rejection = first_rejection or (
+                            SafeZoneCornerRejectionReason.GROUND_ANCHOR_MISSING
+                        )
                         continue
                     anchor_ground, anchor_field, _anchor_role, _anchor_confidence = (
                         anchor_entry
@@ -614,6 +676,9 @@ class SafeZoneCornerLocalizer:
                                 (ground_point, field_point, role, _confidence)
                             )
                     if not matching_corners:
+                        first_rejection = first_rejection or (
+                            SafeZoneCornerRejectionReason.K0_CORNER_DISTANCE_MISMATCH
+                        )
                         continue
                     selected_correspondences = (
                         correspondences
@@ -642,6 +707,9 @@ class SafeZoneCornerLocalizer:
                     ]
                     heading = _mean_angles(line_angles)
                     if heading is None:
+                        first_rejection = first_rejection or (
+                            SafeZoneCornerRejectionReason.HEADING_UNDEFINED
+                        )
                         continue
                     cosine = math.cos(heading)
                     sine = math.sin(heading)
@@ -700,6 +768,9 @@ class SafeZoneCornerLocalizer:
                     point_errors = np.linalg.norm(predicted - expected, axis=1)
                     residual = float(np.sqrt(np.mean(point_errors**2)))
                     if residual > self.config.max_fit_residual_mm:
+                        first_rejection = first_rejection or (
+                            SafeZoneCornerRejectionReason.FIT_RESIDUAL_TOO_LARGE
+                        )
                         continue
                     used_roles = tuple(
                         role for _ground_point, _field_point, role, _confidence
@@ -746,12 +817,19 @@ class SafeZoneCornerLocalizer:
             key=lambda pair: pair[0],
         )
         if not ranked:
-            return None
+            # 循环内首个命中的原因比重采均值本身更能指示现场问题；没有任何
+            # 候选时才回落到聚合原因。
+            return _rejected(
+                first_rejection
+                or SafeZoneCornerRejectionReason.NO_POSE_CANDIDATE
+            )
         if len(ranked) > 1 and math.isclose(
             ranked[0][0], ranked[1][0], rel_tol=0.0, abs_tol=1e-6
         ):
-            return None
-        return ranked[0][1]
+            return _rejected(
+                SafeZoneCornerRejectionReason.AMBIGUOUS_POSE_CANDIDATE
+            )
+        return SafeZoneCornerLocalization(observation=ranked[0][1])
 
 
 def _innovation(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from test_target_ground_geometry import config as physical_geometry_config
+
 from dataclasses import replace
 import math
 
@@ -29,7 +31,6 @@ GREEN = TargetClass.GREEN_SUPPLY
 BLACK = TargetClass.BLACK_CORE
 BLUE = TargetClass.BLUE_DANGER
 ORANGE = TargetClass.ORANGE_INJURED
-UNKNOWN = TargetClass.UNKNOWN
 
 
 def projector():
@@ -39,7 +40,7 @@ def projector():
 def target(i=1, x=300., y=0., cls=GREEN, width=40., depth=40., timestamp=0, frame=0):
     u, v = 500 - y, 800 - x
     box = UndistortedBoundingBox(math.floor(u-width/2), math.floor(v-depth/2), math.ceil(u+width/2), math.ceil(v+depth/2))
-    accepted = cls is not UNKNOWN
+    accepted = True
     segmentation = RoiColorSegmentation(cls, ColorSegmentationStatus.ACCEPTED if accepted else ColorSegmentationStatus.INSUFFICIENT,
         box, np.full((int(box.y_max-box.y_min), int(box.x_max-box.x_min)), 255 if accepted else 0, np.uint8), .9 if accepted else 0, 1. if accepted else 0)
     obs = TargetObservation(frame, timestamp, timestamp, (1000, 1000), cls, cls,
@@ -51,7 +52,7 @@ def target(i=1, x=300., y=0., cls=GREEN, width=40., depth=40., timestamp=0, fram
 
 def selector(**changes):
     return NearFieldGraspSelector(replace(NearFieldGraspConfig(), **changes), projector(), GripperKinematics(),
-        open_servo_angles_deg=(0,180),closed_servo_angles_deg=(90,90))
+        open_servo_angles_deg=(0,180),closed_servo_angles_deg=(90,90), target_geometry=physical_geometry_config())
 
 
 def test_envelope_measurement_does_not_require_center_alignment():
@@ -74,7 +75,8 @@ def test_candidate_geometry_log_contains_horizontal_gate_values():
     assert diagnostic.opening_width_mm == pytest.approx(44.0)
     assert diagnostic.target_final_x_mm == pytest.approx(110.0)
     assert diagnostic.corridor_start_x_mm == pytest.approx(60.0)
-    assert diagnostic.corridor_end_x_mm == pytest.approx(250.0)
+    # 诊断前端与实际扫掠走廊共用公式：夹爪末端前伸 110.15 mm 加行程 190 mm。
+    assert diagnostic.corridor_end_x_mm == pytest.approx(360.15, abs=0.01)
     assert diagnostic.corridor_half_width_mm == pytest.approx(32.0)
     assert diagnostic.forward_distance_mm == pytest.approx(190.0)
     assert "x0_mm=280.00" in line
@@ -84,7 +86,7 @@ def test_candidate_geometry_log_contains_horizontal_gate_values():
     assert "opening_mm=44.00" in line
     assert "target_final_x_mm=110.00" in line
     assert "corridor_start_x_mm=60.00" in line
-    assert "corridor_end_x_mm=250.00" in line
+    assert "corridor_end_x_mm=360.15" in line
     assert "corridor_half_width_mm=32.00" in line
     assert "forward_distance_mm=190.00" in line
 
@@ -101,7 +103,7 @@ def test_selects_supply_combinations_and_span_includes_gaps(classes):
     assert plan.forward_distance_mm == pytest.approx(300-110.0)
 
 
-@pytest.mark.parametrize('cls',[BLUE,UNKNOWN])
+@pytest.mark.parametrize('cls',[BLUE])
 def test_forbidden_between_members_is_never_collected(cls):
     result = selector().select((target(1,y=-60),target(2,y=60,cls=BLACK),target(3,x=200,cls=cls)))
     assert result.plan is None or 3 not in result.plan.member_ids
@@ -115,10 +117,49 @@ def test_orange_target_is_allowed_as_a_single_member_with_its_distance_formula()
 
     assert plan is not None
     assert plan.member_ids == (1,)
-    # x0=280, x1=320, d=40: d + x0 - 210 = 110 mm.
-    assert plan.forward_distance_mm == pytest.approx(110.0)
-    assert grasp_selector.candidate_geometry(orange).target_final_x_mm == pytest.approx(
-        210.0
+    # K0 bottom centre determines travel; top-mask depth cannot extend it.
+    assert plan.forward_distance_mm == pytest.approx(158.0)
+    diagnostic = grasp_selector.candidate_geometry(orange)
+    assert diagnostic.target_final_x_mm == pytest.approx(142.0)
+    assert plan.forward_distance_mm == pytest.approx(300.0 - 142.0)
+
+
+@pytest.mark.parametrize(
+    "cls,depth,width",
+    [(GREEN, 40.0, 40.0), (ORANGE, 60.0, 30.0), (ORANGE, 90.0, 80.0), (BLACK, 120.0, 20.0)],
+)
+def test_corridor_end_diagnostic_matches_the_executed_sweep(cls, depth, width):
+    """诊断走廊前端必须等于实际扫掠矩形前端，不能另算一套更短的行程。"""
+
+    grasp_selector = selector()
+    item = target(cls=cls, x=300.0, depth=depth, width=width)
+    plan = grasp_selector.select((item,)).plan
+    assert plan is not None
+    # 对称目标不需要转向，走廊未旋转，可直接比较前向坐标。
+    assert plan.alignment_angle_rad == pytest.approx(0.0)
+    diagnostic = grasp_selector.candidate_geometry(item)
+    sweep_front = max(point.x for point in plan.regions[0])
+    assert sweep_front == pytest.approx(diagnostic.corridor_end_x_mm, abs=1e-9)
+    # 前端必须包含夹爪末端前伸，不能退化成 corridor_start_x_mm 加行程。
+    assert diagnostic.corridor_end_x_mm > 60.0 + diagnostic.forward_distance_mm
+
+
+@pytest.mark.parametrize("depth", [30.0, 60.0, 120.0])
+def test_orange_travel_follows_k0_not_the_top_projection_depth(depth):
+    """橙色前进终点由可靠底面 K0 决定，上表面投影拉长不增加行程。"""
+
+    grasp_selector = selector()
+    orange = target(cls=ORANGE, x=300.0, depth=depth)
+    plan = grasp_selector.select((orange,)).plan
+    assert plan is not None
+    diagnostic = grasp_selector.candidate_geometry(orange)
+
+    assert diagnostic.depth_mm == pytest.approx(depth)
+    assert plan.forward_distance_mm == pytest.approx(158.0)
+    assert diagnostic.forward_distance_mm == pytest.approx(158.0)
+    # 扫掠前端随开口几何变化，但不随投影深度增长。
+    assert diagnostic.corridor_end_x_mm == pytest.approx(
+        max(point.x for point in plan.regions[0])
     )
 
 
@@ -195,21 +236,37 @@ def test_blue_outside_forward_corridor_does_not_block():
     assert result.plan is not None
 
 
-def test_side_adjacent_blue_blocks_single_green_even_outside_forward_corridor():
+def test_blue_adjacent_but_outside_physical_sweep_allows_single_green():
     policy = NearFieldGraspPolicy(frozenset((GREEN,)), 1)
-    result = selector().select(
-        (
-            target(1, x=300.0, y=0.0),
-            target(2, x=300.0, y=70.0, cls=BLUE),
-        ),
+    safe = selector().select((target(), target(2, x=300, y=70, cls=BLUE)), policy=policy)
+    assert safe.plan is not None and safe.plan.member_ids == (1,)
+    blocked = selector().select((target(), target(2, x=300, y=45, cls=BLUE)), policy=policy)
+    assert blocked.plan is None
+    assert 'blocked_target:2:blue_danger' in blocked.rejections
+
+
+def test_blue_uses_inscribed_radius_for_sweep_blocking():
+    """蓝块只有实体（内切圆）进入实际扫掠走廊才算阻挡。
+
+    蓝块 40 mm 盒体的内切半径 20 mm、外接半径 28.3 mm；中心横向 56 mm 处
+    在走廊外 24 mm，内切圆仍未进入走廊，因此不再当作阻挡（旧的外接半径
+    会在 60.3 mm 内一律拒绝）。蓝块实体仍参与扫掠检查。
+    """
+
+    policy = NearFieldGraspPolicy(frozenset((GREEN,)), 1)
+    allowed = selector().select(
+        (target(), target(2, x=300, y=56, cls=BLUE)),
         policy=policy,
     )
+    assert allowed.plan is not None
+    assert allowed.plan.member_ids == (1,)
 
-    assert result.plan is None
-    assert any(
-        reason.startswith("side_adjacent_incompatible_single_green:")
-        for reason in result.rejections
+    inside = selector().select(
+        (target(), target(2, x=300, y=50, cls=BLUE)),
+        policy=policy,
     )
+    assert inside.plan is None
+    assert 'blocked_target:2:blue_danger' in inside.rejections
 
 
 def test_side_adjacent_orange_does_not_block_single_green():
@@ -267,7 +324,7 @@ def test_blue_keypoint_inside_forward_corridor_blocks():
     assert any('blocked_target:2' in r for r in result.rejections)
 
 
-def test_first_single_green_only_plans_the_nearest_green():
+def test_first_single_green_uses_another_safe_green_when_corridor_is_blocked():
     policy = NearFieldGraspPolicy(frozenset((GREEN,)), 1)
     nearest = target(1, x=300.0, y=0.0)
     farther = target(2, x=350.0, y=200.0)
@@ -278,10 +335,11 @@ def test_first_single_green_only_plans_the_nearest_green():
         policy=policy,
     )
 
-    # The farther green is geometrically a possible fallback around the
-    # blocker, but first transport must not promote it when the nearest
-    # green's forward corridor is unsafe.
-    assert result.plan is None
+    # docs/正式流程设计.md: 首轮候选的前进走廊被蓝色/橙色/黑色/未知目标阻挡时
+    # 先尝试其它安全绿色候选，只有没有合法抓取方案时才进入局部解团。因此被
+    # 阻挡的最近绿色淘汰、更远的合法绿色接管，同时仍只规划一个绿色。
+    assert result.plan is not None
+    assert result.plan.member_ids == (2,)
     assert any("blocked_target:3:blue_danger" in reason for reason in result.rejections)
 
 
@@ -299,7 +357,7 @@ def test_first_single_green_continues_the_aligned_handoff_target():
     assert result.plan.member_ids == (2,)
 
 
-def test_first_single_green_does_not_fall_back_while_handoff_is_outside_near_field():
+def test_first_single_green_falls_back_when_handoff_target_is_outside_near_field():
     policy = NearFieldGraspPolicy(frozenset((GREEN,)), 1)
     closer = target(1, x=180.0, y=-120.0)
     aligned = replace(
@@ -307,14 +365,31 @@ def test_first_single_green_does_not_fall_back_while_handoff_is_outside_near_fie
         handoff_matched=True,
     )
 
-    result = selector(max_range_mm=450.0).select(
-        (closer, aligned),
-        policy=policy,
-        require_handoff_match=True,
-    )
+    result = selector(max_range_mm=450.0).select((closer, aligned), policy=policy)
 
-    assert result.plan is None
+    # 交接目标越过近场半径时只是排序偏好失效，不能让近场对空计划空转。
+    assert result.plan is not None
+    assert result.plan.member_ids == (1,)
     assert "outside_near_field" in result.rejections
+
+
+def test_first_single_green_falls_back_when_handoff_target_has_no_envelope():
+    """复现真机 20260911_1408 日志：交接目标退化为 unknown/无地面包络。"""
+
+    policy = NearFieldGraspPolicy(frozenset((GREEN,)), 1)
+    # 远场交接的绿色已失去颜色包络（现场为 class=unknown, xy=unknown），
+    # 单帧无法重新生成计划；近场必须改选同帧合法绿色而不是等满预算。
+    aligned = replace(
+        target(2, x=300.0, y=0.0),
+        envelope=None,
+        handoff_matched=True,
+    )
+    other = target(5, x=260.0, y=110.0)
+
+    result = selector().select((aligned, other), policy=policy)
+
+    assert result.plan is not None
+    assert result.plan.member_ids == (5,)
 
 
 def test_multi_target_planning_prefers_a_group_containing_handoff_target():
@@ -373,8 +448,8 @@ def test_handoff_prior_matches_only_the_nearest_local_target_and_keeps_its_id():
     assert [item.track_id for item in current if item.handoff_matched] == [1]
 
     ambiguous = replace(
-        target(1, x=312.0, y=0.0, cls=UNKNOWN, timestamp=1, frame=1).observation,
-        model_target_class=UNKNOWN,
+        target(1, x=312.0, y=0.0, cls=GREEN, timestamp=1, frame=1).observation,
+        model_target_class=GREEN,
     )
     current = tracker.update(
         1,
@@ -390,8 +465,8 @@ def test_off_axis_group_aligns_before_fresh_corridor_validation():
         target(2, x=350, y=-90),
         target(3, x=180, y=-100, cls=BLUE, width=10, depth=10),
     ))
-    assert unaligned.plan is not None
-    assert unaligned.plan.member_ids == (2,)
+    assert unaligned.plan is None
+    assert 'blocked_target:3:blue_danger' in unaligned.rejections
 
     aligned = s.select((
         target(1, x=330, y=-30, frame=1, timestamp=1),
@@ -415,7 +490,7 @@ def test_alignment_tolerance_includes_its_boundary():
 
 def test_danger_long_mask_outside_corridor_does_not_replace_its_k0():
     # 颜色掩码的纵向投影可以很长，但走廊门禁只看危险目标的 K0。
-    result = selector().select((target(), target(2, x=300, cls=BLUE, width=10, depth=220)))
+    result = selector().select((target(), target(2, x=430, cls=BLUE, width=10, depth=400)))
     assert result.plan is not None
     assert result.plan.member_ids == (1,)
 
@@ -430,7 +505,11 @@ def test_plan_region_is_the_opening_corridor_only():
         min(point.y for point in plan.regions[0]),
         max(point.y for point in plan.regions[0]),
     )
-    assert (x0, x1) == pytest.approx((60.0, 250.0))
+    assert x0 == 60.0
+    left_servo, right_servo = plan.opening_servo_angles_deg
+    fingertips_x = max(GripperKinematics().left_tip_position(90-left_servo).x,
+                       GripperKinematics().right_tip_position(right_servo-90).x)
+    assert x1 == pytest.approx(fingertips_x + plan.forward_distance_mm)
     assert (y0, y1) == pytest.approx((-32.0, 32.0))
 
 
@@ -444,7 +523,18 @@ def test_maximum_opening_exact_boundary_and_excess():
     s = selector()
     t = target(width=s.maximum_opening_mm-4)
     assert s.select((t,)).plan is not None
-    assert s.select((target(width=s.maximum_opening_mm-3.9),)).plan is None
+    # 单个物块也不能通过收窄开口去夹包络的一部分；真实最大行程是硬门禁。
+    over = s.select((target(width=s.maximum_opening_mm-3.9),)).plan
+    assert over is None
+    assert "maximum_opening_exceeded" in s.select(
+        (target(width=s.maximum_opening_mm-3.9),)
+    ).rejections
+    # 多成员组同样必须淘汰——一组的边界不能靠收窄开口代表。
+    group = s._group_geometry((
+        target(1, x=300.0, y=-30.0, width=s.maximum_opening_mm-3.9),
+        target(2, x=300.0, y=30.0, width=s.maximum_opening_mm-3.9),
+    ))
+    assert "maximum_opening_exceeded" in group.reasons
 
 
 def test_residual_center_error_uses_independent_edge_opening():
@@ -476,17 +566,20 @@ def test_forward_distance_is_set_by_farthest_k0_and_has_a_limit():
     assert 'forward_distance_exceeded' in result.rejections
 
 
-def test_current_target_without_ground_point_does_not_block_near_field_corridor():
+def test_current_danger_without_ground_point_blocks_unproven_near_field_corridor():
     blocked = target(2,x=200,cls=BLUE)
     blocked = replace(blocked, envelope=None, observation=replace(blocked.observation,k0=None,ground_point=None))
     result = selector().select((target(),blocked))
-    assert result.plan is not None
+    assert result.plan is None
+    assert "unknown_target_geometry_missing:2:blue_danger" in result.rejections
 
 
-def test_missing_geometry_far_image_region_can_be_excluded():
+def test_missing_geometry_far_image_region_cannot_be_assumed_clear():
     blocked = target(2,x=50,y=450,cls=BLUE)
     blocked = replace(blocked,envelope=None,observation=replace(blocked.observation,k0=None,ground_point=None))
-    assert selector().select((target(),blocked)).plan is not None
+    result = selector().select((target(),blocked))
+    assert result.plan is None
+    assert "unknown_target_geometry_missing:2:blue_danger" in result.rejections
 
 
 def test_danger_conflict_and_low_confidence_are_retained_as_obstacles():
@@ -528,6 +621,7 @@ def test_handoff_prior_allows_matching_tentative_target_without_changing_tracker
         grasp_config,
         projector(),
         GripperKinematics(),
+        target_geometry=physical_geometry_config(),
         open_servo_angles_deg=(0, 180),
         closed_servo_angles_deg=(90, 90),
     )
@@ -562,6 +656,7 @@ def test_handoff_prior_does_not_bypass_class_or_distance_gate():
         grasp_config,
         projector(),
         GripperKinematics(),
+        target_geometry=physical_geometry_config(),
         open_servo_angles_deg=(0, 180),
         closed_servo_angles_deg=(90, 90),
     )
@@ -583,27 +678,21 @@ def test_handoff_prior_does_not_bypass_class_or_distance_gate():
         assert grasp_selector.select(current).plan is None
 
 
-def test_transient_unknown_supply_recovers_after_stable_clean_frames():
+def test_color_quality_does_not_veto_model_supply():
     tracker = GraspTargetTracker(
         TrackingConfig(1, 80, .1, 500, 1, .1).build_tracker(),
-        projector(),
-        NearFieldGraspConfig(supply_recovery_frames=3),
+        projector(), NearFieldGraspConfig(),
     )
-    assert tracker.update(0, (target(timestamp=0, frame=0).observation,))[0].selectable
-    ambiguous = target(cls=UNKNOWN, timestamp=1, frame=1).observation
-    assert not tracker.update(1, (ambiguous,))[0].selectable
-    for timestamp in (2, 3):
-        clean = target(timestamp=timestamp, frame=timestamp).observation
-        assert not tracker.update(timestamp, (clean,))[0].selectable
-    recovered = tracker.update(4, (target(timestamp=4, frame=4).observation,))
-    assert recovered[0].selectable
+    obs = replace(target().observation,
+                  quality=frozenset((ObservationQuality.COLOR_EVIDENCE_AMBIGUOUS,)))
+    assert tracker.update(0, (obs,))[0].selectable
 
 
 def test_explicit_danger_conflict_does_not_recover_as_supply():
     tracker = GraspTargetTracker(
         TrackingConfig(1, 80, .1, 500, 1, .1).build_tracker(),
         projector(),
-        NearFieldGraspConfig(supply_recovery_frames=3),
+        NearFieldGraspConfig(),
     )
     conflict = replace(
         target(timestamp=0, frame=0).observation,
@@ -620,7 +709,7 @@ def test_new_blue_and_new_supply_abort_active_corridor():
     s=selector()
     plan=s.select((target(),)).plan
     assert plan is not None
-    for cls in (BLUE,ORANGE,UNKNOWN,GREEN):
+    for cls in (BLUE,ORANGE,GREEN):
         assert 'new_sweep_obstacle' in s.recheck(plan,(target(x=290),target(2,x=200,y=30,cls=cls)),progress_mm=10)
 
 
@@ -635,7 +724,7 @@ def test_rule_score_is_primary_and_weights_rank_equal_score_plans_deterministica
     ts=(target(1,x=300,y=-250),target(2,x=300,y=250))
     s=selector(max_range_mm=600)
     a=s.select(ts).plan; b=s.select(tuple(reversed(ts))).plan
-    assert a is not None and b is not None and a.member_ids==b.member_ids==(1,)
+    assert a is not None and b is not None and a.member_ids==b.member_ids
     # 规则总分高的方案不会被更短的低分方案覆盖。
     ts=(target(1,x=180,y=-230),target(2,x=344,y=205,cls=BLACK),target(3,x=316,y=247,cls=BLACK))
     plan=selector(max_range_mm=600).select(ts).plan
@@ -726,7 +815,7 @@ def test_each_farthest_x_anchor_gets_an_independent_corridor_endpoint():
     # 远目标的走廊被危险物挡住时，危险物之后的目标不应否决较短锚点。
     short = target(1, x=180, y=0)
     far = target(2, x=350, y=0)
-    danger = target(3, x=240, y=0, cls=BLUE, width=10, depth=10)
+    danger = target(3, x=300, y=0, cls=BLUE, width=10, depth=10)
     plan = selector(max_range_mm=500).select((short, far, danger)).plan
     assert plan is not None
     assert plan.member_ids == (1,)
@@ -792,7 +881,7 @@ def test_1930_orange_side_rear_supply_outside_full_sweep_is_not_mixed_transport(
     assert result.plan.member_ids == (12,)
 
 
-@pytest.mark.parametrize('cls', [BLUE, UNKNOWN])
+@pytest.mark.parametrize('cls', [BLUE])
 def test_orange_side_rear_exception_never_relaxes_danger_or_unknown(cls):
     s = selector(orange_isolation_radius_mm=100, corridor_lateral_margin_mm=1)
     orange = target(12,x=312.6,y=-144.5,cls=ORANGE,depth=80)

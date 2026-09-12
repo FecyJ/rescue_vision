@@ -7,6 +7,7 @@ import pytest
 
 from rescue_vision.app import gripper_width as app
 from rescue_vision.app.gripper_width_sequence import GraspPreparationSession
+from rescue_vision.config import load_runtime_config
 from rescue_vision.config.near_field_grasp import NearFieldGraspConfig
 from rescue_vision.perception import PerceptionSnapshot
 from rescue_vision.tracking import TrackingConfig
@@ -76,8 +77,12 @@ def test_runtime_finishes_holds_and_releases_resources(monkeypatch,tmp_path,once
             self.exit_requested=False; self.error=None
         def __enter__(self): return self
         def __exit__(self,*_): hardware.completed=True
-        def submit(self,snapshot,ids):
-            self.value=self.session.update(snapshot,locked_ids=ids)
+        def submit(self,snapshot,ids,*,excluded_observation_indices=frozenset()):
+            self.value=self.session.update(
+                snapshot,
+                locked_ids=ids,
+                excluded_observation_indices=excluded_observation_indices,
+            )
         def latest(self): return self.value
         def log(self,text,**_):
             hardware.logs.append(text)
@@ -90,6 +95,7 @@ def test_runtime_finishes_holds_and_releases_resources(monkeypatch,tmp_path,once
         max_wheel_velocity_m_s=.2,build_controller=lambda channel:Controller(),synchronization_timeout_s=1)
     config=NS(near_field_grasp=NearFieldGraspConfig(),hailo=NS(enabled=True),motion=motion,
         uart=NS(enabled=True,build_channel=Channel),tracking=TrackingConfig(1,80,.1,500,1,.1),
+        perception=load_runtime_config("configs/runtime.match.yaml").perception,
         processing=NS(max_observation_age_ms=500),match=NS(robot_footprint_radius_mm=160,
         green_approach_speed_m_s=.1,green_alignment_kp_rad_s=1,
         green_alignment_max_angular_velocity_rad_s=.35,

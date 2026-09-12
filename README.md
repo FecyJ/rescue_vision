@@ -60,7 +60,7 @@ python -m pytest
 | [`config`](src/rescue_vision/config/README.md) | 已实现 | 安全默认配置、静态场地、UART/远程/motion/夹爪机械标定/几何/模型和感知算法装配 |
 | [`communication`](src/rescue_vision/communication/README.md) | 已实现基础设施 | COBS UART 帧、直接 TCP 远程消息、raw/perception/BEV 图传、轻量动态地图 JSON、运动/夹爪/采集严格 schema 和有界队列；正式流程观察发布器待真车验收 |
 | [`motion`](src/rescue_vision/motion/README.md) | 已实现基础设施 | STM32 v3 固定二进制协议、序号安全同步、差速运动、持续扳机双舵机夹爪、单轮加速度限制和远程超时保护；真车联调与 IMU 标定待验收 |
-| [`app`](src/rescue_vision/app/README.md) | 已实现受限初版 | 正式流程（含近场宽度抓取）、末端张爪推送—运输联调、受监督驾驶/采集、固定解团试验、像素居中抓取试验、独立绿黑多目标/单橙色近场收拢试验、编码器+IMU航位推算和不阻塞 observe_only 图传/`map/state` 位姿发布；真车门禁与正式比赛能力待验收 |
+| [`app`](src/rescue_vision/app/README.md) | 已实现受限初版 | 正式流程（含近场宽度抓取）、无解团开场变体、末端张爪推送—运输联调、受监督驾驶/采集、固定解团试验、像素居中抓取试验、独立绿黑多目标/单橙色近场收拢试验、编码器+IMU航位推算和不阻塞 observe_only 图传/`map/state` 位姿发布；真车门禁与正式比赛能力待验收 |
 | [`data`](src/rescue_vision/data/README.md) | 已实现 | 记录检查、清单生成和按会话防泄漏划分 |
 | [`evaluation`](src/rescue_vision/evaluation/README.md) | 已实现 | 分类、地面误差、时延和失败样例报告 |
 | [`perception`](src/rescue_vision/perception/README.md) | 已实现基础设施 | v3 六类/[3,3] Hailo 解析、任务目标与场地特征同帧分流、ROI HSV、中心十字局部轴线精修、独立夹爪宽度估计和统一可视化；正式模型资产与现场性能待验证 |
@@ -72,7 +72,11 @@ python -m pytest
 
 各包常用 API、命令和实际对接示例见 [`src/rescue_vision/README.md`](src/rescue_vision/README.md)。
 
-正式入口使用相对视觉坐标、陀螺仪航向和编码器定距。每次交付直线退出后先复用安全区角点视觉纠偏，再直接扫描可夹取目标；没有绿/黑/橙信息时快速旋转，出现有效信息后降速。首轮只选择最近的单个绿色，一般阶段统一检查候选接近路径，优先近场、再按类别规则分值和距离选择入口，支持绿/黑物资组或单个橙色伤员。若首轮最近绿块的前进走廊存在蓝、橙、黑或未知目标，直接规划解团，不改选更远绿块。固定走廊外的合法目标先进入近场预览并旋转对准，找不到安全预览才继续解团。远场目标接近到 `near_field_grasp.max_range_mm` 前保持闭爪；到达近场后由近场宽度抓取模块负责选组、必要对准、按实际映射动态开爪、定距前进和闭爪。首次单绿近场只继续规划远场已经对准的绿块，不允许邻近绿块接管；一般阶段保留绿黑 1～3 个组合及单橙方案，橙色只形成单目标方案。停车后使用一个有界确认窗口：同一目标 ID 的不同有效帧按 `near_field_grasp.confirmation_frames` 计数，同帧不重复计数，确认成功后以真实编码器/IMU连续静止证据校验停车后采集的当前几何，不再因正常处理延迟超过150 ms就拒绝开爪；仍受观测失联上限、准备结果年龄和尝试总预算限制。短暂漏检不清空已取得进度；明确危险或不合法几何使确认失效，只有真实走廊阻挡才进入解团。首次交付后允许绿色/黑色 1～3 个，或单独转运 1 个橙色伤员；当前帧有可靠地面点且确实进入近场走廊的危险、未知和不确定目标才作为障碍，橙色隔离区内的普通物资只有在完整包络证明位于侧后方且扫掠外时才可放行；蓝色、未知和包络侵入仍拒绝。其它目标缺少 K0 不会被无条件推定在走廊或橙色禁区内。抓取后若已沿己方 y 方向越过 d1，则原地完成完整 bbox/K0/K1/K2 视觉纠偏，否则沿 d1/d2 路线完成校正、推进、释放和退出。普通动作继续使用 `motion.min_wheel_velocity_m_s`，绿色/近场精对准使用独立的 `match.green_alignment_min_wheel_velocity_m_s`。详见[正式流程设计](docs/正式流程设计.md)。
+正式流程的当前搜索行为以[正式流程设计](docs/正式流程设计.md)为准：首轮受阻绿色会先尝试其它安全绿色，只有没有合法抓取方案才进入动态局部解团；解团采用“真实停稳→当前帧接触核心→一次安全检查→少量连续帧确认→冻结→前推/张爪/后退”闭环，退出后再恢复搜索或近场抓取。一圈搜索预算耗尽时保留失败记忆：优先换其它合法目标，无合法目标则执行经过路径检查的有界换位。
+
+正式入口使用相对视觉坐标、陀螺仪航向和编码器定距。每次交付直线退出后先复用安全区角点视觉纠偏，再直接扫描可夹取目标；没有绿/黑/橙信息，或当前帧所有有效非蓝目标的 bbox 中心都在安全区 bbox 内时快速旋转，出现安全区 bbox 外的有效信息后降速。首轮按距离优先尝试安全单绿，一般阶段统一检查候选接近路径，优先近场、再按类别规则分值和距离选择入口，支持绿/黑物资组或单个橙色伤员。首轮最近绿块受阻时先尝试其它安全绿色；没有合法抓取方案才解团。正式解团只在真实停稳后从当前帧选择接触核心，完成一次完整危险/边界检查，并按 `match.breakup_confirmation_frames` 个不同有效帧确认后冻结计划，直接前推、张爪、后退；不依赖近场抓取准备器，也不执行接触后的第二轮参考。远场目标接近到 `near_field_grasp.max_range_mm` 后，近场先以当前朝向计算左右独立开度、机械可达性和实际扫掠；可达且路径合法时直接停车提交，只有不可达才执行一次最小必要转角和最多一次修正，不要求包络中心进入 ±5 mm。首次单绿及一般阶段绿黑/单橙的规则、危险门禁和安全区运输保持不变。详见[正式流程设计](docs/正式流程设计.md)。
+
+安全区 bbox 追踪按误差比例限速并使用中心滞回，换向先等停稳且只接受停车后的新帧；关键点短缺时进入有界静止重观测，中心仍缺点最多同向低速扫视一次，再次停车后进入标定，重复旧帧不会延长窗口或混入五点标定样本。正式 match 的局部解团使用实际 K0 接触点、一次安全检查、少量确认帧和动态前后行程，确认后直接执行，失败再恢复搜索；详情见[正式流程设计](docs/正式流程设计.md)。
 
 另有独立的末端张爪推送—运输联调入口：车辆从 `FieldPoint(0,0)`、`+90°` 出发，直接搜索固定 `TRANSPORT` 走廊内的单个绿色 K0；它不会进入解团状态，按正式流程夹取并运输，只有末端推进时保持夹爪张开推入安全区再退出：
 
@@ -122,8 +126,8 @@ OdometryImu → OdometryImuFusion → FieldPose2D
 FieldPose2D → RemoteLocalizationPublisher → observation/map/state
               （独立低频 JSON 旁路）
 
-PerceptionSnapshot + relative heading/distance ───────→ MatchSequence
-                                                       → 运动/夹爪意图 → MotionController
+PerceptionSnapshot + capture-time pose history ──────→ MatchSequence
+                                                       → 当前目标几何/动作意图 → MotionController
 
 PerceptionSnapshot + near-field session request ──────→ bounded GraspPreparationWorker
                                                        → dynamic grasp plan/angles → MatchSequence
@@ -132,9 +136,9 @@ PerceptionSnapshot + near-field session request ──────→ bounded Gr
 - 像素必须区分 `RawPixel` 与 `UndistortedPixel`；地面点使用 `GroundPoint`，单位 mm。
 - `CameraModel` 是去畸变唯一权威；`GroundProjector` 是去畸变像素与机器人地面/三维投影的唯一权威。
 - 实时路径只处理最新帧；录像、显示和日志使用有界旁路。
-- 危险目标允许 `unknown`/疑似危险，不得用总体指标掩盖危险类漏检。
+- 危险目标允许“证据不足/疑似危险”区分，不得用总体指标掩盖危险类漏检。
 - 规则状态机只消费显式世界、接触、交付和安全证据；正式流程的几何门禁和 d1 视觉纠偏仍需真实接触、地标和现场验收。
-- `scan_target_memory.py` 与 `field_target_cluster.py` 是可复用纯逻辑模块，当前不接入正式流程，也不包含采集时刻位姿对齐或记忆目标接管。
+- `scan_target_memory.py` 与 `field_target_cluster.py` 是可复用纯逻辑模块，当前不接入正式流程；正式 match 自己保留有界的采集时刻编码器/IMU 位姿历史用于延迟几何对齐，不做记忆目标接管。
 - 场地特征观测契约只输出去畸变像素和可选机器人地面观测；检测实现不得在定位
   完成前伪造 `FieldPoint` 或直接修改世界模型。传统全图 OpenCV 场地检测与局部
   场界已删除；仅允许在模型 bbox 内进行中心十字轴线精修。
@@ -234,8 +238,10 @@ GroundPoint ── 中心十字绝对观测 + 编码器/IMU 连续融合 ──>
 | `rescue-vision-green-grab` | 识别绿色物资、开夹爪像素居中接近并合爪的简化试验入口 |
 | `rescue-vision-gripper-width` | 自动选择 1～3 个绿黑物资或单个橙色目标，对准、按几何收拢并合爪保持；不掉头 |
 | `rescue-vision-motion-sequence` | TUI 输入 `a1 a2`，通过 `--distance-m` 配置距离并自动计算速度；默认前进 1.5 m |
+| `rescue-vision-teach-replay` | 记录手推过程的编码器/IMU JSONL，并立即或以后受监督回放轮轨迹 |
 | `rescue-vision-match` | 正式流程入口；支持 `--start-area 2/3`、本地图像预览、observe-only perception JPEG、D2 遥测和按时间命名的流程日志 |
 | `rescue-vision-match-cc` | CC 独立流程入口；使用 `configs/runtime.cc.yaml`，执行稳健解团、单块分级搜索和正式安全区运输 |
+| `rescue-vision-match-nb` | 无解团变体入口；使用 `configs/runtime.match_nb.yaml`，把开场固定启动转向+直行替换为 `match.nb_opening_*` 配置的绝对坐标直线航点（前进→张爪→前进→倒车），每段先原地对准航向再平移、到位后零速停稳，其余复用正式流程 |
 | `rescue-vision-grab-transport` | 末端张爪推送—运输联调入口；从场地 `(0,0,+90°)` 直接搜索绿色物资，按正式流程夹取运输，末端保持张开推入并退出，不执行解团 |
 | `rescue-vision-split` | 按 `recording_id` 整组划分 |
 | `rescue-vision-evaluate` | 生成离线评测报告 |

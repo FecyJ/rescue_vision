@@ -426,9 +426,9 @@ def test_estimator_degrades_unknown_and_bad_masks_without_guessing() -> None:
     )
     unknown = replace(
         source,
-        target_class=TargetClass.UNKNOWN,
+        target_class=TargetClass.GREEN_SUPPLY,
         class_probabilities=ClassProbabilities.from_top_class(
-            TargetClass.UNKNOWN,
+            TargetClass.GREEN_SUPPLY,
             1.0,
         ),
         color_segmentation=unknown_segmentation,
@@ -438,7 +438,7 @@ def test_estimator_degrades_unknown_and_bad_masks_without_guessing() -> None:
         result_timestamp_ns=1_050_000_000,
     )[0]
     assert unknown_result.center_ground is None
-    assert GroundGeometryQuality.UNKNOWN_CLASS in unknown_result.quality
+    assert GroundGeometryQuality.COLOR_MASK_UNAVAILABLE in unknown_result.quality
 
     bad_mask = np.zeros_like(source.color_segmentation.mask)
     bad_mask[2:5, 2:5] = 255

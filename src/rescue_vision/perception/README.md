@@ -107,10 +107,11 @@ finally:
 
 - 四类目标：只消费 K0；K1/K2 必须无效。K0 低于阈值时 `ground_point=None`，
   不使用 bbox 中心或底边兜底。
-- 目标类别默认要求 ROI HSV 颜色证据通过；但当模型检测置信度严格高于
-  `perception.unknown_override_confidence_threshold`（默认 `0.80`）时，颜色证据不足
-  或歧义会回退到模型类别，不输出 `unknown`，并将类别概率设为该模型类别 `1.0`。
-  原颜色质量和 `HIGH_CONFIDENCE_COLOR_OVERRIDE` 标记仍保留，供下游安全策略与诊断使用。
+- 模型类别是任务类别的唯一权威：`target_class` 始终等于 `model_target_class`，
+  类别分布是该类的四类 one-hot，检测置信度独立保存。ROI HSV 只按模型类别提取几何掩码，
+  不覆盖类别，也不产生 `unknown` 任务类别。颜色证据不足时
+  `color_segmentation.candidate_class=None` 并带 `COLOR_EVIDENCE_INSUFFICIENT` 质量位，
+  供下游诊断和几何可用性判断使用。
 - 中心十字：K0 投影到机器人地面系；模型 bbox 内可用 Canny/Hough/直线拟合
   精修两条轴。精修失败保留单点和显式质量，不伪造航向。当前目标与场地
   关键点的机器人地面前向坐标统一应用实测 `+225 mm` 修正，像素坐标不变。

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from test_target_ground_geometry import config as physical_geometry_config
+
 from dataclasses import replace
+import math
 
 import pytest
 
@@ -88,18 +91,21 @@ def test_aligns_group_and_locks_identity(y,sign):
     seq=sequence(); plan=selector().select((target(y=y),)).plan
     decision=seq.step(0,replace(prep(plan,ready=False),checked_member_ids=None),cumulative_distance_m=0)
     assert decision.state is State.ALIGNING and decision.angular_velocity_rad_s*sign>0
+    # A nonzero mechanical turn keeps the configured motion floor so the
+    # IMU-bounded action can make measurable progress.
     assert decision.min_wheel_velocity_m_s == pytest.approx(.01)
     assert seq.locked_ids==(1,)
     # 单帧丢失，仍在已检查旋转时域内，低速继续；不是立即停车。
     missing=GraspPreparation(100,GraspSelection(None,('locked_members_missing',)),(),checked_member_ids=(1,))
     coast=seq.step(100,missing,cumulative_distance_m=0)
     assert coast.state is State.ALIGNING and coast.angular_velocity_rad_s*sign>0
-    expired=seq.step(500_000_001,None,cumulative_distance_m=0)
+    # 对准续转窗口内不因缺帧刹车，避免「转一帧、刹一帧」；超出窗口才停。
+    expired=seq.step(seq.alignment_continue_ns+1,None,cumulative_distance_m=0)
     assert expired.state is State.ALIGNING and expired.soft_brake
     assert expired.reason == 'waiting_locked_target_observation'
 
 
-def test_alignment_direction_does_not_reverse_after_target_crosses_zero() -> None:
+def test_delayed_opposite_angle_does_not_reverse_unfinished_turn() -> None:
     seq = sequence()
     positive = selector().select((target(y=100),)).plan
     negative = selector().select((target(y=-100, timestamp=100, frame=1),)).plan
@@ -113,11 +119,12 @@ def test_alignment_direction_does_not_reverse_after_target_crosses_zero() -> Non
     assert first.state is State.ALIGNING
     assert first.angular_velocity_rad_s > 0
 
+    # 过零后立即反向继续转：不停车、不等新的静止帧，否则一次对准会被
+    # 拆成「转一下、停一下、等一帧」的极限环。
     crossed = seq.step(100, prep(negative, 100, ready=False), cumulative_distance_m=0)
-    assert crossed.state is State.VERIFYING
-    assert crossed.reason == "alignment_crossed_zero_verify"
-    assert crossed.angular_velocity_rad_s == 0
-    assert crossed.soft_brake
+    assert crossed.state is State.ALIGNING
+    assert crossed.angular_velocity_rad_s > 0
+    assert not crossed.soft_brake
 
 
 def test_alignment_verify_loss_returns_to_aligning_without_resetting_timeout() -> None:
@@ -153,7 +160,6 @@ def test_alignment_verify_loss_returns_to_aligning_without_resetting_timeout() -
         cumulative_distance_m=0,
     )
     assert realigning.state is State.ALIGNING
-    assert realigning.reason == "alignment_verify_lost_realign"
     assert realigning.angular_velocity_rad_s > 0
     assert seq._alignment_started_ns == 0
 
@@ -163,6 +169,37 @@ def test_alignment_verify_loss_returns_to_aligning_without_resetting_timeout() -
         cumulative_distance_m=0,
     )
     assert opening.state is State.OPENING
+
+
+def test_delayed_opposite_angle_with_motion_does_not_reverse_unfinished_turn() -> None:
+    """换向不再依赖静止遥测：有底盘运动证据时也立即反向。"""
+
+    seq = sequence()
+    positive = selector().select((target(y=100),)).plan
+    negative = selector().select(
+        (target(y=-100, timestamp=100_000_000, frame=1),)
+    ).plan
+    assert positive is not None and negative is not None
+
+    # 注入「仍在运动」的遥测样本：旧实现会为此刹车并等待新的静止区间。
+    seq.observe_motion(motion_sample(0, count=0))
+    seq.observe_motion(motion_sample(10_000_000, count=1))
+    first = seq.step(
+        0,
+        replace(prep(positive, ready=False), checked_member_ids=None),
+        cumulative_distance_m=0,
+    )
+    assert first.state is State.ALIGNING
+    assert first.angular_velocity_rad_s > 0.0
+
+    crossed = seq.step(
+        100_000_000,
+        prep(negative, 100_000_000, ready=False),
+        cumulative_distance_m=0,
+    )
+    assert crossed.state is State.ALIGNING
+    assert crossed.angular_velocity_rad_s > 0.0
+    assert not crossed.soft_brake
 
 
 def test_confirmation_window_is_the_only_preopening_frame_gate() -> None:
@@ -238,6 +275,7 @@ def test_production_confirmation_does_not_require_a_second_frame_window() -> Non
         near,
         projector(),
         GripperKinematics(),
+        target_geometry=physical_geometry_config(),
         open_servo_angles_deg=(
             gripper.open_left_angle_deg,
             gripper.open_right_angle_deg,
@@ -284,7 +322,7 @@ def test_production_confirmation_does_not_require_a_second_frame_window() -> Non
     assert seq.result.member_ids == plan.member_ids
 
 
-def test_fine_alignment_zone_allows_zero_minimum_wheel_velocity() -> None:
+def test_small_mechanical_alignment_keeps_a_motion_floor() -> None:
     seq = sequence()
     plan = selector().select((target(x=400.0, y=25.0),)).plan
     assert plan is not None
@@ -295,7 +333,7 @@ def test_fine_alignment_zone_allows_zero_minimum_wheel_velocity() -> None:
         cumulative_distance_m=0,
     )
     assert decision.state is State.ALIGNING
-    assert decision.min_wheel_velocity_m_s == 0.0
+    assert decision.min_wheel_velocity_m_s == pytest.approx(0.01)
 
 
 def test_unmatched_worker_result_cannot_open_new_group():
@@ -447,17 +485,63 @@ def test_preparation_session_uses_handoff_prior_for_first_tentative_frame():
         s,
     )
     result = worker.update(
-        snapshot(0, (target(x=430, y=-25),)),
+        snapshot(0, (target(x=430, y=0),)),
         locked_ids=None,
         handoff_prior=NearFieldHandoffPrior(
             target_class=target().observation.target_class,
-            ground_point=target(x=425, y=-29).observation.ground_point,
+            ground_point=target(x=425, y=0).observation.ground_point,
             source_track_id=74,
         ),
     )
     assert result.targets[0].handoff_matched
     assert not result.targets[0].confirmed
     assert result.selection.plan is not None
+
+
+def test_preparation_session_uses_current_servo_reach_without_alignment_plan():
+    planner = selector(confirmation_frames=1)
+    worker = GraspPreparationSession(
+        GraspTargetTracker(
+            TrackingConfig(1, 80, .1, 500, 1, .1).build_tracker(),
+            projector(),
+            planner.config,
+        ),
+        planner,
+    )
+    first = worker.update(snapshot(0, (target(y=10),)), locked_ids=None)
+    assert first.selection.plan is not None
+    assert first.selection.plan.alignment_angle_rad == 0.0
+    assert first.selection.plan.opening_servo_angles_deg[0] != pytest.approx(
+        first.selection.plan.opening_servo_angles_deg[1]
+    )
+
+    locked = worker.update(
+        snapshot(1, (target(y=10),)),
+        locked_ids=first.selection.plan.member_ids,
+    )
+    assert locked.ready
+    assert locked.confirmation_progress == (1, 1)
+    assert locked.selection.plan is not None
+    assert locked.selection.plan.alignment_angle_rad == 0.0
+
+
+def test_preparation_session_aligns_target_outside_current_servo_reach():
+    planner = selector(confirmation_frames=1)
+    worker = GraspPreparationSession(
+        GraspTargetTracker(
+            TrackingConfig(1, 80, .1, 500, 1, .1).build_tracker(),
+            projector(),
+            planner.config,
+        ),
+        planner,
+    )
+
+    result = worker.update(snapshot(0, (target(y=100),)), locked_ids=None)
+
+    # 夹爪末端不能越过中线，偏在中线一侧的目标必须靠近场横向对准转进来，
+    # 而不是被淘汰后让车空等到超时。
+    assert result.selection.plan is not None
+    assert 0.0 < result.selection.plan.alignment_angle_rad < math.atan2(100.0, 300.0)
 
 
 def test_first_green_preparation_waits_for_handoff_instead_of_selecting_neighbor():
@@ -560,6 +644,26 @@ def test_valid_selection_rejections_are_alternative_diagnostics(reason):
     )
 
 
+def test_unknown_frame_does_not_invalidate_locked_target_confirmation():
+    """锁定目标的身份已确认；一帧运动模糊成 unknown 只是缺证据。"""
+
+    plan = selector().select((target(),)).plan
+    assert plan is not None
+    locked_id = plan.member_ids[0]
+
+    # 同一物块被识别成 unknown：包络与观测一致地降级，只是缺证据。
+    unknown = replace(target(), track_id=locked_id)
+    assert not GraspPreparationSession._is_explicit_invalidation(
+        GraspSelection(plan, ()), (unknown,), plan.member_ids,
+    )
+
+    # 明确蓝色危险仍然立即作废整场确认。
+    blue = replace(target(cls=BLUE), track_id=locked_id)
+    assert GraspPreparationSession._is_explicit_invalidation(
+        GraspSelection(plan, ()), (blue,), (locked_id,),
+    )
+
+
 def test_locked_target_identity_is_stable_across_class_order_changes():
     worker = session()
     first = worker.update(
@@ -629,6 +733,9 @@ def test_alignment_hysteresis_keeps_small_post_lock_jitter_stable():
 
     assert ready_result is not None
     assert ready_result.selection.plan is not None
+    # 锁定身份不因小幅抖动改写；包络仍可由当前朝向的左右独立开度覆盖，
+    # 因此不为 8 mm 横向偏差增加无意义的旋转。
+    assert ready_result.selection.plan.member_ids == ids
     assert ready_result.selection.plan.alignment_angle_rad == 0.0
 
 
@@ -686,6 +793,114 @@ def test_alignment_timeout_restarts_search_without_opening_gripper():
     assert timed_out.soft_brake
 
 
+def test_imu_progress_completes_a_turn_longer_than_the_continue_window():
+    """400 ms 只是无运动历史时的兜底；有 IMU 时必须按真实转角转完。"""
+
+    seq = sequence()
+    plan = selector().select((target(y=200),)).plan
+    assert plan is not None
+    angle = plan.alignment_angle_rad
+    # 0.35 rad/s 下约需 1.55 s，远超 400 ms 续转窗口。
+    assert 0.5 < angle < 0.6
+    assert seq.alignment_continue_ns == 400_000_000
+
+    first = seq.step(0, replace(prep(plan, ready=False), checked_member_ids=None),
+                     cumulative_distance_m=0, heading_rad=0.0)
+    assert first.state is State.ALIGNING
+    assert first.angular_velocity_rad_s > 0.0
+
+    speed = 0.35
+    elapsed = 0
+    while elapsed < 1_400_000_000:
+        elapsed += 100_000_000
+        heading = speed * elapsed / 1e9
+        assert heading < angle
+        turning = seq.step(elapsed, None, cumulative_distance_m=0, heading_rad=heading)
+        assert turning.state is State.ALIGNING, (elapsed, turning.reason)
+        assert turning.angular_velocity_rad_s > 0.0
+
+    # 转够真实角度后停在当前帧复核，而不是继续消耗第二次机会。
+    done = seq.step(1_600_000_000, None, cumulative_distance_m=0,
+                    heading_rad=angle)
+    assert done.state is State.ALIGNING
+    assert done.reason == "waiting_locked_target_observation"
+    assert done.soft_brake
+    assert seq._alignment_attempts == 1
+    assert seq._alignment_completed_ns == 1_600_000_000
+
+
+def test_late_frame_from_before_turn_end_cannot_consume_the_correction():
+    """转动结束前采集的迟到帧不算新证据，不能花掉第二次修正机会。"""
+
+    seq = sequence()
+    plan = selector().select((target(y=200),)).plan
+    assert plan is not None
+    angle = plan.alignment_angle_rad
+
+    first = seq.step(0, replace(prep(plan, ready=False), checked_member_ids=None),
+                     cumulative_distance_m=0, heading_rad=0.0)
+    assert first.state is State.ALIGNING
+    completed = seq.step(1_600_000_000, None, cumulative_distance_m=0,
+                         heading_rad=angle)
+    assert completed.reason == "waiting_locked_target_observation"
+    assert seq._alignment_attempts == 1
+
+    # 帧号更新但采集时间早于转动完成时刻：仍是旧几何。
+    late_plan = selector().select(
+        (target(y=180, timestamp=1_500_000_000, frame=7),)
+    ).plan
+    assert late_plan is not None
+    late = seq.step(
+        1_700_000_000,
+        prep(late_plan, 1_500_000_000, ready=False),
+        cumulative_distance_m=0,
+        heading_rad=angle,
+    )
+    assert late.reason == "alignment_waiting_for_new_current_geometry"
+    assert late.soft_brake
+    assert seq._alignment_attempts == 1
+
+    # 真正在转动结束后采集的新帧才允许花掉第二次修正机会。
+    fresh_plan = selector().select(
+        (target(y=180, timestamp=1_700_000_000, frame=8),)
+    ).plan
+    assert fresh_plan is not None
+    correction = seq.step(
+        1_800_000_000,
+        prep(fresh_plan, 1_700_000_000, ready=False),
+        cumulative_distance_m=0,
+        heading_rad=angle,
+    )
+    assert correction.state is State.ALIGNING
+    assert correction.reason == "align_group_envelope_correction"
+    assert seq._alignment_attempts == 2
+
+
+def test_stuck_rotation_still_reaches_the_attempt_deadline():
+    """IMU 一直不动时不能无限旋转，仍受整个尝试的截止时间约束。"""
+
+    seq = sequence()
+    plan = selector().select((target(y=200),)).plan
+    assert plan is not None
+
+    first = seq.step(0, replace(prep(plan, ready=False), checked_member_ids=None),
+                     cumulative_distance_m=0, heading_rad=0.0)
+    assert first.state is State.ALIGNING
+    deadline_ns = seq.alignment_timeout_ns + seq.alignment_motion_allowance_ns
+    assert deadline_ns > seq.alignment_timeout_ns
+
+    # 航向始终停在起点：转角进度为 0，转动永不完成。
+    turning = seq.step(deadline_ns - 1, None, cumulative_distance_m=0,
+                       heading_rad=0.0)
+    assert turning.state is State.ALIGNING
+
+    timed_out = seq.step(deadline_ns, None, cumulative_distance_m=0, heading_rad=0.0)
+    assert timed_out.state is State.SEARCH
+    assert timed_out.reason == "alignment_timeout"
+    assert timed_out.soft_brake
+    assert seq.locked_ids is None
+
+
 def test_verification_timeout_restarts_search_when_stability_never_completes():
     seq = GripperWidthPickupSequence(
         gripper_full_travel_time_s=.1,
@@ -728,7 +943,7 @@ def test_candidate_replan_starts_a_fresh_candidate_timeout():
     )
     invalid = GraspPreparation(
         40_000,
-        GraspSelection(None, ('blocked_target:2:unknown',)),
+        GraspSelection(None, ('blocked_target:2:blue_danger',)),
         (),
         checked_member_ids=first_plan.member_ids,
     )
@@ -867,3 +1082,62 @@ def test_uart_batch_with_equal_receive_time_preserves_distinct_samples():
     plan = selector().select((target(timestamp=100_000_000, frame=1),)).plan
     prepared = replace(prep(plan, 100_000_000), checked_member_ids=None, prepared_timestamp_ns=440_000_000)
     assert seq.step(450_000_000, prepared, cumulative_distance_m=0).state is State.OPENING
+
+
+def test_excluded_collectible_remains_an_obstacle_in_preparation():
+    worker = session()
+    # A delivered/carried member in the proposed sweep cannot silently disappear.
+    scene = snapshot(0, (target(1, x=300), target(2, x=200)))
+    result = worker.update(scene, locked_ids=None, excluded_observation_indices=frozenset({1}))
+    assert len(result.targets) == 2
+    assert not result.targets[1].selectable
+    assert result.selection.plan is None
+    assert any('blocked_target:' in reason for reason in result.selection.rejections)
+
+
+def test_excluded_peripheral_member_does_not_prevent_a_safe_grasp():
+    worker = session()
+    scene = snapshot(0, (target(1, x=300), target(2, x=200, y=200)))
+    result = worker.update(scene, locked_ids=None, excluded_observation_indices=frozenset({1}))
+    assert len(result.targets) == 2
+    assert result.selection.plan is not None
+    assert result.selection.plan.member_ids == (1,)
+
+
+def test_excluded_duplicate_maps_through_same_frame_deduplication():
+    """排除索引指向被去重的副本时，保留的物理轨迹仍不可选。"""
+
+    worker = session()
+    scene = snapshot(7, (target(1, x=300), target(2, x=300)))
+    result = worker.update(
+        scene,
+        locked_ids=None,
+        excluded_observation_indices=frozenset({1}),
+    )
+
+    assert len(result.targets) == 1
+    assert result.targets[0].track_id == 1
+    assert not result.targets[0].selectable
+    assert result.selection.plan is None
+
+
+def test_excluded_index_survives_locked_identity_remap():
+    """锁定目标换 tracker ID 后，排除仍绑定同一物理成员。"""
+
+    worker = session()
+    first = worker.update(snapshot(0, (target(1),)), locked_ids=None)
+    assert first.selection.plan is not None
+    locked_ids = first.selection.plan.member_ids
+    worker.update(snapshot(1, (target(1),)), locked_ids=locked_ids)
+
+    worker.tracker.tracker.reset()
+    remapped = worker.update(
+        snapshot(2, (target(99, x=700), target(2, x=300))),
+        locked_ids=locked_ids,
+        excluded_observation_indices=frozenset({1}),
+    )
+
+    locked = next(item for item in remapped.targets if item.track_id == locked_ids[0])
+    assert not locked.selectable
+    assert remapped.selection.plan is None
+    assert remapped.selection.rejections == ("locked_member_not_selectable",)

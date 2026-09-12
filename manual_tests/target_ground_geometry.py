@@ -28,7 +28,6 @@ _TARGET_COLORS: dict[TargetClass, tuple[int, int, int]] = {
     TargetClass.BLACK_CORE: (80, 80, 80),
     TargetClass.ORANGE_INJURED: (0, 128, 255),
     TargetClass.BLUE_DANGER: (255, 200, 0),
-    TargetClass.UNKNOWN: (255, 0, 255),
 }
 _FOOTPRINT_COLOR = (255, 0, 255)
 _CENTER_COLOR = (0, 255, 255)
@@ -36,7 +35,8 @@ _K0_COLOR = (0, 0, 255)
 
 
 def _target_color(target_class: TargetClass) -> tuple[int, int, int]:
-    return _TARGET_COLORS.get(target_class, _TARGET_COLORS[TargetClass.UNKNOWN])
+    # 四类任务标签是全部取值，不需要未知类兜底色。
+    return _TARGET_COLORS[target_class]
 
 
 def _draw_text(

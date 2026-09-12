@@ -19,7 +19,6 @@ class TargetClass(str, Enum):
     BLACK_CORE = "black_core"
     ORANGE_INJURED = "orange_injured"
     BLUE_DANGER = "blue_danger"
-    UNKNOWN = "unknown"
 
 
 class PoseModelClass(str, Enum):
@@ -63,13 +62,12 @@ def _probability(value: float, location: str) -> float:
 
 @dataclass(frozen=True, slots=True)
 class ClassProbabilities:
-    """四类任务目标和运行时 ``unknown`` 的概率分布。"""
+    """四类任务目标的条件类别分布；检测置信度独立保存。"""
 
     green_supply: float
     black_core: float
     orange_injured: float
     blue_danger: float
-    unknown: float
 
     def __post_init__(self) -> None:
         values = self.as_dict()
@@ -90,19 +88,9 @@ class ClassProbabilities:
         """把只有 top-1 分数的模型结果保守转换为完整分布。"""
 
         confidence = _probability(confidence, "confidence")
-        values = {item: 0.0 for item in TargetClass}
-        if target_class is TargetClass.UNKNOWN:
-            values[TargetClass.UNKNOWN] = 1.0
-        else:
-            values[target_class] = confidence
-            values[TargetClass.UNKNOWN] = 1.0 - confidence
-        return cls(
-            green_supply=values[TargetClass.GREEN_SUPPLY],
-            black_core=values[TargetClass.BLACK_CORE],
-            orange_injured=values[TargetClass.ORANGE_INJURED],
-            blue_danger=values[TargetClass.BLUE_DANGER],
-            unknown=values[TargetClass.UNKNOWN],
-        )
+        # Top-1 backends do not provide calibrated alternative-class scores.
+        # Keep detection confidence on TargetObservation, not as a fifth class.
+        return cls(**{item.value: float(item is target_class) for item in TargetClass})
 
     def as_dict(self) -> dict[str, float]:
         return {
@@ -110,7 +98,6 @@ class ClassProbabilities:
             TargetClass.BLACK_CORE.value: self.black_core,
             TargetClass.ORANGE_INJURED.value: self.orange_injured,
             TargetClass.BLUE_DANGER.value: self.blue_danger,
-            TargetClass.UNKNOWN.value: self.unknown,
         }
 
     def probability(self, target_class: TargetClass) -> float:
@@ -278,8 +265,6 @@ class HsvColorClassifierConfig:
                     )
 
     def ranges_for(self, target_class: TargetClass) -> tuple[HsvRange, ...]:
-        if target_class is TargetClass.UNKNOWN:
-            raise ValueError("unknown does not have an HSV range.")
         return getattr(self, target_class.value)
 
 
@@ -290,7 +275,7 @@ Uint8Array = npt.NDArray[np.uint8]
 class RoiColorSegmentation:
     """去畸变检测框 ROI 内的顶部颜色候选及只读二值掩码。"""
 
-    candidate_class: TargetClass
+    candidate_class: TargetClass | None
     status: ColorSegmentationStatus
     roi_box: UndistortedBoundingBox
     mask: Uint8Array
@@ -298,7 +283,7 @@ class RoiColorSegmentation:
     dominance: float
 
     def __post_init__(self) -> None:
-        if not isinstance(self.candidate_class, TargetClass):
+        if self.candidate_class is not None and not isinstance(self.candidate_class, TargetClass):
             raise ValueError("candidate_class must be a TargetClass.")
         if not isinstance(self.status, ColorSegmentationStatus):
             raise ValueError("status must be a ColorSegmentationStatus.")
@@ -329,16 +314,16 @@ class RoiColorSegmentation:
         object.__setattr__(self, "mask", owned_mask)
         _probability(self.color_fraction, "color_fraction")
         _probability(self.dominance, "dominance")
-        if self.candidate_class is TargetClass.UNKNOWN and (
+        if self.candidate_class is None and (
             np.any(owned_mask)
             or self.color_fraction != 0.0
             or self.dominance != 0.0
         ):
             raise ValueError(
-                "unknown color candidate requires an empty mask and zero evidence."
+                "absent color candidate requires an empty mask and zero evidence."
             )
         if self.status is ColorSegmentationStatus.ACCEPTED and (
-            self.candidate_class is TargetClass.UNKNOWN
+            self.candidate_class is None
             or not np.any(owned_mask)
             or self.color_fraction == 0.0
             or self.dominance == 0.0
@@ -347,7 +332,7 @@ class RoiColorSegmentation:
                 "accepted color segmentation requires a known non-empty candidate."
             )
         if (
-            self.candidate_class is not TargetClass.UNKNOWN
+            self.candidate_class is not None
             and (
                 not np.any(owned_mask)
                 or self.color_fraction == 0.0
@@ -514,19 +499,6 @@ class TargetObservation:
             raise ValueError(
                 f"color_segmentation roi_box {actual_roi!r} does not match "
                 f"rasterized detection box {expected_roi!r}."
-            )
-        if self.color_segmentation.status is ColorSegmentationStatus.ACCEPTED:
-            if self.target_class is not self.color_segmentation.candidate_class:
-                raise ValueError(
-                    "accepted color candidate must equal target_class."
-                )
-        elif (
-            self.target_class is not TargetClass.UNKNOWN
-            and ObservationQuality.HIGH_CONFIDENCE_COLOR_OVERRIDE not in self.quality
-        ):
-            raise ValueError(
-                "rejected color segmentation requires target_class unknown or "
-                "a high-confidence color override."
             )
         _probability(self.k0_confidence, "k0_confidence")
         if self.k0 is not None:

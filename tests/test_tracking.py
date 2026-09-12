@@ -53,18 +53,11 @@ def observation(
         math.ceil(observation_box.y_max) - math.floor(observation_box.y_min),
         math.ceil(observation_box.x_max) - math.floor(observation_box.x_min),
     )
-    if target_class is TargetClass.UNKNOWN:
-        candidate_class = TargetClass.UNKNOWN
-        status = ColorSegmentationStatus.INSUFFICIENT
-        mask = np.zeros(mask_shape, dtype=np.uint8)
-        color_fraction = 0.0
-        dominance = 0.0
-    else:
-        candidate_class = target_class
-        status = ColorSegmentationStatus.ACCEPTED
-        mask = np.full(mask_shape, 255, dtype=np.uint8)
-        color_fraction = 1.0
-        dominance = 1.0
+    candidate_class = target_class
+    status = ColorSegmentationStatus.ACCEPTED
+    mask = np.full(mask_shape, 255, dtype=np.uint8)
+    color_fraction = 1.0
+    dominance = 1.0
     return TargetObservation(
         frame_sequence=sequence,
         capture_timestamp_ns=timestamp_ns,
@@ -209,7 +202,7 @@ def test_short_occlusion_coasts_decays_and_expires() -> None:
     assert tracker.update(1_501_000_000, []) == ()
 
 
-def test_unknown_can_associate_with_known_track_without_erasing_history() -> None:
+def test_reobserved_model_class_keeps_track_history() -> None:
     tracker = MultiTargetTracker(config(confirmation_hits=1))
     track_id = tracker.update(
         1_000_000_000,
@@ -220,7 +213,7 @@ def test_unknown_can_associate_with_known_track_without_erasing_history() -> Non
         [
             observation(
                 1_050_000_000,
-                target_class=TargetClass.UNKNOWN,
+                target_class=TargetClass.GREEN_SUPPLY,
                 confidence=1.0,
             )
         ],

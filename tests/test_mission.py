@@ -62,7 +62,7 @@ def target(
         target_class=target_class,
         class_probabilities=ClassProbabilities.from_top_class(
             target_class,
-            0.9 if target_class is not TargetClass.UNKNOWN else 1.0,
+            0.9,
         ),
         confidence=0.9,
         hazard_state=hazard_state,
@@ -392,7 +392,7 @@ def test_suspected_danger_is_never_selected_or_pushed() -> None:
     machine = started_machine()
     suspected = target(
         1,
-        TargetClass.UNKNOWN,
+        TargetClass.BLUE_DANGER,
         hazard_state=HazardState.SUSPECTED,
         distance_mm=100.0,
     )
@@ -544,7 +544,7 @@ def test_timeouts_preempt_transport_holds(
 ) -> None:
     machine = started_machine()
     targets = (
-        (target(1, TargetClass.UNKNOWN, hazard_state=HazardState.SUSPECTED),)
+        (target(1, TargetClass.BLUE_DANGER, hazard_state=HazardState.SUSPECTED),)
         if transport_ids == (1,)
         else ()
     )

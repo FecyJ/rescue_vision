@@ -194,7 +194,6 @@ class TargetPoseDetector:
         ground_projector: GroundProjector | None = None,
         center_cross_refinement: CenterCrossRefinementConfig | None = None,
         safe_zone_color: SafeZoneColorConfig | None = None,
-        unknown_override_confidence_threshold: float = 0.8,
         clock_ns: Callable[[], int] = monotonic_ns,
     ) -> None:
         self._backend = backend
@@ -202,10 +201,6 @@ class TargetPoseDetector:
         try:
             self._detection_threshold = self._threshold(
                 detection_threshold, "detection_threshold"
-            )
-            self._unknown_override_confidence_threshold = self._threshold(
-                unknown_override_confidence_threshold,
-                "unknown_override_confidence_threshold",
             )
             self._k0_threshold = self._threshold(
                 k0_threshold, "k0_threshold"
@@ -303,31 +298,15 @@ class TargetPoseDetector:
                 undistorted_image_bgr,
                 detection.box,
                 self._color_classifier,
+                target_class=model_target_class,
             )
             if color_segmentation.status is ColorSegmentationStatus.INSUFFICIENT:
                 quality.add(ObservationQuality.COLOR_EVIDENCE_INSUFFICIENT)
             elif color_segmentation.status is ColorSegmentationStatus.AMBIGUOUS:
                 quality.add(ObservationQuality.COLOR_EVIDENCE_AMBIGUOUS)
-            if color_segmentation.status is not ColorSegmentationStatus.ACCEPTED:
-                if (
-                    detection.confidence
-                    > self._unknown_override_confidence_threshold
-                ):
-                    target_class = model_target_class
-                    probabilities = ClassProbabilities.from_top_class(
-                        model_target_class,
-                        1.0,
-                    )
-                    quality.add(ObservationQuality.HIGH_CONFIDENCE_COLOR_OVERRIDE)
-                else:
-                    target_class = TargetClass.UNKNOWN
-            else:
-                target_class = color_segmentation.candidate_class
-                if (
-                    model_target_class is not TargetClass.UNKNOWN
-                    and model_target_class is not target_class
-                ):
-                    quality.add(ObservationQuality.POSE_COLOR_CONFLICT)
+            # Model labels are authoritative. HSV supplies jaw geometry only.
+            target_class = model_target_class
+            probabilities = ClassProbabilities.from_top_class(target_class, detection.confidence)
 
             k0_keypoint = detection.keypoints[0]
             k0 = k0_keypoint.point

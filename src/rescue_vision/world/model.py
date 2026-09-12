@@ -30,7 +30,6 @@ class WorldUncertainty(str, Enum):
     MISSING_ROBOT_FIELD_POSITION = "missing_robot_field_position"
     TARGET_WITHOUT_GROUND_POINT = "target_without_ground_point"
     UNCONFIRMED_TARGET = "unconfirmed_target"
-    UNKNOWN_TARGET = "unknown_target"
     STALE_OPPONENT = "stale_opponent"
 
 
@@ -157,7 +156,6 @@ class WorldModelConfig:
     opponent_max_age_ms: float
     danger_confirm_threshold: float
     danger_suspect_threshold: float
-    unknown_suspect_threshold: float
 
     def __post_init__(self) -> None:
         for name in ("max_visual_age_ms", "opponent_max_age_ms"):
@@ -167,7 +165,6 @@ class WorldModelConfig:
         for name in (
             "danger_confirm_threshold",
             "danger_suspect_threshold",
-            "unknown_suspect_threshold",
         ):
             _probability(getattr(self, name), name)
         if self.danger_suspect_threshold > self.danger_confirm_threshold:
@@ -426,8 +423,6 @@ class WorldModel:
                 uncertainties.add(WorldUncertainty.TARGET_WITHOUT_GROUND_POINT)
             if not track.ever_confirmed:
                 uncertainties.add(WorldUncertainty.UNCONFIRMED_TARGET)
-            if track.target_class is TargetClass.UNKNOWN:
-                uncertainties.add(WorldUncertainty.UNKNOWN_TARGET)
             targets.append(
                 WorldTarget(
                     track_id=track.track_id,
@@ -544,7 +539,6 @@ class WorldModel:
 
     def _hazard_state(self, track: TrackedTarget) -> HazardState:
         danger = track.class_probabilities.blue_danger
-        unknown = track.class_probabilities.unknown
         if (
             track.ever_confirmed
             and danger >= self._config.danger_confirm_threshold
@@ -552,9 +546,7 @@ class WorldModel:
             return HazardState.CONFIRMED
         if (
             danger >= self._config.danger_suspect_threshold
-            or unknown >= self._config.unknown_suspect_threshold
             or track.status is not TrackStatus.CONFIRMED
-            or track.target_class is TargetClass.UNKNOWN
         ):
             return HazardState.SUSPECTED
         return HazardState.CLEAR

@@ -16,6 +16,7 @@ dev = ["pytest>=8,<10"]
 
 [project.scripts]
 rescue-vision-match = "rescue_vision.app.match:main"
+rescue-vision-match-nb = "rescue_vision.app.match_nb:main"
 rescue-vision-match-cc = "rescue_vision.app.match_cc:main"
 rescue-vision-grab-transport = "rescue_vision.app.grab_transport:main"
 rescue-vision-evaluate = "rescue_vision.evaluation.cli:main"
@@ -26,6 +27,7 @@ rescue-vision-cluster-breakup = "rescue_vision.app.cluster_breakup:main"
 rescue-vision-green-grab = "rescue_vision.app.green_grab:main"
 rescue-vision-gripper-width = "rescue_vision.app.gripper_width:main"
 rescue-vision-motion-sequence = "rescue_vision.app.motion_sequence:main"
+rescue-vision-teach-replay = "rescue_vision.app.teach_replay:main"
 rescue-vision-record = "rescue_vision.camera.record_cli:main"
 rescue-vision-split = "rescue_vision.data.split_manifest:main"
 

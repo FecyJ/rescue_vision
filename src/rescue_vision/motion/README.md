@@ -5,6 +5,13 @@
 `control/debug/gripper`。它依赖调用方注入 UART COBS 帧通道和远程连接，不创建
 串口、TCP 服务、定位器或规划器。
 
+`stationary.StationaryMotionEvidence` 是近场抓取和正式解团共用的连续静止证据。
+调用方逐条传入真实 `OdometryImu`；主机接收时刻与图像采集时刻同属单调时钟 ns，
+设备采样时刻只用于验证样本递增和连续性。`stationary_since(now_ns)` 查询仍新鲜的
+静止区间起点，`capture_valid(capture_ns, now_ns, max_age_ns=...)` 验证图像在该区间采集。
+同一静止区间跨应用会话保留；真实轮计数变化、旋转、无效传感器、重复/倒退设备样本
+或遥测间断会使它失效。状态机不能用当前轮询时刻冒充停车时刻；对象不打开设备或线程。
+
 树莓派与 STM32 接口以
 [`docs/树莓派与单片机通信协议v3.md`](../../../docs/树莓派与单片机通信协议v3.md)
 为唯一权威。树莓派端已经使用 COBS、CRC16 和固定长度二进制消息统一运动、

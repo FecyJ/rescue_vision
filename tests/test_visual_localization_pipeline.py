@@ -8,6 +8,8 @@ from rescue_vision.localization import (
     FieldPositionObservation,
     FusedPoseEstimate,
     FusionQuality,
+    SafeZoneCornerLocalization,
+    SafeZoneCornerRejectionReason,
     VisualFusionResult,
     VisualLocalizationPipeline,
 )
@@ -80,7 +82,10 @@ class PriorGuidedCenter(Center):
 class SafeZone:
     def localize(self, result, *, prior_pose=None):
         del result, prior_pose
-        return None
+        # 与真实 localizer 在无安全区观测时的返回一致。
+        return SafeZoneCornerLocalization(
+            rejection=SafeZoneCornerRejectionReason.NO_POSE_CANDIDATE
+        )
 
 
 class Fusion:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import math
 
 import numpy as np
 import pytest
@@ -29,17 +30,19 @@ from rescue_vision.perception import TargetClass
 from rescue_vision.world import TeamColor
 from rescue_vision.tracking import TrackingConfig
 
-from test_match import runtime_config
+from rescue_vision.config import load_runtime_config
+from rescue_vision.perception import PerceptionSnapshot
+from test_match import observation, runtime_config, snapshot
 from test_near_field_grasp import selector, target
 
 
-def _sequence(*, transports: int = 0, config=None, transport_half_width_mm: float = 34.0) -> MatchSequence:
+def _sequence(*, transports: int = 0, config=None, transport_half_width_mm: float = 34.0, max_observation_age_ms: float = 500.0) -> MatchSequence:
     near_config = NearFieldGraspConfig()
     pickup = GripperWidthPickupSequence(
         gripper_full_travel_time_s=0.1,
         forward_speed_m_s=0.1,
         closed_servo_angles_deg=(90.0, 90.0),
-        max_observation_age_ms=500.0,
+        max_observation_age_ms=max_observation_age_ms,
         alignment_min_wheel_velocity_m_s=0.01,
     )
     sequence = MatchSequence(
@@ -51,6 +54,8 @@ def _sequence(*, transports: int = 0, config=None, transport_half_width_mm: floa
         near_field_pickup=pickup,
         near_field_grasp_config=near_config,
         transport_corridor_half_width_mm=transport_half_width_mm,
+        static_map=load_runtime_config("configs/runtime.match.yaml").world.static_map,
+        breakup_target_geometry=load_runtime_config("configs/runtime.match.yaml").perception.target_ground_geometry,
     )
     sequence._transport_count = transports
     sequence.state = MatchState.TRANSPORT_NEAR_FIELD_GRASP
@@ -293,9 +298,13 @@ def test_near_field_confirmation_budget_starts_when_observation_window_opens() -
     sequence._action_settle_until_ns = None
     assert sequence.near_field_observation_window_open(1_000_000_000)
     assert sequence._near_field_confirmation_started_ns == 1_000_000_000
-    assert sequence._near_field_route_decision(6_799_999_999, None) is None
+    # 选不出方案时只等 no_plan_wait_ms（远短于停稳提交预算），到期即带原因重选。
+    wait_ns = int(sequence._near_field_no_plan_wait_ms() * 1e6)
+    assert sequence._near_field_route_decision(
+        1_000_000_000 + wait_ns - 1, None
+    ) is None
 
-    route = sequence._near_field_route_decision(7_000_000_000, None)
+    route = sequence._near_field_route_decision(1_000_000_000 + wait_ns, None)
     assert route is not None and route.route is GraspRoute.RESELECT
     assert sequence.near_field_last_failure_diagnostic is not None
     assert "kind=confirmation_timeout_reselect" in (
@@ -414,13 +423,12 @@ def test_near_field_route_does_not_queue_unconfirmed_alternatives() -> None:
     assert route.plan is first
 
 
-def test_first_green_blocked_corridor_routes_directly_to_breakup() -> None:
+def test_blocked_corridor_without_contact_plan_does_not_stop() -> None:
+    """路由判定阻挡，但当前帧选不出接触计划时不能为不可能的解团停车。"""
+
     sequence = _sequence(transports=0)
     sequence._near_field_route = GraspRoute.DECIDING
     sequence._near_field_confirmation_started_ns = 0
-    nearest = target(1, x=300.0, y=0.0)
-    far_green = target(2, x=700.0, y=0.0)
-    blocker = target(3, x=200.0, y=0.0, cls=TargetClass.BLACK_CORE)
     preparation = GraspPreparation(
         800_000_000,
         GraspSelection(None, ("blocked_target:3:black_core",)),
@@ -436,12 +444,52 @@ def test_first_green_blocked_corridor_routes_directly_to_breakup() -> None:
     )
 
     assert decision.state is MatchState.SEARCH_CLUSTER
+    assert decision.reason == "near_field_route:reselect:breakup_no_contact_plan"
+    assert decision.linear_velocity_m_s == 0.0
+    assert sequence.near_field_route is GraspRoute.RESELECT
+    assert not sequence._breakup_only
+    # 记下物理区域，下一次同样的几何不再重下同一条处方。
+    assert any(
+        failure.reason == "breakup_no_contact_plan"
+        for failure in sequence._near_field_failures
+    )
+
+
+def test_first_green_blocked_corridor_with_contact_plan_routes_to_breakup() -> None:
+    sequence = _sequence(transports=1)
+    sequence._near_field_route = GraspRoute.DECIDING
+    sequence._near_field_confirmation_started_ns = 0
+    sequence._latest_heading_rad = 0.0
+    timestamp_ns = 800_000_000
+    observations = (
+        observation(1, timestamp_ns, GroundPoint(300.0, 0.0)),
+        observation(1, timestamp_ns, GroundPoint(300.0, 60.0)),
+    )
+    sequence._tracker.update(timestamp_ns, observations)
+    sequence._latest_perception = snapshot(1, timestamp_ns, *observations)
+    preparation = GraspPreparation(
+        timestamp_ns,
+        GraspSelection(None, ("blocked_target:3:black_core",)),
+        (),
+        session_id=1,
+    )
+
+    decision = sequence._step_near_field_grasp(
+        timestamp_ns,
+        cumulative_distance_m=0.0,
+        preparation=preparation,
+        path_clear=True,
+    )
+
+    assert decision.state is MatchState.BREAKUP_SETTLE
+    assert decision.angular_velocity_rad_s == 0.0
     assert decision.reason == "near_field_route:breakup"
     assert sequence.near_field_route is GraspRoute.BREAKUP
     assert sequence.selected_track_id is None
+    assert sequence._breakup_proposal is not None
 
 
-def test_first_green_blocked_corridor_does_not_select_a_farther_green() -> None:
+def test_first_green_blocked_corridor_selects_another_safe_green() -> None:
     sequence = _sequence(
         config=runtime_config(opportunistic_single_green_enabled=True),
     )
@@ -451,42 +499,50 @@ def test_first_green_blocked_corridor_does_not_select_a_farther_green() -> None:
         10,
         (
             target(1, x=300.0, y=0.0, timestamp=10, frame=1).observation,
-            target(2, x=700.0, y=0.0, timestamp=10, frame=1).observation,
+            target(2, x=700.0, y=400.0, timestamp=10, frame=1).observation,
             target(3, x=200.0, y=0.0, cls=TargetClass.BLACK_CORE, timestamp=10, frame=1).observation,
         ),
     )
 
     decision = sequence._step_search_cluster(10, 0.0)
 
-    assert decision.state is MatchState.SEARCH_CLUSTER
-    assert decision.reason == "near_field_route:breakup"
-    assert sequence.near_field_route is GraspRoute.BREAKUP
-    assert sequence.selected_track_id is None
+    assert decision.state is MatchState.TRANSPORT_ALIGN_GREEN
+    assert sequence.selected_track_id == 2
+    assert not sequence._breakup_only
 
 
 def test_side_adjacent_incompatible_target_routes_to_breakup_without_reapproach() -> None:
     sequence = _sequence(transports=1)
     sequence._near_field_route = GraspRoute.DECIDING
     sequence._near_field_confirmation_started_ns = 0
+    sequence._latest_heading_rad = 0.0
+    timestamp_ns = 800_000_000
+    observations = (
+        observation(1, timestamp_ns, GroundPoint(300.0, 0.0)),
+        observation(1, timestamp_ns, GroundPoint(300.0, 60.0)),
+    )
+    sequence._tracker.update(timestamp_ns, observations)
+    sequence._latest_perception = snapshot(1, timestamp_ns, *observations)
     rejection = (
         "side_adjacent_incompatible_single_green:"
         "track=2:class=blue_danger:dx_mm=12.0:dy_mm=55.0"
     )
     preparation = GraspPreparation(
-        800_000_000,
+        timestamp_ns,
         GraspSelection(None, (rejection,)),
         (),
         session_id=1,
     )
 
     decision = sequence._step_near_field_grasp(
-        800_000_000,
+        timestamp_ns,
         cumulative_distance_m=0.0,
         preparation=preparation,
         path_clear=True,
     )
 
-    assert decision.state is MatchState.SEARCH_CLUSTER
+    assert decision.state is MatchState.BREAKUP_SETTLE
+    assert decision.angular_velocity_rad_s == 0.0
     assert decision.reason == "near_field_route:breakup"
     assert not sequence._near_field_far_reapproach_used
 
@@ -595,7 +651,10 @@ def test_missing_static_path_wait_starts_near_field_alignment_deadline() -> None
 
 def test_opportunistic_green_uses_fixed_transport_corridor_k0() -> None:
     sequence = _sequence(
-        config=runtime_config(opportunistic_single_green_enabled=True),
+        config=runtime_config(
+            opportunistic_single_green_enabled=True,
+            breakup_backward_distance_m=0.4,
+        ),
         transport_half_width_mm=34.0,
     )
     sequence._latest_heading_rad = 0.0
@@ -618,9 +677,12 @@ def test_opportunistic_green_uses_fixed_transport_corridor_k0() -> None:
     assert sequence.transport_corridor_effective_half_width_mm == 44.0
 
 
-def test_single_green_side_adjacent_blue_is_rejected_before_near_field_approach() -> None:
+def test_single_green_side_adjacent_blue_defers_to_actual_near_field_sweep() -> None:
     sequence = _sequence(
-        config=runtime_config(opportunistic_single_green_enabled=True),
+        config=runtime_config(
+            opportunistic_single_green_enabled=True,
+            breakup_backward_distance_m=0.4,
+        ),
         transport_half_width_mm=34.0,
     )
     green = target(i=1, x=400.0, y=0.0, timestamp=10, frame=1).observation
@@ -633,12 +695,13 @@ def test_single_green_side_adjacent_blue_is_rejected_before_near_field_approach(
         frame=1,
     ).observation
     sequence._tracker.update(10, [green, blue])
+    sequence.state = MatchState.SEARCH_CLUSTER
+    sequence._latest_heading_rad = 0.0
+    sequence._latest_perception = PerceptionSnapshot(1, 10, 10, (green, blue), None)
 
-    assert sequence._single_green_side_neighbor_requires_breakup(10)
-    assert sequence._find_opportunistic_single_green(10) is None
+    assert sequence._find_opportunistic_single_green(10) is not None
     decision = sequence._step_search_cluster(10, 0.0)
-    assert decision.state is MatchState.SEARCH_CLUSTER
-    assert decision.reason == "near_field_route:breakup"
+    assert decision.state is MatchState.TRANSPORT_ALIGN_GREEN
 
 
 def test_single_green_side_adjacent_orange_is_not_rejected_before_approach() -> None:
@@ -658,7 +721,6 @@ def test_single_green_side_adjacent_orange_is_not_rejected_before_approach() -> 
     ).observation
     sequence._tracker.update(10, [green, orange])
 
-    assert not sequence._single_green_side_neighbor_requires_breakup(10)
     assert sequence._find_opportunistic_single_green(10) is not None
     decision = sequence._step_search_cluster(10, 0.0)
     assert decision.state is MatchState.TRANSPORT_ALIGN_GREEN
@@ -692,7 +754,7 @@ def test_target_without_ground_point_does_not_block_fixed_transport_corridor() -
     assert not sequence._first_green_forward_corridor_blocked(10)
 
 
-def test_opportunistic_green_outside_transport_corridor_continues_cluster_logic() -> None:
+def test_green_outside_transport_corridor_gets_grasp_preview_before_breakup() -> None:
     sequence = _sequence(
         config=runtime_config(opportunistic_single_green_enabled=True),
         transport_half_width_mm=34.0,
@@ -704,8 +766,8 @@ def test_opportunistic_green_outside_transport_corridor_continues_cluster_logic(
     ]
     sequence._tracker.update(10, observations)
     decision = sequence._step_search_cluster(10, 0.0)
-    assert decision.state is MatchState.ALIGN_CLUSTER_ONCE
-    assert decision.reason == "cluster_seen_stop_collect_reference"
+    assert decision.state is MatchState.TRANSPORT_ALIGN_GREEN
+    assert decision.reason.startswith("near_field_group_preview")
 
 
 def test_second_green_in_fixed_transport_corridor_blocks_single_opportunity() -> None:
@@ -910,6 +972,7 @@ def test_match_preview_highlights_the_selected_far_field_cluster() -> None:
     second = target(i=2, x=420.0, y=20.0, timestamp=0, frame=0).observation
     sequence._tracker.update(0, (first, second))
 
+    sequence._latest_perception = PerceptionSnapshot(0, 0, 0, (first, second), None)
     measurement = sequence._cluster_ground_measurement(0)
     assert measurement is not None
     assert sequence.preview_selected_track_ids == (1, 2)
@@ -1116,3 +1179,254 @@ def test_reapproach_rejects_same_danger_path_as_search_seed():
                                 target(2,x=350,y=50,cls=TargetClass.BLUE_DANGER,timestamp=10,frame=1).observation])
     assert sequence._find_approach_seed(10) is None
     assert sequence._find_far_reapproach_target(10) is None
+
+
+def _complete_supply_pickup(sequence, members, *, now=0):
+    plan = selector().select(members, policy=sequence.near_field_policy).plan
+    assert plan is not None
+    prep = _preparation(plan, session_id=sequence.near_field_session_id, timestamp_ns=now)
+    sequence._near_field_route = GraspRoute.DIRECT_NEAR
+    sequence._step_near_field_grasp(now, 0.0, prep, True)
+    sequence._step_near_field_grasp(now + 100_000_001, 0.0, None, True)
+    sequence._step_near_field_grasp(now + 200_000_001, plan.forward_distance_mm / 1000, None, True)
+    return sequence._step_near_field_grasp(now + 300_000_001, plan.forward_distance_mm / 1000, None, True)
+
+
+def test_greedy_supply_completion_scans_and_accumulates_to_three():
+    sequence = _sequence(transports=1)
+    sequence._latest_heading_rad = 0.0
+    complete = _complete_supply_pickup(sequence, (target(cls=TargetClass.BLACK_CORE),))
+    assert complete.state is MatchState.TRANSPORT_GREEDY_SCAN
+    assert complete.gripper_posture is GripperPosture.CLOSED
+    assert sequence.near_field_policy.max_targets == 2
+    assert TargetClass.ORANGE_INJURED not in sequence.near_field_policy.allowed_classes
+    sequence._begin_near_field_grasp(400_000_000)
+    assert sequence._transport_target_classes == (TargetClass.BLACK_CORE,)
+    complete = _complete_supply_pickup(sequence, (
+        target(i=2, x=300, y=-15, timestamp=400_000_000),
+        target(i=3, x=300, y=15, timestamp=400_000_000),
+    ), now=400_000_000)
+    assert complete.state is MatchState.TRANSPORT_ALIGN_RED_ZONE
+    assert len(sequence._transport_target_classes) == 3
+    assert not sequence._greedy_active
+
+
+@pytest.mark.parametrize('reason', ['blocked', 'timeout'])
+def test_greedy_failure_returns_with_existing_load(reason):
+    sequence = _sequence(transports=1)
+    sequence._transport_target_classes = (TargetClass.BLACK_CORE,)
+    sequence._begin_greedy_scan(0)
+    sequence._begin_near_field_grasp(1)
+    decision = sequence._route_after_near_field_failure(2, reason=reason, geometric_block=reason == 'blocked')
+    assert decision.state is MatchState.TRANSPORT_ALIGN_RED_ZONE
+    assert sequence._transport_target_classes == (TargetClass.BLACK_CORE,)
+
+
+def test_greedy_scan_times_out_and_does_not_reuse_capture_frame():
+    sequence = _sequence(transports=1)
+    sequence._latest_heading_rad = 0.0
+    sequence._transport_target_classes = (TargetClass.GREEN_SUPPLY,)
+    sequence._tracker.update(10, [target(timestamp=10).observation])
+    sequence._begin_greedy_scan(10)
+    scanning = sequence._step_greedy_scan(11, 0.0)
+    assert scanning.state is MatchState.TRANSPORT_GREEDY_SCAN
+    assert scanning.angular_velocity_rad_s != 0
+    done = sequence._step_greedy_scan(1_000_000_000_000, 0.0)
+    assert done.state is MatchState.TRANSPORT_ALIGN_RED_ZONE
+    assert done.reason == 'greedy_return:scan_timeout'
+
+
+def test_greedy_scan_found_supply_enters_global_alignment_chain():
+    sequence = _sequence(transports=1)
+    sequence._latest_heading_rad = 0.0
+    sequence._transport_target_classes = (TargetClass.GREEN_SUPPLY,)
+    sequence._begin_greedy_scan(0)
+    sequence._tracker.update(10, [target(timestamp=10).observation])
+    decision = sequence._step_greedy_scan(10, 0.0)
+    # 命中即走全局夹取前置链：目标被选中并成为近场交接先验，对准由实际几何
+    # 决定（需要时反向），不再重开一次自由选组会话。
+    assert decision.state is MatchState.TRANSPORT_ALIGN_GREEN
+    assert decision.selected_track_id == 1
+    # 近场链路在远场只携带闭合夹爪接近，开口仍由近场计划决定。
+    assert decision.gripper_posture is GripperPosture.CLOSED
+    assert sequence.selected_track_id == 1
+    assert sequence._transport_target_classes == (TargetClass.GREEN_SUPPLY,)
+
+
+@pytest.mark.parametrize('members', [
+    (target(i=1), target(i=2, y=25)),
+    (target(cls=TargetClass.ORANGE_INJURED),),
+    (target(x=110),),
+])
+def test_greedy_rejects_over_capacity_orange_and_carried_plans(members):
+    sequence = _sequence(transports=1)
+    sequence._transport_target_classes = (TargetClass.GREEN_SUPPLY, TargetClass.BLACK_CORE)
+    sequence._begin_greedy_scan(0)
+    sequence._begin_near_field_grasp(1)
+    plan = selector().select(members).plan
+    assert plan is not None
+    decision = sequence._step_near_field_grasp(2, 0.0, _preparation(plan, session_id=sequence.near_field_session_id), True)
+    assert decision.state is MatchState.TRANSPORT_ALIGN_RED_ZONE
+    assert len(sequence._transport_target_classes) == 2
+
+
+def test_greedy_supplementary_pickup_returns_without_rescanning():
+    sequence = _sequence(transports=1)
+    scan = _complete_supply_pickup(sequence, (target(),))
+    assert scan.state is MatchState.TRANSPORT_GREEDY_SCAN
+    now = 2_000_000_000
+    sequence._begin_near_field_grasp(now)
+    decision = _complete_supply_pickup(
+        sequence,
+        (
+            target(i=2, timestamp=now),
+            target(i=3, timestamp=now, y=25),
+        ),
+        now=now,
+    )
+    # 补夹命中一次就累计并直接返程，不再重复整圈扫描。
+    assert len(sequence._transport_target_classes) == 3
+    assert decision.state is MatchState.TRANSPORT_ALIGN_RED_ZONE
+    assert decision.reason == 'greedy_return:supplementary_pickup_complete'
+    assert not sequence._greedy_active
+
+
+def test_greedy_scan_finishes_configured_rotation():
+    sequence = _sequence(transports=1)
+    sequence._transport_target_classes = (TargetClass.GREEN_SUPPLY,)
+    sequence._latest_heading_rad = 0.0
+    sequence._begin_greedy_scan(0)
+    import math
+    for index in range(1, 9):
+        decision = sequence._step_greedy_scan(index, -index * math.pi / 4)
+    assert decision.state is MatchState.TRANSPORT_ALIGN_RED_ZONE
+    assert decision.reason == 'greedy_return:scan_complete'
+
+
+@pytest.mark.parametrize('cls', [TargetClass.BLUE_DANGER, TargetClass.ORANGE_INJURED])
+def test_greedy_scan_ignores_non_supply_targets(cls):
+    sequence = _sequence(transports=1)
+    sequence._latest_heading_rad = 0.0
+    sequence._transport_target_classes = (TargetClass.GREEN_SUPPLY,)
+    sequence._begin_greedy_scan(0)
+    sequence._tracker.update(10, [target(timestamp=10, cls=cls).observation])
+    assert sequence._step_greedy_scan(10, 0.0).state is MatchState.TRANSPORT_GREEDY_SCAN
+
+
+def _greedy_scan_velocity(sequence, frame_sequence, timestamp_ns, *observations_):
+    sequence._latest_perception = snapshot(frame_sequence, timestamp_ns, *observations_)
+    return sequence._greedy_scan_angular_velocity_rad_s()
+
+
+def test_greedy_scan_uses_empty_speed_only_without_usable_supply_information():
+    sequence = _sequence(transports=1)
+    sequence._transport_target_classes = (TargetClass.GREEN_SUPPLY,)
+    scan_velocity = sequence.config.close_gripper_spin_angular_velocity_rad_s
+    empty_velocity = sequence.config.cluster_search_empty_angular_velocity_rad_s
+    assert abs(empty_velocity) > abs(scan_velocity)
+
+    # 只有蓝色、已收拢物资或已交付物资时按全局空场速度快速转动。
+    assert _greedy_scan_velocity(sequence, 1, 10) == pytest.approx(
+        empty_velocity
+    )
+    assert _greedy_scan_velocity(
+        sequence,
+        1,
+        10,
+        observation(1, 10, GroundPoint(300.0, 0.0), target_class=TargetClass.BLUE_DANGER),
+    ) == pytest.approx(empty_velocity)
+    assert _greedy_scan_velocity(
+        sequence,
+        1,
+        10,
+        observation(
+            1,
+            10,
+            GroundPoint(sequence._greedy_new_target_min_x_mm() - 10.0, 0.0),
+        ),
+    ) == pytest.approx(empty_velocity)
+
+    # 出现可补夹的绿/黑信息后回到闭爪扫描速度，不快速掠过候选。
+    assert _greedy_scan_velocity(
+        sequence,
+        1,
+        10,
+        observation(1, 10, GroundPoint(300.0, 0.0)),
+    ) == pytest.approx(scan_velocity)
+    assert _greedy_scan_velocity(
+        sequence,
+        1,
+        10,
+        observation(1, 10, GroundPoint(300.0, 0.0), target_class=TargetClass.BLACK_CORE),
+    ) == pytest.approx(scan_velocity)
+    # 没有地面点就无法证明它已被收拢，按新物资候选保守处理，保持扫描速度。
+    assert _greedy_scan_velocity(
+        sequence,
+        1,
+        10,
+        replace(
+            observation(1, 10, GroundPoint(300.0, 0.0)),
+            ground_point=None,
+        ),
+    ) == pytest.approx(scan_velocity)
+
+
+def test_greedy_scan_rotates_fast_while_no_supply_is_visible():
+    sequence = _sequence(transports=1)
+    sequence._latest_heading_rad = 0.0
+    sequence._transport_target_classes = (TargetClass.GREEN_SUPPLY,)
+    sequence._begin_greedy_scan(0)
+    sequence._latest_perception = snapshot(1, 10)
+    decision = sequence._step_greedy_scan(10, 0.0)
+    assert decision.state is MatchState.TRANSPORT_GREEDY_SCAN
+    assert decision.angular_velocity_rad_s == pytest.approx(
+        sequence.config.cluster_search_empty_angular_velocity_rad_s
+    )
+    # 速度切换不改变扫描方向。
+    assert (
+        decision.angular_velocity_rad_s
+        * sequence.config.close_gripper_spin_angular_velocity_rad_s
+        > 0.0
+    )
+
+
+def test_greedy_scan_completes_at_configured_rotation_budget():
+    sequence = _sequence(transports=1)
+    sequence._transport_target_classes = (TargetClass.GREEN_SUPPLY,)
+    sequence._latest_heading_rad = 0.0
+    sequence._begin_greedy_scan(0)
+    budget = sequence.config.spin_angle_rad
+    steps = int(math.ceil(budget / (math.pi / 4.0)))
+    decision = None
+    for index in range(1, steps + 1):
+        decision = sequence._step_greedy_scan(index, -index * math.pi / 4)
+    assert decision is not None
+    assert decision.state is MatchState.TRANSPORT_ALIGN_RED_ZONE
+    assert decision.reason == 'greedy_return:scan_complete'
+    # 预算按实际累计转角结算：刚好达到预算即结束，不提前也不拖满。
+    assert steps * math.pi / 4 >= budget
+    assert (steps - 1) * math.pi / 4 < budget
+
+
+def test_formal_match_config_uses_270_degree_greedy_scan_budget():
+    match_config = load_runtime_config("configs/runtime.match.yaml")
+
+    assert match_config.match.spin_angle_rad == pytest.approx(
+        math.radians(270.0)
+    )
+    assert match_config.match.spin_angle_rad < 2.0 * math.pi
+    assert abs(
+        match_config.match.cluster_search_empty_angular_velocity_rad_s
+    ) > abs(match_config.match.close_gripper_spin_angular_velocity_rad_s)
+
+
+def test_greedy_confirmation_timeout_returns_without_far_reapproach(monkeypatch):
+    sequence = _sequence(transports=1)
+    sequence._transport_target_classes = (TargetClass.BLACK_CORE,)
+    sequence._begin_greedy_scan(0)
+    sequence._begin_near_field_grasp(1)
+    monkeypatch.setattr(sequence, '_find_far_reapproach_target', lambda *_: pytest.fail('loaded robot must not reapproach'))
+    sequence._step_near_field_grasp(2, 0.0, None, None)
+    decision = sequence._step_near_field_grasp(10_000_000_000, 0.0, None, None)
+    assert decision.state is MatchState.TRANSPORT_ALIGN_RED_ZONE
+    assert sequence._transport_target_classes == (TargetClass.BLACK_CORE,)

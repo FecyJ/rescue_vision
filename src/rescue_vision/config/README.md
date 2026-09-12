@@ -31,7 +31,7 @@ grab_transport = config.build_grab_transport_sequence()
 | `match` | 正式流程启动、目标团、机会抓取、绿色接近、安全区 d1/d2、刹车补偿和退出参数 |
 | `match_cc` | CC 严格成团、单块通道净空、单块对准、20 ms 指令间隔和动作速度参数 |
 | `tracking` / `world` / `mission` | 轨迹生命周期、静态地图、颜色派生和规则状态机 |
-| `perception` / `hailo` | Pose、HSV、中心十字和安全区观测；`unknown_override_confidence_threshold` 控制高置信度模型类别对未知颜色结果的覆盖 |
+| `perception` / `hailo` | Pose、HSV、中心十字和安全区观测；模型类别为权威，HSV 只提取几何掩码 |
 | `localization` | 安全区/中心十字视觉锚点和编码器/IMU 融合 |
 | `near_field_grasp` | 正式流程近场交接及独立绿黑多目标收拢的范围、几何余量、确认窗口和评分权重 |
 | `green_grab` | 赛外像素居中抓取试验 |
@@ -44,27 +44,41 @@ grab_transport = config.build_grab_transport_sequence()
 
 目标团选择由 `cluster_*`、机会抓取由 `opportunistic_single_green_*` 控制。机会抓取先按
 `motion.gripper.transport_*` 固定姿态检查前向走廊；首轮只接受单个绿色，一般阶段允许
-绿/黑物资组或单个橙色伤员；没有安全方案才继续目标团解团。固定走廊外的合法目标
-先进入停车路由窗口。进入近场后由唯一确认窗口按同一目标 ID 收集不同有效帧，
-在安全近场组、远距重接近和解团之间只做一次路由；确认中的几何随该目标的最新有效帧更新，
+绿/黑物资组或单个橙色伤员；没有安全方案才继续目标团解团。正式动态解团在真实停稳后
+从当前帧选择接触核心，完成一次完整危险/边界检查，再按
+`match.breakup_confirmation_frames` 个不同有效帧确认并冻结，直接前推、张爪、后退；
+它不依赖近场准备器，也不执行单独接近或接触后第二轮复核。固定走廊外的合法目标
+仍先进入近场停车路由窗口。进入近场后锁定同一物理成员（tracker ID 变化由 K0 连续性关联），
 开爪提交时冻结执行计划，再按正式流程接近，进入 `near_field_grasp.max_range_mm` 后由近场状态机接管。首轮策略（单个
 绿色）与后续策略（绿/黑 1～3 个或单橙色）由 `MatchSequence` 按运输次数选择；近场配置同时
-用于独立收拢入口。`supply_recovery_frames` 控制单帧未知/质量异常后的稳定物资恢复帧数；
-明确危险证据不通过该参数解除。`action_settle_time_s` 在转向/直线切换前保持零速。
-普通运动的非零单轮最低速度由 `motion.min_wheel_velocity_m_s` 控制；绿色目标和近场组
-精对准使用 `match.green_alignment_min_wheel_velocity_m_s` 的单次覆盖值，当前 match
-模板为 0.01 m/s，避免改变启动和普通运输动作的最低速度。
-近场组的 `center_tolerance_mm` 是进入允许范围，当前 match 模板为 20 mm；进入滞回范围由
-`alignment_hysteresis_mm` 保持，锁定后固定旋转方向；
+用于独立收拢入口。单帧颜色证据不足或质量异常不累计疑似/恢复计数：锁定身份不因该单帧
+清零，下一帧当前清洁几何可继续，明确危险证据保持到轨迹消失。
+`action_settle_time_s` 在转向/直线切换前保持零速。
+普通运动的非零单轮最低速度由 `motion.min_wheel_velocity_m_s` 控制；远场绿色目标对准仍使用
+`match.green_alignment_min_wheel_velocity_m_s` 的单次覆盖值。近场选择器先在当前机器人方向下
+用原始横向包络分别反解左右舵机角度；两侧都可达且扫掠合法时直接提交，仅不可达才选最小必要
+转角，任一侧仍不可达即淘汰候选。
 已锁定目标使用 `max_range_mm + range_hysteresis_mm` 的退出半径，避免边界观测抖动换组；
-唯一确认窗口由 `confirmation_frames` 和 `alignment_timeout_ms` 共同限制，计时从 settle 完成后的 observation window 打开开始；
-单橙色计划还受配置项 `orange_isolation_radius_mm` 的硬门禁：只有当前帧有地面位置且落入半径的其它目标才拒绝；缺少 K0 的目标不作无条件推定。
+正式配置 `confirmation_frames=1`，表示真实停稳后的一个当前帧复核；
+`alignment_timeout_ms` 仅作为停稳和当前准备结果的总提交预算；
+单橙色计划还受配置项 `orange_isolation_radius_mm` 的硬门禁：只有当前帧有地面位置且落入半径的其它目标才拒绝，缺少 K0 的无关合法目标不作距离推定；当前扫掠内缺少 K0 的蓝色危险目标不能证明安全，拒绝提交。
 
-`cluster_search_empty_angular_velocity_rad_s` 是只有蓝色/未知或无任务目标时的同向快速扫描
-速度，必须不慢于 `cluster_search_angular_velocity_rad_s`。安全区运输参数分为夹取→d1、
+`cluster_search_empty_angular_velocity_rad_s` 是没有可搜索的绿/黑/橙目标时的同向快速扫描
+速度；如果当前帧所有有效非蓝目标的 bbox 中心都落在任一安全区 bbox 内，也使用该速度。它必须
+不慢于 `cluster_search_angular_velocity_rad_s`。同一速度也用于合爪后的补夹扫描
+（`TRANSPORT_GREEDY_SCAN`）：当前帧没有可补夹的绿/黑信息时快速转动，出现可补夹信息后回到
+`close_gripper_spin_angular_velocity_rad_s`，两条速度共用 `spin_angle_rad` 作为本次扫描的
+旋转预算。目标方向走廊的横向阻挡门限按两块实体的内切半径之和加
+`near_field_grasp.clearance_mm / 2 + corridor_lateral_margin_mm` 逐目标计算，
+`green_path_half_width_mm` 只是缺少目标物理尺寸配置时的回退值；近场蓝块净空同样使用内切半径，
+外接半径不再把只是近旁的蓝块当成阻挡。安全区运输参数分为夹取→d1、
 d1→d2、d2→末段三段；若夹取位置沿己方 y 方向已越过 d1，则跳过回到 d1 的直线段。
-纠偏搜索使用 `safe_zone_key_search_angular_velocity_rad_s`，并由
-`safe_zone_bbox_edge_margin_px` 要求完整 bbox 离开图像边缘后才采集 K0/K1/K2；角点和静态
+纠偏搜索使用 `safe_zone_key_search_angular_velocity_rad_s`；有 bbox 时由
+`safe_zone_bbox_turn_kp_rad_s`、`safe_zone_bbox_turn_max_angular_velocity_rad_s` 和中心滞回参数
+按归一化水平误差比例追踪，换向先等待轮速停稳并只消费停车后的新帧。关键点暂缺时进入
+`safe_zone_keypoint_reobserve_timeout_s` 静止重观测；bbox 居中仍缺点时最多同向低速扫视一次，
+扫描后重新停车取新帧。
+`safe_zone_bbox_edge_margin_px` 仍要求完整 bbox 离开图像边缘后才采集 K0/K1/K2；角点和静态
 地标拟合 `FieldPose2D` 后覆盖当前航位。`safe_zone_d2_braking_overrun_*`
 和 `safe_zone_d2_to_final_braking_overrun_mm` 只补偿预计刹车过冲。绿/黑物资末段使用
 `safe_zone_d2_to_final_speed_m_s` 与 `safe_zone_d2_to_final_braking_overrun_mm`；单个橙色
@@ -72,8 +86,8 @@ d1→d2、d2→末段三段；若夹取位置沿己方 y 方向已越过 d1，�
 `safe_zone_orange_d2_to_final_braking_overrun_mm`。解团阶段可用
 `breakup_max_wheel_acceleration_m_s2` 覆盖 `motion.max_wheel_acceleration_m_s2`，设为
 `null` 时继承全局值。释放并直线倒车退出后会再次执行同一视觉纠偏，再用新帧直接开始
-搜索，不做固定退出转向。视觉纠偏只消费停稳阶段的当前观测，不接入采集时刻位姿对齐或
-跨帧目标记忆。
+搜索，不做固定退出转向。视觉纠偏只消费停稳阶段的当前观测；正式 match 的目标对准会使用
+有限采集时刻编码器/IMU 位姿历史，不接入跨帧目标记忆。
 绿/黑物资路线终点由 `safe_zone_fallback_target_field_mm` 配置，单个橙色
 伤员由 `safe_zone_injured_target_field_mm` 配置；两者都是 `FieldPoint`，单位 mm。
 
@@ -81,9 +95,18 @@ d1→d2、d2→末段三段；若夹取位置沿己方 y 方向已越过 d1，�
 
 `configs/runtime.cc.yaml` 只在 `match` 节保留 CC 确实复用的启动、近场入口和安全区运输
 参数；CC 特有阈值全部位于 `match_cc`。`cluster_neighbor_distance_mm` 定义团内每块
-至少拥有两个邻居的距离上限；原解团的5帧均值、单次角度对准、固定接近和前推/后退
+至少拥有两个邻居的距离上限；CC 的5帧均值、单次角度对准、固定接近和前推/后退
 参数继续来自 `match.cluster_*`/`breakup_*`，其中 `cluster_align_hold_ms=1000` 是缺团后
-重新搜索的最长等待。`isolated_line_clearance_mm` 定义绿/黑物块的原点—K0 线段净空，
+重新搜索的最长等待。正式 match 的 `breakup_confirmation_frames` 控制停稳后接触核心
+确认所需的连续有效帧数；停稳后仍选不出任何合法接触计划时，`breakup_no_plan_reobserve_ms`
+只给一个有界的重观测窗口就退出本次区域，不占满按确认帧数计的确认预算。
+`breakup_forward_distance_m` 和
+`breakup_backward_distance_m` 是动态计划的行程上限；`breakup_penetration_mm` /
+`breakup_retry_penetration_mm` 分别限制首次和第二次及以后的局部穿入，
+`breakup_max_attempts` 是同一物理接触团允许的推进尝试次数，取值范围 `[1, 4]`；
+第 2 次及以后都使用 `breakup_retry_penetration_mm`，且只有比上一次更深才会被采纳。
+CC 入口仍把同名前进/后退值作为固定动作距离。
+`isolated_line_clearance_mm` 定义绿/黑物块的原点—K0 线段净空，
 橙色净空则逐帧使用颜色掩码的地面投影宽度。`block_alignment_tolerance_mm` 控制单块
 y 对准误差。未知键、非有限数值、
 超过底盘速度上限的动作参数都会在打开硬件前被拒绝。
@@ -113,8 +136,7 @@ python -m pytest tests/test_config.py
 `confirmation_frames` 必须为正。`grasp_commit_max_observation_age_ms` 限制准备结果发布年龄、
 静止遥测的间断/年龄，以及没有静止证据时的短龄几何；实际静止期间采集的当前计划使用
 `processing.max_observation_age_ms` 作为观测失联上限。`stationary_max_gyro_rad_s` 为有限正数，
-默认0.03 rad/s；完整证据条件见 [app README](../app/README.md)。准备器不改写 `capture_timestamp_ns`。`fine_alignment_zone_rad`
-与 `fine_alignment_min_wheel_velocity_m_s` 只影响近零角度的单次对准指令，后者允许为零。
+默认0.03 rad/s；完整证据条件见 [app README](../app/README.md)。准备器不改写 `capture_timestamp_ns`。
 规则分值、权重与余量有限且非负，权重和必须有限且大于零；
 `orange_priority_weight` 必须大于数量、净空、距离和对准权重之和，以保证单橙严格优先于同分的绿黑组合；
 尺寸、范围和确认数量严格校验，未知字段拒绝加载。`max_range_mm` 是 K0 的机器人相对
@@ -122,7 +144,8 @@ python -m pytest tests/test_config.py
 目标 K0 的期望结束位置，`corridor_start_x_mm` 和 `corridor_lateral_margin_mm` 定义危险
 目标 K0 的前进扫掠走廊；`side_neighbor_longitudinal_margin_mm` 与
 `side_neighbor_lateral_margin_mm` 定义预测抓取方向下非橙计划的蓝色侧邻、以及单橙计划的
-蓝/橙侧邻 K0 中心差门限，明显前后错开的目标不触发该门禁。角度安全端点继续使用
+蓝/橙侧邻 K0 中心差门限，明显前后错开的目标不触发该门禁。
+角度安全端点继续使用
 `motion.gripper`；不再从 `match` 读取
 车体包络或夹臂扫掠余量。
 

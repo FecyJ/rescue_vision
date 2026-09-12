@@ -180,6 +180,8 @@ def isolated_targets(
 class MatchCCSequence(MatchSequence):
     """CC 状态机；仅继承正式流程的启动、安全短路、运输和退出实现。"""
 
+    _dynamic_breakup_enabled = False
+
     def __init__(self, *args, cc_config: MatchCCRuntimeConfig, projector=None, orange_selector=None, **kwargs):
         super().__init__(*args, **kwargs)
         self._initialize_cc(cc_config, projector, orange_selector)
@@ -230,6 +232,7 @@ class MatchCCSequence(MatchSequence):
             configured.near_field_grasp,
             projector,
             GripperKinematics(),
+            target_geometry=configured.perception.target_ground_geometry,
             open_servo_angles_deg=(gripper.open_left_angle_deg, gripper.open_right_angle_deg),
             closed_servo_angles_deg=(gripper.closed_left_angle_deg, gripper.closed_right_angle_deg),
         )
@@ -237,6 +240,8 @@ class MatchCCSequence(MatchSequence):
         sequence.__dict__.update(base.__dict__)
         sequence._initialize_cc(configured.match_cc, projector, orange_selector)
         return sequence
+
+    _greedy_pickup_enabled = False
 
     @property
     def near_field_policy(self) -> NearFieldGraspPolicy:

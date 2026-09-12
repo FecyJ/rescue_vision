@@ -170,6 +170,40 @@ def _overlay_near_field_corridor(
     )
 
 
+def _overlay_breakup_plan(frame, sequence, projector):
+    """Draw only on the plan's capture frame; never project stale robot coordinates."""
+    plan = sequence.breakup_preview_plan
+    if frame is None or plan is None or projector is None or frame.timestamp_ns != plan.capture_timestamp_ns:
+        return frame
+    import cv2
+    from rescue_vision.camera.frame import CameraFrame
+    from rescue_vision.geometry.types import GroundPoint
+    from rescue_vision.perception.detector import MODEL_GROUND_FORWARD_BIAS_MM
+
+    image = frame.image_bgr.copy()
+    bearing = math.atan2(plan.aim.y, plan.aim.x)
+    c, s = math.cos(bearing), math.sin(bearing)
+    length = plan.approach_distance_mm + plan.forward_distance_mm
+    width = plan.sweep_half_width_mm
+    points = [GroundPoint(c*x-s*y-MODEL_GROUND_FORWARD_BIAS_MM, s*x+c*y)
+              for x,y in ((0,-width),(length,-width),(length,width),(0,width))]
+    points.append(GroundPoint(plan.aim.x-MODEL_GROUND_FORWARD_BIAS_MM,plan.aim.y))
+    try:
+        pixels = projector.ground_to_pixels(tuple(points))
+        if not all(math.isfinite(p.u) and math.isfinite(p.v) and max(abs(p.u),abs(p.v)) < 1e7 for p in pixels):
+            return frame
+        xy = [(round(p.u),round(p.v)) for p in pixels]
+        for i in range(4):
+            cv2.line(image,xy[i],xy[(i+1)%4],(255,0,255),2)
+        cv2.drawMarker(image,xy[4],(255,0,255),cv2.MARKER_CROSS,24,3)
+        cv2.putText(image,f"BREAK #{plan.aim_id} try={plan.attempt} F={plan.forward_distance_mm:.0f} R={plan.backward_distance_mm:.0f}mm",
+                    (12,32),cv2.FONT_HERSHEY_SIMPLEX,.65,(255,0,255),2,cv2.LINE_AA)
+    except (ValueError, IndexError):
+        return frame
+    return CameraFrame(frame.sequence,frame.timestamp_ns,image,
+                       metadata={**frame.metadata,"breakup_aim_id":str(plan.aim_id),"breakup_attempt":str(plan.attempt)})
+
+
 def _overlay_match_selected_targets(
     frame: CameraFrame | None,
     sequence: MatchSequence,
@@ -453,20 +487,15 @@ def _run_hardware(
             f"{config.near_field_grasp.max_range_mm:g} "
             "near_field_max_targets="
             f"{config.near_field_grasp.max_targets} "
-            "near_field_center_tolerance_mm="
-            f"{config.near_field_grasp.center_tolerance_mm:g} "
-            "near_field_alignment_hysteresis_mm="
-            f"{config.near_field_grasp.alignment_hysteresis_mm:g} "
-            "near_field_alignment_timeout_ms="
+            "near_field_direct_current_heading=true "
+            "near_field_commit_timeout_ms="
             f"{config.near_field_grasp.alignment_timeout_ms:g} "
+            "near_field_no_plan_wait_ms="
+            f"{config.near_field_grasp.no_plan_wait_ms:g} "
             "near_field_grasp_commit_max_observation_age_ms="
             f"{config.near_field_grasp.grasp_commit_max_observation_age_ms:g} "
             "near_field_confirmation_frames="
             f"{config.near_field_grasp.confirmation_frames} "
-            "near_field_fine_alignment_zone_rad="
-            f"{config.near_field_grasp.fine_alignment_zone_rad:g} "
-            "near_field_fine_alignment_min_wheel_velocity_m_s="
-            f"{config.near_field_grasp.fine_alignment_min_wheel_velocity_m_s:g} "
             "orange_isolation_radius_mm="
             f"{config.near_field_grasp.orange_isolation_radius_mm:g} "
             "transport_corridor_half_width_mm="
@@ -481,6 +510,7 @@ def _run_hardware(
             f"{config.match.safe_zone_d2_braking_overrun_y_mm:g}) "
             f"action_settle_time_s={config.match.action_settle_time_s:g} "
             f"close_gripper_spin_angle_rad={config.match.spin_angle_rad:g} "
+            f"breakup_confirmation_frames={config.match.breakup_confirmation_frames} "
             f"breakup_field_half_extent_mm={config.match.breakup_field_half_extent_mm:g} "
             f"breakup_gripper_offset_mm={config.match.breakup_gripper_offset_mm:g}",
             flush=True,
@@ -557,6 +587,7 @@ def _run_hardware(
                 config.near_field_grasp,
                 pipeline.ground_projector,
                 GripperKinematics(),
+            target_geometry=config.perception.target_ground_geometry,
                 open_servo_angles_deg=(
                     gripper.open_left_angle_deg,
                     gripper.open_right_angle_deg,
@@ -828,13 +859,24 @@ def _run_hardware(
                 near_field_worker_session_id: int | None = None
                 near_field_last_error: str | None = None
                 near_field_last_failure_reported: str | None = None
+                breakup_last_failure_reported: str | None = None
                 last_state: MatchState | None = None
+                last_opening_phase: str | None = None
                 preview_state_text = sequence.state.value
                 preview_reason_text = "started"
                 next_progress_ns = 0
+                next_observer_render_ns = 0
+                last_control_tick_ns: int | None = None
+                control_period_ms: list[float] = []
+                next_control_timing_report_ns = time.monotonic_ns() + 2_000_000_000
                 recent_rendered_frames = {}
                 while not stop_requested:
                     now_ns = time.monotonic_ns()
+                    if last_control_tick_ns is not None:
+                        control_period_ms.append(
+                            (now_ns - last_control_tick_ns) / 1_000_000.0
+                        )
+                    last_control_tick_ns = now_ns
                     apply_motion_acceleration_limit()
                     controller.update(now_ns=now_ns)
                     branch_error: str | None = None
@@ -921,13 +963,13 @@ def _run_hardware(
                     near_field_preparation = None
                     near_field_path_clear = None
                     if (
-                        sequence.state is MatchState.TRANSPORT_NEAR_FIELD_GRASP
+                        (sequence.state is MatchState.TRANSPORT_NEAR_FIELD_GRASP or sequence.breakup_observing)
                         and sequence.near_field_enabled
                     ):
                         ensure_near_field_worker()
                     if (
                         near_field_worker is not None
-                        and sequence.state is MatchState.TRANSPORT_NEAR_FIELD_GRASP
+                        and (sequence.state is MatchState.TRANSPORT_NEAR_FIELD_GRASP or sequence.breakup_observing)
                     ):
                         session_id = sequence.near_field_session_id
                         if near_field_worker_session_id != session_id:
@@ -943,6 +985,7 @@ def _run_hardware(
                         ):
                             near_field_worker.submit(
                                 latest_snapshot,
+                                excluded_observation_indices=sequence.grasp_excluded_observation_indices(latest_snapshot),
                                 session_id=session_id,
                                 policy=sequence.near_field_policy,
                                 locked_ids=sequence.near_field_locked_ids,
@@ -958,7 +1001,6 @@ def _run_hardware(
                             near_field_preparation is not None
                             and near_field_selection is not None
                             and near_field_selection.plan is not None
-                            and near_field_selection.plan.alignment_angle_rad == 0.0
                         ):
                             near_field_path_clear = sequence.near_field_plan_path_clear(
                                 near_field_selection.plan,
@@ -987,26 +1029,82 @@ def _run_hardware(
                         near_field_preparation=near_field_preparation,
                         near_field_path_clear=near_field_path_clear,
                     )
-                    if (
-                        decision.state is MatchState.TRANSPORT_NEAR_FIELD_GRASP
-                        and sequence.near_field_active_plan is None
-                    ):
-                        corridor_frame = rendered
-                        if near_field_preparation is not None:
-                            corridor_frame = recent_rendered_frames.get(
-                                near_field_preparation.capture_timestamp_ns,
-                                rendered,
-                            )
-                        rendered = _overlay_near_field_corridor(
-                            corridor_frame,
-                            near_field_preparation,
-                            near_field_selector,
+
+                    # The action result is the control deadline.  Apply the
+                    # wheel command before any observer-only image overlay,
+                    # remote publication, or verbose diagnostic formatting.
+                    apply_motion_acceleration_limit()
+                    if decision.state in {
+                        MatchState.FINISH_STOP,
+                        MatchState.TERMINAL_STOP,
+                    }:
+                        controller.soft_brake()
+                    elif decision.soft_brake:
+                        brake_key = (decision.state, decision.reason)
+                        if brake_key != last_soft_brake_key:
+                            controller.soft_brake()
+                            last_soft_brake_key = brake_key
+                    else:
+                        last_soft_brake_key = None
+                        controller.drive_wheel_limited(
+                            decision.linear_velocity_m_s,
+                            decision.angular_velocity_rad_s,
+                            min_wheel_velocity_m_s=decision.min_wheel_velocity_m_s,
                         )
-                    rendered = _overlay_match_selected_targets(
-                        rendered,
-                        sequence,
-                        near_field_preparation,
-                    )
+
+                    if decision.gripper_angles_deg is not None:
+                        angles = decision.gripper_angles_deg
+                    elif decision.gripper_posture is GripperPosture.OPEN:
+                        angles = (gripper.open_left_angle_deg, gripper.open_right_angle_deg)
+                    elif decision.gripper_posture is GripperPosture.TRANSPORT:
+                        angles = gripper.transport_angles_deg
+                    else:
+                        angles = (gripper.closed_left_angle_deg, gripper.closed_right_angle_deg)
+                    assert angles is not None
+                    if angles != last_gripper_angles:
+                        controller.set_gripper_angles(*angles)
+                        print(
+                            "gripper_command="
+                            f"posture={decision.gripper_posture.value} "
+                            f"left={angles[0]:g} right={angles[1]:g}",
+                            flush=True,
+                        )
+                        last_gripper_angles = angles
+
+                    # Selected-target/plan overlays are useful for supervision
+                    # but are not control evidence.  Keep them in a bounded
+                    # observer cadence so large ROI masks and projections do
+                    # not elongate the control period.
+                    if now_ns >= next_observer_render_ns:
+                        try:
+                            if (
+                                decision.state is MatchState.TRANSPORT_NEAR_FIELD_GRASP
+                                and sequence.near_field_active_plan is None
+                            ):
+                                corridor_frame = rendered
+                                if near_field_preparation is not None:
+                                    corridor_frame = recent_rendered_frames.get(
+                                        near_field_preparation.capture_timestamp_ns,
+                                        rendered,
+                                    )
+                                rendered = _overlay_near_field_corridor(
+                                    corridor_frame,
+                                    near_field_preparation,
+                                    near_field_selector,
+                                )
+                            rendered = _overlay_match_selected_targets(
+                                rendered,
+                                sequence,
+                                near_field_preparation,
+                            )
+                            rendered = _overlay_breakup_plan(
+                                rendered,
+                                sequence,
+                                pipeline.ground_projector,
+                            )
+                        except Exception as exc:
+                            print(f"observer_overlay_hold={exc}", flush=True)
+                        next_observer_render_ns = now_ns + 100_000_000
                     if decision.reason == "near_field_grasp_complete_start_safe_zone_d1_line":
                         print(
                             f"near_field_result={sequence.near_field_result}",
@@ -1019,8 +1117,14 @@ def _run_hardware(
                     ):
                         print(failure_diagnostic, flush=True)
                         near_field_last_failure_reported = failure_diagnostic
+                    breakup_failure = sequence.breakup_last_failure_diagnostic
+                    if (
+                        breakup_failure is not None
+                        and breakup_failure != breakup_last_failure_reported
+                    ):
+                        print(breakup_failure, flush=True)
+                        breakup_last_failure_reported = breakup_failure
                     update_d2_telemetry_phase(decision, now_ns)
-                    apply_motion_acceleration_limit()
                     preview_state_text = decision.state.value
                     preview_reason_text = decision.reason
                     if decision.state is MatchState.TRANSPORT_NEAR_FIELD_GRASP:
@@ -1053,6 +1157,19 @@ def _run_hardware(
                     state_changed = decision.state is not last_state
                     if state_changed:
                         _print_state_banner(decision.state, decision.reason)
+                        last_state = decision.state
+                    # 变体入口可选的航点诊断：按阶段变化记录目标航点、估计位置和
+                    # 剩余误差，便于事后判断是策略不到位还是航位推算已漂移。
+                    opening_phase = getattr(
+                        sequence, "nb_opening_route_phase", None
+                    )
+                    if opening_phase != last_opening_phase:
+                        last_opening_phase = opening_phase
+                        diagnostic = getattr(
+                            sequence, "nb_opening_diagnostic", None
+                        )
+                        if diagnostic is not None:
+                            print(f"nb_opening={diagnostic}", flush=True)
                     if decision.reason == "near_field_opening:open_group_width":
                         plan_age = (
                             None
@@ -1073,24 +1190,6 @@ def _run_hardware(
                             f"confirmation={None if near_field_preparation is None else near_field_preparation.confirmation_progress}",
                             flush=True,
                         )
-                    if decision.gripper_angles_deg is not None:
-                        angles = decision.gripper_angles_deg
-                    elif decision.gripper_posture is GripperPosture.OPEN:
-                        angles = (gripper.open_left_angle_deg, gripper.open_right_angle_deg)
-                    elif decision.gripper_posture is GripperPosture.TRANSPORT:
-                        angles = gripper.transport_angles_deg
-                    else:
-                        angles = (gripper.closed_left_angle_deg, gripper.closed_right_angle_deg)
-                    assert angles is not None
-                    if angles != last_gripper_angles:
-                        controller.set_gripper_angles(*angles)
-                        print(
-                            "gripper_command="
-                            f"posture={decision.gripper_posture.value} "
-                            f"left={angles[0]:g} right={angles[1]:g}",
-                            flush=True,
-                        )
-                        last_gripper_angles = angles
                     if remote_transport is not None:
                         try:
                             _publish_remote_match_state(
@@ -1107,30 +1206,13 @@ def _run_hardware(
                     }:
                         if not state_changed:
                             _print_state_banner(decision.state, decision.reason)
-                        controller.soft_brake()
                         print(
                             f"terminal_state={decision.state.value} "
                             f"reason={decision.reason}",
                             flush=True,
                         )
                         break
-                    if decision.soft_brake:
-                        brake_key = (decision.state, decision.reason)
-                        if brake_key != last_soft_brake_key:
-                            controller.soft_brake()
-                            last_soft_brake_key = brake_key
-                    else:
-                        last_soft_brake_key = None
-                        controller.drive_wheel_limited(
-                            decision.linear_velocity_m_s,
-                            decision.angular_velocity_rad_s,
-                            min_wheel_velocity_m_s=(
-                                decision.min_wheel_velocity_m_s
-                            ),
-                        )
-                    if decision.state is not last_state or now_ns >= next_progress_ns:
-                        if not state_changed:
-                            _print_state_banner(decision.state, decision.reason)
+                    if now_ns >= next_progress_ns:
                         path_text = (
                             sequence.green_isolation_diagnostic(now_ns)
                             if decision.state
@@ -1198,6 +1280,19 @@ def _run_hardware(
                         )
                         last_state = decision.state
                         next_progress_ns = now_ns + 1_000_000_000
+                    if now_ns >= next_control_timing_report_ns:
+                        if control_period_ms:
+                            ordered = sorted(control_period_ms)
+                            p50 = ordered[(len(ordered) - 1) * 50 // 100]
+                            p95 = ordered[(len(ordered) - 1) * 95 // 100]
+                            print(
+                                "control_timing="
+                                f"(samples={len(ordered)},period_ms_p50={p50:.1f},"
+                                f"period_ms_p95={p95:.1f},period_ms_max={max(ordered):.1f})",
+                                flush=True,
+                            )
+                        control_period_ms = []
+                        next_control_timing_report_ns = now_ns + 2_000_000_000
                     time.sleep(0.005)
         finally:
             try:

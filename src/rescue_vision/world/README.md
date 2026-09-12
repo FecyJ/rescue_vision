@@ -122,8 +122,7 @@ world:
 
 - 曾完成跨帧确认且危险概率达到 `danger_confirm_threshold` 时是
   `CONFIRMED`；短时 `COASTING` 不会抹掉危险历史；
-- 危险概率达到较低疑似阈值、未知概率过高、轨迹未确认或处于
-  `COASTING`、类别为 `UNKNOWN` 时是 `SUSPECTED`；
+- 危险概率达到较低疑似阈值、轨迹未确认或处于 `COASTING` 时是 `SUSPECTED`；
 - 其余才是 `CLEAR`。
 
 状态机只允许选择 `CLEAR` 目标。`SUSPECTED` 不会被强行改成普通物资。

@@ -39,7 +39,12 @@ class GrabTransportSequence(
     前段夹取和运输沿用父类；仅覆盖安全区末端的闭爪推进姿态。
     """
 
+    _greedy_pickup_enabled = False
+
     _first_green_blocked_routes_to_breakup = False
+    # This entry is a single-green transport bench test; it must never enter
+    # the formal match's dynamic breakup planner.
+    _dynamic_breakup_enabled = False
 
     INITIAL_FIELD_POSITION: FieldPoint = FieldPoint(0.0, 0.0)
     INITIAL_HEADING_RAD: float = math.pi / 2.0

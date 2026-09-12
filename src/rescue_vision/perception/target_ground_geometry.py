@@ -194,7 +194,6 @@ class GroundGeometryMethod(str, Enum):
 
 
 class GroundGeometryQuality(str, Enum):
-    UNKNOWN_CLASS = "unknown_class"
     COLOR_MASK_UNAVAILABLE = "color_mask_unavailable"
     K0_UNAVAILABLE = "k0_unavailable"
     FIT_LOW_CONFIDENCE = "fit_low_confidence"
@@ -894,13 +893,6 @@ class TargetGroundGeometryEstimator:
         result_timestamp_ns: int,
     ) -> TargetGroundGeometry:
         quality: set[GroundGeometryQuality] = set()
-        if observation.target_class not in COLOR_TARGET_CLASSES:
-            quality.add(GroundGeometryQuality.UNKNOWN_CLASS)
-            return self._unavailable(
-                observation,
-                result_timestamp_ns,
-                quality,
-            )
         segmentation = observation.color_segmentation
         if (
             segmentation.status is not ColorSegmentationStatus.ACCEPTED

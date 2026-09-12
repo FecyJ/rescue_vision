@@ -1,6 +1,7 @@
-# 正式流程：首轮搜索最近单绿；其走廊不安全时直接解团；一般阶段按不同 X 终点优先寻找可抓取物资组。
+# strategy 流程：启动冲刺后只搜索蓝色危险物块，能直接夹取则单个转运，
+# 否则允许对全蓝色目标团执行动态解团；两次分别放到对面安全区左右 D2 点。
 # 本文件以启动区域 2（地图右上角、红方）为坐标基准；区域 3 通过
-# rescue-vision-match 的 --start-area 3 在运行时做中心对称并切换为蓝方。
+# match_strategy 的 --start-area 3 在运行时做中心对称并切换为蓝方。
 
 camera:
   backend: rpicam_vid
@@ -124,12 +125,12 @@ match:
   robot_footprint_radius_mm: 160.0
   safety_margin_mm: 10.0
   enabled: true
-  # 启动右转角，单位 rad；角速度符号决定右转方向。
-  startup_turn_angle_rad: 0.5
-  startup_turn_angular_velocity_rad_s: -1.5
+  # strategy 启动第一腿右转、第二腿左转的角度；两腿均为 45°。
+  startup_turn_angle_rad: 0.7853981634
+  startup_turn_angular_velocity_rad_s: -2
   startup_turn_settle_time_s: 0.1
-  # 启动直行距离和速度，单位 m、m/s。
-  startup_forward_distance_m: 1.5
+  # 第一腿短冲距离和速度；单位 m、m/s。
+  startup_forward_distance_m: 1.2
   startup_forward_speed_m_s: 0.5
   startup_forward_settle_time_s: 0.1
   # 启动直行的左右轮速 PID；现场先调 P，I/D 通常保持 0。
@@ -141,22 +142,10 @@ match:
   startup_straight_pid_max_angular_velocity_rad_s: 0.08
   # 目标团搜索原地转速和单方向扫描跨度，单位 rad/s、rad。
   cluster_search_angular_velocity_rad_s: -0.3
-  # 当前帧只有蓝色或没有任务目标时使用的同向快速扫描角速度。
+  # 当前帧只有蓝色/未知目标或没有任务目标时使用的同向快速扫描角速度。
   cluster_search_empty_angular_velocity_rad_s: -0.8
-  # 一次决策的旋转预算，单位 rad。搜索、对准、近场和重选之间连续累计绝对
-  # 转角，只有真正执行完一次抓取或一次解团推挤、或确认场上不再有蓝块以外
-  # 的可收集信息时才重新计时。整整一圈用完仍未执行任何动作时必须推进：
-  # 先选其它未被失败记忆挡住的合法计划；没有合法计划时执行经过路径检查的
-  # 有界 cluster_relocate 换位。原地转向或新会话不会清除失败记忆。
   cluster_search_sweep_angle_rad: 6.283185307179586
   cluster_min_detections: 2
-  # 成团的地面中心距上限，单位 mm。按物体的半对角接触上界加地面拟合中心
-  # 不确定度（perception.target_ground_geometry.fitting.max_center_uncertainty_mm
-  # 为 12 mm/个，两两合计 +24 mm）换算：物资/危险块角对角 56.6、伤员与方块
-  # 73.0、黑核与方块 51.4，加不确定度后最高 97 mm，100 mm 覆盖全部常见接触
-  # 组合。再放大到 115 mm 只能多并进"两个伤员角对角"，同时会把 100～120 mm
-  # 的散件（实测最近邻分布里占 5%）也判成团，反过来要求推移无关目标；
-  # 伤员本来就单独转运。保持 100 mm。
   cluster_group_ground_mm: 100.0
   # 旧/CC 入口的目标团接近参数；正式动态解团停稳后直接使用当前帧，不单独接近。
   cluster_breakup_standoff_mm: 260.0
@@ -167,50 +156,36 @@ match:
   cluster_align_hold_ms: 2000.0
   cluster_align_kp_rad_s: 0.5
   cluster_align_max_angular_velocity_rad_s: 0.35
-  # 搜索目标团时启用机会抓取；首轮单绿，一般阶段优先多物资组。
-  opportunistic_single_green_enabled: true
+  # strategy 第二腿左转后直冲 1 m；复用该配置字段，单位 m、m/s。
+  cluster_relocate_distance_m: 1.0
+  cluster_relocate_speed_m_s: 0.5
+  # strategy 不搜索绿/黑/橙，直接按蓝色目标路径处理。
+  opportunistic_single_green_enabled: false
   # 保留为旧纯逻辑夹具的邻域诊断参数；正式单绿机会使用固定 TRANSPORT 走廊判定。
   opportunistic_single_green_clearance_mm: 120.0
   # 解团前推/后退的距离和速度，单位 m、m/s。
   # match: 进退距离为上限；CC: 仍为固定距离。以下局部参数仅用于 match。
-  breakup_penetration_mm: 360.0
-  breakup_retry_penetration_mm: 360.0
-  # 最小推进门槛，单位 mm。门槛取 `breakup_min_penetration_mm +
-  # breakup_braking_margin_mm` 与局部接触集自身纵向跨度的较小值：浅团只要能
-  # 整段推穿就成立。40 mm 正四面体黑核的内切接触盘只有 2r≈23 mm，固定门槛
-  # 30 mm 会让它永远选不出瞄准点（现场日志里 129 次逐候选淘汰有 127 次是
-  # 23.1 mm）。行程不足以推穿接触跨度时仍按当时门槛淘汰。
+  breakup_penetration_mm: 240.0
+  breakup_retry_penetration_mm: 240.0
   breakup_min_penetration_mm: 10.0
   breakup_retreat_clearance_mm: 40.0
   breakup_push_margin_mm: 60.0
   breakup_braking_margin_mm: 20.0
   breakup_deceleration_m_s2: 0.8
-  # 同一个物理瞄准点（场地点，容差 cluster_group_ground_mm）最多尝试次数；
-  # 用尽后换下一个瞄准点或下一个团，不再连坐整片区域。
-  breakup_max_attempts: 3
+  breakup_max_attempts: 2
   # 停稳后当前接触核心需要的连续有效帧数；不再执行接近后第二轮复核。
   breakup_confirmation_frames: 1
-  # 停稳后仍选不出任何合法接触计划时的重观测窗口，单位 ms。重复观测只有在
-  # 新一帧检出新的可接触成员时才可能改变结果，所以只等一到两帧就退出本次
-  # 区域，不占满上面的确认帧预算（现场感知 250～430 ms，取约两帧）。
-  breakup_no_plan_reobserve_ms: 1000.0
   breakup_forward_distance_m: 0.8
-  breakup_forward_speed_m_s: 0.6
+  breakup_forward_speed_m_s: 0.4
   breakup_backward_distance_m: 0.8
-  breakup_backward_speed_m_s: 0.45
+  breakup_backward_speed_m_s: 0.3
   # 解团阶段临时单轮最大加速度，单位 m/s²；null 继承 motion 全局值，按实车单独调节。
   breakup_max_wheel_acceleration_m_s2: 4.0
-  # 合爪后的补夹扫描：有可补夹信息时按 close_gripper_spin_angular_velocity_rad_s
-  # 转动，当前帧只有蓝色或已收拢/已交付物资时改用
-  # cluster_search_empty_angular_velocity_rad_s 快速转动；两条速度共用
-  # spin_angle_rad 作为本次扫描的旋转预算（原 2*pi，现改为 270 度），单位
-  # rad/s、rad。扫描命中即进入全局对准链，完成一次补夹后直接返程。
+  # 合爪后原地扫描一整圈，单位 rad/s、rad。
   close_gripper_spin_angular_velocity_rad_s: -0.4
-  spin_angle_rad: 4.712388980384690
-  # 走廊横向阻挡门限的回退半宽，单位 mm。正式远场搜索按两块实体的内切
-  # 半径之和加近场夹爪余量（clearance_mm/2 + corridor_lateral_margin_mm）
-  # 逐目标计算门限，不再用固定半宽，也不再用蓝块外接半径；只有缺少目标
-  # 物理尺寸配置的纯逻辑调用方才使用本回退值。
+  spin_angle_rad: 6.283185307179586
+  # 解团后绿色目标对齐接近走廊的横向阻挡半宽，单位 mm；正式远场搜索仍按
+  # motion.gripper.transport_* 的固定包络评估走廊，但实际夹爪保持 CLOSED。
   green_path_half_width_mm: 50.0
   # 绿色目标允许的最大观测年龄，单位 ms。
   green_max_age_ms: 1000.0
@@ -255,17 +230,18 @@ match:
   safe_zone_d2_to_final_speed_m_s: 0.45
   # 单橙色伤员 d2→安全区末端的独立速度，单位 m/s；当前先与通用末段一致，按实测单独调节。
   safe_zone_orange_d2_to_final_speed_m_s: 0.45
-  # d2 闭爪推进后末段的固定刹车过冲提前量，正值沿己方安全区方向在终点前停车，单位 mm。
-  safe_zone_d2_to_final_braking_overrun_mm: 70.0
+  # strategy 在 D2 释放，不执行 D2→安全区深处的二次推进。
+  safe_zone_d2_to_final_braking_overrun_mm: 0.0
   # 单橙色伤员 d2→安全区末端的独立刹车过冲提前量，单位 mm；当前先与通用末段一致。
   safe_zone_orange_d2_to_final_braking_overrun_mm: 80.0
   # d2→安全区末端的临时单轮最大加速度，单位 m/s²；允许独立高于 motion 全局基准，
   # 现场按刹车距离实测调整。
   safe_zone_d2_to_final_max_wheel_acceleration_m_s2: 4.0
-  # 安全区路线推进终点 FieldPoint：[x_mm, y_mm]；同时定义 d1/d2 基准坐标。
-  # 绿/黑物资区与橙色伤员区的独立运输终点，单位 mm。
-  safe_zone_fallback_target_field_mm: [-130.0, 1115.0]
-  safe_zone_injured_target_field_mm: [130.0, 1115.0]
+  # strategy 对面安全区左右 D2 的最终对齐点，单位 mm；
+  # x<0 为第一趟左侧点，x>0 为第二趟右侧点。策略阶段不再从该点
+  # 额外向安全区内部推进；恢复 match 后继续使用同一参数作为 d2 偏移。
+  safe_zone_fallback_target_field_mm: [-130.0, -1000.0]
+  safe_zone_injured_target_field_mm: [130.0, -1000.0]
   # 安全区路线航向保持参数；角度单位 rad，角速度单位 rad/s。
   safe_zone_fallback_heading_tolerance_rad: 0.02
   safe_zone_fallback_heading_kp_rad_s: 1.0
@@ -277,7 +253,7 @@ match:
   # 夹取后→d1、d1→d2 直线段软刹车后的场地坐标过冲分量，单位 mm；有符号。
   # 正值表示刹车后仍向 FieldPoint 的 +x/+y 方向移动，策略会将对应停车目标
   # 向负方向提前。
-  safe_zone_d2_braking_overrun_x_mm: 20.0
+  safe_zone_d2_braking_overrun_x_mm: 0.0
   safe_zone_d2_braking_overrun_y_mm: 0.0
   # d1 处和 90° 校准后均要求左右轮速低于阈值并连续确认后再继续。
   safe_zone_calibration_stop_speed_threshold_m_s: 0.02
@@ -291,13 +267,22 @@ match:
   # 地图物理边界为 ±1500 mm；夹爪偏移 200 mm 后，解团中点允许范围为 ±1300 mm。
   breakup_field_half_extent_mm: 1500.0
   breakup_gripper_offset_mm: 200.0
-  # 每轮交付次数；达到后结束流程。
-  required_transports: 16
+  # strategy 固定执行两趟：左侧 D2 一件、右侧 D2 一件。
+  required_transports: 2
   # 退出安全区后的倒车速度，单位 m/s。
   return_backup_speed_m_s: 0.3
 
 localization:
   enabled: false
+  # d1 视觉纠偏只在 _safe_zone_vehicle_stopped 连续确认 0.3 s 轮速 <= 0.02 m/s
+  # 之后才采集 K0/K1/K2 均值，车体停稳期间旧帧的三点几何仍然成立；而实测安全区
+  # 阶段 capture_to_result p50 中位数约 343 ms、观测年龄最大 638 ms，默认 250 ms
+  # 会让每一次标定都在年龄门被拒（现场表现为 calibration_failure=observation_stale）。
+  # 取 800 与 processing.max_observation_age_ms 对齐：该值同时是主循环快照门的上界，
+  # 写更大不会生效。注意该键同时约束行进中的安全区绝对定位，本配置 localization
+  # 关闭时不受影响。
+  safe_zone_corners:
+    max_observation_age_ms: 800.0
   fusion:
     enabled: false
     initial_pose:
@@ -352,18 +337,17 @@ near_field_grasp:
   side_neighbor_lateral_margin_mm: 60.0
   # 组合开口在目标包络之外预留的总宽度，单位 mm。
   clearance_mm: 4.0
-  # 保留给兼容调用方的几何参数；正式近场是否转向由左右机械可达性决定，
-  # 不把该值作为包络中心提交门槛。
+  # 近场横向对准的进入容差；偏离超过它才生成旋转计划。
   center_tolerance_mm: 5.0
   # 近场停稳并用当前帧提交的总预算，单位 ms。
-  # 完全选不出方案时只给一个有界感知窗口；到期必须换位、换向或进入解团，
-  # 不能在同一物理区域重复零速等待。
-  no_plan_wait_ms: 800.0
-  # 没有新计划时最多执行一次短有界转角；超过后由 IMU/新帧复核，
-  # 禁止按旧视觉角连续旋转数秒。
-  alignment_continue_max_age_ms: 400.0
+  # 完全选不出方案（无合法候选且无几何阻挡证据）时只给短窗口等观测抖动
+  # 恢复；车已停稳且场景静止，重复观测不改变门禁结果，不等满提交预算。
+  no_plan_wait_ms: 2000.0
+  # 对准期间没有新计划时允许继续朝上一帧对准角旋转的年龄上限，单位 ms。
+  # 必须宽于感知单帧周期，否则会在「转一帧、刹一帧」之间来回。
+  alignment_continue_max_age_ms: 2000.0
   alignment_hysteresis_mm: 10.0
-  alignment_timeout_ms: 1800.0
+  alignment_timeout_ms: 6000.0
   # 只有不超过此年龄的准备结果才允许提交开爪，单位 ms。
   grasp_commit_max_observation_age_ms: 150.0
   # 实测轮编码器不变且IMU角速度低于此值，才积累静止证据。
@@ -377,7 +361,7 @@ near_field_grasp:
   orange_isolation_radius_mm: 60.0
   # 颜色掩码至少需要的前景像素数；不足时视为无有效地面包络。
   min_mask_pixels: 1
-  # 单帧未知/质量异常不清空锁定身份；下一帧当前清洁几何即可恢复候选。
+  # 单帧未知/质量异常后，连续稳定为绿/黑多少帧才重新允许入组。
   # 净空评分归一化的参考长度，单位 mm；100 mm 对应评分 1.0。
   clearance_scale_mm: 100.0
   # 初赛规则分值；候选先按总分排序。

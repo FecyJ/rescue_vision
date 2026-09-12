@@ -16,6 +16,11 @@ from rescue_vision.app.cluster_breakup import (
     RemotePerceptionTransport,
     TargetedClusterMeasurement,
 )
+from rescue_vision.app.breakup_planner import (
+    BreakupPlan,
+    BreakupTarget,
+    plan_breakup,
+)
 from rescue_vision.app.manual_capture import run_manual_capture_session
 from rescue_vision.app.gripper_width_sequence import (
     GraspPreparation,
@@ -51,6 +56,7 @@ from rescue_vision.app.grab_transport import (
     GrabTransportSequence,
 )
 from rescue_vision.app.match_cc import MatchCCSequence
+from rescue_vision.app.match_nb import MatchNBSequence
 from rescue_vision.app.motion_sequence import (
     MotionSequencePhase,
     MotionSequencePlan,
@@ -72,6 +78,9 @@ __all__ = [
     "RemotePerceptionPublisher",
     "RemotePerceptionTransport",
     "TargetedClusterMeasurement",
+    "BreakupPlan",
+    "BreakupTarget",
+    "plan_breakup",
     "run_manual_capture_session",
     "GraspPreparation",
     "GraspPreparationSession",
@@ -99,6 +108,7 @@ __all__ = [
     "configure_match_start_area",
     "GrabTransportSequence",
     "MatchCCSequence",
+    "MatchNBSequence",
     "MotionSequencePhase",
     "MotionSequencePlan",
     "MotionSequenceResult",

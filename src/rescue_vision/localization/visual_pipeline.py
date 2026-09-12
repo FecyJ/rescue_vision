@@ -52,7 +52,9 @@ class VisualLocalizationPipeline:
         prior = prior_estimate.pose
         confirmed = self._tracker.confirm_center_cross(result)
         self._tracker.update(confirmed, pose=prior)
-        safe_observation = self._safe_zone.localize(confirmed, prior_pose=prior)
+        safe_observation = self._safe_zone.localize(
+            confirmed, prior_pose=prior
+        ).observation
         center_observation = self._center.localize(confirmed, prior_pose=prior)
         selected_cross, selected_safe_zone = select_same_frame_pose_observation(
             center_observation,

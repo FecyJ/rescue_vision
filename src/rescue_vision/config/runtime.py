@@ -302,7 +302,6 @@ def _perception_defaults() -> dict[str, Any]:
     return {
         "detection_threshold": 0.25,
         "k0_threshold": 0.50,
-        "unknown_override_confidence_threshold": 0.80,
         "center_cross_refinement": {
             "enabled": True,
             "canny_low": 50,
@@ -812,6 +811,23 @@ class MatchRuntimeConfig:
     # 旧纯逻辑夹具的构造兼容字段；正式运行由 near_field_grasp.max_range_mm
     # 统一控制近场接管，YAML 不再接受该字段。
     opportunistic_single_green_realign_standoff_mm: float = 350.0
+    # match 动态解团参数；CC 保留固定距离动作。
+    breakup_penetration_mm: float = 80.0
+    breakup_retry_penetration_mm: float = 120.0
+    breakup_min_penetration_mm: float = 10.0
+    breakup_retreat_clearance_mm: float = 20.0
+    breakup_push_margin_mm: float = 30.0
+    breakup_braking_margin_mm: float = 20.0
+    breakup_deceleration_m_s2: float = 0.8
+    # 同一物理接触团允许的推进尝试次数，取值范围 [1, 4]。第 2 次及以后
+    # 都使用 breakup_retry_penetration_mm，且必须比上一次更深才会被采纳。
+    breakup_max_attempts: int = 2
+    # 当前帧接触核心的连续有效感知帧数；正式解团不再使用近场抓取确认。
+    breakup_confirmation_frames: int = 3
+    # 停稳后仍选不出任何合法接触计划时的重观测窗口，单位 ms。重复观测只有
+    # 在新一帧检出新的可接触成员时才可能改变结果，所以只等一到两帧，不占满
+    # 按确认帧数计的完整确认预算。
+    breakup_no_plan_reobserve_ms: float = 1_000.0
     breakup_forward_distance_m: float = 0.7
     breakup_forward_speed_m_s: float = 0.40
     breakup_backward_distance_m: float = 0.2
@@ -839,8 +855,18 @@ class MatchRuntimeConfig:
     green_preclose_max_carried_blocks: int = 2
     transport_rotate_angular_velocity_rad_s: float = 0.30
     safe_zone_key_search_angular_velocity_rad_s: float = 0.45
+    # 有安全区 bbox 时按归一化水平误差比例转向；无 bbox 仍使用上面的搜索速度。
+    safe_zone_bbox_turn_kp_rad_s: float = 0.80
+    safe_zone_bbox_turn_max_angular_velocity_rad_s: float = 0.25
+    safe_zone_bbox_turn_deadband_ratio: float = 0.02
+    safe_zone_bbox_turn_resume_ratio: float = 0.03
     # 只有 bbox 与图像四边至少保留该余量，才允许进入关键点停稳取样。
     safe_zone_bbox_edge_margin_px: float = 2.0
+    # 安全区关键点缺失后的静止重观测窗口，单位 s。
+    safe_zone_keypoint_reobserve_timeout_s: float = 0.80
+    # bbox 居中但关键点仍缺失时的小距离倒车参数，单位分别为 m/s、m。
+    safe_zone_keypoint_reverse_speed_m_s: float = 0.08
+    safe_zone_keypoint_reverse_max_distance_m: float = 0.20
     transport_align_tolerance_mm: float = 30.0
     # 普通 正式流程的单段安全区运输速度，单位 m/s。
     # 正式流程 安全区三段直行速度，分别为夹取后→d1、d1→d2、d2→末段，单位 m/s。
@@ -889,6 +915,28 @@ class MatchRuntimeConfig:
     safe_zone_exit_distance_m: float = 0.30
     required_transports: int = 4
     return_backup_speed_m_s: float = 0.08
+    # 无解团（no-breakup）变体开场：把固定启动转向+直行替换为绝对场地坐标
+    # 的直线航点序列。坐标为 mm、速度为 m/s、夹爪角度为 deg；由 match_nb
+    # 子类读取，正式 match 不读取这些字段。默认值与
+    # configs/runtime.match_nb.yaml 的区域 2 示例一致。
+    nb_opening_first_target_field: FieldPoint = FieldPoint(130.0, 800.0)
+    nb_opening_first_speed_m_s: float = 0.15
+    nb_opening_gripper_left_deg: float = 50.0
+    nb_opening_gripper_right_deg: float = 130.0
+    nb_opening_second_target_field: FieldPoint = FieldPoint(130.0, -900.0)
+    nb_opening_second_speed_m_s: float = 0.15
+    nb_opening_reverse_target_field: FieldPoint = FieldPoint(130.0, 0.0)
+    nb_opening_reverse_speed_m_s: float = 0.15
+    nb_opening_align_tolerance_mm: float = 30.0
+    nb_opening_heading_tolerance_rad: float = 0.02
+    nb_opening_heading_kp_rad_s: float = 1.0
+    nb_opening_heading_max_angular_velocity_rad_s: float = 0.30
+    # 未对准时的原地对准角速度上限，单位 rad/s；与直线保持上限分开配置。
+    nb_opening_align_angular_velocity_rad_s: float = 0.50
+    # 每个航点到位后的零速停稳时间，单位 s；必须大于等于 0。
+    nb_opening_settle_time_s: float = 0.30
+    # 航向对准的最长持续时间，单位 s；超时保守停车而不是持续旋转。
+    nb_opening_align_timeout_s: float = 8.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -905,6 +953,13 @@ class MatchRuntimeConfig:
             raise ValueError(
                 "safe_zone_injured_target_field must be a FieldPoint."
             )
+        for name in (
+            "nb_opening_first_target_field",
+            "nb_opening_second_target_field",
+            "nb_opening_reverse_target_field",
+        ):
+            if not isinstance(getattr(self, name), FieldPoint):
+                raise ValueError(f"{name} must be a FieldPoint.")
         for name in (
             "robot_footprint_radius_mm",
             "safety_margin_mm",
@@ -947,6 +1002,8 @@ class MatchRuntimeConfig:
             "green_preclose_recheck_hold_ms",
             "transport_rotate_angular_velocity_rad_s",
             "safe_zone_key_search_angular_velocity_rad_s",
+            "safe_zone_bbox_turn_kp_rad_s",
+            "safe_zone_bbox_turn_max_angular_velocity_rad_s",
             "transport_align_tolerance_mm",
             "safe_zone_grab_to_d1_speed_m_s",
             "safe_zone_d1_to_d2_speed_m_s",
@@ -964,10 +1021,40 @@ class MatchRuntimeConfig:
             "safe_zone_calibration_stop_confirm_time_s",
             "safe_zone_exit_distance_m",
             "return_backup_speed_m_s",
+            "safe_zone_keypoint_reobserve_timeout_s",
+            "safe_zone_keypoint_reverse_speed_m_s",
+            "safe_zone_keypoint_reverse_max_distance_m",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive.")
+        for name in (
+            "nb_opening_first_speed_m_s",
+            "nb_opening_second_speed_m_s",
+            "nb_opening_reverse_speed_m_s",
+            "nb_opening_align_tolerance_mm",
+            "nb_opening_heading_kp_rad_s",
+            "nb_opening_heading_max_angular_velocity_rad_s",
+            "nb_opening_align_angular_velocity_rad_s",
+            "nb_opening_align_timeout_s",
+            # 容差为 0 会让“未对准”永远成立并耗尽对准超时，因此必须为正。
+            "nb_opening_heading_tolerance_rad",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive.")
+        for name in ("nb_opening_gripper_left_deg", "nb_opening_gripper_right_deg"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or not 0.0 <= value <= 180.0:
+                raise ValueError(f"{name} must be finite and in [0, 180].")
+        # 允许 0：表示航点到位后不停顿直接进入下一段。
+        if (
+            not math.isfinite(float(self.nb_opening_settle_time_s))
+            or float(self.nb_opening_settle_time_s) < 0.0
+        ):
+            raise ValueError(
+                "nb_opening_settle_time_s must be finite and non-negative."
+            )
         if self.safe_zone_d2_to_final_max_wheel_acceleration_m_s2 is not None:
             acceleration = self.safe_zone_d2_to_final_max_wheel_acceleration_m_s2
             if (
@@ -980,6 +1067,23 @@ class MatchRuntimeConfig:
                     "safe_zone_d2_to_final_max_wheel_acceleration_m_s2 must be "
                     "finite and positive, or None."
                 )
+        for name in ('breakup_penetration_mm', 'breakup_retry_penetration_mm', 'breakup_min_penetration_mm', 'breakup_retreat_clearance_mm', 'breakup_push_margin_mm', 'breakup_braking_margin_mm', 'breakup_deceleration_m_s2', 'breakup_no_plan_reobserve_ms'):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive, got {value!r}.")
+        if not self.breakup_min_penetration_mm <= self.breakup_penetration_mm <= self.breakup_retry_penetration_mm:
+            raise ValueError("breakup penetration requires min <= first <= retry.")
+        if isinstance(self.breakup_max_attempts, bool) or not isinstance(self.breakup_max_attempts, int) or not 1 <= self.breakup_max_attempts <= 4:
+            raise ValueError(f"breakup_max_attempts must be an integer in [1, 4], got {self.breakup_max_attempts!r}.")
+        # 允许 1：与近场 confirmation_frames 一致，接触核心只认一帧就冻结。
+        # 现场感知慢时多帧确认会凑不齐而反复超时重选，需要能配成单帧。
+        if (isinstance(self.breakup_confirmation_frames, bool)
+                or not isinstance(self.breakup_confirmation_frames, int)
+                or not 1 <= self.breakup_confirmation_frames <= 5):
+            raise ValueError(
+                "breakup_confirmation_frames must be an integer in [1, 5], "
+                f"got {self.breakup_confirmation_frames!r}."
+            )
         if self.breakup_max_wheel_acceleration_m_s2 is not None:
             acceleration = self.breakup_max_wheel_acceleration_m_s2
             if (
@@ -1075,6 +1179,23 @@ class MatchRuntimeConfig:
         ):
             raise ValueError(
                 "safe_zone_bbox_edge_margin_px must be finite and non-negative."
+            )
+        for name in (
+            "safe_zone_bbox_turn_deadband_ratio",
+            "safe_zone_bbox_turn_resume_ratio",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0 or value > 1.0:
+                raise ValueError(
+                    f"{name} must be finite and in [0, 1]."
+                )
+        if not (
+            self.safe_zone_bbox_turn_deadband_ratio
+            < self.safe_zone_bbox_turn_resume_ratio
+        ):
+            raise ValueError(
+                "safe_zone_bbox_turn_deadband_ratio must be smaller than "
+                "safe_zone_bbox_turn_resume_ratio."
             )
         for name in (
             "startup_straight_pid_kp_rad_s_per_m_s",
@@ -1307,7 +1428,6 @@ class WorldRuntimeConfig:
 class PerceptionConfig:
     detection_threshold: float
     k0_threshold: float
-    unknown_override_confidence_threshold: float
     color_classifier: HsvColorClassifierConfig
     target_ground_geometry: TargetGroundGeometryConfig
     center_cross_refinement: CenterCrossRefinementConfig
@@ -1454,9 +1574,6 @@ class AppConfig:
             backend,
             detection_threshold=self.perception.detection_threshold,
             k0_threshold=self.perception.k0_threshold,
-            unknown_override_confidence_threshold=(
-                self.perception.unknown_override_confidence_threshold
-            ),
             color_classifier=self.perception.color_classifier,
             max_observation_age_ms=self.processing.max_observation_age_ms,
             ground_projector=ground_projector,
@@ -1574,6 +1691,17 @@ class AppConfig:
         )
 
         return GrabTransportSequence.from_app_config(self)
+
+    def build_match_nb_sequence(self) -> MatchNBSequence:
+        """装配无解团变体流程；开场改为绝对坐标直线航点，其余复用正式流程。"""
+
+        if not self.match.enabled:
+            raise RuntimeError(
+                "match.enabled must be true to build the flow."
+            )
+        from rescue_vision.app.match_nb import MatchNBSequence
+
+        return MatchNBSequence.from_app_config(self)
 
 
 def load_runtime_config(path: str | Path) -> AppConfig:
@@ -2288,6 +2416,17 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         "match",
     )
     match_keys = {
+        "breakup_penetration_mm",
+        "breakup_retry_penetration_mm",
+        "breakup_min_penetration_mm",
+        "breakup_retreat_clearance_mm",
+        "breakup_push_margin_mm",
+        "breakup_braking_margin_mm",
+        "breakup_deceleration_m_s2",
+        "breakup_max_attempts",
+        "breakup_confirmation_frames",
+        "breakup_no_plan_reobserve_ms",
+
         "robot_footprint_radius_mm",
         "safety_margin_mm",
         "enabled",
@@ -2338,7 +2477,14 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         "green_approach_speed_m_s",
         "transport_rotate_angular_velocity_rad_s",
         "safe_zone_key_search_angular_velocity_rad_s",
+        "safe_zone_bbox_turn_kp_rad_s",
+        "safe_zone_bbox_turn_max_angular_velocity_rad_s",
+        "safe_zone_bbox_turn_deadband_ratio",
+        "safe_zone_bbox_turn_resume_ratio",
         "safe_zone_bbox_edge_margin_px",
+        "safe_zone_keypoint_reobserve_timeout_s",
+        "safe_zone_keypoint_reverse_speed_m_s",
+        "safe_zone_keypoint_reverse_max_distance_m",
         "transport_align_tolerance_mm",
         "safe_zone_grab_to_d1_speed_m_s",
         "safe_zone_d1_to_d2_speed_m_s",
@@ -2365,6 +2511,21 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         "safe_zone_exit_distance_m",
         "required_transports",
         "return_backup_speed_m_s",
+        "nb_opening_first_target_field_mm",
+        "nb_opening_first_speed_m_s",
+        "nb_opening_gripper_left_deg",
+        "nb_opening_gripper_right_deg",
+        "nb_opening_second_target_field_mm",
+        "nb_opening_second_speed_m_s",
+        "nb_opening_reverse_target_field_mm",
+        "nb_opening_reverse_speed_m_s",
+        "nb_opening_align_tolerance_mm",
+        "nb_opening_heading_tolerance_rad",
+        "nb_opening_heading_kp_rad_s",
+        "nb_opening_heading_max_angular_velocity_rad_s",
+        "nb_opening_align_angular_velocity_rad_s",
+        "nb_opening_settle_time_s",
+        "nb_opening_align_timeout_s",
     }
     _reject_unknown(match_raw, match_keys, "match")
     match_enabled = match_raw.get("enabled", False)
@@ -2448,7 +2609,41 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         ),
     )
 
+    def nb_field_point(key: str, default: list[float]) -> FieldPoint:
+        value = match_raw.get(key, default)
+        if not isinstance(value, list) or len(value) != 2:
+            raise ValueError(f"match.{key} must be [x_mm, y_mm].")
+        return FieldPoint(
+            _finite_float(value[0], f"match.{key}[0]", minimum=-float("inf")),
+            _finite_float(value[1], f"match.{key}[1]", minimum=-float("inf")),
+        )
+
+    nb_opening_first_target_field = nb_field_point(
+        "nb_opening_first_target_field_mm", [130.0, 800.0]
+    )
+    nb_opening_second_target_field = nb_field_point(
+        "nb_opening_second_target_field_mm", [130.0, -900.0]
+    )
+    nb_opening_reverse_target_field = nb_field_point(
+        "nb_opening_reverse_target_field_mm", [130.0, 0.0]
+    )
+
     match = MatchRuntimeConfig(
+        breakup_penetration_mm=match_float("breakup_penetration_mm", 80.0),
+        breakup_retry_penetration_mm=match_float("breakup_retry_penetration_mm", 120.0),
+        breakup_min_penetration_mm=match_float("breakup_min_penetration_mm", 10.0),
+        breakup_retreat_clearance_mm=match_float("breakup_retreat_clearance_mm", 20.0),
+        breakup_push_margin_mm=match_float("breakup_push_margin_mm", 30.0),
+        breakup_braking_margin_mm=match_float("breakup_braking_margin_mm", 20.0),
+        breakup_deceleration_m_s2=match_float("breakup_deceleration_m_s2", 0.8),
+        breakup_max_attempts=_positive_int(match_raw.get("breakup_max_attempts", 2), "match.breakup_max_attempts"),
+        breakup_confirmation_frames=_positive_int(
+            match_raw.get("breakup_confirmation_frames", 3),
+            "match.breakup_confirmation_frames",
+        ),
+        breakup_no_plan_reobserve_ms=match_float(
+            "breakup_no_plan_reobserve_ms", 1_000.0
+        ),
         robot_footprint_radius_mm=match_float("robot_footprint_radius_mm", 160.0),
         safety_margin_mm=match_float("safety_margin_mm", 80.0),
         enabled=match_enabled,
@@ -2591,8 +2786,29 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         safe_zone_key_search_angular_velocity_rad_s=match_float(
             "safe_zone_key_search_angular_velocity_rad_s", 0.45
         ),
+        safe_zone_bbox_turn_kp_rad_s=match_float(
+            "safe_zone_bbox_turn_kp_rad_s", 0.80
+        ),
+        safe_zone_bbox_turn_max_angular_velocity_rad_s=match_float(
+            "safe_zone_bbox_turn_max_angular_velocity_rad_s", 0.25
+        ),
+        safe_zone_bbox_turn_deadband_ratio=match_nonnegative_float(
+            "safe_zone_bbox_turn_deadband_ratio", 0.02
+        ),
+        safe_zone_bbox_turn_resume_ratio=match_nonnegative_float(
+            "safe_zone_bbox_turn_resume_ratio", 0.03
+        ),
         safe_zone_bbox_edge_margin_px=match_nonnegative_float(
             "safe_zone_bbox_edge_margin_px", 2.0
+        ),
+        safe_zone_keypoint_reobserve_timeout_s=match_float(
+            "safe_zone_keypoint_reobserve_timeout_s", 0.80
+        ),
+        safe_zone_keypoint_reverse_speed_m_s=match_float(
+            "safe_zone_keypoint_reverse_speed_m_s", 0.08
+        ),
+        safe_zone_keypoint_reverse_max_distance_m=match_float(
+            "safe_zone_keypoint_reverse_max_distance_m", 0.20
         ),
         transport_align_tolerance_mm=match_float(
             "transport_align_tolerance_mm", 30.0
@@ -2681,6 +2897,29 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         return_backup_speed_m_s=match_float(
             "return_backup_speed_m_s", 0.08
         ),
+        nb_opening_first_target_field=nb_opening_first_target_field,
+        nb_opening_first_speed_m_s=match_float("nb_opening_first_speed_m_s", 0.15),
+        nb_opening_gripper_left_deg=match_float("nb_opening_gripper_left_deg", 50.0),
+        nb_opening_gripper_right_deg=match_float("nb_opening_gripper_right_deg", 130.0),
+        nb_opening_second_target_field=nb_opening_second_target_field,
+        nb_opening_second_speed_m_s=match_float("nb_opening_second_speed_m_s", 0.15),
+        nb_opening_reverse_target_field=nb_opening_reverse_target_field,
+        nb_opening_reverse_speed_m_s=match_float("nb_opening_reverse_speed_m_s", 0.15),
+        nb_opening_align_tolerance_mm=match_float("nb_opening_align_tolerance_mm", 30.0),
+        nb_opening_heading_tolerance_rad=match_float(
+            "nb_opening_heading_tolerance_rad", 0.02
+        ),
+        nb_opening_heading_kp_rad_s=match_float("nb_opening_heading_kp_rad_s", 1.0),
+        nb_opening_heading_max_angular_velocity_rad_s=match_float(
+            "nb_opening_heading_max_angular_velocity_rad_s", 0.30
+        ),
+        nb_opening_align_angular_velocity_rad_s=match_float(
+            "nb_opening_align_angular_velocity_rad_s", 0.50
+        ),
+        nb_opening_settle_time_s=match_nonnegative_float(
+            "nb_opening_settle_time_s", 0.30
+        ),
+        nb_opening_align_timeout_s=match_float("nb_opening_align_timeout_s", 8.0),
     )
     match_cc = parse_match_cc_config(root.get("match_cc", {}))
     if match_cc.enabled and not match.enabled:
@@ -2725,6 +2964,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "green_alignment_max_angular_velocity_rad_s",
             "transport_rotate_angular_velocity_rad_s",
             "safe_zone_key_search_angular_velocity_rad_s",
+            "safe_zone_bbox_turn_max_angular_velocity_rad_s",
             "safe_zone_fallback_max_angular_velocity_rad_s",
         ):
             if abs(getattr(match, name)) > motion.max_angular_velocity_rad_s:
@@ -2853,7 +3093,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "opponent_max_age_ms",
             "danger_confirm_threshold",
             "danger_suspect_threshold",
-            "unknown_suspect_threshold",
             "team_color",
             "static_map",
         },
@@ -2877,10 +3116,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         danger_suspect_threshold=_threshold(
             world_raw.get("danger_suspect_threshold", 0.15),
             "world.danger_suspect_threshold",
-        ),
-        unknown_suspect_threshold=_threshold(
-            world_raw.get("unknown_suspect_threshold", 0.50),
-            "world.unknown_suspect_threshold",
         ),
     )
     try:
@@ -3138,7 +3373,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         {
             "detection_threshold",
             "k0_threshold",
-            "unknown_override_confidence_threshold",
             "center_cross_refinement",
             "safe_zone_color",
             "color_classifier",
@@ -3157,14 +3391,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     k0_threshold = _threshold(
         _required(perception_raw, "k0_threshold", "perception"),
         "perception.k0_threshold",
-    )
-    unknown_override_confidence_threshold = _threshold(
-        _required(
-            perception_raw,
-            "unknown_override_confidence_threshold",
-            "perception",
-        ),
-        "perception.unknown_override_confidence_threshold",
     )
     for location, value in (
         ("perception.detection_threshold", detection_threshold),
@@ -3607,7 +3833,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     perception = PerceptionConfig(
         detection_threshold=detection_threshold,
         k0_threshold=k0_threshold,
-        unknown_override_confidence_threshold=unknown_override_confidence_threshold,
         color_classifier=color_classifier,
         target_ground_geometry=target_ground_geometry,
         center_cross_refinement=center_cross_refinement,

@@ -102,8 +102,6 @@ class GripperWidthMeasurement:
             )
         if not isinstance(self.target_class, TargetClass):
             raise ValueError("target_class must be a TargetClass value.")
-        if self.target_class is TargetClass.UNKNOWN:
-            raise ValueError("target_class unknown cannot have a width measurement.")
         for name in (
             "center_x_mm",
             "center_y_mm",
@@ -400,7 +398,7 @@ def measure_target_envelope(
     """与居中门限无关的单目标测量；无有效 K0/颜色掩码时返回缺失。"""
     if isinstance(min_mask_pixels, bool) or not isinstance(min_mask_pixels, int) or min_mask_pixels <= 0:
         raise ValueError(f"min_mask_pixels must be a positive integer, got {min_mask_pixels!r}.")
-    if observation.ground_point is None or observation.color_segmentation.status is not ColorSegmentationStatus.ACCEPTED:
+    if observation.ground_point is None or observation.color_segmentation.candidate_class is not observation.target_class:
         return None
     if cv2.countNonZero(observation.color_segmentation.mask) < min_mask_pixels:
         return None

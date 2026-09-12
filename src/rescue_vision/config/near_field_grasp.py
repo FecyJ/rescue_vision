@@ -17,8 +17,9 @@ class NearFieldGraspConfig:
     max_forward_distance_mm: float = 450.0
     # 绿/黑组前进结束时，最远目标 K0 希望保留在机器人前方的距离。
     target_final_x_mm: float = 110.0
-    # 单个橙色目标按最近端加完整纵向跨度计算，减去该终点参考距离。
-    orange_target_final_x_mm: float = 210.0
+    # 单个橙色目标前进结束时，最前 K0 底面中心希望保留在机器人前方的距离。
+    # 颜色上表面投影的纵向拉长不作为前进深度。
+    orange_target_final_x_mm: float = 142.0
     # 夹爪前端参考线；危险目标 K0 只有落入从此处开始的扫掠矩形才阻挡动作。
     corridor_start_x_mm: float = 60.0
     corridor_lateral_margin_mm: float = 10.0
@@ -27,17 +28,24 @@ class NearFieldGraspConfig:
     side_neighbor_longitudinal_margin_mm: float = 60.0
     side_neighbor_lateral_margin_mm: float = 90.0
     clearance_mm: float = 4.0
-    # 组中心进入此横向允许范围后停止旋转；边界包含，单位 mm。
+    # 兼容旧橙色侧后方例外的中心参考值；正式近场提交不使用中心门槛。
     center_tolerance_mm: float = 20.0
-    # 进入允许范围后的滞回余量，单位 mm。
+    # 橙色侧后方放行判定使用的对准滞回。
     alignment_hysteresis_mm: float = 10.0
-    # 从近场会话打开到完成对准/确认的总预算，单位 ms。
-    alignment_timeout_ms: float = 6_000.0
+    # 从近场会话打开到停稳后当前帧提交的总预算（提交链路兜底），单位 ms。
+    # 选不出方案的空等由 no_plan_wait_ms 单独限制，不占用本预算。
+    alignment_timeout_ms: float = 1_800.0
+    # 没有新计划时的单次有界转角动作上限，单位 ms；到期必须复核当前几何。
+    alignment_continue_max_age_ms: float = 400.0
+    # 完全选不出方案（无合法候选且无几何阻挡证据）时的等待上限，单位 ms。
+    # 车已停稳、场景静止，重复观测不会改变门禁结果，所以只给短窗口等一次
+    # 观测抖动恢复；超过就换候选或解团，不占用上面的提交预算。
+    no_plan_wait_ms: float = 800.0
     # 无静止证据的几何、准备发布和静止遥测的年龄上限，单位 ms。
     # 停车后采集且持续静止的当前计划使用 processing 的观测失联上限。
     grasp_commit_max_observation_age_ms: float = 150.0
     stationary_max_gyro_rad_s: float = 0.03
-    # 唯一近场确认窗口需要的不同有效感知帧数量。
+    # 停稳后当前帧复核数量；正式配置使用 1，不做额外多帧中心确认。
     confirmation_frames: int = 3
     # 进入最终精对准区的角度半径，单位 rad。
     fine_alignment_zone_rad: float = 0.08
@@ -48,7 +56,6 @@ class NearFieldGraspConfig:
     min_mask_pixels: int = 1
     # 可抓目标轨迹出现一次未知/普通质量异常后，需要连续多少个干净观测才恢复可选。
     # 已出现明确危险模型证据的轨迹不使用此恢复路径。
-    supply_recovery_frames: int = 3
     clearance_scale_mm: float = 100.0
     # 初赛规则分值；候选先按总分排序，几何权重只处理同分方案。
     green_score_points: float = 5.0
@@ -68,7 +75,6 @@ class NearFieldGraspConfig:
             "max_candidates",
             "min_mask_pixels",
             "confirmation_frames",
-            "supply_recovery_frames",
         }
         nonnegative = {
             "corridor_lateral_margin_mm",

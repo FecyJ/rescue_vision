@@ -8,6 +8,8 @@ from enum import Enum
 import numpy as np
 import pytest
 
+from rescue_vision.app.breakup_planner import BreakupPlan
+
 from rescue_vision.app import (
     GripperPosture,
     MatchSequence,
@@ -17,6 +19,7 @@ from rescue_vision.app import (
     configure_match_start_area,
 )
 from rescue_vision.config import MatchRuntimeConfig, load_runtime_config
+from rescue_vision.config.near_field_grasp import NearFieldGraspConfig
 from rescue_vision.geometry.types import FieldPoint, GroundPoint, UndistortedPixel
 from rescue_vision.localization import (
     FieldPose2D,
@@ -243,10 +246,12 @@ def make_static_map() -> StaticFieldMap:
 def runtime_config(**overrides: object) -> MatchRuntimeConfig:
     values: dict[str, object] = {
         "enabled": True,
+        "opportunistic_single_green_enabled": True,
         "green_grab_offset_mm": 150.0,
         "safe_zone_fallback_target_field": FieldPoint(-165.0, 1137.0),
-        # Most state-transition tests focus on the following action; the
-        # production match YAML explicitly exercises the three-frame gate.
+        # Most state-transition tests focus on the following action. The
+        # dataclass default still gates on three frames, so pin the production
+        # single-frame value explicitly here.
         "green_alignment_stable_frames": 1,
     }
     values.update(overrides)
@@ -257,6 +262,7 @@ def make_sequence(
     *, config: MatchRuntimeConfig | None = None,
     initial_field_position: FieldPoint | None = FieldPoint(0.0, 0.0),
     team_color: TeamColor = TeamColor.RED,
+    near_field_grasp_config: NearFieldGraspConfig | None = None,
 ) -> MatchSequence:
     runtime = config or runtime_config()
     return MatchSequence(
@@ -275,9 +281,21 @@ def make_sequence(
         team_color=team_color,
         safe_zone_corner_localizer=SafeZoneCornerLocalizer(make_static_map()),
         static_map=make_static_map(),
+        near_field_grasp_config=near_field_grasp_config,
+        breakup_target_geometry=load_runtime_config("configs/runtime.match.yaml").perception.target_ground_geometry,
         initial_field_position=initial_field_position,
     )
 
+
+
+def inject_breakup_plan(sequence, *, heading=0.0, approach=100.0):
+    sequence._breakup_plan = BreakupPlan((1, 2), (1, 2), 1, GroundPoint(450,0), heading,
+        approach, sequence.config.breakup_forward_distance_m*1000,
+        sequence.config.breakup_backward_distance_m*1000, 80., 0, 1,
+        (FieldPoint(450,0), FieldPoint(480,0)), FieldPoint(450,0), 160.)
+    sequence._breakup_forward_base_distance_m = sequence._breakup_backward_base_distance_m = 0.
+    sequence._cluster_approach_base_distance_m = 0.
+    sequence._breakup_retreat_mm = sequence.config.breakup_backward_distance_m*1000
 
 def start_sequence(sequence: MatchSequence) -> None:
     ready = sequence.preflight(
@@ -287,7 +305,7 @@ def start_sequence(sequence: MatchSequence) -> None:
     assert ready.state is MatchState.PREFLIGHT
     sequence.start(1)
     sequence._started = True
-    sequence.state = MatchState.CHECK_ISOLATED_GREEN
+    sequence.state = MatchState.SEARCH_CLUSTER
 
 
 def test_start_area_3_mirrors_match_pose_route_and_team_color() -> None:
@@ -302,10 +320,10 @@ def test_start_area_3_mirrors_match_pose_route_and_team_color() -> None:
         math.pi / 2.0
     )
     assert area_3.match.safe_zone_fallback_target_field == FieldPoint(
-        135.0, -1115.0
+        130.0, -1115.0
     )
     assert area_3.match.safe_zone_injured_target_field == FieldPoint(
-        -135.0, -1115.0
+        -130.0, -1115.0
     )
     assert area_3.match.safe_zone_d2_braking_overrun_x_mm == pytest.approx(-20.0)
     assert area_3.world.static_map is area_2.world.static_map
@@ -313,7 +331,7 @@ def test_start_area_3_mirrors_match_pose_route_and_team_color() -> None:
     sequence = MatchSequence.from_app_config(area_2, start_area=3)
     assert sequence._team_color is TeamColor.BLUE
     assert sequence.estimated_field_position == FieldPoint(-1350.0, -1350.0)
-    assert sequence._safe_zone_transport_endpoint() == FieldPoint(135.0, -1115.0)
+    assert sequence._safe_zone_transport_endpoint() == FieldPoint(130.0, -1115.0)
 
 
 def test_blue_start_area_uses_negative_y_safe_zone_route() -> None:
@@ -462,6 +480,51 @@ def test_cluster_search_uses_fast_speed_until_collectible_information_appears() 
         == "search_cluster_right"
     )
 
+
+def test_cluster_search_uses_fast_speed_when_targets_are_inside_safe_zone_bbox() -> None:
+    sequence = make_sequence(
+        config=runtime_config(
+            cluster_search_angular_velocity_rad_s=-0.2,
+            cluster_search_empty_angular_velocity_rad_s=-0.6,
+            cluster_min_detections=2,
+        )
+    )
+    start_sequence(sequence)
+    sequence.state = MatchState.SEARCH_CLUSTER
+    sequence._breakup_only = True
+
+    safe_zone = safe_zone_snapshot(
+        1,
+        10,
+        None,
+        None,
+        None,
+        box=UndistortedBoundingBox(10.0, 10.0, 90.0, 90.0),
+    )
+    perception = replace(
+        safe_zone,
+        observations=(
+            observation(
+                1,
+                10,
+                GroundPoint(500.0, 0.0),
+                target_class=TargetClass.ORANGE_INJURED,
+                box_x=40.0,
+            ),
+        ),
+    )
+
+    decision = sequence.step(
+        10,
+        perception=perception,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+    )
+
+    assert decision.angular_velocity_rad_s == pytest.approx(-0.6)
+    assert decision.reason == "search_cluster_right"
+
+
 def test_match_cli_passes_selected_start_area(monkeypatch) -> None:
     from rescue_vision.app import match as match_module
     import rescue_vision.app.match_runtime as match_runtime
@@ -517,10 +580,10 @@ def test_config_uses_configured_gripper_and_transport_values() -> None:
         0.3
     )
     assert config.match.safe_zone_d1_to_d2_speed_m_s == pytest.approx(
-        0.3
+        0.35
     )
     assert config.match.safe_zone_d2_to_final_speed_m_s == pytest.approx(
-        0.4
+        0.45
     )
     assert config.match.safe_zone_orange_d2_to_final_speed_m_s == pytest.approx(
         0.45
@@ -538,6 +601,7 @@ def test_config_uses_configured_gripper_and_transport_values() -> None:
         == pytest.approx(80.0)
     )
     assert config.match.breakup_max_wheel_acceleration_m_s2 == pytest.approx(4.0)
+    assert config.match.breakup_confirmation_frames == 1
     assert config.match.startup_turn_settle_time_s == pytest.approx(
         0.1
     )
@@ -545,32 +609,39 @@ def test_config_uses_configured_gripper_and_transport_values() -> None:
         0.1
     )
     assert config.match.breakup_settle_time_s == pytest.approx(0.1)
-    assert config.match.green_alignment_tolerance_mm == pytest.approx(20.0)
-    assert config.match.green_alignment_hysteresis_mm == pytest.approx(5.0)
-    assert config.match.green_alignment_timeout_ms == pytest.approx(4000.0)
-    assert config.match.green_alignment_stable_frames == 3
+    assert config.match.green_alignment_tolerance_mm == pytest.approx(40.0)
+    assert config.match.green_alignment_hysteresis_mm == pytest.approx(20.0)
+    assert config.match.green_alignment_timeout_ms == pytest.approx(6000.0)
+    assert config.match.green_alignment_stable_frames == 1
     assert config.match.green_alignment_min_wheel_velocity_m_s == pytest.approx(
         0.01
     )
-    assert config.near_field_grasp.center_tolerance_mm == pytest.approx(20.0)
+    assert config.near_field_grasp.center_tolerance_mm == pytest.approx(5.0)
     assert config.near_field_grasp.alignment_hysteresis_mm == pytest.approx(10.0)
-    assert config.near_field_grasp.alignment_timeout_ms == pytest.approx(6000.0)
+    assert config.near_field_grasp.alignment_timeout_ms == pytest.approx(1800.0)
+    # 无方案等待必须短于停稳提交预算：车停稳后重复观测不改变门禁结果，
+    # 空等只会推迟换候选/解团；提交预算要覆盖实测 1.0~2.0 s 的确认链路。
+    assert config.near_field_grasp.no_plan_wait_ms == pytest.approx(800.0)
+    assert (
+        config.near_field_grasp.no_plan_wait_ms
+        < config.near_field_grasp.alignment_timeout_ms
+    )
     assert config.near_field_grasp.grasp_commit_max_observation_age_ms == pytest.approx(
         150.0
     )
-    assert config.near_field_grasp.confirmation_frames == 3
+    assert config.near_field_grasp.confirmation_frames == 1
     assert config.near_field_grasp.fine_alignment_zone_rad == pytest.approx(0.08)
     assert config.near_field_grasp.fine_alignment_min_wheel_velocity_m_s == pytest.approx(
         0.0
     )
     assert config.near_field_grasp.orange_isolation_radius_mm == pytest.approx(
-        100.0
+        60.0
     )
     assert config.match.safe_zone_fallback_target_field == FieldPoint(
-        -135.0, 1115.0
+        -130.0, 1115.0
     )
     assert config.match.safe_zone_injured_target_field == FieldPoint(
-        135.0, 1115.0
+        130.0, 1115.0
     )
     assert config.match.safe_zone_calibration_start_offset_mm == 700.0
     assert config.match.safe_zone_open_offset_mm == 300.0
@@ -598,8 +669,15 @@ def test_config_uses_configured_gripper_and_transport_values() -> None:
         200.0
     )
     assert config.match.safe_zone_exit_distance_m == pytest.approx(0.5)
-    assert config.match.cluster_search_empty_angular_velocity_rad_s == pytest.approx(-0.6)
+    assert config.match.cluster_search_empty_angular_velocity_rad_s == pytest.approx(-0.8)
     assert config.match.safe_zone_key_search_angular_velocity_rad_s == pytest.approx(0.8)
+    assert config.match.safe_zone_bbox_turn_kp_rad_s == pytest.approx(0.8)
+    assert config.match.safe_zone_bbox_turn_max_angular_velocity_rad_s == pytest.approx(0.25)
+    assert config.match.safe_zone_bbox_turn_deadband_ratio == pytest.approx(0.02)
+    assert config.match.safe_zone_bbox_turn_resume_ratio == pytest.approx(0.03)
+    assert config.match.safe_zone_keypoint_reobserve_timeout_s == pytest.approx(0.8)
+    assert config.match.safe_zone_keypoint_reverse_speed_m_s == pytest.approx(0.08)
+    assert config.match.safe_zone_keypoint_reverse_max_distance_m == pytest.approx(0.20)
     assert config.match.safe_zone_bbox_edge_margin_px == pytest.approx(12.0)
     assert isinstance(
         MatchSequence.from_app_config(config),
@@ -835,6 +913,112 @@ def test_d1_bbox_search_rotates_until_keypoints_are_visible() -> None:
     assert stopped.reason == "safe_zone_keypoints_stopped_start_calibration"
 
 
+def test_centered_missing_keypoints_reverses_until_they_appear() -> None:
+    sequence = make_sequence(initial_field_position=FieldPoint(0.0, 0.0))
+    start_sequence(sequence)
+    sequence.state = MatchState.TRANSPORT_RELEASE
+    sequence._safe_zone_phase = "searching_safe_zone_keypoints"
+
+    centered_partial = safe_zone_snapshot(
+        1,
+        10,
+        GroundPoint(400.0, 0.0),
+        GroundPoint(350.0, 50.0),
+        None,
+        box=UndistortedBoundingBox(40.0, 20.0, 60.0, 80.0),
+    )
+    started = sequence.step(
+        10,
+        perception=centered_partial,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    assert started.reason == "safe_zone_keypoints_missing_start_reobserve"
+    assert started.linear_velocity_m_s == 0.0
+    assert started.angular_velocity_rad_s == 0.0
+    assert sequence._safe_zone_phase == "reobserving_safe_zone_keypoints"
+
+    reversing = sequence.step(
+        20,
+        perception=centered_partial,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    assert reversing.reason == "safe_zone_keypoints_reobserve_waiting_for_new_frame"
+    assert reversing.linear_velocity_m_s == 0.0
+    assert reversing.angular_velocity_rad_s == 0.0
+
+    complete = sequence.step(
+        30,
+        perception=safe_zone_snapshot(
+            2,
+            30,
+            GroundPoint(450.0, 0.0),
+            GroundPoint(400.0, 50.0),
+            GroundPoint(400.0, -50.0),
+            box=UndistortedBoundingBox(40.0, 20.0, 60.0, 80.0),
+        ),
+        heading_rad=0.0,
+        cumulative_distance_m=-0.05,
+        left_speed_feedback_m_s=-0.05,
+        right_speed_feedback_m_s=-0.05,
+    )
+    assert complete.reason == "safe_zone_keypoints_reobserved_stop_before_calibration"
+    assert complete.linear_velocity_m_s == 0.0
+    assert complete.angular_velocity_rad_s == 0.0
+    assert sequence._safe_zone_phase == "stopping_after_bbox_keypoints"
+
+
+def test_complete_keypoints_are_centered_before_calibration_stop() -> None:
+    sequence = make_sequence(initial_field_position=FieldPoint(0.0, 0.0))
+    start_sequence(sequence)
+    sequence.state = MatchState.TRANSPORT_RELEASE
+    sequence._safe_zone_phase = "searching_safe_zone_keypoints"
+
+    off_center = sequence.step(
+        10,
+        perception=safe_zone_snapshot(
+            1,
+            10,
+            GroundPoint(400.0, 0.0),
+            GroundPoint(350.0, 50.0),
+            GroundPoint(350.0, -50.0),
+            box=UndistortedBoundingBox(10.0, 10.0, 50.0, 90.0),
+        ),
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    assert off_center.reason == "safe_zone_center_full_bbox_before_keypoints"
+    assert off_center.angular_velocity_rad_s > 0.0
+    assert sequence._safe_zone_phase == "searching_safe_zone_keypoints"
+
+    centered = sequence.step(
+        20,
+        perception=safe_zone_snapshot(
+            2,
+            20,
+            GroundPoint(400.0, 0.0),
+            GroundPoint(350.0, 50.0),
+            GroundPoint(350.0, -50.0),
+            box=UndistortedBoundingBox(40.0, 10.0, 60.0, 90.0),
+        ),
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    assert centered.reason == "safe_zone_keypoints_seen_stop_before_calibration"
+    assert centered.linear_velocity_m_s == 0.0
+    assert centered.angular_velocity_rad_s == 0.0
+    assert sequence._safe_zone_phase == "stopping_after_bbox_keypoints"
+
+
 def test_collecting_partial_keypoints_restarts_bbox_search() -> None:
     sequence = make_sequence(initial_field_position=FieldPoint(0.0, 0.0))
     start_sequence(sequence)
@@ -858,10 +1042,287 @@ def test_collecting_partial_keypoints_restarts_bbox_search() -> None:
         right_speed_feedback_m_s=0.0,
     )
 
-    assert sequence._safe_zone_phase == "searching_safe_zone_keypoints"
-    assert decision.reason == "safe_zone_center_full_bbox_before_keypoints"
+    assert sequence._safe_zone_phase == "reobserving_safe_zone_keypoints"
+    assert decision.reason == "safe_zone_keypoints_missing_start_reobserve"
     assert decision.linear_velocity_m_s == 0.0
-    assert decision.angular_velocity_rad_s > 0.0
+    assert decision.angular_velocity_rad_s == 0.0
+
+    waiting = sequence.step(
+        100,
+        perception=sequence._latest_perception,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    assert waiting.reason == "safe_zone_keypoints_reobserve_waiting_for_new_frame"
+    assert waiting.angular_velocity_rad_s == 0.0
+
+    expired = sequence.step(
+        800_000_011,
+        perception=sequence._latest_perception,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    assert sequence._safe_zone_phase == "searching_safe_zone_keypoints"
+    assert expired.reason == "safe_zone_center_full_bbox_before_keypoints"
+    assert expired.angular_velocity_rad_s > 0.0
+
+
+def test_safe_zone_bbox_turn_uses_proportional_speed_and_deadband() -> None:
+    sequence = make_sequence(initial_field_position=FieldPoint(0.0, 0.0))
+    start_sequence(sequence)
+    sequence.state = MatchState.TRANSPORT_RELEASE
+    sequence._safe_zone_phase = "searching_safe_zone_keypoints"
+    sequence._safe_zone_keypoint_scan_attempted = True
+    sequence._safe_zone_keypoint_reverse_attempted = True
+
+    centered = sequence.step(
+        10,
+        perception=safe_zone_snapshot(
+            1,
+            10,
+            None,
+            None,
+            None,
+            box=UndistortedBoundingBox(40.0, 20.0, 60.0, 80.0),
+        ),
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    assert centered.angular_velocity_rad_s == 0.0
+
+    small_error = sequence.step(
+        20,
+        perception=safe_zone_snapshot(
+            2,
+            20,
+            None,
+            None,
+            None,
+            box=UndistortedBoundingBox(41.0, 20.0, 61.0, 80.0),
+        ),
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    assert small_error.angular_velocity_rad_s == 0.0
+
+    large_error = sequence.step(
+        30,
+        perception=safe_zone_snapshot(
+            3,
+            30,
+            None,
+            None,
+            None,
+            box=UndistortedBoundingBox(60.0, 20.0, 80.0, 80.0),
+        ),
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    assert large_error.angular_velocity_rad_s == pytest.approx(-0.25)
+
+    near_error = sequence.step(
+        40,
+        perception=safe_zone_snapshot(
+            4,
+            40,
+            None,
+            None,
+            None,
+            box=UndistortedBoundingBox(47.5, 20.0, 67.5, 80.0),
+        ),
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    assert near_error.angular_velocity_rad_s == pytest.approx(-0.12)
+
+
+def test_safe_zone_bbox_reversal_waits_for_stop_and_new_frame() -> None:
+    sequence = make_sequence(initial_field_position=FieldPoint(0.0, 0.0))
+    start_sequence(sequence)
+    sequence.state = MatchState.TRANSPORT_RELEASE
+    sequence._safe_zone_phase = "searching_safe_zone_keypoints"
+
+    left = safe_zone_snapshot(
+        1,
+        10,
+        None,
+        None,
+        None,
+        box=UndistortedBoundingBox(20.0, 20.0, 40.0, 80.0),
+    )
+    right = safe_zone_snapshot(
+        2,
+        20,
+        None,
+        None,
+        None,
+        box=UndistortedBoundingBox(60.0, 20.0, 80.0, 80.0),
+    )
+    right_new = safe_zone_snapshot(
+        3,
+        500_000_000,
+        None,
+        None,
+        None,
+        box=UndistortedBoundingBox(60.0, 20.0, 80.0, 80.0),
+    )
+    first = sequence.step(
+        10,
+        perception=left,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    assert first.angular_velocity_rad_s > 0.0
+
+    requested = sequence.step(
+        20,
+        perception=right,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.1,
+        right_speed_feedback_m_s=-0.1,
+    )
+    assert requested.angular_velocity_rad_s == 0.0
+
+    waiting_stop = sequence.step(
+        100,
+        perception=right,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    assert waiting_stop.reason == "safe_zone_waiting_for_vehicle_stop_before_reversal"
+
+    waiting_frame = sequence.step(
+        300_000_100,
+        perception=right,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    assert waiting_frame.reason == "safe_zone_waiting_for_new_frame_before_reversal"
+
+    resumed = sequence.step(
+        500_000_000,
+        perception=right_new,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    assert resumed.angular_velocity_rad_s < 0.0
+    assert resumed.reason == "safe_zone_center_full_bbox_before_keypoints"
+
+
+def test_safe_zone_keypoint_reobserve_accepts_only_a_new_complete_frame() -> None:
+    sequence = make_sequence(initial_field_position=FieldPoint(0.0, 0.0))
+    start_sequence(sequence)
+    sequence.state = MatchState.TRANSPORT_RELEASE
+    sequence._safe_zone_phase = "collecting_safe_zone_keys_closed"
+    partial = safe_zone_snapshot(
+        1,
+        10,
+        GroundPoint(400.0, 0.0),
+        GroundPoint(350.0, 50.0),
+        None,
+    )
+    started = sequence.step(
+        10,
+        perception=partial,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    assert started.reason == "safe_zone_keypoints_missing_start_reobserve"
+
+    duplicate = sequence.step(
+        100,
+        perception=partial,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    assert duplicate.reason == "safe_zone_keypoints_reobserve_waiting_for_new_frame"
+
+    complete = sequence.step(
+        200,
+        perception=safe_zone_snapshot(
+            2,
+            200,
+            GroundPoint(400.0, 0.0),
+            GroundPoint(350.0, 50.0),
+            GroundPoint(350.0, -50.0),
+        ),
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    assert complete.reason == "safe_zone_keypoints_reobserved_stop_before_calibration"
+    assert sequence._safe_zone_phase == "stopping_after_bbox_keypoints"
+
+
+def test_safe_zone_centered_missing_keypoints_get_one_bounded_scan() -> None:
+    sequence = make_sequence(initial_field_position=FieldPoint(0.0, 0.0))
+    start_sequence(sequence)
+    sequence.state = MatchState.TRANSPORT_RELEASE
+    sequence._safe_zone_phase = "collecting_safe_zone_keys_closed"
+    centered_partial = safe_zone_snapshot(
+        1,
+        10,
+        GroundPoint(400.0, 0.0),
+        GroundPoint(350.0, 50.0),
+        None,
+        box=UndistortedBoundingBox(40.0, 20.0, 60.0, 80.0),
+    )
+    sequence.step(
+        10,
+        perception=centered_partial,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    scanning = sequence.step(
+        800_000_011,
+        perception=centered_partial,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    assert sequence._safe_zone_phase == "scanning_safe_zone_keypoints"
+    assert scanning.reason == "safe_zone_keypoint_reobserve_scan"
+    assert scanning.angular_velocity_rad_s == pytest.approx(0.25)
+
+    scan_done = sequence.step(
+        1_600_000_011,
+        perception=centered_partial,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    assert sequence._safe_zone_phase == "reobserving_safe_zone_keypoints"
+    assert scan_done.reason == "safe_zone_keypoint_scan_complete_reobserve"
 
 
 def test_rejected_safe_zone_calibration_restarts_turning_search() -> None:
@@ -879,7 +1340,7 @@ def test_rejected_safe_zone_calibration_restarts_turning_search() -> None:
         1,
         10,
         *triple,
-        box=UndistortedBoundingBox(0.0, 10.0, 40.0, 90.0),
+        box=UndistortedBoundingBox(12.0, 10.0, 52.0, 90.0),
     )
 
     decision = sequence.step(
@@ -890,7 +1351,7 @@ def test_rejected_safe_zone_calibration_restarts_turning_search() -> None:
     )
 
     assert sequence._safe_zone_phase == "searching_safe_zone_keypoints"
-    assert decision.reason == "safe_zone_center_full_bbox_before_keypoints"
+    assert decision.reason == "safe_zone_visual_calibration_rejected_rotate_for_keypoints"
     assert decision.linear_velocity_m_s == 0.0
     assert decision.angular_velocity_rad_s > 0.0
     assert sequence._safe_zone_key_samples == []
@@ -993,7 +1454,7 @@ def test_directly_aligns_without_confirm_reverse_scan() -> None:
         cumulative_distance_m=0.0,
     )
     assert first.state is MatchState.SEARCH_CLUSTER
-    sequence.state = MatchState.CHECK_ISOLATED_GREEN
+    sequence.state = MatchState.SEARCH_CLUSTER
     found = sequence.step(
         20,
         perception=snapshot(2, 20, observation(2, 20, GroundPoint(500.0, 0.0))),
@@ -1073,7 +1534,7 @@ def test_first_search_enters_common_cluster_search() -> None:
     assert started_search.angular_velocity_rad_s == pytest.approx(-0.30)
 
 
-def test_common_search_does_not_wait_for_green_full_sweep() -> None:
+def test_first_search_does_not_break_black_only_group() -> None:
     sequence = make_sequence(
         config=runtime_config(opportunistic_single_green_enabled=True)
     )
@@ -1129,8 +1590,8 @@ def test_common_search_does_not_wait_for_green_full_sweep() -> None:
         cumulative_distance_m=0.0,
     )
 
-    assert found.state is MatchState.ALIGN_CLUSTER_ONCE
-    assert found.reason == "cluster_seen_stop_collect_reference"
+    assert found.state is MatchState.SEARCH_CLUSTER
+    assert found.reason == "search_cluster_right"
 
 
 def test_green_cluster_preference_only_applies_to_required_first_delivery() -> None:
@@ -1332,7 +1793,7 @@ def test_far_direct_green_realigns_at_near_standoff() -> None:
     sequence = make_sequence(
         config=runtime_config(
             green_grab_offset_mm=150.0,
-            opportunistic_single_green_enabled=False,
+            opportunistic_single_green_enabled=True,
             opportunistic_single_green_realign_standoff_mm=350.0,
         )
     )
@@ -1345,14 +1806,11 @@ def test_far_direct_green_realigns_at_near_standoff() -> None:
         cumulative_distance_m=0.0,
     )
     assert first.state is MatchState.SEARCH_CLUSTER
-    sequence.state = MatchState.CHECK_ISOLATED_GREEN
+    sequence.state = MatchState.SEARCH_CLUSTER
 
-    found = sequence.step(
-        20,
-        perception=snapshot(2, 20, observation(2, 20, GroundPoint(500.0, 0.0))),
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-    )
+    sequence._update_tracker(20, snapshot(2, 20, observation(2, 20, GroundPoint(500.0, 0.0))))
+    # Exercise the direct handoff API; common search now uses grasp-priority entry.
+    found = sequence._begin_green_transport(20, sequence._tracker.tracks[0])
     assert found.state is MatchState.TRANSPORT_ALIGN_GREEN
     assert found.reason == "green_path_clear_align_direct:1"
     assert sequence._opportunistic_single_green is False
@@ -1411,7 +1869,7 @@ def test_green_alignment_waits_before_forward_when_settle_enabled() -> None:
         config=runtime_config(
             action_settle_time_s=0.5,
             green_grab_offset_mm=150.0,
-            opportunistic_single_green_enabled=False,
+            opportunistic_single_green_enabled=True,
         )
     )
     start_sequence(sequence)
@@ -1422,7 +1880,7 @@ def test_green_alignment_waits_before_forward_when_settle_enabled() -> None:
         heading_rad=0.0,
         cumulative_distance_m=0.0,
     )
-    sequence.state = MatchState.CHECK_ISOLATED_GREEN
+    sequence.state = MatchState.SEARCH_CLUSTER
     sequence.step(
         20,
         perception=snapshot(2, 20, observation(2, 20, GroundPoint(300.0, 0.0))),
@@ -1792,7 +2250,7 @@ def test_search_does_not_direct_grab_non_green_target() -> None:
     assert decision.reason == "search_cluster_right"
 
 
-def test_search_direct_grab_requires_singleton_clearance() -> None:
+def test_search_prefers_safe_single_over_unnecessary_breakup() -> None:
     sequence = make_sequence(
         config=runtime_config(
             opportunistic_single_green_enabled=True,
@@ -1825,8 +2283,8 @@ def test_search_direct_grab_requires_singleton_clearance() -> None:
             cumulative_distance_m=0.0,
         )
 
-    assert decision.state is MatchState.ALIGN_CLUSTER_ONCE
-    assert decision.state is not MatchState.TRANSPORT_ALIGN_GREEN
+    assert decision.state is MatchState.TRANSPORT_ALIGN_GREEN
+    assert decision.selected_track_id == 1
 
 
 def test_opportunistic_grab_rechecks_singleton_after_reference_collection() -> None:
@@ -1918,7 +2376,7 @@ def test_lost_green_target_restarts_search_after_bounded_wait() -> None:
     assert restarted.reason == "green_target_timeout_restart_breakup_search"
 
 
-def test_cluster_alignment_uses_average_of_all_cluster_points() -> None:
+def test_cluster_alignment_aims_at_actual_member() -> None:
     sequence = make_sequence()
     start_sequence(sequence)
     sequence.state = MatchState.SEARCH_CLUSTER
@@ -1960,68 +2418,100 @@ def test_cluster_alignment_uses_average_of_all_cluster_points() -> None:
 
     measurement = sequence._cluster_ground_measurement(20)
     assert measurement is not None
-    assert measurement.center.x == pytest.approx(450.0)
-    assert measurement.center.y == pytest.approx(16.6666666667)
-    assert measurement.nearest_forward_x_mm == 400.0
+    assert measurement.center in (GroundPoint(400,100), GroundPoint(500,-50), GroundPoint(450,0))
+    assert measurement.nearest_forward_x_mm == pytest.approx(math.hypot(measurement.center.x, measurement.center.y))
+    assert sequence._breakup_proposal.aim_id in sequence._breakup_proposal.contact_ids
 
 
-def test_cluster_reference_is_locked_after_five_stopped_samples() -> None:
+def test_all_blue_cluster_is_ignored_for_breakup() -> None:
     sequence = make_sequence()
-    start_sequence(sequence)
-    sequence.state = MatchState.SEARCH_CLUSTER
-
-    def cluster_snapshot(
-        frame: int,
-        timestamp_ns: int,
-        y_offset: float,
-    ) -> PerceptionSnapshot:
-        return snapshot(
-            frame,
-            timestamp_ns,
-            observation(frame, timestamp_ns, GroundPoint(400.0, 100.0 + y_offset)),
-            observation(
-                frame,
-                timestamp_ns,
-                GroundPoint(500.0, -50.0 + y_offset),
-                target_class=TargetClass.BLACK_CORE,
-                box_x=30.0,
-            ),
-        )
-
-    sequence.step(
-        10,
-        perception=cluster_snapshot(1, 10, 0.0),
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-    )
-    first = sequence.step(
+    sequence._latest_heading_rad = 0.0
+    observations = [
+        observation(
+            1,
+            10,
+            GroundPoint(400.0, -20.0),
+            target_class=TargetClass.BLUE_DANGER,
+            box_x=10.0,
+        ),
+        observation(
+            1,
+            10,
+            GroundPoint(400.0, 20.0),
+            target_class=TargetClass.BLUE_DANGER,
+            box_x=30.0,
+        ),
+    ]
+    sequence._tracker.update(10, observations)
+    sequence._tracker.update(
         20,
-        perception=cluster_snapshot(2, 20, 0.0),
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
+        [
+            replace(
+                item,
+                frame_sequence=2,
+                capture_timestamp_ns=20,
+                result_timestamp_ns=20,
+            )
+            for item in observations
+        ],
     )
-    assert first.state is MatchState.ALIGN_CLUSTER_ONCE
-    assert first.linear_velocity_m_s == 0.0
-    for frame, y_offset in enumerate((10.0, 20.0, 30.0, 40.0), start=3):
-        sequence.step(
-            frame * 10,
-            perception=cluster_snapshot(frame, frame * 10, y_offset),
-            heading_rad=0.0,
-            cumulative_distance_m=0.0,
-        )
 
-    assert sequence._cluster_reference is not None
-    assert sequence._cluster_reference.x == pytest.approx(450.0)
-    assert sequence._cluster_reference.y == pytest.approx(45.0)
-    locked = sequence._cluster_reference
+    assert sequence._cluster_ground_measurement(20) is None
+    assert sequence._last_cluster_rejection_reason == "breakup_no_contact_plan_or_retry_exhausted"
 
-    sequence.step(
-        70,
-        perception=cluster_snapshot(7, 70, 300.0),
-        heading_rad=1.0,
-        cumulative_distance_m=0.0,
+
+def test_mixed_cluster_with_blue_is_still_available_for_breakup() -> None:
+    sequence = make_sequence()
+    sequence._latest_heading_rad = 0.0
+    observations = [
+        observation(1, 10, GroundPoint(400.0, -20.0)),
+        observation(
+            1,
+            10,
+            GroundPoint(400.0, 20.0),
+            target_class=TargetClass.BLUE_DANGER,
+            box_x=30.0,
+        ),
+    ]
+    sequence._tracker.update(10, observations)
+    sequence._tracker.update(
+        20,
+        [
+            replace(
+                item,
+                frame_sequence=2,
+                capture_timestamp_ns=20,
+                result_timestamp_ns=20,
+            )
+            for item in observations
+        ],
     )
-    assert sequence._cluster_reference == locked
+
+    sequence._latest_perception = snapshot(2, 20, *(replace(item, frame_sequence=2,
+        capture_timestamp_ns=20, result_timestamp_ns=20) for item in observations))
+    assert sequence._cluster_ground_measurement(20) is not None
+
+
+def test_cluster_reference_locks_real_contact_after_three_stopped_frames() -> None:
+    sequence = make_sequence(config=runtime_config(opportunistic_single_green_enabled=False,
+        cluster_align_hold_ms=3000, safe_zone_calibration_stop_confirm_time_s=0.01,
+        breakup_backward_distance_m=0.4, breakup_confirmation_frames=3))
+    start_sequence(sequence)
+    sequence._breakup_only = True
+    for frame in range(1, 10):
+        now = frame * 20_000_000
+        result = sequence.step(now, perception=snapshot(frame, now,
+            observation(frame, now, GroundPoint(400, 0)),
+            observation(frame, now, GroundPoint(450, 0), target_class=TargetClass.BLUE_DANGER, box_x=30)),
+            heading_rad=0., cumulative_distance_m=0., left_speed_feedback_m_s=0., right_speed_feedback_m_s=0.)
+        if result.reason == "breakup_plan_frozen":
+            break
+    assert result.state is MatchState.BREAKUP_FORWARD
+    assert result.reason == "breakup_plan_frozen"
+    assert len(sequence._breakup_reference_frames) == sequence.config.breakup_confirmation_frames
+    locked = sequence._breakup_plan
+    assert locked is not None and locked.aim in (GroundPoint(400,0), GroundPoint(450,0))
+    assert sequence._breakup_plan is locked
 
 
 def test_ignores_nearby_object_outside_forward_corridor() -> None:
@@ -2041,7 +2531,7 @@ def test_ignores_nearby_object_outside_forward_corridor() -> None:
         heading_rad=0.0,
         cumulative_distance_m=0.0,
     )
-    sequence.state = MatchState.CHECK_ISOLATED_GREEN
+    sequence.state = MatchState.SEARCH_CLUSTER
     found = sequence.step(
         20,
         perception=snapshot(
@@ -2064,7 +2554,10 @@ def test_ignores_nearby_object_outside_forward_corridor() -> None:
 
 
 def test_relative_forward_corridor_rejects_blue_blocker_and_logs_details() -> None:
-    sequence = make_sequence(config=runtime_config(green_path_half_width_mm=50.0))
+    sequence = make_sequence(config=runtime_config(
+        green_path_half_width_mm=50.0,
+        breakup_backward_distance_m=0.4,
+    ))
     start_sequence(sequence)
     green_point = GroundPoint(500.0, 200.0)
     blue_point = GroundPoint(300.0, 120.0)
@@ -2087,9 +2580,9 @@ def test_relative_forward_corridor_rejects_blue_blocker_and_logs_details() -> No
             cumulative_distance_m=0.0,
         )
         if frame == 1:
-            sequence.state = MatchState.CHECK_ISOLATED_GREEN
+            sequence.state = MatchState.SEARCH_CLUSTER
 
-    assert decision.state is MatchState.SEARCH_CLUSTER
+    assert decision.state is MatchState.BREAKUP_SETTLE
     diagnostic = sequence.green_isolation_diagnostic(20)
     assert "class=blue_danger" in diagnostic
     assert "aligned_forward=" in diagnostic
@@ -2098,43 +2591,97 @@ def test_relative_forward_corridor_rejects_blue_blocker_and_logs_details() -> No
     assert "path=path_track_2" in diagnostic
 
 
-def test_path_blocking_uses_configured_lateral_threshold() -> None:
-    green_point = GroundPoint(500.0, 200.0)
-    blue_point = GroundPoint(267.4, 139.3)
+def _corridor_decision(green_point: GroundPoint, blue_point: GroundPoint, **sequence_kwargs):
+    """在搜索态用同一帧绿/蓝布局推进一步，返回该帧决策。"""
 
-    for half_width_mm, expected_state in (
-        (20.0, MatchState.TRANSPORT_ALIGN_GREEN),
-        (50.0, MatchState.SEARCH_CLUSTER),
-    ):
-        sequence = make_sequence(
-            config=runtime_config(green_path_half_width_mm=half_width_mm)
-        )
-        start_sequence(sequence)
-        for frame, timestamp_ns in ((1, 10), (2, 20)):
-            decision = sequence.step(
+    sequence = make_sequence(
+        config=runtime_config(
+            breakup_backward_distance_m=0.4,
+        ),
+        **sequence_kwargs,
+    )
+    start_sequence(sequence)
+    for frame, timestamp_ns in ((1, 10), (2, 20)):
+        decision = sequence.step(
+            timestamp_ns,
+            perception=snapshot(
+                frame,
                 timestamp_ns,
-                perception=snapshot(
+                observation(frame, timestamp_ns, green_point),
+                observation(
                     frame,
                     timestamp_ns,
-                    observation(frame, timestamp_ns, green_point),
-                    observation(
-                        frame,
-                        timestamp_ns,
-                        blue_point,
-                        target_class=TargetClass.BLUE_DANGER,
-                        box_x=30.0,
-                    ),
+                    blue_point,
+                    target_class=TargetClass.BLUE_DANGER,
+                    box_x=30.0,
                 ),
-                heading_rad=0.0,
-                cumulative_distance_m=0.0,
-            )
-            if frame == 1:
-                sequence.state = MatchState.CHECK_ISOLATED_GREEN
-        assert decision.state is expected_state
+            ),
+            heading_rad=0.0,
+            cumulative_distance_m=0.0,
+        )
+        if frame == 1:
+            sequence.state = MatchState.SEARCH_CLUSTER
+    return decision
+
+
+def test_path_blocking_uses_physical_contact_threshold_not_fixed_half_width() -> None:
+    # 参考绿块 (500,200)，航向 0。蓝块横向偏置 40 mm 时两块实体仍可能接触，
+    # 偏置 46 mm 时已经不在夹取路径上。
+    green_point = GroundPoint(500.0, 200.0)
+    on_path_blue = GroundPoint(263.6, 148.5)
+    off_path_blue = GroundPoint(261.4, 154.1)
+    near_config = NearFieldGraspConfig(
+        clearance_mm=4.0,
+        corridor_lateral_margin_mm=1.0,
+    )
+    # 内切半径 20+20 加实际夹爪余量 3，正是图中 43 mm 的门限；固定 50 mm
+    # 会把 46 mm 的蓝块也算成阻挡并提前进入解团。
+    assert 43.0 < 46.0 < 50.0
+
+    blocked = _corridor_decision(
+        green_point,
+        on_path_blue,
+        near_field_grasp_config=near_config,
+    )
+    assert blocked.state is MatchState.BREAKUP_SETTLE
+
+    clear = _corridor_decision(
+        green_point,
+        off_path_blue,
+        near_field_grasp_config=near_config,
+    )
+    assert clear.state is MatchState.TRANSPORT_ALIGN_GREEN
+
+
+def test_path_blocking_falls_back_to_configured_half_width_without_geometry() -> None:
+    sequence = make_sequence(
+        config=runtime_config(green_path_half_width_mm=40.0),
+        near_field_grasp_config=NearFieldGraspConfig(),
+    )
+    sequence._breakup_target_geometry = None
+    threshold = sequence._path_block_half_width_mm(
+        TargetClass.GREEN_SUPPLY,
+        TargetClass.BLUE_DANGER,
+    )
+    assert threshold == pytest.approx(40.0)
+
+    sequence._breakup_target_geometry = load_runtime_config(
+        "configs/runtime.match.yaml"
+    ).perception.target_ground_geometry
+    # 有物理尺寸时按两块实体内切半径加近场夹爪余量计算，与固定半宽无关。
+    assert sequence._path_block_half_width_mm(
+        TargetClass.GREEN_SUPPLY,
+        TargetClass.BLUE_DANGER,
+    ) == pytest.approx(
+        20.0 + 20.0 + 4.0 / 2.0 + 10.0
+    )
 
 
 def test_path_blocker_rejects_target_but_non_green_does_not_recheck() -> None:
-    sequence = make_sequence(config=runtime_config(green_grab_offset_mm=150.0))
+    sequence = make_sequence(config=runtime_config(
+        green_grab_offset_mm=150.0,
+        breakup_backward_distance_m=0.4,
+    ))
     start_sequence(sequence)
     for frame, timestamp_ns in ((1, 10), (2, 20)):
         blocker = observation(
@@ -2156,8 +2703,8 @@ def test_path_blocker_rejects_target_but_non_green_does_not_recheck() -> None:
             cumulative_distance_m=0.0,
         )
         if frame == 1:
-            sequence.state = MatchState.CHECK_ISOLATED_GREEN
-    assert decision.state is MatchState.SEARCH_CLUSTER
+            sequence.state = MatchState.SEARCH_CLUSTER
+    assert decision.state is MatchState.BREAKUP_SETTLE
 
     # 另起一轮验证近目标的 x-150 定距，以及非绿色近目标不触发复核。
     sequence = make_sequence(
@@ -2173,7 +2720,7 @@ def test_path_blocker_rejects_target_but_non_green_does_not_recheck() -> None:
         heading_rad=0.0,
         cumulative_distance_m=0.0,
     )
-    sequence.state = MatchState.CHECK_ISOLATED_GREEN
+    sequence.state = MatchState.SEARCH_CLUSTER
     found = sequence.step(
         20,
         perception=snapshot(2, 20, observation(2, 20, GroundPoint(300.0, 0.0))),
@@ -3238,6 +3785,7 @@ def test_breakup_blocks_entire_route_to_own_safe_zone(team, heading, phase) -> N
     sequence._cluster_reference_distance_mm = 1000.0
     if phase is MatchState.BREAKUP_BACKWARD:
         heading = normalize_angle(heading + math.pi)
+    inject_breakup_plan(sequence, heading=heading)
     decision = sequence.step(10, perception=None, heading_rad=heading, cumulative_distance_m=0.0)
     # 路线终点已在安全区外，仍必须识别中途穿越；后退按负位移检查。
     assert decision.reason == "target_path_intersects_safe_zone_stop_and_reselect"
@@ -3254,6 +3802,7 @@ def test_breakup_missing_guard_inputs_holds(missing) -> None:
     sequence._breakup_static_map = None if missing == "map" else load_runtime_config("configs/runtime.match.yaml").world.static_map
     start_sequence(sequence)
     sequence.state = MatchState.BREAKUP_FORWARD
+    inject_breakup_plan(sequence)
     decision = sequence.step(10, perception=None, heading_rad=None if missing == "heading" else 0.0,
                              cumulative_distance_m=0.0)
     assert decision.reason == "breakup_safe_zone_guard_missing_pose_or_map"
@@ -3266,6 +3815,7 @@ def test_breakup_opponent_zone_also_stops_and_reselects() -> None:
     sequence._breakup_static_map = load_runtime_config("configs/runtime.match.yaml").world.static_map
     start_sequence(sequence)
     sequence.state = MatchState.BREAKUP_FORWARD
+    inject_breakup_plan(sequence)
     decision = sequence.step(10, perception=None, heading_rad=-math.pi / 2, cumulative_distance_m=0.0)
     assert decision.linear_velocity_m_s == 0.0
     assert decision.state is MatchState.SEARCH_CLUSTER
@@ -3280,6 +3830,7 @@ def test_breakup_clearance_and_tangent_are_blocked() -> None:
     sequence._breakup_static_map = static_map
     start_sequence(sequence)
     sequence.state = MatchState.BREAKUP_FORWARD
+    inject_breakup_plan(sequence)
     decision = sequence.step(10, perception=None, heading_rad=math.pi / 2, cumulative_distance_m=0.0)
     assert decision.reason == "target_path_intersects_safe_zone_stop_and_reselect"
 
@@ -3298,7 +3849,7 @@ def test_factory_wires_configured_guard_geometry() -> None:
     sequence = MatchSequence.from_app_config(config)
     assert sequence._near_field_pickup is not None
     assert sequence._near_field_pickup.commit_age_ns == 150_000_000
-    assert config.near_field_grasp.confirmation_frames == 3
+    assert config.near_field_grasp.confirmation_frames == 1
     assert sequence._near_field_pickup.fine_alignment_zone_rad == pytest.approx(
         0.08
     )
@@ -3322,6 +3873,7 @@ def test_approach_checks_following_push_before_moving() -> None:
     # 接近本身仅 100 mm 安全，但随后前推将越界。
     sequence._cluster_reference_distance_mm = sequence.config.cluster_breakup_standoff_mm + 100.0
     sequence._cluster_reference_field_point = FieldPoint(0.0, 500.0)
+    inject_breakup_plan(sequence)
     decision = sequence.step(10, perception=None, heading_rad=math.pi / 2, cumulative_distance_m=0.0)
     assert decision.reason == "target_path_intersects_safe_zone_stop_and_reselect"
     assert decision.linear_velocity_m_s == 0.0
@@ -3334,6 +3886,7 @@ def test_breakup_safe_parallel_route_continues() -> None:
     ).world.static_map
     start_sequence(sequence)
     sequence.state = MatchState.BREAKUP_FORWARD
+    inject_breakup_plan(sequence)
     decision = sequence.step(10, perception=None, heading_rad=0.0, cumulative_distance_m=0.0)
     assert decision.state is MatchState.BREAKUP_FORWARD
     assert decision.linear_velocity_m_s == sequence.config.breakup_forward_speed_m_s
@@ -3346,6 +3899,7 @@ def test_reselect_waits_for_stop_and_new_frame_then_grabs_next_green() -> None:
     ), initial_field_position=FieldPoint(0.0, 500.0))
     start_sequence(sequence)
     sequence.state = MatchState.BREAKUP_FORWARD
+    inject_breakup_plan(sequence)
     blocked = sequence.step(10, perception=None, heading_rad=math.pi / 2,
                             cumulative_distance_m=0.0)
     assert blocked.state is MatchState.SEARCH_CLUSTER
@@ -3426,10 +3980,12 @@ def test_selection_prefers_green_group_before_larger_non_green_group() -> None:
         ],
     )
 
+    sequence._latest_perception = snapshot(2, 20, *(replace(item, frame_sequence=2,
+        capture_timestamp_ns=20, result_timestamp_ns=20) for item in observations))
     measurement = sequence._cluster_ground_measurement(20)
 
     assert measurement is not None
-    assert measurement.center == GroundPoint(600.0, 0.0)
+    assert measurement.center in (GroundPoint(600.0, -20.0), GroundPoint(600.0, 20.0))
 
 
 def test_breakup_center_uses_field_boundary_minus_gripper_offset() -> None:
@@ -3469,25 +4025,6 @@ def test_breakup_center_uses_field_boundary_minus_gripper_offset() -> None:
     )
 
 
-def test_breakup_rechecks_locked_center_before_settle() -> None:
-    sequence = make_sequence()
-    start_sequence(sequence)
-    sequence.state = MatchState.APPROACH_CLUSTER
-    sequence._cluster_reference_distance_mm = 260.0
-    sequence._cluster_reference_field_point = FieldPoint(1400.0, 0.0)
-
-    rejected = sequence.step(
-        10,
-        perception=None,
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-    )
-
-    assert rejected.state is MatchState.SEARCH_CLUSTER
-    assert rejected.linear_velocity_m_s == 0.0
-    assert "breakup_center_out_of_field_boundary" in rejected.reason
-
-
 @pytest.mark.parametrize("heading", [math.pi / 2, -math.pi / 2])
 def test_green_selection_skips_both_safe_zones(heading) -> None:
     sequence = make_sequence(config=runtime_config(opportunistic_single_green_enabled=True))
@@ -3500,6 +4037,72 @@ def test_green_selection_skips_both_safe_zones(heading) -> None:
         ), heading_rad=heading, cumulative_distance_m=0.0)
     assert decision.state is MatchState.TRANSPORT_ALIGN_GREEN
     assert sequence._selected_green_ground == GroundPoint(300.0, -900.0)
+
+
+def test_grasp_exclusions_mark_delivered_supplies_but_not_danger() -> None:
+    sequence = make_sequence()
+    start_sequence(sequence)
+    sequence._latest_heading_rad = 0.0
+
+    # 初始位姿在场地原点、航向 0，机器人系坐标与场地坐标一致。
+    delivered = observation(1, 10, GroundPoint(0.0, 1400.0))
+    outside = observation(1, 10, GroundPoint(300.0, -900.0))
+    danger_inside = observation(
+        1, 10, GroundPoint(100.0, 1300.0), target_class=TargetClass.BLUE_DANGER,
+    )
+
+    filtered = sequence.grasp_excluded_observation_indices(
+        snapshot(1, 10, delivered, outside, danger_inside)
+    )
+
+    assert filtered == frozenset({0})
+
+
+def test_grasp_exclusions_mark_carried_members_during_refill_scan() -> None:
+    sequence = make_sequence()
+    start_sequence(sequence)
+    sequence._latest_heading_rad = 0.0
+    sequence._near_field_grasp_config = NearFieldGraspConfig()
+    stowed_limit = sequence._greedy_new_target_min_x_mm()
+    assert stowed_limit == pytest.approx(160.0)
+
+    # 爪内成员：地面投影落在扫描本身要求新物资越过的界限之内。
+    carried = observation(1, 10, GroundPoint(stowed_limit - 60.0, 10.0))
+    new_supply = observation(1, 10, GroundPoint(stowed_limit + 140.0, -40.0))
+    carried_danger = observation(
+        1, 10, GroundPoint(stowed_limit - 60.0, -20.0),
+        target_class=TargetClass.BLUE_DANGER,
+    )
+    frame = snapshot(1, 10, carried, new_supply, carried_danger)
+    sequence._greedy_active = True
+
+    during_scan = sequence.grasp_excluded_observation_indices(frame)
+    assert during_scan == frozenset({0})
+
+    # 没有补夹扫描时不能启用该界限，否则会把正在接近的目标一并滤掉。
+    sequence._greedy_active = False
+    untouched = sequence.grasp_excluded_observation_indices(frame)
+    assert untouched == frozenset()
+
+
+def test_near_field_plan_with_delivered_member_is_not_committed() -> None:
+    from test_near_field_grasp import selector as near_selector, target as near_target
+
+    near_selector_ = near_selector()
+    plan = near_selector_.select((near_target(1, x=300.0, y=0.0),)).plan
+    assert plan is not None
+
+    # 航向 0 时场地坐标 = 起点 + 机器人系坐标，用起点把同一个计划移到安全区内。
+    outside = make_sequence(initial_field_position=FieldPoint(0.0, 0.0))
+    start_sequence(outside)
+    outside._latest_heading_rad = 0.0
+    assert outside._near_field_plan_has_delivered_member(plan) is False
+    assert outside._near_field_plan_has_delivered_member(None) is False
+
+    inside = make_sequence(initial_field_position=FieldPoint(-100.0, 1400.0))
+    start_sequence(inside)
+    inside._latest_heading_rad = 0.0
+    assert inside._near_field_plan_has_delivered_member(plan) is True
 
 
 def test_green_approach_rechecks_route_and_clears_selection() -> None:
@@ -3539,3 +4142,26 @@ def test_green_reference_safe_zone_route_reselects_after_stop() -> None:
     assert decision.state is MatchState.SEARCH_CLUSTER
     assert decision.reason == "target_path_intersects_safe_zone_stop_and_reselect"
     assert decision.linear_velocity_m_s == decision.angular_velocity_rad_s == 0.0
+
+
+def test_all_blue_largest_cluster_does_not_hide_smaller_mixed_cluster():
+    sequence = make_sequence()
+    sequence._latest_heading_rad = 0.0
+    sequence._transport_count = 1
+    objects = [
+        observation(1, 10, GroundPoint(400, -300 + index * 30),
+                    target_class=TargetClass.BLUE_DANGER, box_x=5 + index * 15)
+        for index in range(3)
+    ] + [
+        observation(1, 10, GroundPoint(400, 300), box_x=55),
+        observation(1, 10, GroundPoint(400, 330), target_class=TargetClass.BLACK_CORE, box_x=75),
+    ]
+    sequence._tracker.update(10, objects)
+    sequence._tracker.update(20, [replace(item, frame_sequence=2, capture_timestamp_ns=20,
+                                        result_timestamp_ns=20) for item in objects])
+    sequence._latest_perception = snapshot(2, 20, *(replace(item, frame_sequence=2,
+        capture_timestamp_ns=20, result_timestamp_ns=20) for item in objects))
+    measurement = sequence._cluster_ground_measurement(20)
+    assert measurement is not None
+    assert measurement.center in (GroundPoint(400,300), GroundPoint(400,330))
+    assert len(sequence._cluster_selected_track_ids) == 2

@@ -7,6 +7,8 @@ import math
 from typing import cast
 
 from rescue_vision.config.near_field_grasp import NearFieldGraspConfig
+from rescue_vision.app.breakup_planner import physical_radii
+from rescue_vision.perception.target_ground_geometry import TargetGroundGeometryConfig
 from rescue_vision.geometry.types import GroundPoint, UndistortedPixel
 from rescue_vision.geometry.ground_projector import GroundProjector
 from rescue_vision.motion.gripper_kinematics import GripperKinematics
@@ -203,8 +205,6 @@ class GraspTargetTracker:
         self.max_relative_speed_mm_s = max_relative_speed_mm_s
         self._memory: dict[int, GraspTarget] = {}
         self._forbidden: set[int] = set()
-        self._suspected: set[int] = set()
-        self._supply_clear_hits: dict[int, int] = {}
         self._last_timestamp_ns = -1
         self._handoff_prior: NearFieldHandoffPrior | None = None
         self._handoff_track_id: int | None = None
@@ -224,8 +224,6 @@ class GraspTargetTracker:
         self.tracker.reset()
         self._memory.clear()
         self._forbidden.clear()
-        self._suspected.clear()
-        self._supply_clear_hits.clear()
         self._last_timestamp_ns = -1
         self._handoff_prior = None
         self._handoff_track_id = None
@@ -247,12 +245,6 @@ class GraspTargetTracker:
         if self._handoff_track_id not in live_ids:
             self._handoff_track_id = None
         self._forbidden.intersection_update(live_ids)
-        self._suspected.intersection_update(live_ids)
-        self._supply_clear_hits = {
-            track_id: hits
-            for track_id, hits in self._supply_clear_hits.items()
-            if track_id in live_ids
-        }
         handoff_observation = None
         if self._handoff_prior is not None and self._handoff_track_id is None:
             matching_observations = tuple(
@@ -309,25 +301,12 @@ class GraspTargetTracker:
             clean_graspable = (
                 obs.target_class in GRASPABLE_CLASSES
                 and obs.model_target_class in GRASPABLE_CLASSES
-                and not obs.quality
+                and obs.ground_point is not None
                 and track.confidence >= self.tracker.config.min_confidence
             )
             if explicit_forbidden:
                 # 明确危险证据在轨迹存续期内保持，不能被后续类别抖动解除。
                 self._forbidden.add(track.track_id)
-                self._suspected.discard(track.track_id)
-                self._supply_clear_hits.pop(track.track_id, None)
-            elif clean_graspable and track.track_id in self._suspected:
-                hits = self._supply_clear_hits.get(track.track_id, 0) + 1
-                if hits >= self.config.supply_recovery_frames:
-                    self._suspected.discard(track.track_id)
-                    self._supply_clear_hits.pop(track.track_id, None)
-                else:
-                    self._supply_clear_hits[track.track_id] = hits
-            elif not clean_graspable:
-                # 单帧 unknown/质量异常只进入可恢复疑似态，不永久毒化可抓目标轨迹。
-                self._suspected.add(track.track_id)
-                self._supply_clear_hits[track.track_id] = 0
             try:
                 envelope = measure_target_envelope(obs, self.projector, min_mask_pixels=self.config.min_mask_pixels)
             except ValueError:
@@ -338,7 +317,6 @@ class GraspTargetTracker:
                 envelope,
                 track.status is TrackStatus.CONFIRMED,
                 track.track_id not in self._forbidden
-                and track.track_id not in self._suspected
                 and clean_graspable,
                 handoff_matched=handoff_matched,
             ))
@@ -373,9 +351,10 @@ class CandidateGeometry:
     """单个候选目标的横向开口与前进行程诊断，单位均为 mm。
 
     ``x0_mm``/``x1_mm``/``depth_mm`` 只用于观察颜色掩码投影的纵向范围，
-    不再作为目标自身的容纳硬约束。绿/黑组动作距离由 K0 的最远 ``x`` 和
-    ``target_final_x_mm`` 决定；单个橙色目标使用最近端加完整纵向跨度，
-    再减去 ``orange_target_final_x_mm``。
+    不再作为目标自身的容纳硬约束。前进行程一律由最远 K0 的 ``x`` 决定：
+    绿/黑组减去 ``target_final_x_mm``，单个橙色目标减去
+    ``orange_target_final_x_mm``。``corridor_end_x_mm`` 与实际扫掠走廊
+    使用同一公式，包含夹爪末端前伸距离。
     """
 
     track_id: int
@@ -576,7 +555,7 @@ class GraspSelection:
 class NearFieldGraspSelector:
     def __init__(self, config: NearFieldGraspConfig, projector: GroundProjector,
                  kinematics: GripperKinematics, *, open_servo_angles_deg: tuple[float, float],
-                 closed_servo_angles_deg: tuple[float, float]):
+                 closed_servo_angles_deg: tuple[float, float], target_geometry: TargetGroundGeometryConfig):
         if not isinstance(config, NearFieldGraspConfig):
             raise TypeError("config must be a NearFieldGraspConfig.")
         if not isinstance(projector, GroundProjector):
@@ -586,6 +565,9 @@ class NearFieldGraspSelector:
         for name, angles in (("open_servo_angles_deg", open_servo_angles_deg), ("closed_servo_angles_deg", closed_servo_angles_deg)):
             if not isinstance(angles, tuple) or len(angles) != 2 or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or not 0.0 <= float(value) <= 180.0 for value in angles):
                 raise ValueError(f"{name} must contain two angles in [0, 180].")
+        if not isinstance(target_geometry, TargetGroundGeometryConfig):
+            raise TypeError("target_geometry must be TargetGroundGeometryConfig")
+        self.target_geometry = target_geometry
         self.config, self.projector, self.kinematics = config, projector, kinematics
         self.open_angles, self.closed_angles = open_servo_angles_deg, closed_servo_angles_deg
         # 反解同时验证舵机方向、端点和值域。
@@ -672,6 +654,8 @@ class NearFieldGraspSelector:
         self,
         target: GraspTarget,
         targets: tuple[GraspTarget, ...],
+        *,
+        align: bool = True,
     ) -> str | None:
         """检查橙色伤员周围的独立性禁入区。"""
 
@@ -694,7 +678,11 @@ class NearFieldGraspSelector:
                 center.y - other_point.y,
             )
             if distance_mm <= radius + 1e-9:
-                if self._orange_side_rear_supply_clear(target, other):
+                if self._orange_side_rear_supply_clear(
+                    target,
+                    other,
+                    align=align,
+                ):
                     continue
                 return (
                     "orange_not_isolated_track:"
@@ -702,7 +690,13 @@ class NearFieldGraspSelector:
                 )
         return None
 
-    def _orange_side_rear_supply_clear(self, orange: GraspTarget, other: GraspTarget) -> bool:
+    def _orange_side_rear_supply_clear(
+        self,
+        orange: GraspTarget,
+        other: GraspTarget,
+        *,
+        align: bool,
+    ) -> bool:
         """圆形近邻区内仅放行有完整当前包络证明位于扫掠外的侧后方物资。
 
         危险/未知、缺包络、前方或贴邻目标仍执行原隔离门禁；不减小隔离半径。
@@ -713,10 +707,15 @@ class NearFieldGraspSelector:
             return False
         try:
             geometries = [self._group_geometry(
-                (orange,), range_limit_mm=self.config.max_range_mm + self.config.range_hysteresis_mm,
+                (orange,), align=align,
+                range_limit_mm=self.config.max_range_mm + self.config.range_hysteresis_mm,
             )]
-            if abs(orange.envelope.center.y) <= self.config.center_tolerance_mm + self.config.alignment_hysteresis_mm:
-                # 对准滞回可能让实际计划保持零角度；例外必须对这条走廊也成立。
+            if (
+                align
+                and abs(orange.envelope.center.y)
+                <= self.config.center_tolerance_mm
+                + self.config.alignment_hysteresis_mm
+            ):
                 geometries.append(self._group_geometry(
                     (orange,), align=False,
                     range_limit_mm=self.config.max_range_mm + self.config.range_hysteresis_mm,
@@ -738,6 +737,30 @@ class NearFieldGraspSelector:
                 return False
         return True
 
+    def _gripper_tip_x_mm(self, servo_angles_deg: tuple[float, float]) -> float:
+        """返回给定舵机角度下夹爪末端的前向 ``x``，含走廊起点下限。"""
+
+        left = self.kinematics.left_tip_position(
+            self.closed_angles[0] - servo_angles_deg[0],
+        )
+        right = self.kinematics.right_tip_position(
+            servo_angles_deg[1] - self.closed_angles[1],
+        )
+        return max(left.x, right.x, self.config.corridor_start_x_mm)
+
+    def _sweep_end_x_mm(
+        self,
+        servo_angles_deg: tuple[float, float],
+        distance: float,
+    ) -> float:
+        """返回夹爪开口前进 ``distance`` 后的扫掠前端 ``x``。
+
+        执行走廊与 ``CandidateGeometry.corridor_end_x_mm`` 诊断共用本公式，
+        夹爪末端前伸距离不会被漏算成只有 ``corridor_start_x_mm`` 加行程。
+        """
+
+        return self._gripper_tip_x_mm(servo_angles_deg) + distance
+
     def _regions(
         self,
         angle: float,
@@ -752,9 +775,11 @@ class NearFieldGraspSelector:
         会进入夹爪张开的横向范围。
         """
 
+        servo = self.servo_angles_for_edges(left_tip_y_mm, right_tip_y_mm)
+        # Sweep reaches the physical fingertips, not just corridor_start + travel.
         corridor = _rectangle(
             self.config.corridor_start_x_mm,
-            self.config.corridor_start_x_mm + distance,
+            self._sweep_end_x_mm(servo, distance),
             right_tip_y_mm - self.config.corridor_lateral_margin_mm,
             left_tip_y_mm + self.config.corridor_lateral_margin_mm,
         )
@@ -770,7 +795,16 @@ class NearFieldGraspSelector:
         # 同样不能用旧包络或旧像素框代替当前空间证据。
         if target.observed and target.observation.ground_point is not None:
             point = (target.observation.ground_point,)
-            return min(polygon_distance(point, region) for region in regions)
+            gap = min(polygon_distance(point, region) for region in regions)
+            if target.observation.target_class is TargetClass.BLUE_DANGER:
+                # 蓝块有实体：中心在路径外也可能被夹到，所以按实体半径收缩
+                # 净空。取内切半径——一定被实体占据的圆盘——与解团接触判定
+                # 同一条原则“内切半径才成立”；外接半径会把只是近旁、并不在
+                # 夹取路径上的蓝块当成阻挡，制造不必要的换组和解团。蓝块实体
+                # 始终参与扫掠检查，危险证据不因此删除。
+                radius, _ = physical_radii(self.target_geometry.geometry_for(TargetClass.BLUE_DANGER))
+                gap = max(0.0, gap - radius)
+            return gap
         return math.inf
 
     @staticmethod
@@ -860,10 +894,10 @@ class NearFieldGraspSelector:
         )
         for other, dx_mm, dy_mm in side_neighbors:
             other_class = other.observation.target_class
-            if other_class not in {
-                TargetClass.BLUE_DANGER,
-                TargetClass.ORANGE_INJURED,
-            }:
+            if other_class is TargetClass.BLUE_DANGER:
+                # Actual jaw sweep below is authoritative; adjacency alone is not a veto.
+                continue
+            if other_class is not TargetClass.ORANGE_INJURED:
                 continue
             if other_class is TargetClass.ORANGE_INJURED and not single_orange:
                 continue
@@ -906,6 +940,89 @@ class NearFieldGraspSelector:
         forward_distance_mm: float
         reasons: tuple[str, ...]
 
+    def _mechanically_reachable(
+        self,
+        points: tuple[GroundPoint, ...],
+        angle_rad: float,
+    ) -> bool:
+        """Return whether both jaws can reach the rotated object envelope.
+
+        ``angle_rad`` is the vehicle turn from the current heading.  The
+        envelope is evaluated in the post-turn robot frame and each jaw is
+        solved independently.  This deliberately does not use the envelope
+        centre as a centring requirement: a target is reachable whenever the
+        left and right physical edges can be covered by the real servo
+        travels.
+        """
+
+        rotated = tuple(_rotate(point, -angle_rad) for point in points)
+        _, _, y0, y1 = _bounds(rotated)
+        half_clearance = self.config.clearance_mm / 2.0
+        left_tip_y = y1 + half_clearance
+        right_tip_y = y0 - half_clearance
+        if not rotated or any(point.x <= 0.0 for point in rotated):
+            return False
+        if left_tip_y - right_tip_y > self.maximum_opening_mm + 1e-9:
+            return False
+        try:
+            self.servo_angles_for_edges(left_tip_y, right_tip_y)
+        except ValueError:
+            return False
+        return True
+
+    def _minimum_reachable_angle(
+        self,
+        points: tuple[GroundPoint, ...],
+        *,
+        align: bool,
+    ) -> float:
+        """Find the smallest signed turn that makes both jaws reachable.
+
+        The useful physical range is the forward half-plane.  A coarse scan
+        finds the first feasible interval on each side and a binary search
+        refines its boundary.  The selector is a bounded background operation
+        and this avoids adding a second geometric approximation or a centre
+        tolerance to the control path.
+        """
+
+        if not align or self._mechanically_reachable(points, 0.0):
+            return 0.0
+
+        centres = tuple(points)
+        centre = GroundPoint(
+            sum(point.x for point in centres) / len(centres),
+            sum(point.y for point in centres) / len(centres),
+        )
+        preferred_sign = 1.0 if centre.y >= 0.0 else -1.0
+        step = math.radians(1.0)
+        maximum = math.pi / 2.0 - 1e-6
+        best: float | None = None
+        for sign in (preferred_sign, -preferred_sign):
+            previous = 0.0
+            distance = step
+            while distance <= maximum + 1e-9:
+                candidate = sign * min(distance, maximum)
+                if self._mechanically_reachable(points, candidate):
+                    low, high = previous, abs(candidate)
+                    for _ in range(45):
+                        middle = (low + high) / 2.0
+                        if self._mechanically_reachable(points, sign * middle):
+                            high = middle
+                        else:
+                            low = middle
+                    # Land inside the feasible interval, not on its floating-point
+                    # boundary. A small geometry margin avoids repeated micro-turns.
+                    refined = sign * high
+                    interior = sign * min(high + math.radians(2.0), maximum)
+                    if self._mechanically_reachable(points, interior):
+                        refined = interior
+                    if best is None or abs(refined) < abs(best) - 1e-12:
+                        best = refined
+                    break
+                previous = abs(candidate)
+                distance += step
+        return 0.0 if best is None else best
+
     def _group_geometry(
         self,
         members: tuple[GraspTarget, ...],
@@ -937,17 +1054,13 @@ class NearFieldGraspSelector:
             raise ValueError("range_limit_mm must be finite and positive.")
         if any(point.x <= 0.0 or math.hypot(point.x, point.y) > range_limit for point in centers):
             reasons.append("outside_near_field")
-        alignment_tolerance = (
-            self.config.center_tolerance_mm
-            if alignment_tolerance_mm is None
-            else self._validate_alignment_tolerance(alignment_tolerance_mm)
-        )
-        angle = (
-            math.atan2(center.y, center.x)
-            if align
-            and abs(center.y) > alignment_tolerance
-            else 0.0
-        )
+        # ``alignment_tolerance_mm`` remains accepted for callers of the
+        # historical API, but it is no longer a centring gate.  Physical
+        # reachability is evaluated at the current heading first and only then
+        # is the minimum necessary turn selected.
+        if alignment_tolerance_mm is not None:
+            self._validate_alignment_tolerance(alignment_tolerance_mm)
+        angle = self._minimum_reachable_angle(points, align=align)
         clearance_half = self.config.clearance_mm / 2.0
         rotated_points = tuple(_rotate(point, -angle) for point in points)
         rotated_centers = tuple(_rotate(point, -angle) for point in centers)
@@ -955,19 +1068,28 @@ class NearFieldGraspSelector:
         left_tip_y = y1 + clearance_half
         right_tip_y = y0 - clearance_half
         # 开口宽度仍包含总余量，但左右末端分别反解到各自边界，不再使用
-        # 一个统一的对称相对角度。
-        opening = left_tip_y - right_tip_y
-        if opening > self.maximum_opening_mm + 1e-9:
+        # 一个统一的对称相对角度。任何超出真实最大开口的包络都拒绝，
+        # 不能通过收窄夹爪去夹包络的一部分。
+        if left_tip_y - right_tip_y > self.maximum_opening_mm + 1e-9:
             reasons.append("maximum_opening_exceeded")
+        opening = left_tip_y - right_tip_y
+        if reasons:
             opening_servo_angles = self.open_angles
         else:
-            opening_servo_angles = self.servo_angles_for_edges(
-                left_tip_y,
-                right_tip_y,
-            )
+            try:
+                opening_servo_angles = self.servo_angles_for_edges(
+                    left_tip_y,
+                    right_tip_y,
+                )
+            except ValueError as exc:
+                # Keep the concrete mechanical reason in diagnostics and let
+                # the selector reject this candidate rather than allowing an
+                # exception to become a retry loop in the control state.
+                reasons.append(str(exc).split(":", 1)[0])
+                opening_servo_angles = self.open_angles
         # 绿/黑目标之间允许在揽入过程中滑动/转动；前进行程由最远目标 K0
-        # 决定。单个橙色目标按其旋转后颜色包络计算：x0 是最近端，
-        # d = x1 - x0，前进距离为 x0 + d - 210 mm。
+        # 决定。单个橙色目标同样使用可靠底面中心 K0，颜色上表面投影的
+        # 纵向拉长不作为前进深度：前进距离为最前 K0 减去橙色终点。
         x_front = max(point.x for point in rotated_centers)
         is_single_orange = (
             len(members) == 1
@@ -975,15 +1097,11 @@ class NearFieldGraspSelector:
         )
         if is_single_orange:
             target_final_x = self.config.orange_target_final_x_mm
-            depth = x1 - x0
-            forward_distance = max(
-                0.0,
-                x0 + depth - target_final_x,
-            )
         else:
             target_final_x = self.config.target_final_x_mm
-            forward_distance = max(0.0, x_front - target_final_x)
-        corridor_end = self.config.corridor_start_x_mm + forward_distance
+        forward_distance = max(0.0, x_front - target_final_x)
+        # 与 `_regions()` 的实际扫掠走廊共用同一前端公式。
+        corridor_end = self._sweep_end_x_mm(opening_servo_angles, forward_distance)
         corridor_half_width = max(
             abs(right_tip_y - self.config.corridor_lateral_margin_mm),
             abs(left_tip_y + self.config.corridor_lateral_margin_mm),
@@ -1220,8 +1338,8 @@ class NearFieldGraspSelector:
         *,
         locked_ids: tuple[int, ...] | None = None,
         policy: NearFieldGraspPolicy | None = None,
+        align: bool = True,
         alignment_tolerance_mm: float | None = None,
-        require_handoff_match: bool = False,
     ) -> GraspSelection:
         targets = tuple(targets)
         if not all(isinstance(target, GraspTarget) for target in targets):
@@ -1230,12 +1348,12 @@ class NearFieldGraspSelector:
             policy = self.default_policy
         if not isinstance(policy, NearFieldGraspPolicy):
             raise TypeError("policy must be a NearFieldGraspPolicy or None.")
+        if not isinstance(align, bool):
+            raise ValueError("align must be a boolean.")
         if alignment_tolerance_mm is not None:
             alignment_tolerance_mm = self._validate_alignment_tolerance(
                 alignment_tolerance_mm
             )
-        if not isinstance(require_handoff_match, bool):
-            raise ValueError("require_handoff_match must be a boolean.")
         if locked_ids is not None:
             locked_ids = tuple(locked_ids)
             if not locked_ids or len(set(locked_ids)) != len(locked_ids) or any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in locked_ids):
@@ -1256,37 +1374,37 @@ class NearFieldGraspSelector:
         for candidate in candidates:
             if locked_ids is not None and candidate.track_id not in locked_ids:
                 continue
-            rejection = self._orange_isolation_rejection(candidate, targets)
+            rejection = self._orange_isolation_rejection(
+                candidate,
+                targets,
+                align=align,
+            )
             if rejection is not None:
                 rejections.append(rejection)
                 continue
             isolated_candidates.append(candidate)
-        # 首轮比赛规则要求恰好一个绿色物资。已有远场交接时只规划该
-        # 目标；没有交接先验的独立入口仍只规划最近绿色。其它检测继续
-        # 保留在 ``targets`` 中参加所选目标的障碍门禁。
+        # 首轮比赛规则要求恰好一个绿色物资。远场交接目标只作为排序偏好
+        # （见上方候选排序与 ``_plan_rank``），不再独占候选：每个可选绿色
+        # 各自形成一个单目标计划，由排名决定实际抓取哪一个。交接目标在
+        # 当前帧无法生成合法计划时由下一个绿色接管，否则近场会为一个
+        # 不可交付的目标空转到 ``alignment_timeout`` 再重选，反复空转。
         first_single_green = (
             policy.allowed_classes == frozenset((TargetClass.GREEN_SUPPLY,))
             and policy.max_targets == 1
         )
-        if first_single_green and (
-            require_handoff_match
-            or any(target.handoff_matched for target in targets)
-        ):
-            # 首轮远场已经对准哪块绿色，近场就只继续规划该物块。即使它在
-            # 某一帧暂时失去资格或越过近场边界，也不能让旁边绿色接管。
-            candidates = [
-                target for target in isolated_candidates if target.handoff_matched
-            ][:1]
-        else:
-            candidates = isolated_candidates[
-                : 1 if first_single_green else self.config.max_candidates
-            ]
+        candidates = isolated_candidates[: self.config.max_candidates]
         if locked_ids is not None:
-            groups = [tuple(t for t in targets if t.track_id in locked_ids)]
+            locked_targets = tuple(
+                target for target in targets if target.track_id in locked_ids
+            )
+            if any(
+                not self._eligible(target, policy)
+                for target in locked_targets
+            ):
+                return GraspSelection(None, ("locked_member_not_selectable",))
+            groups = [locked_targets]
         elif first_single_green:
-            # 首轮规则已经把身份限制为一个绿色目标；不要为一个物块再
-            # 进入通用组合枚举或候选队列。
-            groups = [] if not candidates else [(candidates[0],)]
+            groups = [(target,) for target in candidates]
         else:
             # 伤员从候选生成开始就是严格单目标方案；绿/黑只能彼此组合。
             # 不能先生成混合组、再依赖后续异常把橙色剔除。
@@ -1314,7 +1432,11 @@ class NearFieldGraspSelector:
             for target in targets:
                 if target.track_id not in locked_ids:
                     continue
-                rejection = self._orange_isolation_rejection(target, targets)
+                rejection = self._orange_isolation_rejection(
+                    target,
+                    targets,
+                    align=align,
+                )
                 if rejection is not None:
                     return GraspSelection(None, (rejection,))
         plans, preview_plans, seen = [], [], set()
@@ -1323,6 +1445,7 @@ class NearFieldGraspSelector:
                 while True:
                     plan = self._build(
                         group,
+                        align=align,
                         policy=policy,
                         alignment_tolerance_mm=alignment_tolerance_mm,
                         range_limit_mm=(
@@ -1344,6 +1467,21 @@ class NearFieldGraspSelector:
                     for target in targets:
                         if target.track_id in plan.member_ids:
                             continue
+                        if (
+                            target.observed
+                            and (
+                                target.observation.target_class
+                                in {TargetClass.BLUE_DANGER}
+                                or target.observation.model_target_class
+                                in {TargetClass.BLUE_DANGER}
+                            )
+                            and target.observation.ground_point is None
+                        ):
+                            raise ValueError(
+                                "unknown_target_geometry_missing:"
+                                f"{target.track_id}:"
+                                f"{target.observation.target_class.value}"
+                            )
                         gap = self._obstacle_distance(target, plan.regions)
                         if gap <= 1e-6:
                             if (
@@ -1511,6 +1649,7 @@ class NearFieldGraspSelector:
             isolation_rejection = self._orange_isolation_rejection(
                 current,
                 targets,
+                align=False,
             )
             if isolation_rejection is not None:
                 return isolation_rejection

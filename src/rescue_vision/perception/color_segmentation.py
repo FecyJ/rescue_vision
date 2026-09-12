@@ -78,6 +78,7 @@ def segment_roi_colors(
     image_hsv: np.ndarray,
     box: UndistortedBoundingBox,
     config: HsvColorClassifierConfig,
+    *, target_class: TargetClass | None = None,
 ) -> tuple[RoiColorSegmentation, ClassProbabilities]:
     """在一个已校验检测框中产生顶部颜色掩码和最终分类概率。"""
 
@@ -116,14 +117,14 @@ def segment_roi_colors(
         empty_mask = np.zeros(roi_hsv.shape[:2], dtype=np.uint8)
         return (
             RoiColorSegmentation(
-                candidate_class=TargetClass.UNKNOWN,
+                candidate_class=None,
                 status=ColorSegmentationStatus.INSUFFICIENT,
                 roi_box=roi_box,
                 mask=empty_mask,
                 color_fraction=0.0,
                 dominance=0.0,
             ),
-            ClassProbabilities.from_top_class(TargetClass.UNKNOWN, 1.0),
+            ClassProbabilities(0.25, 0.25, 0.25, 0.25),
         )
 
     ranked = sorted(
@@ -131,7 +132,7 @@ def segment_roi_colors(
         key=lambda target_class: counts[target_class],
         reverse=True,
     )
-    candidate_class = ranked[0]
+    candidate_class = ranked[0] if target_class is None else target_class
     candidate_count = counts[candidate_class]
     runner_up_count = counts[ranked[1]]
     roi_area = roi_hsv.shape[0] * roi_hsv.shape[1]
@@ -150,26 +151,16 @@ def segment_roi_colors(
         status = ColorSegmentationStatus.ACCEPTED
 
     segmentation = RoiColorSegmentation(
-        candidate_class=candidate_class,
+        candidate_class=candidate_class if candidate_count else None,
         status=status,
         roi_box=roi_box,
         mask=masks[candidate_class],
         color_fraction=color_fraction,
         dominance=dominance,
     )
-    if status is not ColorSegmentationStatus.ACCEPTED:
-        probabilities = ClassProbabilities.from_top_class(
-            TargetClass.UNKNOWN,
-            1.0,
-        )
-    else:
-        probabilities = ClassProbabilities(
-            green_supply=counts[TargetClass.GREEN_SUPPLY] / total_colored,
-            black_core=counts[TargetClass.BLACK_CORE] / total_colored,
-            orange_injured=counts[TargetClass.ORANGE_INJURED] / total_colored,
-            blue_danger=counts[TargetClass.BLUE_DANGER] / total_colored,
-            unknown=0.0,
-        )
+    probabilities = ClassProbabilities(
+        **{item.value: counts[item] / total_colored for item in COLOR_TARGET_CLASSES}
+    )
     return segmentation, probabilities
 
 
@@ -177,6 +168,7 @@ def segment_bgr_roi_colors(
     image_bgr: np.ndarray,
     box: UndistortedBoundingBox,
     config: HsvColorClassifierConfig,
+    *, target_class: TargetClass | None = None,
 ) -> tuple[RoiColorSegmentation, ClassProbabilities]:
     """只把一个检测 ROI 转换到 HSV 后执行颜色分类。
 
@@ -207,7 +199,7 @@ def segment_bgr_roi_colors(
         float(x_max - x_min),
         float(y_max - y_min),
     )
-    segmentation, probabilities = segment_roi_colors(roi_hsv, local_box, config)
+    segmentation, probabilities = segment_roi_colors(roi_hsv, local_box, config, target_class=target_class)
     return (
         RoiColorSegmentation(
             candidate_class=segmentation.candidate_class,

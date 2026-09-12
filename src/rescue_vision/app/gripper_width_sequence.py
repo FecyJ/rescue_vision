@@ -11,8 +11,11 @@ from rescue_vision.app.near_field_grasp import (
     GraspSelection, GraspTarget, GraspTargetTracker, NearFieldGraspPlan,
     NearFieldGraspPolicy, NearFieldGraspSelector, NearFieldHandoffPrior,
 )
-from rescue_vision.motion.protocol import OdometryImu, SensorFlags
-from rescue_vision.perception import PerceptionSnapshot
+from rescue_vision.motion.protocol import OdometryImu
+from rescue_vision.motion.stationary import StationaryMotionEvidence
+from rescue_vision.localization import normalize_angle
+from rescue_vision.geometry.types import GroundPoint
+from rescue_vision.perception import PerceptionSnapshot, TargetObservation
 from rescue_vision.perception.types import ObservationQuality, TargetClass
 
 __all__ = [
@@ -30,6 +33,40 @@ def _timestamp_ns(value: int, name: str = "timestamp_ns") -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{name} must be a non-negative integer, got {value!r}.")
     return value
+
+
+def _validate_candidate_exclusions(snapshot: PerceptionSnapshot, indices: frozenset[int]) -> None:
+    if not isinstance(indices, frozenset) or any(
+        isinstance(index, bool) or not isinstance(index, int)
+        or not 0 <= index < len(snapshot.observations) for index in indices
+    ):
+        raise ValueError(f"excluded_observation_indices outside frame of {len(snapshot.observations)} observations: {indices!r}")
+
+
+def _same_frame_observation(
+    candidate: TargetObservation,
+    excluded: TargetObservation,
+) -> bool:
+    """Match an exclusion through tracker de-duplication without losing identity."""
+
+    if candidate is excluded:
+        return True
+    if (
+        candidate.frame_sequence != excluded.frame_sequence
+        or candidate.capture_timestamp_ns != excluded.capture_timestamp_ns
+        or candidate.target_class is not excluded.target_class
+        or candidate.model_target_class is not excluded.model_target_class
+    ):
+        return False
+    if candidate.ground_point is not None and excluded.ground_point is not None:
+        return (
+            math.hypot(
+                candidate.ground_point.x - excluded.ground_point.x,
+                candidate.ground_point.y - excluded.ground_point.y,
+            ) <= 15.0
+            and candidate.box.iou(excluded.box) >= 0.7
+        )
+    return candidate.box == excluded.box and candidate.k0 == excluded.k0
 
 
 class GripperWidthPickupState(str, Enum):
@@ -136,9 +173,9 @@ class GraspPreparationSession:
         self._confirmation_count = 0
         self._confirmation_last_frame_sequence: int | None = None
         self._confirmation_plan: NearFieldGraspPlan | None = None
-        self._alignment_latched = False
         self._last_frame_sequence: int | None = None
         self._last_preparation: GraspPreparation | None = None
+        self._locked_member_points: dict[int, GroundPoint] = {}
 
     def reset(self) -> None:
         """清空确认窗口并重置近场 tracker。"""
@@ -150,15 +187,138 @@ class GraspPreparationSession:
         self._confirmation_count = 0
         self._confirmation_last_frame_sequence = None
         self._confirmation_plan = None
-        self._alignment_latched = False
         self._last_frame_sequence = None
         self._last_preparation = None
+        self._locked_member_points.clear()
 
     def _clear_confirmation(self) -> None:
         self._confirmation_count = 0
         self._confirmation_last_frame_sequence = None
         self._confirmation_plan = None
-        self._alignment_latched = False
+
+    def _canonicalize_locked_targets(
+        self,
+        targets: tuple[GraspTarget, ...],
+        locked_ids: tuple[int, ...] | None,
+    ) -> tuple[GraspTarget, ...]:
+        """Keep a locked physical member stable when its tracker ID changes."""
+
+        if locked_ids is None or not self._locked_member_points:
+            return targets
+        used_actual: set[int] = set()
+        replacements: dict[int, int] = {}
+        max_distance = self.tracker.tracker.config.max_association_ground_mm * 1.5
+        for canonical_id in locked_ids:
+            if canonical_id not in self._locked_member_points:
+                continue
+            reference = self._locked_member_points[canonical_id]
+            direct = next(
+                (
+                    target
+                    for target in targets
+                    if target.track_id == canonical_id
+                    and target.observed
+                    and target.observation.target_class is not TargetClass.BLUE_DANGER
+                    and target.observation.model_target_class is not TargetClass.BLUE_DANGER
+                    and target.observation.ground_point is not None
+                    and math.hypot(
+                        target.observation.ground_point.x - reference.x,
+                        target.observation.ground_point.y - reference.y,
+                    )
+                    <= max_distance
+                ),
+                None,
+            )
+            if direct is not None:
+                used_actual.add(direct.track_id)
+                continue
+            candidates = tuple(
+                target
+                for target in targets
+                if target.observed
+                and target.track_id not in used_actual
+                and target.observation.target_class is not TargetClass.BLUE_DANGER
+                and target.observation.model_target_class is not TargetClass.BLUE_DANGER
+                and target.observation.ground_point is not None
+                and math.hypot(
+                    target.observation.ground_point.x - reference.x,
+                    target.observation.ground_point.y - reference.y,
+                )
+                <= max_distance
+            )
+            candidate = min(
+                candidates,
+                key=lambda target: (
+                    math.hypot(
+                        target.observation.ground_point.x - reference.x,
+                        target.observation.ground_point.y - reference.y,
+                    ),
+                    target.track_id,
+                ),
+                default=None,
+            )
+            if candidate is None:
+                # Preserve an explicit danger identity as well.  It will not
+                # produce a grasp plan, but mapping it to the locked physical
+                # member lets the safety gate invalidate immediately instead
+                # of mistaking an ID change for a one-frame disappearance.
+                danger_candidates = tuple(
+                    target
+                    for target in targets
+                    if target.observed
+                    and target.track_id not in used_actual
+                    and (
+                        target.observation.target_class is TargetClass.BLUE_DANGER
+                        or target.observation.model_target_class is TargetClass.BLUE_DANGER
+                    )
+                    and target.observation.ground_point is not None
+                    and math.hypot(
+                        target.observation.ground_point.x - reference.x,
+                        target.observation.ground_point.y - reference.y,
+                    )
+                    <= max_distance
+                )
+                candidate = min(
+                    danger_candidates,
+                    key=lambda target: (
+                        math.hypot(
+                            target.observation.ground_point.x - reference.x,
+                            target.observation.ground_point.y - reference.y,
+                        ),
+                        target.track_id,
+                    ),
+                    default=None,
+                )
+            if candidate is not None:
+                used_actual.add(candidate.track_id)
+                replacements[candidate.track_id] = canonical_id
+        if not replacements:
+            return targets
+        # A freshly created tracker ID may collide with an old canonical ID
+        # that now belongs to another object.  Give mapped members priority and
+        # move only the unrelated diagnostic target to a temporary positive ID;
+        # never create duplicate member IDs in a plan.
+        ordered = sorted(
+            targets,
+            key=lambda target: target.track_id not in replacements,
+        )
+        next_id = max(
+            (target.track_id for target in targets),
+            default=0,
+        ) + 1_000_000_000
+        used_ids: set[int] = set()
+        canonicalized: dict[int, int] = {}
+        for target in ordered:
+            desired = replacements.get(target.track_id, target.track_id)
+            if desired in used_ids:
+                desired = next_id
+                next_id += 1
+            used_ids.add(desired)
+            canonicalized[target.track_id] = desired
+        return tuple(
+            replace(target, track_id=canonicalized[target.track_id])
+            for target in targets
+        )
 
     @staticmethod
     def _is_explicit_invalidation(
@@ -176,12 +336,13 @@ class GraspPreparationSession:
             }
             for target in locked.values():
                 observation = target.observation
-                if observation.target_class in {
-                    TargetClass.BLUE_DANGER,
-                    TargetClass.UNKNOWN,
-                } or observation.model_target_class is TargetClass.BLUE_DANGER:
-                    return True
-                if ObservationQuality.POSE_COLOR_CONFLICT in observation.quality:
+                # 锁定目标的身份已由 tracker 确认；旋转/运动模糊把某一帧
+                # 识别成 unknown 只是缺证据，不是危险证据，不能作废整个
+                # 确认窗口。明确蓝色危险和颜色冲突仍然立即失效。
+                if (
+                    observation.target_class is TargetClass.BLUE_DANGER
+                    or observation.model_target_class is TargetClass.BLUE_DANGER
+                ):
                     return True
         invalid_prefixes = (
             "blocked_target:",
@@ -207,9 +368,11 @@ class GraspPreparationSession:
     def update(self, snapshot: PerceptionSnapshot, *, locked_ids: tuple[int, ...] | None,
                policy: NearFieldGraspPolicy | None = None,
                session_id: int = 0,
-               handoff_prior: NearFieldHandoffPrior | None = None) -> GraspPreparation:
+               handoff_prior: NearFieldHandoffPrior | None = None,
+               excluded_observation_indices: frozenset[int] = frozenset()) -> GraspPreparation:
         if not isinstance(snapshot, PerceptionSnapshot):
             raise TypeError("snapshot must be a PerceptionSnapshot.")
+        _validate_candidate_exclusions(snapshot, excluded_observation_indices)
         if locked_ids is not None:
             locked_ids = tuple(locked_ids)
         if policy is None:
@@ -247,6 +410,7 @@ class GraspPreparationSession:
             self._locked_ids = locked_ids
             if locked_ids is None:
                 self._locked_member_classes = None
+                self._locked_member_points.clear()
             elif previous_plan is not None and previous_plan.member_ids == locked_ids:
                 self._locked_member_classes = tuple(
                     member.observation.target_class
@@ -261,23 +425,28 @@ class GraspPreparationSession:
             else None
         )
         targets = self.tracker.update(snapshot.capture_timestamp_ns, snapshot.observations)
-        alignment_tolerance_mm = self.selector.config.center_tolerance_mm + (
-            self.selector.config.alignment_hysteresis_mm
-            if self._alignment_latched
-            else 0.0
+        targets = self._canonicalize_locked_targets(targets, locked_ids)
+        excluded = tuple(
+            snapshot.observations[index]
+            for index in excluded_observation_indices
+        )
+        # Keep the complete scene as obstacle evidence; only candidacy changes.
+        targets = tuple(
+            replace(target, selectable=False)
+            if any(
+                _same_frame_observation(target.observation, item)
+                for item in excluded
+            )
+            else target
+            for target in targets
         )
         selection = self.selector.select(
             targets,
             locked_ids=locked_ids,
             policy=policy,
-            alignment_tolerance_mm=alignment_tolerance_mm,
-            require_handoff_match=(
-                handoff_prior is not None
-                and locked_ids is None
-                and policy.allowed_classes
-                == frozenset((TargetClass.GREEN_SUPPLY,))
-                and policy.max_targets == 1
-            ),
+            # 先在当前朝向检查左右末端的物理可达性；只有边界确实越过
+            # 一侧行程时才生成一次 ALIGNING 计划，不能因中心偏离就旋转。
+            align=True,
         )
         self._last_selection = selection
         plan = selection.plan
@@ -290,6 +459,12 @@ class GraspPreparationSession:
             self._locked_member_classes = tuple(
                 member.observation.target_class for member in plan.members
             )
+        if locked_ids is not None and plan is not None and plan.member_ids == locked_ids:
+            self._locked_member_points = {
+                member.track_id: member.observation.ground_point
+                for member in plan.members
+                if member.observation.ground_point is not None
+            }
         if plan is not None and self._locked_member_classes is not None:
             current_classes = tuple(
                 member.observation.target_class for member in plan.members
@@ -349,25 +524,21 @@ class GraspPreparationSession:
                     selection.preview_plan,
                 )
         elif locked_ids is not None and plan is not None:
-            if plan.alignment_angle_rad != 0.0:
-                self._clear_confirmation()
-            else:
-                self._alignment_latched = True
-                is_new_frame = (
-                    plan.frame_sequence
-                    != self._confirmation_last_frame_sequence
+            is_new_frame = (
+                plan.frame_sequence
+                != self._confirmation_last_frame_sequence
+            )
+            if is_new_frame:
+                self._confirmation_last_frame_sequence = plan.frame_sequence
+                self._confirmation_count = min(
+                    self.selector.config.confirmation_frames,
+                    self._confirmation_count + 1,
                 )
-                if is_new_frame:
-                    self._confirmation_last_frame_sequence = plan.frame_sequence
-                    self._confirmation_count = min(
-                        self.selector.config.confirmation_frames,
-                        self._confirmation_count + 1,
-                    )
-                    self._confirmation_plan = plan
-                elif self._confirmation_plan is None:
-                    self._confirmation_plan = plan
-                if self._confirmation_count >= self.selector.config.confirmation_frames:
-                    self._confirmation_plan = plan
+                self._confirmation_plan = plan
+            elif self._confirmation_plan is None:
+                self._confirmation_plan = plan
+            if self._confirmation_count >= self.selector.config.confirmation_frames:
+                self._confirmation_plan = plan
         ready = (
             locked_ids is not None
             and self._confirmation_plan is not None
@@ -429,6 +600,7 @@ class GraspPreparationWorker:
             NearFieldGraspPolicy,
             int,
             NearFieldHandoffPrior | None,
+            frozenset[int],
         ] | None = None
         self._latest: GraspPreparation | None = None
         self._stopping = False
@@ -480,9 +652,11 @@ class GraspPreparationWorker:
         policy: NearFieldGraspPolicy,
         locked_ids: tuple[int, ...] | None,
         handoff_prior: NearFieldHandoffPrior | None = None,
+        excluded_observation_indices: frozenset[int] = frozenset(),
     ) -> None:
         if not isinstance(snapshot, PerceptionSnapshot):
             raise TypeError("snapshot must be a PerceptionSnapshot.")
+        _validate_candidate_exclusions(snapshot, excluded_observation_indices)
         if isinstance(session_id, bool) or not isinstance(session_id, int) or session_id < 0:
             raise ValueError("session_id must be a non-negative integer.")
         if not isinstance(policy, NearFieldGraspPolicy):
@@ -505,6 +679,7 @@ class GraspPreparationWorker:
                 policy,
                 session_id,
                 handoff_prior,
+                excluded_observation_indices,
             )
             self._condition.notify_all()
 
@@ -529,6 +704,7 @@ class GraspPreparationWorker:
                     policy,
                     session_id,
                     handoff_prior,
+                    excluded_observation_indices,
                 ) = request
                 if self._worker_session_id != session_id:
                     self.session.reset()
@@ -540,6 +716,7 @@ class GraspPreparationWorker:
                         policy=policy,
                         session_id=session_id,
                         handoff_prior=handoff_prior,
+                        excluded_observation_indices=excluded_observation_indices,
                     )
                 except Exception as exc:
                     with self._condition:
@@ -675,6 +852,7 @@ class GripperWidthPickupSequence:
                  alignment_kp_rad_s: float = 1.0, alignment_max_angular_velocity_rad_s: float = 0.35,
                  alignment_min_wheel_velocity_m_s: float | None = None,
                  alignment_timeout_ms: float = 8_000.0,
+                 alignment_continue_max_age_ms: float = 400.0,
                  grasp_commit_max_observation_age_ms: float = 150.0,
                  stationary_max_gyro_rad_s: float = 0.03,
                  fine_alignment_zone_rad: float = 0.08,
@@ -682,6 +860,10 @@ class GripperWidthPickupSequence:
         self.travel_ns = round(_positive(gripper_full_travel_time_s, "gripper_full_travel_time_s") * 1e9)
         self.speed = _positive(forward_speed_m_s, "forward_speed_m_s")
         self.age_ns = round(_positive(max_observation_age_ms, "max_observation_age_ms") * 1e6)
+        # 对准续转窗口宽于单帧观测年龄：感知慢于一帧时不中断旋转。
+        self.alignment_continue_ns = round(
+            _positive(alignment_continue_max_age_ms, "alignment_continue_max_age_ms") * 1e6
+        )
         self.commit_age_ns = round(
             _positive(
                 grasp_commit_max_observation_age_ms,
@@ -690,8 +872,9 @@ class GripperWidthPickupSequence:
             * 1e6
         )
         self.stationary_max_gyro_rad_s = _positive(stationary_max_gyro_rad_s, "stationary_max_gyro_rad_s")
-        self._motion: OdometryImu | None = None
-        self._stationary_since_ns: int | None = None
+        self.motion_evidence = StationaryMotionEvidence(
+            max_gap_ns=self.commit_age_ns, max_gyro_rad_s=self.stationary_max_gyro_rad_s,
+        )
         self.fine_alignment_zone_rad = _positive(
             fine_alignment_zone_rad,
             "fine_alignment_zone_rad",
@@ -728,8 +911,16 @@ class GripperWidthPickupSequence:
         self._abort_capture_ns = -1
         self._abort_reason = ""
         self._alignment_plan: NearFieldGraspPlan | None = None
-        self._alignment_direction: int | None = None
         self._alignment_started_ns: int | None = None
+        self._alignment_start_heading_rad: float | None = None
+        self._alignment_turn_started_ns: int | None = None
+        self._alignment_direction = 0.0
+        self._alignment_budget_rad = 0.0
+        self._alignment_progress_rad = 0.0
+        self._alignment_attempts = 0
+        self.alignment_motion_allowance_ns = 0
+        self._alignment_completed_ns = -1
+        self._alignment_finished = False
 
     def observe_motion(self, message: OdometryImu) -> None:
         """消费真实编码器/IMU样本；接收时间与相机同为主机单调时钟。
@@ -737,53 +928,36 @@ class GripperWidthPickupSequence:
         计数变化、旋转、无效传感器、样本倒退或遥测间断均使静止证据失效。
         不把零速指令、重复消息或重新发布的视觉结果当作静止证据。
         """
-        if not isinstance(message, OdometryImu):
-            raise TypeError("message must be OdometryImu.")
-        previous = self._motion
-        self._motion = message
-        required = SensorFlags.LEFT_ENCODER_VALID | SensorFlags.RIGHT_ENCODER_VALID | SensorFlags.IMU_VALID
-        valid = (
-            message.sensor_flags & required == required
-            and not message.sensor_flags & (SensorFlags.SAMPLE_OVERRUN | SensorFlags.GYRO_SATURATED)
-            and abs(message.gyro_z_rad_s) <= self.stationary_max_gyro_rad_s
-        )
-        continuous = (
-            previous is not None
-            and previous.sensor_flags & required == required
-            and not previous.sensor_flags & (SensorFlags.SAMPLE_OVERRUN | SensorFlags.GYRO_SATURATED)
-            and abs(previous.gyro_z_rad_s) <= self.stationary_max_gyro_rad_s
-            and 0 <= message.received_timestamp_ns - previous.received_timestamp_ns <= self.commit_age_ns
-            and 0 < (message.sample_timestamp_us - previous.sample_timestamp_us) * 1000 <= self.commit_age_ns
-            and message.left_encoder_count == previous.left_encoder_count
-            and message.right_encoder_count == previous.right_encoder_count
-        )
-        if not valid or not continuous:
-            self._stationary_since_ns = None
-        elif self._stationary_since_ns is None:
-            # 使用第二个样本的接收时刻，避免把尚未证实的区间算成静止。
-            self._stationary_since_ns = message.received_timestamp_ns
+        self.motion_evidence.observe(message)
 
     def motion_diagnostic(self, timestamp_ns: int) -> str:
         """记录静止证据来源，区分视觉延迟和底盘实际仍在移动。"""
-        since = "none" if self._stationary_since_ns is None else f"{self._stationary_since_ns / 1e6:.1f}"
-        motion = self._motion
-        age = "none" if motion is None else f"{(timestamp_ns - motion.received_timestamp_ns) / 1e6:.1f}"
-        gyro = "none" if motion is None else f"{motion.gyro_z_rad_s:.4f}"
-        return f"stationary_since_ms={since} motion_age_ms={age} gyro_z_rad_s={gyro}"
+        return self.motion_evidence.diagnostic(timestamp_ns)
 
     def _stationary_plan_valid(self, now_ns: int, prep: GraspPreparation) -> bool:
         plan = prep.selection.plan
-        motion = self._motion
         return (
             plan is not None
-            and motion is not None
-            and self._stationary_since_ns is not None
-            and self._stationary_since_ns <= plan.capture_timestamp_ns <= motion.received_timestamp_ns
-            and 0 <= now_ns - motion.received_timestamp_ns <= self.commit_age_ns
-            and 0 <= now_ns - plan.capture_timestamp_ns <= self.age_ns
+            and self.motion_evidence.capture_valid(plan.capture_timestamp_ns, now_ns, max_age_ns=self.age_ns)
             # 缺失后缓存的确认计划不能借新快照/新发布时间续命。
             and plan.capture_timestamp_ns == prep.capture_timestamp_ns
-            and all(member.observed for member in plan.members)
+            and self._current_plan_evidence_valid(prep)
+        )
+
+    @staticmethod
+    def _current_plan_evidence_valid(prep: GraspPreparation) -> bool:
+        """Require clean current-frame evidence before opening the jaws."""
+
+        plan = prep.selection.plan
+        if plan is None or plan.capture_timestamp_ns != prep.capture_timestamp_ns:
+            return False
+        by_id = {target.track_id: target for target in prep.targets}
+        return all(
+            (current := by_id.get(member.track_id)) is not None
+            and current.observed
+            and current.selectable
+            and current.envelope is not None
+            for member in plan.members
         )
 
     def reset(self) -> None:
@@ -801,8 +975,16 @@ class GripperWidthPickupSequence:
         self._abort_capture_ns = -1
         self._abort_reason = ""
         self._alignment_plan = None
-        self._alignment_direction = None
         self._alignment_started_ns = None
+        self._alignment_start_heading_rad = None
+        self._alignment_turn_started_ns = None
+        self._alignment_direction = 0.0
+        self._alignment_budget_rad = 0.0
+        self._alignment_progress_rad = 0.0
+        self._alignment_attempts = 0
+        self.alignment_motion_allowance_ns = 0
+        self._alignment_completed_ns = -1
+        self._alignment_finished = False
 
     def progress_mm(self, cumulative_distance_m: float | None) -> float:
         return 0.0 if cumulative_distance_m is None or self._distance_start is None else max(0.0, (cumulative_distance_m - self._distance_start) * 1000)
@@ -814,8 +996,13 @@ class GripperWidthPickupSequence:
         self.active_plan = None
         self.locked_ids = None
         self._alignment_plan = None
-        self._alignment_direction = None
         self._alignment_started_ns = None
+        self._alignment_start_heading_rad = None
+        self._alignment_turn_started_ns = None
+        self._alignment_direction = 0.0
+        self._alignment_budget_rad = 0.0
+        self._alignment_progress_rad = 0.0
+        self._alignment_finished = False
         return self._decision(now_ns, reason, brake=True)
 
     def _replan(self, now_ns: int, reason: str) -> GripperWidthPickupDecision:
@@ -825,8 +1012,13 @@ class GripperWidthPickupSequence:
         self.active_plan = None
         self.locked_ids = None
         self._alignment_plan = None
-        self._alignment_direction = None
         self._alignment_started_ns = None
+        self._alignment_start_heading_rad = None
+        self._alignment_turn_started_ns = None
+        self._alignment_direction = 0.0
+        self._alignment_budget_rad = 0.0
+        self._alignment_progress_rad = 0.0
+        self._alignment_finished = False
         return self._decision(now_ns, f"candidate_replan:{reason}", brake=True)
 
     def alignment_timeout_reached(self, timestamp_ns: int) -> bool:
@@ -848,7 +1040,7 @@ class GripperWidthPickupSequence:
             }
             and self.active_plan is None
             and timestamp_ns - self._alignment_started_ns
-            >= self.alignment_timeout_ns
+            >= self.alignment_timeout_ns + self.alignment_motion_allowance_ns
         )
 
     def hold_for_static_path_validation(
@@ -894,13 +1086,6 @@ class GripperWidthPickupSequence:
     def _decision(self, now_ns: int, reason: str, *, speed: float = 0.0, angular: float = 0.0,
                   angles: tuple[float, float] | None = None, brake: bool = False) -> GripperWidthPickupDecision:
         minimum = self.alignment_min_wheel_velocity_m_s
-        if (
-            self.state is GripperWidthPickupState.ALIGNING
-            and self._alignment_plan is not None
-            and abs(self._alignment_plan.alignment_angle_rad)
-            <= self.fine_alignment_zone_rad
-        ):
-            minimum = self.fine_alignment_min_wheel_velocity_m_s
         return GripperWidthPickupDecision(
             now_ns,
             self.state,
@@ -916,6 +1101,64 @@ class GripperWidthPickupSequence:
             ),
         )
 
+    def _start_alignment_turn(
+        self,
+        now_ns: int,
+        plan: NearFieldGraspPlan,
+        heading_rad: float | None,
+    ) -> None:
+        """Start one bounded coarse/correction turn for the locked target."""
+
+        self._alignment_attempts += 1
+        # At most two turns; each gets only the time its requested angle needs.
+        turn_speed = max(0.05, min(self.max_angular, self.kp * abs(plan.alignment_angle_rad)))
+        if heading_rad is not None:
+            self.alignment_motion_allowance_ns += round((abs(plan.alignment_angle_rad) / turn_speed + 0.2) * 1e9)
+        self._alignment_plan = plan
+        self._alignment_direction = math.copysign(
+            1.0,
+            plan.alignment_angle_rad,
+        )
+        self._alignment_budget_rad = min(
+            abs(plan.alignment_angle_rad),
+            math.pi / 2.0,
+        )
+        self._alignment_progress_rad = 0.0
+        self._alignment_start_heading_rad = heading_rad
+        self._alignment_turn_started_ns = now_ns
+        if self._alignment_started_ns is None:
+            self._alignment_started_ns = now_ns
+        self.state = GripperWidthPickupState.ALIGNING
+
+    def _alignment_turn_complete(
+        self,
+        now_ns: int,
+        heading_rad: float | None,
+    ) -> bool:
+        """Use IMU progress when available, otherwise a bounded fallback timer."""
+
+        start = self._alignment_start_heading_rad
+        bounded_elapsed = (
+            self._alignment_turn_started_ns is not None
+            and now_ns - self._alignment_turn_started_ns
+            >= min(self.alignment_continue_ns, 500_000_000)
+        )
+        if heading_rad is not None and start is not None:
+            delta = normalize_angle(heading_rad - start)
+            self._alignment_progress_rad = max(
+                0.0,
+                delta if self._alignment_direction > 0.0 else -delta,
+            )
+            return (
+                self._alignment_progress_rad >= self._alignment_budget_rad - 1e-3
+            )
+        if self._alignment_started_ns is None:
+            return False
+        # Without a motion history there is deliberately no time compensation;
+        # this is only a short, bounded turn after which a new frame must prove
+        # the geometry again.
+        return bounded_elapsed
+
     def step(
         self,
         timestamp_ns: int,
@@ -923,12 +1166,19 @@ class GripperWidthPickupSequence:
         *,
         cumulative_distance_m: float | None,
         path_clear: bool = True,
+        heading_rad: float | None = None,
     ) -> GripperWidthPickupDecision:
         if isinstance(timestamp_ns, bool) or not isinstance(timestamp_ns, int) or timestamp_ns < 0 or timestamp_ns < self._last_ns:
             raise ValueError(f"Invalid/nonmonotonic timestamp_ns {timestamp_ns!r}.")
         self._last_ns = timestamp_ns
         if cumulative_distance_m is not None and (isinstance(cumulative_distance_m, bool) or not math.isfinite(cumulative_distance_m)):
             raise ValueError(f"Invalid cumulative_distance_m {cumulative_distance_m!r}.")
+        if heading_rad is not None and (
+            isinstance(heading_rad, bool)
+            or not isinstance(heading_rad, (int, float))
+            or not math.isfinite(float(heading_rad))
+        ):
+            raise ValueError(f"Invalid heading_rad {heading_rad!r}.")
         if not isinstance(path_clear, bool):
             raise ValueError("path_clear must be a boolean.")
         if preparation is not None and not isinstance(preparation, GraspPreparation):
@@ -958,8 +1208,12 @@ class GripperWidthPickupSequence:
             self.state = GripperWidthPickupState.SEARCH
             self.locked_ids = None
             self._alignment_plan = None
-            self._alignment_direction = None
             self._alignment_started_ns = None
+            self._alignment_start_heading_rad = None
+            self._alignment_turn_started_ns = None
+            self._alignment_direction = 0.0
+            self._alignment_budget_rad = 0.0
+            self._alignment_progress_rad = 0.0
             return self._decision(now, "alignment_timeout", brake=True)
         if self.state is GripperWidthPickupState.ABORTED:
             if (
@@ -1004,6 +1258,10 @@ class GripperWidthPickupSequence:
                                 "member_class_risk:",
                                 "member_outside_opening:",
                                 "confirmation_invalidated_explicit_risk",
+                                # 对准后仍够不到：不是数据问题，等下去也不会好，
+                                # 解锁重选并把证据交给上层升级到解团。
+                                "left_tip_y_mm",
+                                "right_tip_y_mm",
                             )
                         )
                         for reason in current_prep.selection.rejections
@@ -1015,9 +1273,23 @@ class GripperWidthPickupSequence:
                         "candidate_invalid:" + ",".join(current_prep.selection.rejections),
                     )
                 if self.state is GripperWidthPickupState.ALIGNING and self._alignment_plan is not None:
-                    age = now - self._alignment_plan.capture_timestamp_ns
-                    if 0 <= age <= self.age_ns:
-                        return self._decision(now, "alignment_recent_checked_plan", angular=self._angular(self._alignment_plan) * 0.5)
+                    # A missing result is not permission to keep turning on an
+                    # old visual angle.  The one bounded turn ends on measured
+                    # IMU progress (or on the short fallback budget) and then
+                    # waits for a new current-frame geometry check.
+                    if not self._alignment_turn_complete(now, heading_rad):
+                        return self._decision(
+                            now,
+                            "alignment_recent_checked_plan",
+                            angular=self._angular(self._alignment_plan),
+                        )
+                    self._alignment_finished = True
+                    self._alignment_completed_ns = now
+                    return self._decision(
+                        now,
+                        "waiting_locked_target_observation",
+                        brake=True,
+                    )
                 if self.locked_ids is not None:
                     return self._decision(
                         now,
@@ -1025,38 +1297,84 @@ class GripperWidthPickupSequence:
                         brake=True,
                     )
                 return self._decision(now, "waiting_eligible_group", brake=True)
-            same_locked_group = self.locked_ids == plan.member_ids
             self.locked_ids = plan.member_ids
             if plan.alignment_angle_rad != 0:
-                direction = 1 if plan.alignment_angle_rad > 0 else -1
-                if same_locked_group and self._alignment_direction is not None:
-                    if self.state is GripperWidthPickupState.VERIFYING:
-                        # VERIFYING 只是对准稳定性确认；同一组重新超出
-                        # 对准允许范围时必须恢复旋转，不能锁死在等待态。
-                        # 先停车再换向；此处不重置整次近场确认/对准超时。
-                        self.state = GripperWidthPickupState.ALIGNING
-                        self._alignment_direction = direction
-                        self._alignment_plan = plan
+                if (
+                    self.state is GripperWidthPickupState.ALIGNING
+                    and self._alignment_plan is not None
+                ):
+                    new_after_finished = False
+                    same_visual_plan = (
+                        plan.frame_sequence == self._alignment_plan.frame_sequence
+                        and plan.capture_timestamp_ns
+                        == self._alignment_plan.capture_timestamp_ns
+                    )
+                    if self._alignment_finished:
+                        if same_visual_plan or plan.capture_timestamp_ns <= self._alignment_completed_ns:
+                            return self._decision(
+                                now,
+                                "alignment_waiting_for_new_current_geometry",
+                                brake=True,
+                            )
+                        # A genuinely newer frame may justify the one allowed
+                        # correction; it must not inherit the completed turn's
+                        # progress or restart the overall attempt deadline.
+                        self._alignment_plan = None
+                        self._alignment_finished = False
+                        new_after_finished = True
+                    if not new_after_finished and self._alignment_turn_complete(now, heading_rad):
+                        self._alignment_finished = True
+                        self._alignment_completed_ns = now
                         return self._decision(
                             now,
-                            "alignment_verify_lost_realign",
-                            angular=self._angular(plan),
-                        )
-                    if direction != self._alignment_direction:
-                        self.state = GripperWidthPickupState.VERIFYING
-                        self._alignment_plan = plan
-                        return self._decision(
-                            now,
-                            "alignment_crossed_zero_verify",
+                            "alignment_bounded_turn_complete_wait_current_geometry",
                             brake=True,
                         )
-                self._alignment_direction = direction
-                self.state = GripperWidthPickupState.ALIGNING
-                self._alignment_plan = plan
-                if self._alignment_started_ns is None:
-                    self._alignment_started_ns = now
-                return self._decision(now, "align_group_envelope", angular=self._angular(plan))
+                    if not new_after_finished:
+                        return self._decision(
+                            now, "align_group_envelope" if self._alignment_attempts == 1 else "align_group_envelope_correction",
+                            angular=self._angular(self._alignment_plan),
+                        )
+                same_visual_plan = (
+                    self.state is GripperWidthPickupState.VERIFYING
+                    and self._alignment_plan is not None
+                    and plan.frame_sequence == self._alignment_plan.frame_sequence
+                    and plan.capture_timestamp_ns
+                    == self._alignment_plan.capture_timestamp_ns
+                )
+                if same_visual_plan:
+                    return self._decision(
+                        now,
+                        "alignment_waiting_for_new_current_geometry",
+                        brake=True,
+                    )
+                direction = math.copysign(1.0, plan.alignment_angle_rad)
+                if self._alignment_attempts >= 2:
+                    return self._replan(
+                        now,
+                        "alignment_attempt_budget_exhausted",
+                    )
+                if (
+                    self._alignment_attempts > 0
+                    and self._alignment_direction != 0.0
+                    and direction != self._alignment_direction
+                ):
+                    # A reverse after the first bounded turn is the single
+                    # allowed correction.  A second reversal is an actual
+                    # failure, not another reason to oscillate.
+                    if self._alignment_attempts >= 2:
+                        return self._replan(
+                            now,
+                            "alignment_direction_changed_after_bounded_turn",
+                        )
+                self._start_alignment_turn(now, plan, heading_rad)
+                return self._decision(
+                    now,
+                    "align_group_envelope" if self._alignment_attempts == 1 else "align_group_envelope_correction",
+                    angular=self._angular(plan),
+                )
             self.state = GripperWidthPickupState.VERIFYING
+            self._alignment_plan = plan
             # 零角度只表示进入允许范围；唯一确认窗口由 preparation.ready
             # 给出，动作层不再串接第二个帧计数或静止等待。
             if self._alignment_started_ns is None:
@@ -1074,12 +1392,18 @@ class GripperWidthPickupSequence:
                     "confirmation_waiting_for_fresh_plan",
                     brake=True,
                 )
-            if self._motion is not None and not self._stationary_plan_valid(now, current_prep):
+            if self.motion_evidence.latest is not None and not self._stationary_plan_valid(now, current_prep):
                 return self._decision(now, "confirmation_waiting_for_stationary_capture", brake=True)
             if preparation_age_ns is None or preparation_age_ns > self.commit_age_ns:
                 return self._decision(
                     now,
                     "confirmation_waiting_for_fresh_preparation",
+                    brake=True,
+                )
+            if not self._current_plan_evidence_valid(current_prep):
+                return self._decision(
+                    now,
+                    "confirmation_waiting_for_current_clean_geometry",
                     brake=True,
                 )
             if not current_prep.ready:
@@ -1094,7 +1418,6 @@ class GripperWidthPickupSequence:
                 return self._abort(now, "near_field_path_blocked", current_prep)
             self.active_plan = plan
             self.result = None
-            self._alignment_direction = None
             self._alignment_started_ns = None
             self._distance_start = cumulative_distance_m
             self._phase_ns = now

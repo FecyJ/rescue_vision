@@ -13,7 +13,11 @@ import numpy as np
 from rescue_vision.camera.frame import CameraFrame
 from rescue_vision.perception.detector import TargetPoseDetector
 from rescue_vision.perception.field_feature_types import FieldFeatureDetectionResult, SafeZoneColor
-from rescue_vision.perception.types import TargetClass, TargetObservation
+from rescue_vision.perception.types import (
+    TargetClass,
+    TargetObservation,
+    UndistortedBoundingBox,
+)
 from rescue_vision.perception.timing import (
     PerceptionTiming,
     is_observation_fresh,
@@ -26,13 +30,45 @@ _TARGET_COLORS: dict[TargetClass, tuple[int, int, int]] = {
     TargetClass.BLACK_CORE: (80, 80, 80),
     TargetClass.ORANGE_INJURED: (0, 128, 255),
     TargetClass.BLUE_DANGER: (255, 200, 0),
-    TargetClass.UNKNOWN: (255, 0, 255),
 }
 _K0_COLOR = (0, 0, 255)
 _STALE_COLOR = (0, 0, 255)
 
 # 推理旁路 worker 的耗时诊断打印间隔；只用于定位感知链路瓶颈。
 _TIMING_REPORT_INTERVAL_NS = 2_000_000_000
+
+
+def _box_area_kpx(box: UndistortedBoundingBox) -> float:
+    """返回一个检测框的面积，单位千像素；无效框按零计。"""
+
+    return max(0.0, float(box.x_max - box.x_min)) * max(
+        0.0, float(box.y_max - box.y_min)
+    ) / 1000.0
+
+
+def detection_set_metrics(
+    observations: Sequence[TargetObservation],
+    field_features: FieldFeatureDetectionResult | None,
+) -> dict[str, float]:
+    """统计本帧检测框数量与总像素面积，用于解释后处理耗时随画面变化。
+
+    ``segment_bgr_roi_colors`` 逐目标按 ROI 面积分割、``_safe_zone_identity``
+    按安全区框面积统计颜色，两者耗时都正比于框面积之和，因此这三个量是判断
+    "后处理变慢" 是画面内容还是链路退化所需的证据。
+    """
+
+    areas = [_box_area_kpx(item.box) for item in observations]
+    field_areas: list[float] = []
+    if field_features is not None:
+        field_areas.extend(_box_area_kpx(zone.box) for zone in field_features.safe_zones)
+        if field_features.center_cross is not None:
+            field_areas.append(_box_area_kpx(field_features.center_cross.box))
+    return {
+        "obs_count": float(len(areas)),
+        "obs_area_kpx": float(sum(areas)),
+        "max_box_kpx": max(areas, default=0.0),
+        "field_area_kpx": float(sum(field_areas)),
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +114,7 @@ class PerceptionSnapshot:
 
 
 def _target_color(target_class: TargetClass) -> tuple[int, int, int]:
-    return _TARGET_COLORS.get(target_class, _TARGET_COLORS[TargetClass.UNKNOWN])
+    return _TARGET_COLORS[target_class]
 
 
 def _draw_text(
@@ -528,6 +564,13 @@ class PerceptionFrameRenderer:
                         self._latest_snapshot = snapshot
                         self._processed_count += 1
                         self._stale_dropped_count += int(result.stale_dropped)
+                        if self._render_enabled:
+                            self._pending_render = (frame, snapshot)
+                    # Publish the control-consumable result before collecting
+                    # observer metrics or waking the render worker.  A slow
+                    # ROI diagnostic/render path must not delay an async
+                    # result that is already complete.
+                    with self._lock:
                         for name, value_ns in (
                             ("capture_to_submit_ms", timing.capture_to_submit_ns),
                             ("queue_wait_ms", timing.queue_wait_ns),
@@ -537,8 +580,11 @@ class PerceptionFrameRenderer:
                         ):
                             if value_ns is not None:
                                 self._metrics.setdefault(name, []).append(value_ns / 1_000_000.0)
-                        if self._render_enabled:
-                            self._pending_render = (frame, snapshot)
+                        for name, value in detection_set_metrics(
+                            result.observations,
+                            result.field_features,
+                        ).items():
+                            self._metrics.setdefault(name, []).append(value)
                     if self._render_enabled:
                         self._render_condition.set()
         except BaseException as error:

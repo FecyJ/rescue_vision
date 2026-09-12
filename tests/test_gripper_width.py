@@ -49,13 +49,14 @@ def _observation(
             else np.zeros((4, 4), dtype=np.uint8)
         )
     )
-    candidate = (
-        target_class
-        if status is ColorSegmentationStatus.ACCEPTED
-        else TargetClass.UNKNOWN
-    )
     segmentation = RoiColorSegmentation(
-        candidate_class=candidate,
+        # 没有颜色证据时 ROI 候选类别为空，而不是又一个任务类别；模型类别
+        # 仍然是权威，颜色只负责几何。
+        candidate_class=(
+            target_class
+            if status is ColorSegmentationStatus.ACCEPTED
+            else None
+        ),
         status=status,
         roi_box=box,
         mask=owned_mask,
@@ -68,8 +69,10 @@ def _observation(
         result_timestamp_ns=1_001,
         image_size=(30, 40),
         model_target_class=target_class,
-        target_class=candidate,
-        class_probabilities=ClassProbabilities.from_top_class(candidate, 1.0),
+        # 模型类别是权威；缺颜色证据只体现为 candidate_class=None，
+        # 不再制造第五个任务类别。
+        target_class=target_class,
+        class_probabilities=ClassProbabilities.from_top_class(target_class, 1.0),
         detection_confidence=0.9,
         box=box,
         color_segmentation=segmentation,

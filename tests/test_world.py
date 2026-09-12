@@ -32,7 +32,6 @@ def config(**overrides: object) -> WorldModelConfig:
         "opponent_max_age_ms": 500.0,
         "danger_confirm_threshold": 0.6,
         "danger_suspect_threshold": 0.2,
-        "unknown_suspect_threshold": 0.5,
     }
     values.update(overrides)
     return WorldModelConfig(**values)  # type: ignore[arg-type]
@@ -132,11 +131,8 @@ def test_world_marks_confirmed_and_suspected_hazards() -> None:
                 target_class=TargetClass.BLUE_DANGER,
                 confidence=0.8,
             ),
-            track(
-                track_id=2,
-                target_class=TargetClass.UNKNOWN,
-                confidence=1.0,
-            ),
+            replace(track(track_id=2, target_class=TargetClass.BLUE_DANGER),
+                    status=TrackStatus.TENTATIVE, ever_confirmed=False),
             track(track_id=3),
         ],
     )
@@ -174,7 +170,7 @@ def test_world_exposes_visual_and_coordinate_uncertainty() -> None:
         visual_timestamp_ns=0,
         tracks=[
             replace(
-                track(target_class=TargetClass.UNKNOWN),
+                track(target_class=TargetClass.BLUE_DANGER),
                 status=TrackStatus.TENTATIVE,
                 ever_confirmed=False,
                 ground_point=None,
@@ -186,7 +182,6 @@ def test_world_exposes_visual_and_coordinate_uncertainty() -> None:
         WorldUncertainty.MISSING_ROBOT_FIELD_POSITION,
         WorldUncertainty.TARGET_WITHOUT_GROUND_POINT,
         WorldUncertainty.UNCONFIRMED_TARGET,
-        WorldUncertainty.UNKNOWN_TARGET,
     }
 
 
@@ -305,7 +300,6 @@ def test_world_rejects_regressing_or_duplicate_external_observations() -> None:
         ("opponent_max_age_ms", float("inf")),
         ("danger_confirm_threshold", 1.1),
         ("danger_suspect_threshold", -0.1),
-        ("unknown_suspect_threshold", 2.0),
     ],
 )
 def test_world_config_rejects_invalid_values(

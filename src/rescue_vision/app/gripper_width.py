@@ -83,12 +83,13 @@ class _PreparationWorker:
             self._preview_thread.join()
         self._worker.__exit__()
 
-    def submit(self, snapshot, locked_ids):
+    def submit(self, snapshot, locked_ids, *, excluded_observation_indices=frozenset()):
         self._worker.submit(
             snapshot,
             session_id=0,
             policy=self.selector.default_policy,
             locked_ids=locked_ids,
+            excluded_observation_indices=excluded_observation_indices,
         )
 
     def log(self, text: str, *, flush: bool = True) -> None:
@@ -253,6 +254,7 @@ def _run_session(
     )
     kinematics = GripperKinematics()
     selector = NearFieldGraspSelector(grasp_config, pipeline.ground_projector, kinematics,
+        target_geometry=runtime_config.perception.target_ground_geometry,
         open_servo_angles_deg=(gripper.open_left_angle_deg, gripper.open_right_angle_deg),
         closed_servo_angles_deg=(gripper.closed_left_angle_deg, gripper.closed_right_angle_deg))
     target_tracker = GraspTargetTracker(runtime_config.tracking.build_tracker(), pipeline.ground_projector, grasp_config,
@@ -270,6 +272,9 @@ def _run_session(
                 runtime_config.match.green_alignment_min_wheel_velocity_m_s
             ),
             alignment_timeout_ms=grasp_config.alignment_timeout_ms,
+            alignment_continue_max_age_ms=(
+                grasp_config.alignment_continue_max_age_ms
+            ),
             grasp_commit_max_observation_age_ms=(
                 grasp_config.grasp_commit_max_observation_age_ms
             ),

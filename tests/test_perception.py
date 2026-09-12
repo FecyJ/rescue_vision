@@ -125,7 +125,6 @@ def test_target_classes_follow_pose_convention() -> None:
         "black_core",
         "orange_injured",
         "blue_danger",
-        "unknown",
     ]
     with pytest.raises(ValueError):
         TargetClass("hazard")
@@ -165,7 +164,7 @@ def test_detector_uses_hsv_class_and_projects_k0() -> None:
     assert observation.model_target_class is TargetClass.GREEN_SUPPLY
     assert observation.target_class is TargetClass.GREEN_SUPPLY
     assert observation.class_probabilities.green_supply == pytest.approx(1.0)
-    assert observation.class_probabilities.unknown == 0.0
+    assert set(observation.class_probabilities.as_dict()) == {item.value for item in TargetClass}
     assert observation.detection_confidence == pytest.approx(0.8)
     # 临时修改：目标地面点 x 统一补偿 +225（见 detector.py 临时注释）。
     assert observation.ground_point == GroundPoint(235.0, 18.0)
@@ -196,7 +195,7 @@ def test_initial_hsv_ranges_classify_official_target_colors(
 ) -> None:
     box = UndistortedBoundingBox(2.0, 3.0, 8.0, 9.0)
     image = image_with_regions((box, hsv))
-    observation = detector([[detection()]]).detect(
+    observation = detector([[detection(class_id=list(TargetClass).index(expected))]]).detect(
         frame(image),
         image,
         result_timestamp_ns=1_010_000_000,
@@ -206,7 +205,7 @@ def test_initial_hsv_ranges_classify_official_target_colors(
     assert observation.color_segmentation.candidate_class is expected
 
 
-def test_hsv_overrides_pose_class_and_records_conflict() -> None:
+def test_model_class_is_authoritative_over_roi_background() -> None:
     box = UndistortedBoundingBox(2.0, 3.0, 8.0, 9.0)
     blue_image = image_with_regions((box, (95, 150, 200)))
     blue = detector([[detection(class_id=0)]]).detect(
@@ -215,8 +214,8 @@ def test_hsv_overrides_pose_class_and_records_conflict() -> None:
         result_timestamp_ns=1_010_000_000,
     )[0]
     assert blue.model_target_class is TargetClass.GREEN_SUPPLY
-    assert blue.target_class is TargetClass.BLUE_DANGER
-    assert blue.quality == frozenset({ObservationQuality.POSE_COLOR_CONFLICT})
+    assert blue.target_class is TargetClass.GREEN_SUPPLY
+    assert ObservationQuality.POSE_COLOR_CONFLICT not in blue.quality
 
     green_image = image_with_regions((box, (60, 255, 200)))
     green = detector([[detection(class_id=3)]]).detect(
@@ -225,8 +224,8 @@ def test_hsv_overrides_pose_class_and_records_conflict() -> None:
         result_timestamp_ns=1_010_000_000,
     )[0]
     assert green.model_target_class is TargetClass.BLUE_DANGER
-    assert green.target_class is TargetClass.GREEN_SUPPLY
-    assert ObservationQuality.POSE_COLOR_CONFLICT in green.quality
+    assert green.target_class is TargetClass.BLUE_DANGER
+    assert ObservationQuality.POSE_COLOR_CONFLICT not in green.quality
 
 
 def test_insufficient_color_and_k0_degrade_conservatively() -> None:
@@ -239,9 +238,9 @@ def test_insufficient_color_and_k0_degrade_conservatively() -> None:
         result_timestamp_ns=1_010_000_000,
     )[0]
 
-    assert observation.target_class is TargetClass.UNKNOWN
-    assert observation.class_probabilities.unknown == 1.0
-    assert observation.color_segmentation.candidate_class is TargetClass.UNKNOWN
+    assert observation.target_class is observation.model_target_class
+    assert set(observation.class_probabilities.as_dict()) == {item.value for item in TargetClass}
+    assert observation.color_segmentation.candidate_class is None
     assert observation.color_segmentation.status is ColorSegmentationStatus.INSUFFICIENT
     assert observation.k0 is None
     assert observation.ground_point is None
@@ -264,12 +263,11 @@ def test_high_confidence_model_class_overrides_rejected_color() -> None:
     assert observation.model_target_class is TargetClass.GREEN_SUPPLY
     assert observation.target_class is TargetClass.GREEN_SUPPLY
     assert observation.class_probabilities.green_supply == pytest.approx(1.0)
-    assert observation.class_probabilities.unknown == pytest.approx(0.0)
+    assert set(observation.class_probabilities.as_dict()) == {item.value for item in TargetClass}
     assert observation.color_segmentation.status is ColorSegmentationStatus.INSUFFICIENT
     assert observation.quality == frozenset(
         {
             ObservationQuality.COLOR_EVIDENCE_INSUFFICIENT,
-            ObservationQuality.HIGH_CONFIDENCE_COLOR_OVERRIDE,
         }
     )
 
@@ -289,9 +287,9 @@ def test_high_confidence_model_class_overrides_ambiguous_color() -> None:
     )[0]
 
     assert observation.target_class is TargetClass.GREEN_SUPPLY
-    assert observation.class_probabilities.unknown == pytest.approx(0.0)
+    assert set(observation.class_probabilities.as_dict()) == {item.value for item in TargetClass}
     assert observation.color_segmentation.status is ColorSegmentationStatus.AMBIGUOUS
-    assert ObservationQuality.HIGH_CONFIDENCE_COLOR_OVERRIDE in observation.quality
+    assert ObservationQuality.COLOR_EVIDENCE_AMBIGUOUS in observation.quality
 
 
 def test_high_confidence_override_threshold_is_strict() -> None:
@@ -302,7 +300,7 @@ def test_high_confidence_override_threshold_is_strict() -> None:
         result_timestamp_ns=1_010_000_000,
     )[0]
 
-    assert observation.target_class is TargetClass.UNKNOWN
+    assert observation.target_class is observation.model_target_class
     assert ObservationQuality.HIGH_CONFIDENCE_COLOR_OVERRIDE not in observation.quality
 
 
@@ -325,7 +323,7 @@ def test_low_coverage_keeps_candidate_roi_mask_for_diagnostics() -> None:
     )[0]
 
     segmentation = observation.color_segmentation
-    assert observation.target_class is TargetClass.UNKNOWN
+    assert observation.target_class is observation.model_target_class
     assert segmentation.candidate_class is TargetClass.GREEN_SUPPLY
     assert segmentation.status is ColorSegmentationStatus.INSUFFICIENT
     assert segmentation.roi_box == UndistortedBoundingBox(2.0, 3.0, 8.0, 9.0)
@@ -333,7 +331,7 @@ def test_low_coverage_keeps_candidate_roi_mask_for_diagnostics() -> None:
     assert np.count_nonzero(segmentation.mask) == 9
 
 
-def test_ambiguous_two_color_roi_degrades_to_unknown() -> None:
+def test_ambiguous_two_color_roi_keeps_model_class() -> None:
     box = UndistortedBoundingBox(0.0, 0.0, 16.0, 12.0)
     hsv = np.full((12, 16, 3), (95, 150, 200), dtype=np.uint8)
     hsv[:, :8] = (60, 255, 200)
@@ -347,8 +345,8 @@ def test_ambiguous_two_color_roi_degrades_to_unknown() -> None:
         result_timestamp_ns=1_010_000_000,
     )[0]
 
-    assert observation.target_class is TargetClass.UNKNOWN
-    assert observation.class_probabilities.unknown == 1.0
+    assert observation.target_class is observation.model_target_class
+    assert set(observation.class_probabilities.as_dict()) == {item.value for item in TargetClass}
     assert observation.color_segmentation.status is ColorSegmentationStatus.AMBIGUOUS
     assert observation.color_segmentation.dominance == pytest.approx(0.5)
     assert ObservationQuality.COLOR_EVIDENCE_AMBIGUOUS in observation.quality
@@ -365,7 +363,7 @@ def test_morphology_removes_isolated_color_noise() -> None:
         result_timestamp_ns=1_010_000_000,
     )[0]
 
-    assert observation.target_class is TargetClass.UNKNOWN
+    assert observation.target_class is observation.model_target_class
     assert not np.any(observation.color_segmentation.mask)
 
 
@@ -741,3 +739,33 @@ def test_observations_to_evaluation_records_full_chain() -> None:
     assert matched["hsv_color_fraction"] == pytest.approx(1.0)
     assert matched["hsv_dominance"] == pytest.approx(1.0)
     assert matched["quality"] == []
+
+
+def test_detection_set_metrics_report_box_area() -> None:
+    image = image_with_regions()
+    result = detector([[detection()]]).detect_realtime(
+        frame(image),
+        image,
+        result_timestamp_ns=1_010_000_000,
+    )
+
+    metrics = visualization.detection_set_metrics(
+        result.observations,
+        result.field_features,
+    )
+
+    box = result.observations[0].box
+    expected_kpx = (box.x_max - box.x_min) * (box.y_max - box.y_min) / 1000.0
+    assert metrics["obs_count"] == 1.0
+    assert metrics["obs_area_kpx"] == pytest.approx(expected_kpx)
+    assert metrics["max_box_kpx"] == pytest.approx(expected_kpx)
+    assert metrics["field_area_kpx"] >= 0.0
+
+
+def test_detection_set_metrics_tolerate_empty_frame() -> None:
+    assert visualization.detection_set_metrics((), None) == {
+        "obs_count": 0.0,
+        "obs_area_kpx": 0.0,
+        "max_box_kpx": 0.0,
+        "field_area_kpx": 0.0,
+    }

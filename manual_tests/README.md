@@ -119,14 +119,45 @@ python manual_tests/keyboard_drive.py \
   --supervised-physical-stop-ready
 ```
 
-按键：`W`/`↑` 前进，`S`/`↓` 后退，`A`/`←` 原地左转，`D`/`→` 原地右转；
-按住前进与转向可组合成弧线；`Z` 夹爪打开、`X` 夹爪运输姿态、`C` 夹爪关闭，
-`空格` 松手停车，`Esc`/`q` 退出。默认速度取
+按键：`W`/`↑` 锁存前进，`S`/`↓` 锁存后退；先按 W/S，再按住
+`A`/`←` 或 `D`/`→` 即可组合左/右弧线，松开转向键后自动回正。终端没有
+key-up 事件，因此纵向运动会保持到按下相反纵向键或 `空格`，不能依靠松开 W/S
+停车。`Z` 夹爪打开、`X` 夹爪运输姿态、`C` 夹爪关闭，`Esc`/`q` 退出。默认速度取
 `min(0.15, motion.max_linear_velocity_m_s)` m/s、转向取
 `min(0.60, motion.max_angular_velocity_rad_s)` rad/s，可用 `--speed-m-s` 和
 `--turn-rad-s` 覆盖，但不得超出配置硬上限。终端每 200 ms 打印一行命令名、
 目标 twist、左右轮目标、夹爪目标角度、目标类别/置信度/地面点、中心十字与
 安全区数量，以及 STM32 电机/看门狗/急停/停车原因状态。
+
+每次运行都会先打印日志路径，并把底盘指令变化实时输出为 `control_log=...`，同时
+通过有界旁路线程写入 `--log-dir` 下按时间命名的 `keyboard_drive_*.jsonl`（默认
+`logs/`）。日志保存相对单调时间、控制器实际采用的 twist、目标左右轮速，以及
+100 Hz 累计编码器和 Z 轴陀螺仪遥测。退出时先写零速并软刹车，然后继续记录至编码器
+稳定或 1.5 s 有界截止，使制动尾程也进入参考轨迹。夹爪键不属于车辆运动轨迹，不写入
+该日志。
+
+将车辆放回同一起点、确认相同运行配置和清空运动区域后，可回放底盘轨迹：
+
+```bash
+python manual_tests/keyboard_drive.py \
+  --config configs/runtime.yaml \
+  --replay logs/keyboard_drive_YYYYmmdd_HHMMSS_ffffff.jsonl \
+  --supervised-physical-stop-ready
+```
+
+脚本会在打开 UART 前校验日志 schema、设备时间单调性、编码器有效位、首尾零速、
+轮速上限，以及轮距、轮径、每转计数、陀螺仪方向、速度/加速度限制和左右轮权重；
+随后要求人工输入 `REPLAY`。当前 v2 日志是唯一支持格式，旧的纯指令 v1 日志会被拒绝。
+回放不启动相机或 Hailo，而是以记录轮速为前馈、以左右轮累计行程误差为反馈，并用记录
+和现场 IMU 相对航向误差作有界差速修正。参考时间结束后继续闭环收敛到左右轮各 5 mm、
+航向 3° 的终点容差，最长额外等待 3 s；现场编码器/IMU 超过 200 ms 未更新、控制链路
+异常或终点无法收敛均会软刹车并报错。过程中按 `空格`、`q`、`Esc`、`Ctrl+C` 或
+SIGTERM 也会软刹车。
+
+这种方式能抵消调度抖动、轮速建立差异及一部分左右轮误差，但编码器无法观测轮胎相对
+地面的纵向/横向打滑，IMU 相对航向也不是场地绝对位置。地面、负载和轮胎条件应尽量与
+录制时一致，车辆必须回到相同起点，并由操作员全程监督；需要场地绝对轨迹重复精度时，
+还需接入已完成真机验收的视觉绝对定位闭环。
 
 需要在图像中显示场地绝对坐标和航角时，先在 `runtime.yaml` 中完成并启用
 `localization.fusion`，再添加 `--enable-localization`。窗口会显示融合得到的
@@ -431,6 +462,29 @@ rescue-vision-manual-capture \
 
 ## 固定流程解团检查
 
+正式 `rescue-vision-match` 的动态解团延迟回归见下节；本节的固定试验入口不使用动态策略。
+
+### 正式流程解团闭环验收（真机未验证）
+
+运行 `rescue-vision-match --config configs/runtime.match.yaml --supervised-physical-stop-ready
+--local-preview --log-dir logs`，确认解团严格按以下顺序运行：
+
+1. 车辆先真实停稳；停稳必须由连续有效轮编码器/IMU证据确认，零速命令不能替代它。
+2. 停稳后的当前帧找到一个带可靠 K0 的接触核心，并一次完成危险目标、场界、安全区和
+   机器人包络检查；不等待近场抓取准备器。
+3. 当前核心通过 `match.breakup_confirmation_frames` 个不同有效帧后出现
+   `breakup_plan_frozen`，随后按闭爪前推、停稳张爪、后退、停稳闭爪执行；不经过单独
+   对准、接近或接触后第二轮复核。
+4. 注入真实轮计数变化、IMU旋转、遥测断档/无效、重复帧、外围目标闪烁和危险侵入，确认
+   旧几何不会冻结；确认超时后退出当前区域并扫描其它候选。
+5. 控制轮询、感知延迟和帧间隔仍按 AGENTS 的时序场景测量，分别记录非零动作发生时间、
+   观测年龄、确认帧数和前推/后退实际里程。蓝色危险类单列记录误纳入、最大推移与越界/入区风险。
+
+静止证据、日志字段和状态机约束以 [AGENTS.md](../AGENTS.md) 及
+[正式流程设计](../docs/正式流程设计.md) 为准。自动回归不能证明真实碰撞效果或 Pi/Hailo 性能。
+
+### 固定入口步骤
+
 只在空旷、已划出中心目标区、物理急停可立即触发且人员全程监督时运行：
 
 ```bash
@@ -464,6 +518,35 @@ rescue-vision-cluster-breakup \
 固件使能、急停复位或命令拒绝原因，不得通过伪造里程或跳过定距门禁继续流程。
 
 
+## 无解团开场航点验收（未验证）
+
+开场由固定启动转向+直行改为绝对场地坐标直线航点的变体入口。航点、速度、夹爪角度和
+对准参数以 [app README](../src/rescue_vision/app/README.md) 为权威，这里只列真机核对项。
+先在物理急停与全程监督下运行：
+
+```bash
+rescue-vision-match-nb --config configs/runtime.match_nb.yaml \
+  --supervised-physical-stop-ready --log-dir logs
+```
+
+逐项确认：
+
+1. 每段直线先原地旋转对准航向，再开始平移。若看到车辆一边转向一边前进、轨迹明显是
+   弧线，说明对准门没有生效，必须停车检查——起始航向误差可达 60° 以上，边转边走会让
+   终点横向偏出数百 mm。
+2. 每次阶段变化都会打印 `nb_opening=phase=... target=... position=... error=...`。
+   核对 `error` 的绝对值不超过 `nb_opening_align_tolerance_mm`（加上一个控制周期的
+   行程余量）；`error` 明显偏大时，先区分是车辆没到位还是航位推算本身漂移。
+3. 每个航点到位后有 `nb_opening_*_arrival_settle` 的零速停顿，时长约
+   `nb_opening_settle_time_s`；停稳结束才从新位姿起算下一段。测量车轮在停稳期间确实不动。
+4. 倒车段线速度为负，车辆沿原路退回而不是继续向前。
+5. 人为制造航向不可信（例如临时把 `motion.odometry.gyro_z_sign` 取反）后运行，确认连续
+   未对准超过 `nb_opening_align_timeout_s` 时打印
+   `nb_opening_align_timeout_stop` 并进入 `terminal_stop`，而不是持续旋转。
+6. 把 `nb_opening_align_angular_velocity_rad_s` 调到接近
+   `2*motion.min_wheel_velocity_m_s/wheel_track_m` 时，确认单轮最低速度抬升导致的
+   旋转加速仍在可接受范围。
+
 ## 正式流程近场接管验收（未验证）
 
 运行 `rescue-vision-match` 时，确认搜索态先按固定
@@ -495,7 +578,10 @@ configs/runtime.match.yaml --supervised-physical-stop-ready --local-preview --on
 3. 测试走廊内额外绿黑被纳入后总数不超过 3；测试 4 个、最大开口边界、纵向间距较大、
    掩码投影受顶部影响、强阴影和短暂遮挡。确认危险记忆未因一帧消失而清空。
 4. 验证对准允许范围、滞回、唯一确认窗口的 `confirmation_frames` 和总预算
-   `alignment_timeout_ms`（超时应带原因回到搜索）。同一帧重复提交不得增加确认进度；快控制/慢感知、
+   `alignment_timeout_ms`（超时应带原因回到搜索）。选不出方案时应只等
+   `no_plan_wait_ms` 就带原因换候选/解团，不得占用整个提交预算空等；实测成功提交
+   链路（停稳→当前帧→异步结果→开爪）耗时，确认它仍落在 `alignment_timeout_ms` 内。
+   同一帧重复提交不得增加确认进度；快控制/慢感知、
    短暂漏帧和一次规划旁路异常不得把已取得的确认永久清零。若出现新的明确危险或不合法组合，
    旧确认必须失效。在橙色目标周围 50 mm 内摆放有可靠 K0 的其它物块，确认橙色计划被硬拒绝；另测缺少地面位置的目标，确认它不会被无依据当作禁区阻挡。再验证静止规划阶段的危险/未知目标拒绝、编码器
    中断/停滞、相机/规划旁路失效和 GUI 关闭。张爪后运动模糊或新 `unknown` 不应单独

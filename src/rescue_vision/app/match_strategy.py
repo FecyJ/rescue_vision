@@ -23,13 +23,17 @@ from rescue_vision.app.gripper_width_sequence import (
     GripperWidthPickupState,
 )
 from rescue_vision.app.near_field_grasp import (
+    GraspScore,
+    GraspSelection,
     GraspTarget,
     NearFieldGraspPlan,
     NearFieldHandoffPrior,
     NearFieldGraspPolicy,
+    NearFieldGraspSelector,
 )
 from rescue_vision.config.near_field_grasp import NearFieldGraspConfig
 from rescue_vision.geometry.types import FieldPoint, GroundPoint
+from rescue_vision.geometry.ground_projector import GroundProjector
 from rescue_vision.localization import (
     FieldPose2D,
     SafeZoneCornerLocalizer,
@@ -43,15 +47,26 @@ from rescue_vision.perception import (
     SafeZoneColor,
     SafeZoneObservation,
     TargetClass,
-    TargetObservation,
     UndistortedBoundingBox,
 )
+from rescue_vision.perception.gripper_width import measure_target_envelope
 from rescue_vision.tracking import MultiTargetTracker, TrackStatus, TrackedTarget
 from rescue_vision.mission import SafetySignals
 from rescue_vision.motion.gripper_kinematics import GripperKinematics
 from rescue_vision.motion.protocol import OdometryImu
 from rescue_vision.motion.stationary import StationaryMotionEvidence
 from rescue_vision.world.static_map import PhysicalRegionKind, StaticFieldMap, TeamColor
+
+# ``match_runtime`` 是共用硬件循环，并按身份比较这些流程类型。策略入口
+# 保留本文件的实现副本，但对外重新使用正式入口的运行时类型，确保状态
+# 比较、预检和共享观察器在独立启动策略时仍然有效。
+from rescue_vision.app.match import (
+    MatchDecision as _SharedMatchDecision,
+    MatchPreflight as _SharedMatchPreflight,
+    MatchSequence as _SharedMatchSequence,
+    MatchStartArea as _SharedMatchStartArea,
+    MatchState as _SharedMatchState,
+)
 
 if TYPE_CHECKING:
     from rescue_vision.config import AppConfig, MatchRuntimeConfig
@@ -103,11 +118,6 @@ class MatchState(str, Enum):
     CC_ORANGE_OPEN_GAP = "cc_orange_open_gap"
     CC_ORANGE_FORWARD = "cc_orange_forward"
     CC_ORANGE_CLOSE_GAP = "cc_orange_close_gap"
-    # 无解团（no-breakup）变体的开场直线航点状态；由 match_nb 子类驱动。
-    NB_OPENING_TO_FIRST = "nb_opening_to_first"
-    NB_OPENING_GRIPPER_OPEN = "nb_opening_gripper_open"
-    NB_OPENING_TO_SECOND = "nb_opening_to_second"
-    NB_OPENING_REVERSE = "nb_opening_reverse"
 
 
 class MatchStartArea(str, Enum):
@@ -261,6 +271,13 @@ class MatchDecision:
             )
 
 
+# 必须放在 ``MatchSequence`` 定义之前，使其类级状态集合也使用共享枚举。
+MatchDecision = _SharedMatchDecision
+MatchPreflight = _SharedMatchPreflight
+MatchStartArea = _SharedMatchStartArea
+MatchState = _SharedMatchState
+
+
 def _clamp(value: float, minimum: float, maximum: float) -> float:
     return min(max(value, minimum), maximum)
 
@@ -336,33 +353,7 @@ class _GroundClusterMeasurement:
     center: GroundPoint
     nearest_forward_x_mm: float
 
-
-@dataclass(frozen=True, slots=True)
-class _PoseHistoryEntry:
-    """场地航位在一个控制时刻的快照，用于对齐延迟观测。"""
-
-    timestamp_ns: int
-    cumulative_distance_m: float
-    heading_rad: float
-    position: FieldPoint
-
-
-@dataclass(frozen=True, slots=True)
-class _AttemptFailureRecord:
-    """按物理目标/区域记忆一次失败，而不是按 tracker ID 记忆。"""
-
-    target_class: TargetClass | None
-    relative_point: GroundPoint | None
-    field_point: FieldPoint | None
-    robot_position: FieldPoint | None
-    heading_rad: float | None
-    track_id: int | None
-    reason: str
-    timestamp_ns: int
-    region_field_points: tuple[FieldPoint, ...] = ()
-
-
-class MatchSequence:
+class MatchSequence(_SharedMatchSequence):
     """可重放的正式动作流程；step() 只消费观测、里程和航向并输出意图。"""
 
     # 独立的抓取—运输联调入口覆盖为只搜索，不执行正式解团路由。
@@ -445,12 +436,6 @@ class MatchSequence:
         self._breakup_actual_backward_mm = 0.0
         self._breakup_retreat_mm = 0.0
         evidence_config = near_field_grasp_config or NearFieldGraspConfig()
-        # 夹爪实际开口之外的走廊余量：包络外侧的一半 ``clearance_mm`` 加
-        # 近场走廊横向安全余量。远场走廊门禁与近场扫掠使用同一组数值。
-        self._path_corridor_margin_mm = (
-            evidence_config.clearance_mm / 2.0
-            + evidence_config.corridor_lateral_margin_mm
-        )
         self._stationary_motion = (near_field_pickup.motion_evidence if near_field_pickup is not None
                                    else StationaryMotionEvidence(
                                        max_gap_ns=round(evidence_config.grasp_commit_max_observation_age_ms*1e6),
@@ -460,21 +445,9 @@ class MatchSequence:
         self._breakup_anchor: FieldPoint | None = None
         self._breakup_reference_current = False
         self._breakup_observation_deadline_ns: int | None = None
-        self._breakup_no_plan_since_ns: int | None = None
-        self._breakup_failed_aims: list[FieldPoint] = []
-        # Keep the robot pose alongside physical breakup failures.  A turn or
-        # a new session does not change this memory; a verified translation can
-        # make a later retry a genuinely different approach.
-        self._breakup_failed_aim_positions: list[FieldPoint | None] = []
-        self._breakup_attempt_positions: list[FieldPoint | None] = []
-        self._rotation_budget_commit_diagnostic: str | None = None
+        self._breakup_failed_regions: list[tuple[FieldPoint, ...]] = []
         self._breakup_search_frame: tuple[int, int] | None = None
         self._breakup_wait_detail = "not_observing"
-        self._breakup_last_failure_diagnostic: str | None = None
-        # 最近一次解团选组的逐候选拒绝原因，用于解释"选不出接触计划"。
-        self._breakup_plan_rejections: tuple[str, ...] = ()
-        # 当前确认集合首帧对应的机器人位姿；位姿变化才作废既有确认。
-        self._breakup_confirm_pose: tuple[float | None, float | None] | None = None
         self.config = config
         self._tracker = tracker
         self._team_color = team_color
@@ -505,6 +478,21 @@ class MatchSequence:
         self._startup_turn_last_heading: float | None = None
         self._startup_turn_progress_rad = 0.0
         self._startup_forward_base_distance_m: float | None = None
+        # 策略专用启动冲刺：第一段为右转/短冲，第二段为左转/长冲。
+        self._strategy_startup_leg = 1
+        self._strategy_blue_transport = False
+        self._strategy_delivery_slot = 0
+        self._strategy_safe_zone_color: SafeZoneColor | None = None
+        self._strategy_blue_grasp_phase = "idle"
+        self._strategy_saved_near_field_pickup: GripperWidthPickupSequence | None = None
+        self._strategy_blue_projector: GroundProjector | None = None
+        self._strategy_blue_selector: NearFieldGraspSelector | None = None
+        self._strategy_blue_last_preparation: GraspPreparation | None = None
+        self._strategy_blue_preparation_key: tuple[int, int, int] | None = None
+        self._strategy_blue_confirmation_count = 0
+        self._strategy_blue_confirmation_last_frame: int | None = None
+        self._strategy_blue_confirmation_ids: tuple[int, ...] | None = None
+        self._strategy_formal_phase = False
         self._straight_pid_integral = 0.0
         self._straight_pid_last_error: float | None = None
         self._straight_pid_last_timestamp_ns: int | None = None
@@ -546,17 +534,6 @@ class MatchSequence:
         self._initial_field_position = initial_field_position
         self._fallback_field_position = initial_field_position
         self._fallback_last_distance_m: float | None = None
-        self._pose_history: list[_PoseHistoryEntry] = []
-        self._green_target_field_point: FieldPoint | None = None
-        self._green_alignment_target_heading_rad: float | None = None
-        self._green_turn_start_heading_rad: float | None = None
-        self._green_turn_direction = 0.0
-        self._green_turn_budget_rad = 0.0
-        self._green_turn_progress_rad = 0.0
-        self._green_turn_attempts = 0
-        self._green_turn_active = False
-        self._green_alignment_wait_since_ns: int | None = None
-        self._near_field_failures: list[_AttemptFailureRecord] = []
         self._safe_zone_scan_last_heading: float | None = None
         self._safe_zone_scan_progress_rad = 0.0
         self._cluster_search_angular_velocity_rad_s = (
@@ -730,6 +707,28 @@ class MatchSequence:
                 config.near_field_grasp.fine_alignment_min_wheel_velocity_m_s
             ),
         )
+        strategy_geometry = config.build_geometry()
+        if strategy_geometry is None or not isinstance(
+            strategy_geometry.ground_projector,
+            GroundProjector,
+        ):
+            raise RuntimeError(
+                "Strategy blue grasp requires a GroundProjector."
+            )
+        strategy_selector = NearFieldGraspSelector(
+            config.near_field_grasp,
+            strategy_geometry.ground_projector,
+            GripperKinematics(),
+            target_geometry=config.perception.target_ground_geometry,
+            open_servo_angles_deg=(
+                gripper.open_left_angle_deg,
+                gripper.open_right_angle_deg,
+            ),
+            closed_servo_angles_deg=(
+                gripper.closed_left_angle_deg,
+                gripper.closed_right_angle_deg,
+            ),
+        )
         transport_angles = gripper.transport_angles_deg
         if transport_angles is None:
             raise RuntimeError("Match flow requires transport gripper calibration.")
@@ -784,6 +783,30 @@ class MatchSequence:
             transport_corridor_half_width_mm=transport_opening_width_mm / 2.0,
             breakup_target_geometry=config.perception.target_ground_geometry,
         )
+        # 该入口只执行单个蓝色危险物块；近场动作复用正式 match 的
+        # GripperWidthPickupSequence，唯一差别是蓝色目标由本文件生成同构计划。
+        sequence._strategy_saved_near_field_pickup = near_field_pickup
+        sequence._strategy_blue_projector = strategy_geometry.ground_projector
+        sequence._strategy_blue_selector = strategy_selector
+        sequence._near_field_pickup = None
+        sequence._strategy_safe_zone_color = (
+            SafeZoneColor.BLUE
+            if config.world.team_color is TeamColor.RED
+            else SafeZoneColor.RED
+        )
+        endpoint = runtime.safe_zone_fallback_target_field
+        if math.isclose(endpoint.y, initial.position.y, abs_tol=1e-6):
+            sequence._safe_zone_forward_y_sign = (
+                -1.0 if config.world.team_color is TeamColor.BLUE else 1.0
+            )
+        else:
+            sequence._safe_zone_forward_y_sign = (
+                1.0 if endpoint.y > initial.position.y else -1.0
+            )
+        sequence._strategy_startup_leg = 1
+        sequence._strategy_blue_transport = False
+        sequence._strategy_delivery_slot = 0
+        sequence._strategy_formal_phase = False
         sequence._safe_zone_corner_localizer = config.build_safe_zone_corner_localizer()
         sequence._breakup_static_map = config.world.static_map
         sequence._breakup_clearance_mm = (
@@ -908,7 +931,6 @@ class MatchSequence:
             f"far_reapproach_used={self._near_field_far_reapproach_used},"
             f"candidates={self._near_field_route_candidate_count},"
             f"confirmation_ms={elapsed:.1f},"
-            f"physical_failure_records={len(self._near_field_failures)},"
             f"rejections={self._near_field_route_rejections}"
         )
 
@@ -943,12 +965,7 @@ class MatchSequence:
             plan_age_text = "none"
             preparation_age_text = "none"
             confirmation_text = "none"
-            capture_age_text = "none"
         else:
-            capture_age = timestamp_ns - preparation.capture_timestamp_ns
-            capture_age_text = (
-                "none" if capture_age < 0 else f"{capture_age / 1_000_000.0:.1f}"
-            )
             plan_age = preparation.plan_age_ns(timestamp_ns)
             preparation_age = preparation.preparation_age_ns(timestamp_ns)
             plan_age_text = (
@@ -965,16 +982,9 @@ class MatchSequence:
             )
         started_text = "none" if started is None else f"{started / 1_000_000.0:.1f}"
         elapsed_text = "none" if elapsed is None else f"{elapsed:.1f}"
-        deadline_text = (
-            "none"
-            if started is None
-            else f"{(started + round(self._near_field_handoff_timeout_ms() * 1_000_000.0)) / 1_000_000.0:.1f}"
-        )
         return (
             f"confirmation_started_ms={started_text} "
             f"confirmation_elapsed_ms={elapsed_text} "
-            f"attempt_deadline_ms={deadline_text} "
-            f"capture_age_ms={capture_age_text} "
             f"plan_age_ms={plan_age_text} "
             f"preparation_age_ms={preparation_age_text} "
             f"confirmation={confirmation_text} "
@@ -1006,14 +1016,8 @@ class MatchSequence:
     @property
     def breakup_observing(self) -> bool:
         # 解团确认只消费 MatchSequence 自己的当前帧，不启动近场抓取准备器。
-        # CLOSE_GRIPPER_SPIN 仅保留给兼容的旧状态注入；正式解团闭爪后直接搜索。
+        # 合爪后的绿色补夹扫描仍需要该准备器，因此只保留 CLOSE_GRIPPER_SPIN。
         return self._dynamic_breakup_enabled and self.state is MatchState.CLOSE_GRIPPER_SPIN
-
-    @property
-    def breakup_last_failure_diagnostic(self) -> str | None:
-        """Return the most recent bounded breakup failure for telemetry."""
-
-        return self._breakup_last_failure_diagnostic
 
     def near_field_observation_window_open(self, timestamp_ns: int) -> bool:
         """报告近场是否已经完成刹车并可打开确认窗口。
@@ -1109,25 +1113,16 @@ class MatchSequence:
         self._started = True
         self._startup_turn_last_heading = None
         self._startup_turn_progress_rad = 0.0
+        self._strategy_startup_leg = 1
+        self._strategy_blue_transport = False
+        self._strategy_delivery_slot = self._transport_count
+        self._strategy_blue_grasp_phase = "idle"
+        self._strategy_blue_preparation_key = None
+        self._strategy_formal_phase = False
         self._reset_straight_pid()
         self._fallback_field_position = self._initial_field_position
         self._fallback_last_distance_m = None
         self._latest_cumulative_distance_m = None
-        self._pose_history.clear()
-        self._near_field_failures.clear()
-        self._breakup_failed_aims.clear()
-        self._breakup_failed_aim_positions.clear()
-        self._breakup_attempts.clear()
-        self._breakup_attempt_positions.clear()
-        self._green_target_field_point = None
-        self._green_alignment_target_heading_rad = None
-        self._green_turn_start_heading_rad = None
-        self._green_turn_direction = 0.0
-        self._green_turn_budget_rad = 0.0
-        self._green_turn_progress_rad = 0.0
-        self._green_turn_attempts = 0
-        self._green_turn_active = False
-        self._green_alignment_wait_since_ns = None
         if self._near_field_pickup is not None:
             self._near_field_pickup.reset()
             self._near_field_session_id = 0
@@ -1168,7 +1163,6 @@ class MatchSequence:
         ):
             raise ValueError("cumulative_distance_m must be finite when present.")
         self._update_fallback_field_position(heading_rad, cumulative_distance_m)
-        self._record_pose_history(timestamp_ns, heading_rad, cumulative_distance_m)
         if safety is None:
             safety = SafetySignals.nominal(timestamp_ns)
         if not isinstance(safety, SafetySignals):
@@ -1191,31 +1185,6 @@ class MatchSequence:
             if dynamic is not None:
                 return dynamic
 
-        return self._dispatch_state(
-            timestamp_ns,
-            perception=perception,
-            heading_rad=heading_rad,
-            cumulative_distance_m=cumulative_distance_m,
-            left_speed_feedback_m_s=left_speed_feedback_m_s,
-            right_speed_feedback_m_s=right_speed_feedback_m_s,
-            near_field_preparation=near_field_preparation,
-            near_field_path_clear=near_field_path_clear,
-        )
-
-    def _dispatch_state(
-        self,
-        timestamp_ns: int,
-        *,
-        perception: PerceptionSnapshot | None,
-        heading_rad: float | None,
-        cumulative_distance_m: float | None,
-        left_speed_feedback_m_s: float | None,
-        right_speed_feedback_m_s: float | None,
-        near_field_preparation: GraspPreparation | None,
-        near_field_path_clear: bool | None,
-    ) -> MatchDecision:
-        """按当前状态分发控制意图；子类可先处理自身状态再委托父类。"""
-
         if self.state is MatchState.STARTUP_TURN_RIGHT:
             return self._step_startup_turn(timestamp_ns, heading_rad)
         if self.state is MatchState.STARTUP_TURN_SETTLE:
@@ -1232,13 +1201,15 @@ class MatchSequence:
                 right_speed_feedback_m_s,
             )
         if self.state is MatchState.STARTUP_FORWARD_SETTLE:
-            return self._step_settle(
-                timestamp_ns,
-                MatchState.SEARCH_CLUSTER,
-                "startup_forward_settled_search_cluster",
-            )
+            return self._step_strategy_startup_forward_settle(timestamp_ns)
         if self.state is MatchState.SEARCH_CLUSTER:
-            return self._step_search_cluster(timestamp_ns, heading_rad)
+            if self._strategy_formal_phase:
+                return _SharedMatchSequence._step_search_cluster(
+                    self,
+                    timestamp_ns,
+                    heading_rad,
+                )
+            return self._step_strategy_search_cluster(timestamp_ns, heading_rad)
         if self.state is MatchState.ALIGN_CLUSTER_ONCE:
             return self._step_align_cluster(timestamp_ns)
         if self.state is MatchState.APPROACH_CLUSTER:
@@ -1343,7 +1314,7 @@ class MatchSequence:
             self.config.startup_turn_angular_velocity_rad_s,
         )
         self._startup_turn_progress_rad += delta
-        if self._startup_turn_progress_rad >= self.config.startup_turn_angle_rad:
+        if self._startup_turn_progress_rad >= self.config.startup_turn_angle_rad - 1e-9:
             self.state = MatchState.STARTUP_TURN_SETTLE
             self._settle_until_ns = timestamp_ns + self._seconds_to_ns(
                 self.config.startup_turn_settle_time_s
@@ -1460,7 +1431,6 @@ class MatchSequence:
         if travelled >= self.config.cluster_relocate_distance_m - 1e-9:
             self._consecutive_cluster_losses = 0
             self._begin_cluster_search()
-            self._breakup_only = False
             self.state = MatchState.SEARCH_CLUSTER
             return self._decision(
                 timestamp_ns,
@@ -1677,72 +1647,6 @@ class MatchSequence:
                                          target.target_class, target.ground_point, contact, safety))
         return tuple(targets)
 
-    def _aim_in_failed_aims(self, aim: FieldPoint) -> bool:
-        """只封锁真正失败过的瞄准点。
-
-        旧实现拿失败计划的整组成员去和候选做多数匹配，一次确认超时就把
-        整片区域判死；现场 20260912_0053 里一个失败点让 100 mm 内所有团
-        连续 20 秒无法解团。
-        """
-
-        current_position = self.estimated_field_position
-        positions = self._breakup_failed_aim_positions
-        positions_aligned = len(positions) == len(self._breakup_failed_aims)
-        for index, failed in enumerate(self._breakup_failed_aims):
-            if math.hypot(aim.x - failed.x, aim.y - failed.y) > self.config.cluster_group_ground_mm:
-                continue
-            # An explicitly recorded relocation is the only way to make a
-            # failed physical aim eligible again.  In particular, rotating in
-            # place and starting a new session keep the failure active.
-            failed_position = positions[index] if positions_aligned else None
-            if (
-                failed_position is not None
-                and current_position is not None
-                and math.hypot(
-                    current_position.x - failed_position.x,
-                    current_position.y - failed_position.y,
-                ) >= 100.0
-            ):
-                continue
-            return True
-        return False
-
-    @staticmethod
-    def _boxes_overlap(a: UndistortedBoundingBox, b: UndistortedBoundingBox) -> bool:
-        return (a.x_min <= b.x_max and b.x_min <= a.x_max
-                and a.y_min <= b.y_max and b.y_min <= a.y_max)
-
-    def _target_overlaps_safe_zone_bbox(
-        self,
-        box: UndistortedBoundingBox | None,
-        perception: PerceptionSnapshot | None = None,
-    ) -> bool:
-        """图像上目标框与任一安全区框重叠即视为已交付物资。
-
-        交付线（场地 y=1115）、静态地图多边形（y≥1200）和实测地标（y=1137）
-        三个数值不一致，靠场地位姿反推会把刚推进安全区的物块重新当成候选，
-        且位姿误差会让它更不可靠；图像重叠只看"物块是否压在安全区上"，
-        不依赖位姿推算。没有安全区框（未启用颜色识别或无该帧特征）时不排除。
-        """
-
-        if box is None:
-            return False
-        perception = self._latest_perception if perception is None else perception
-        features = None if perception is None else perception.field_features
-        if features is None:
-            return False
-        return any(
-            self._boxes_overlap(box, zone.box)
-            for zone in features.safe_zones
-        )
-
-    def _track_box(self, track_id: int) -> UndistortedBoundingBox | None:
-        return next(
-            (target.box for target in self._tracker.tracks
-             if target.track_id == track_id),
-            None,
-        )
-
     def _choose_breakup_plan(self, timestamp_ns: int, *, approach: bool = False,
                              required_ids: frozenset[int] | None = None,
                              required_aim_id: int | None = None) -> BreakupPlan | None:
@@ -1751,14 +1655,6 @@ class MatchSequence:
             self._last_cluster_rejection_reason = "breakup_missing_pose_map_or_geometry"
             return None
         targets = self._breakup_targets(timestamp_ns)
-        # 已放入安全区的物资不再作为成组或瞄准点候选；它们仍留在 targets 中
-        # 参加推移净空检查，不能被碰撞也不能被忽略。
-        non_contact_ids = frozenset(
-            target.track_id
-            for target in targets
-            if self._ground_in_safe_zone(target.center, target.capture_timestamp_ns)
-            or self._target_overlaps_safe_zone_bbox(self._track_box(target.track_id))
-        )
         priority_ids: set[int] = set()
         for reason in self._near_field_route_rejections:
             if reason.startswith("blocked_target:"):
@@ -1774,67 +1670,32 @@ class MatchSequence:
                     allowed_classes=self.near_field_policy.allowed_classes,
                     approach=approach, required_ids=required_ids,
                     rejection_reasons=self._near_field_route_rejections,
-                    priority_ids=frozenset(priority_ids), required_aim_id=required_aim_id,
-                    non_contact_ids=non_contact_ids)
-        rejections: list[str] = []
-        candidates = plan_breakup(targets, rejections=rejections, **args)
+                    priority_ids=frozenset(priority_ids), required_aim_id=required_aim_id)
+        candidates = plan_breakup(targets, **args)
+        tolerance = self.config.cluster_group_ground_mm + self.config.breakup_retry_penetration_mm
         tried_groups: set[tuple[int, ...]] = set()
         for candidate in candidates:
-            if self._aim_in_failed_aims(candidate.aim_field):
-                rejections.append(
-                    f"aim={candidate.aim_id} reason=group_in_failed_region "
-                    f"members={candidate.member_ids}"
-                )
+            if any(same_local_group(region, candidate.member_field_points, self.config.cluster_group_ground_mm)
+                   for region in self._breakup_failed_regions):
                 continue
             if candidate.member_ids in tried_groups:
                 continue
             tried_groups.add(candidate.member_ids)
-            history = [
-                plan
-                for index, plan in enumerate(self._breakup_attempts)
-                if math.hypot(
-                    plan.aim_field.x - candidate.aim_field.x,
-                    plan.aim_field.y - candidate.aim_field.y,
-                ) <= self.config.cluster_group_ground_mm
-                and self._breakup_attempt_is_current(index)
-            ]
+            history = [p for p in self._breakup_attempts
+                       if same_local_group(p.member_field_points, candidate.member_field_points, tolerance)]
             if len(history) >= self.config.breakup_max_attempts:
-                rejections.append(
-                    f"aim={candidate.aim_id} reason=group_attempts_exhausted "
-                    f"members={candidate.member_ids} attempts={len(history)}"
-                )
                 continue
             if history:
                 previous = history[-1]
                 retries = plan_breakup(targets, **{**args, 'required_ids': frozenset(candidate.member_ids)},
                                        attempt=len(history)+1, previous_aim=previous.aim_field,
-                                       previous_penetration_mm=previous.penetration_mm,
-                                       rejections=rejections)
+                                       previous_penetration_mm=previous.penetration_mm)
                 if retries:
-                    self._breakup_plan_rejections = tuple(rejections[-8:])
                     return retries[0]
             else:
-                self._breakup_plan_rejections = tuple(rejections[-8:])
                 return candidate
-        self._breakup_plan_rejections = tuple(rejections[-8:])
         self._last_cluster_rejection_reason = "breakup_no_contact_plan_or_retry_exhausted"
         return None
-
-    def _breakup_attempt_is_current(self, index: int) -> bool:
-        """Return whether an old completed push still has the same geometry."""
-
-        if len(self._breakup_attempt_positions) != len(self._breakup_attempts):
-            # Tests and legacy pure-logic callers may seed only plan history;
-            # without a pose there is no evidence of a valid relocation.
-            return True
-        recorded = self._breakup_attempt_positions[index]
-        current = self.estimated_field_position
-        if recorded is None or current is None:
-            return True
-        return math.hypot(
-            current.x - recorded.x,
-            current.y - recorded.y,
-        ) < 100.0
 
     def _try_dynamic_grasp(self, timestamp_ns: int) -> MatchDecision | None:
         if not self.config.opportunistic_single_green_enabled:
@@ -1906,10 +1767,6 @@ class MatchSequence:
         self._breakup_reference_current = False
         self._breakup_observation_deadline_ns = None
         self._breakup_wait_detail = "waiting_stationarity"
-        self._breakup_last_failure_diagnostic = None
-        self._breakup_plan_rejections = ()
-        self._breakup_confirm_pose = None
-        self._breakup_no_plan_since_ns: int | None = None
 
     def _start_breakup_attempt(
         self,
@@ -1918,10 +1775,6 @@ class MatchSequence:
     ) -> None:
         self._start_breakup_observation(timestamp_ns)
         self._breakup_proposal = plan
-        self._breakup_alignment_done = plan is None
-        self._breakup_alignment_allowance_ns = (0 if plan is None or self._latest_heading_rad is None else
-            round((abs(normalize_angle(plan.heading_rad - self._latest_heading_rad)) /
-                   self.config.cluster_align_max_angular_velocity_rad_s + 0.4) * 1e9))
         self._cluster_selected_track_ids = () if plan is None else plan.member_ids
         # 动态正式解团不再单独旋转/接近；停稳后直接确认当前接触核心。
         self.state = MatchState.BREAKUP_SETTLE
@@ -1964,36 +1817,23 @@ class MatchSequence:
                 and self._breakup_capture_valid(preparation.capture_timestamp_ns, timestamp_ns))
 
     def _breakup_new_stopped_frame(self, timestamp_ns: int) -> bool:
-        # 只有机器人自身位姿确实变化才作废既有确认。静止区间会因为设备样本
-        # 重复或质量位抖动重新落定，但那不是核心变化；冻结前仍会用当前静止
-        # 区间重新校验候选帧的采集时间，所以这里不需要为安全多清一次。
-        pose = (self._latest_cumulative_distance_m, self._latest_heading_rad)
-        if self._breakup_confirm_pose is not None and pose != self._breakup_confirm_pose:
+        since = self._breakup_stationary_since(timestamp_ns)
+        if since is None:
+            self._breakup_stopped_ns = None
+            self._breakup_reference_frames.clear()
+            self._breakup_reference_current = False
+            self._breakup_wait_detail = "waiting_stationarity_or_telemetry"
+            return False
+        if since != self._breakup_stopped_ns:
             self._breakup_reference_frames.clear()
             self._breakup_reference_current = False
             self._breakup_anchor = None
             self._cluster_selected_track_ids = ()
-            self._breakup_confirm_pose = None
-        since = self._breakup_stationary_since(timestamp_ns)
-        if since is None:
-            # 遥测断档或静止证据尚未重新连续，只说明当前帧不能用于冻结。
-            self._breakup_stopped_ns = None
-            self._breakup_wait_detail = "waiting_stationarity_or_telemetry"
-            return False
-        # 静止区间重新落定只更新起点，不清确认。
-        self._breakup_stopped_ns = since
+            self._breakup_stopped_ns = since
         # Time budget starts when actual stationary evidence is available. Frame
         # delivery latency gets a bounded allowance, never an artificial new stop.
-        # 参考确认需要 breakup_confirmation_frames 个不同采集，按每帧允许的
-        # 观测年龄逐帧预算；只加单帧余量会让多帧确认在慢感知下必然超时。
         if self._breakup_observation_deadline_ns is None:
-            self._breakup_no_plan_since_ns = timestamp_ns
-            self._breakup_observation_deadline_ns = (
-                timestamp_ns
-                + self._cluster_align_hold_ns
-                + self.config.breakup_confirmation_frames
-                * round(self.config.green_max_age_ms * 1e6)
-            )
+            self._breakup_observation_deadline_ns = timestamp_ns + self._cluster_align_hold_ns + round(self.config.green_max_age_ms*1e6)
         perception = self._latest_perception
         if perception is None:
             self._breakup_wait_detail = "waiting_perception_delivery"
@@ -2009,11 +1849,6 @@ class MatchSequence:
             self._breakup_wait_detail = "waiting_distinct_capture"
             return False
         self._breakup_last_capture_ns = perception.capture_timestamp_ns
-        if self._breakup_confirm_pose is None:
-            # 记录首帧确认时的机器人位姿：此后的确认只在位姿未变时继续有效。
-            self._breakup_confirm_pose = (
-                self._latest_cumulative_distance_m, self._latest_heading_rad,
-            )
         self._breakup_wait_detail = "new_stationary_capture"
         return True
 
@@ -2021,39 +1856,13 @@ class MatchSequence:
         if self._breakup_observation_deadline_ns is not None:
             return timestamp_ns >= self._breakup_observation_deadline_ns
         return (self._breakup_phase_started_ns is not None
-                and timestamp_ns-self._breakup_phase_started_ns >= self._cluster_align_hold_ns + getattr(self, "_breakup_alignment_allowance_ns", 0))
+                and timestamp_ns-self._breakup_phase_started_ns >= self._cluster_align_hold_ns)
 
     def _resume_dynamic_search(self, timestamp_ns: int, reason: str) -> MatchDecision:
         plan = self._breakup_proposal or self._breakup_plan
-        perception = self._latest_perception
-        observation_age = (
-            "none"
-            if perception is None
-            else f"{max(0, timestamp_ns - perception.capture_timestamp_ns) / 1_000_000.0:.1f}"
-        )
         if plan is not None and ("timeout" in reason or "rejection" in reason):
-            self._breakup_failed_aims.append(plan.aim_field)
-            self._breakup_failed_aim_positions.append(self.estimated_field_position)
-            self._breakup_failed_aims = self._breakup_failed_aims[-32:]
-            self._breakup_failed_aim_positions = self._breakup_failed_aim_positions[-32:]
-            self._breakup_last_failure_diagnostic = (
-                "breakup_failure "
-                f"aim_id={plan.aim_id} members={plan.member_ids} "
-                f"contact={plan.contact_ids} attempt={plan.attempt} "
-                f"reason={reason} confirmation={len(self._breakup_reference_frames)}/"
-                f"{self.config.breakup_confirmation_frames} "
-                f"observation_age_ms={observation_age} "
-                f"deadline_ns={self._breakup_observation_deadline_ns}"
-            )
-        elif "timeout" in reason or "rejection" in reason:
-            self._breakup_last_failure_diagnostic = (
-                "breakup_failure aim_id=none members=none "
-                f"reason={reason} confirmation={len(self._breakup_reference_frames)}/"
-                f"{self.config.breakup_confirmation_frames} "
-                f"observation_age_ms={observation_age} "
-                f"deadline_ns={self._breakup_observation_deadline_ns} "
-                f"rejected_candidates=[{';'.join(self._breakup_plan_rejections)}]"
-            )
+            self._breakup_failed_regions.append(plan.member_field_points)
+            self._breakup_failed_regions = self._breakup_failed_regions[-32:]
         self._begin_cluster_search()
         self._breakup_only = False
         self.state = MatchState.SEARCH_CLUSTER
@@ -2083,41 +1892,25 @@ class MatchSequence:
                 # 该计划只用于记录本次待确认区域；执行计划仍必须来自停稳后的当前帧。
                 self._start_breakup_attempt(timestamp_ns, plan)
                 return self._decision(timestamp_ns, 0.0, 0.0, "cluster_seen_stop_collect_reference", soft_brake=True)
-        committed = self._advance_cluster_search_sweep(timestamp_ns, heading_rad)
-        if committed is not None:
-            return committed
+        self._advance_cluster_search_sweep(heading_rad)
         return self._decision(timestamp_ns, 0.0, self._cluster_search_angular_velocity_rad_s,
                               "search_cluster_right" if self._cluster_search_angular_velocity_rad_s < 0 else "search_cluster_left")
 
     def _collect_dynamic_breakup(self, timestamp_ns: int) -> MatchDecision | None:
         if self._breakup_observation_expired(timestamp_ns):
             return self._resume_dynamic_search(timestamp_ns, "breakup_reference_timeout_reselect")
-        proposal = self._breakup_proposal
-        if proposal is not None and not getattr(self, "_breakup_alignment_done", True):
-            if self._latest_heading_rad is None:
-                return self._decision(timestamp_ns, 0.0, 0.0, "breakup_alignment_missing_heading", soft_brake=True)
-            error = normalize_angle(proposal.heading_rad - self._latest_heading_rad)
-            if abs(error) > self.config.cluster_align_tolerance_rad:
-                maximum = self.config.cluster_align_max_angular_velocity_rad_s
-                return self._decision(timestamp_ns, 0.0, math.copysign(min(maximum, max(0.08, abs(error))), error),
-                                      "breakup_align_contact_imu", posture=GripperPosture.CLOSED)
-            self._breakup_alignment_done = True
         new_capture = self._breakup_new_stopped_frame(timestamp_ns)
         if new_capture:
             self._breakup_reference_current = False
             # Pin the physical impact core, not the entire connected component:
             # peripheral omissions and tracker ID changes must not erase evidence.
-            candidate = self._choose_breakup_plan(
-                timestamp_ns,
-                approach=False,
-            )
+            candidate = self._choose_breakup_plan(timestamp_ns, approach=False)
             if (candidate is not None and self._breakup_anchor is not None
                     and math.hypot(candidate.aim_field.x-self._breakup_anchor.x,
                                    candidate.aim_field.y-self._breakup_anchor.y)
                     > self.config.cluster_group_ground_mm):
                 candidate = None
             if candidate is not None:
-                self._breakup_no_plan_since_ns = None
                 if self._breakup_anchor is None:
                     self._breakup_anchor = candidate.aim_field
                 self._breakup_proposal = candidate
@@ -2128,14 +1921,7 @@ class MatchSequence:
                 if len(self._breakup_reference_frames) < self.config.breakup_confirmation_frames:
                     self._breakup_reference_frames.add((perception.frame_sequence, perception.capture_timestamp_ns))
             else:
-                if self._breakup_no_plan_since_ns is None:
-                    self._breakup_no_plan_since_ns = timestamp_ns
                 self._breakup_wait_detail = "impact_core_unavailable_or_unsafe"
-        # A boundary-arriving valid frame is processed before the no-plan cutoff.
-        if (self._breakup_no_plan_since_ns is not None
-                and timestamp_ns - self._breakup_no_plan_since_ns
-                >= round(self.config.breakup_no_plan_reobserve_ms * 1e6)):
-            return self._resume_dynamic_search(timestamp_ns, "breakup_reference_timeout_reselect")
         candidate = self._breakup_proposal
         if len(self._breakup_reference_frames) < self.config.breakup_confirmation_frames:
             return self._decision(timestamp_ns, 0.0, 0.0, f"breakup_reference:{self._breakup_wait_detail}", soft_brake=True)
@@ -2200,13 +1986,11 @@ class MatchSequence:
                 return self._decision(timestamp_ns, 0.0, 0.0, "breakup_waiting_stop_before_gripper", posture=posture, soft_brake=True)
             self._gripper_phase_started_ns = timestamp_ns
             if forward:
-                self._breakup_retreat_mm = max(0.0, travel - (plan.forward_distance_mm - plan.penetration_mm)) + self.config.breakup_retreat_clearance_mm + self.config.breakup_braking_margin_mm
+                self._breakup_retreat_mm = travel+self.config.breakup_retreat_clearance_mm+self.config.breakup_braking_margin_mm
                 if self._breakup_retreat_mm > self.config.breakup_backward_distance_m*1000:
                     return self._resume_dynamic_search(timestamp_ns, "breakup_actual_overrun_reselect")
                 self._breakup_attempts.append(plan)
                 self._breakup_attempts = self._breakup_attempts[-32:]
-                self._breakup_attempt_positions.append(self.estimated_field_position)
-                self._breakup_attempt_positions = self._breakup_attempt_positions[-32:]
                 self.state = MatchState.OPEN_GRIPPER_SETTLE
                 return self._decision(timestamp_ns, 0.0, 0.0, "breakup_forward_complete_open", posture=GripperPosture.OPEN, soft_brake=True)
             self.state = MatchState.CLOSE_GRIPPER_SETTLE
@@ -2226,25 +2010,29 @@ class MatchSequence:
             else:
                 self._breakup_rejected_grasp_ids.clear()
                 self._breakup_only = False
+                self._breakup_plan = None
                 self._reset_tracker_for_new_preview_epoch()
                 self._last_tracker_frame_sequence = None
-                # The push has already completed its one current-geometry
-                # decision.  Re-enter the common search directly; a second
-                # post-contact stationary/preparation window only repeats the
-                # same failed gate and can consume another multi-second turn.
-                self._begin_cluster_search()
-                self._reset_rotation_budget()
-                self.state = MatchState.SEARCH_CLUSTER
-                return self._decision(
-                    timestamp_ns,
-                    0.0,
-                    self._cluster_search_angular_velocity_rad_s,
-                    "breakup_gripper_complete_resume_search",
-                    posture=posture,
-                    soft_brake=True,
-                )
+                self._start_breakup_observation(timestamp_ns)
+                self.state = MatchState.CLOSE_GRIPPER_SPIN
             return self._decision(timestamp_ns, 0.0, 0.0, "breakup_gripper_complete", posture=posture, soft_brake=True)
-        return None
+        # Old post-breakup isolated-green states now perform a bounded stationary multi-target check.
+        if self._breakup_phase_started_ns is None:
+            return self._resume_dynamic_search(timestamp_ns, "breakup_exit_without_reference_search")
+        new_capture = self._breakup_new_stopped_frame(timestamp_ns)
+        grasp = self._try_dynamic_grasp(timestamp_ns)
+        if grasp is not None:
+            return grasp
+        if new_capture:
+            if self._breakup_geometric_block(timestamp_ns):
+                self._breakup_only = True
+                candidate = self._choose_breakup_plan(timestamp_ns, approach=False)
+                if candidate is not None:
+                    self._start_breakup_attempt(timestamp_ns, candidate)
+                    return self._decision(timestamp_ns, 0.0, 0.0, "breakup_local_retry_collect", soft_brake=True)
+        if self._breakup_observation_expired(timestamp_ns):
+            return self._resume_dynamic_search(timestamp_ns, "breakup_exit_recheck_complete_search")
+        return self._decision(timestamp_ns, 0.0, 0.0, "breakup_exit_recheck_grasp", soft_brake=True)
 
     def _breakup_heading_correction(self, plan: BreakupPlan) -> float:
         heading = self._latest_heading_rad
@@ -2294,18 +2082,12 @@ class MatchSequence:
             self._cluster_selected_track_ids = plan.member_ids
             return _GroundClusterMeasurement(plan.aim, math.hypot(plan.aim.x, plan.aim.y))
         self._cluster_selected_track_ids = ()
-        # 已放入安全区的物资不再是搜索目标：它仍留在轨迹里继续参与障碍、
-        # 危险和解团推移检查，但不能成为被选中去接近/解团的团成员。
         candidates = tuple(
             target
             for target in self._tracker.tracks
             if target.ground_point is not None
             and target.ever_confirmed
             and self._target_is_fresh(target, timestamp_ns)
-            and not self._ground_in_safe_zone(
-                target.ground_point, target.last_seen_timestamp_ns
-            )
-            and not self._target_overlaps_safe_zone_bbox(target.box)
         )
         points = [target.ground_point for target in candidates]
         remaining_points = points
@@ -2406,15 +2188,22 @@ class MatchSequence:
             or target.status is not TrackStatus.CONFIRMED
             or not target.ever_confirmed
             or target.ground_point is None
+            or any(
+                quality
+                in {
+                    ObservationQuality.COLOR_EVIDENCE_INSUFFICIENT,
+                    ObservationQuality.COLOR_EVIDENCE_AMBIGUOUS,
+                    ObservationQuality.POSE_COLOR_CONFLICT,
+                }
+                for quality in target.quality
+            )
         ):
             return False
         return True
 
-    def _graspable_target_is_usable(self, target: TrackedTarget) -> bool:
+    @staticmethod
+    def _graspable_target_is_usable(target: TrackedTarget) -> bool:
         """确认的绿/黑物资或橙色伤员候选。"""
-        if (self._ground_in_safe_zone(target.ground_point, target.last_seen_timestamp_ns)
-                or self._target_overlaps_safe_zone_bbox(target.box)):
-            return False
 
         if (
             target.target_class not in {
@@ -2427,7 +2216,15 @@ class MatchSequence:
             or target.ground_point is None
         ):
             return False
-        return True
+        return not any(
+            quality
+            in {
+                ObservationQuality.COLOR_EVIDENCE_INSUFFICIENT,
+                ObservationQuality.COLOR_EVIDENCE_AMBIGUOUS,
+                ObservationQuality.POSE_COLOR_CONFLICT,
+            }
+            for quality in target.quality
+        )
 
     def _selected_green_is_usable(self, target: TrackedTarget) -> bool:
         """已选目标允许短时 coasting，但类别/质量变化仍不能继续夹取。
@@ -2447,7 +2244,15 @@ class MatchSequence:
         return (
             target.target_class in allowed_classes
             and target.ever_confirmed
-
+            and not any(
+                quality
+                in {
+                    ObservationQuality.COLOR_EVIDENCE_INSUFFICIENT,
+                    ObservationQuality.COLOR_EVIDENCE_AMBIGUOUS,
+                    ObservationQuality.POSE_COLOR_CONFLICT,
+                }
+                for quality in target.quality
+            )
         )
 
     def _selected_target(self) -> TrackedTarget | None:
@@ -2461,54 +2266,6 @@ class MatchSequence:
             ),
             None,
         )
-
-    def _ground_in_safe_zone(self, point: GroundPoint | None, capture_ns: int) -> bool:
-        if point is None or self._breakup_static_map is None:
-            return False
-        now_ns = self._last_timestamp_ns or capture_ns
-        current = self._ground_point_at_now(point, capture_ns, now_ns)
-        field = self._field_point_from_ground(current if current is not None else point)
-        return field is not None and safe_zone_intersection(self._breakup_static_map, field, field, 0.0) is True
-
-    def _observation_is_selectable(
-        self,
-        item: TargetObservation,
-        stowed_limit_mm: float | None,
-        perception: PerceptionSnapshot | None = None,
-    ) -> bool:
-        """判断一条观测是否还能作为新的抓取候选。
-
-        蓝色危险证据永远保留：已放入安全区的物资和夹在爪内的成员仍然必须
-        能参与夹爪扫掠检查。补夹扫描期间，爪内成员的地面投影落在扫描本身
-        已经要求新物资越过的同一前向界限之内，因此复用该界限排除，不引入
-        第二套判定。
-        """
-
-        if (
-            item.target_class is TargetClass.BLUE_DANGER
-            or item.model_target_class is TargetClass.BLUE_DANGER
-        ):
-            return True
-        if self._ground_in_safe_zone(item.ground_point, item.capture_timestamp_ns):
-            return False
-        if self._target_overlaps_safe_zone_bbox(item.box, perception):
-            return False
-        if stowed_limit_mm is None or item.ground_point is None:
-            return True
-        now_ns = self._last_timestamp_ns or item.capture_timestamp_ns
-        current = self._ground_point_at_now(
-            item.ground_point, item.capture_timestamp_ns, now_ns,
-        )
-        point = current if current is not None else item.ground_point
-        return point.x > stowed_limit_mm
-
-    def grasp_excluded_observation_indices(self, perception: PerceptionSnapshot) -> frozenset[int]:
-        """Mark delivered/carried candidates without deleting obstacle evidence."""
-        if not isinstance(perception, PerceptionSnapshot):
-            raise TypeError("perception must be a PerceptionSnapshot.")
-        stowed_limit = self._greedy_new_target_min_x_mm() if self._greedy_active else None
-        return frozenset(index for index, item in enumerate(perception.observations)
-                         if not self._observation_is_selectable(item, stowed_limit, perception))
 
     def _target_is_fresh(self, target: TrackedTarget, timestamp_ns: int) -> bool:
         return (
@@ -2605,7 +2362,8 @@ class MatchSequence:
         self._cluster_search_angular_velocity_rad_s = (
             self.config.cluster_search_angular_velocity_rad_s
         )
-        # 旋转预算跨状态连续，不在这里清零；见 _reset_rotation_budget()。
+        self._cluster_search_last_heading = None
+        self._cluster_search_progress_rad = 0.0
         self._cluster_align_hold_center = None
         self._cluster_align_lost_since_ns = None
         self._return_phase = "idle"
@@ -2628,15 +2386,6 @@ class MatchSequence:
         self._cluster_breakup_end_field_point = None
         self._cluster_selected_track_ids = ()
         self._last_cluster_rejection_reason = None
-        self._green_target_field_point = None
-        self._green_alignment_target_heading_rad = None
-        self._green_turn_start_heading_rad = None
-        self._green_turn_direction = 0.0
-        self._green_turn_budget_rad = 0.0
-        self._green_turn_progress_rad = 0.0
-        self._green_turn_attempts = 0
-        self._green_turn_active = False
-        self._green_alignment_wait_since_ns = None
         self._opportunistic_single_green = False
         self._near_field_group_preview = False
         self._green_realign_pending = False
@@ -2676,107 +2425,32 @@ class MatchSequence:
             )
         self._fallback_last_distance_m = cumulative_distance_m
 
-    def _record_pose_history(
+    def _advance_cluster_search_sweep(
         self,
-        timestamp_ns: int,
         heading_rad: float | None,
-        cumulative_distance_m: float | None,
     ) -> None:
-        """Record measured pose pairs without inventing capture-time motion."""
-
-        position = self._fallback_field_position
+        if heading_rad is None:
+            return
+        heading = heading_rad
+        previous = self._cluster_search_last_heading
+        self._cluster_search_last_heading = heading
+        if previous is None:
+            return
+        self._cluster_search_progress_rad += self._directional_delta(
+            previous,
+            heading,
+            self._cluster_search_angular_velocity_rad_s,
+        )
         if (
-            heading_rad is None
-            or cumulative_distance_m is None
-            or position is None
-            or not math.isfinite(float(heading_rad))
-            or not math.isfinite(float(cumulative_distance_m))
+            self._cluster_search_progress_rad
+            >= self.config.cluster_search_sweep_angle_rad
         ):
-            return
-        entry = _PoseHistoryEntry(
-            timestamp_ns,
-            float(cumulative_distance_m),
-            float(heading_rad),
-            position,
-        )
-        if self._pose_history and self._pose_history[-1].timestamp_ns == timestamp_ns:
-            self._pose_history[-1] = entry
-        elif not self._pose_history or timestamp_ns > self._pose_history[-1].timestamp_ns:
-            self._pose_history.append(entry)
-        else:
-            return
-        del self._pose_history[:-256]
-
-    def _pose_at(self, timestamp_ns: int) -> _PoseHistoryEntry | None:
-        """Interpolate only inside recorded control history."""
-
-        if not self._pose_history or timestamp_ns < self._pose_history[0].timestamp_ns:
-            return None
-        if timestamp_ns > self._pose_history[-1].timestamp_ns:
-            return None
-        for left, right in zip(self._pose_history, self._pose_history[1:]):
-            if timestamp_ns == left.timestamp_ns:
-                return left
-            if left.timestamp_ns < timestamp_ns <= right.timestamp_ns:
-                span = right.timestamp_ns - left.timestamp_ns
-                ratio = 0.0 if span <= 0 else (timestamp_ns - left.timestamp_ns) / span
-                heading_delta = normalize_angle(right.heading_rad - left.heading_rad)
-                return _PoseHistoryEntry(
-                    timestamp_ns,
-                    left.cumulative_distance_m
-                    + ratio * (right.cumulative_distance_m - left.cumulative_distance_m),
-                    normalize_angle(left.heading_rad + ratio * heading_delta),
-                    FieldPoint(
-                        left.position.x + ratio * (right.position.x - left.position.x),
-                        left.position.y + ratio * (right.position.y - left.position.y),
-                    ),
-                )
-        if timestamp_ns == self._pose_history[-1].timestamp_ns:
-            return self._pose_history[-1]
-        return None
-
-    @staticmethod
-    def _field_point_from_pose(
-        pose: _PoseHistoryEntry,
-        ground_point: GroundPoint,
-    ) -> FieldPoint:
-        cosine = math.cos(pose.heading_rad)
-        sine = math.sin(pose.heading_rad)
-        return FieldPoint(
-            pose.position.x + cosine * ground_point.x - sine * ground_point.y,
-            pose.position.y + sine * ground_point.x + cosine * ground_point.y,
-        )
-
-    def _ground_point_at_now(
-        self,
-        ground_point: GroundPoint,
-        capture_timestamp_ns: int,
-        timestamp_ns: int,
-    ) -> GroundPoint | None:
-        """Transform a captured robot-frame point through measured motion."""
-
-        capture_pose = self._pose_at(capture_timestamp_ns)
-        current_pose = self._pose_at(timestamp_ns)
-        if capture_pose is None or current_pose is None:
-            return None
-        field_point = self._field_point_from_pose(capture_pose, ground_point)
-        delta_x = field_point.x - current_pose.position.x
-        delta_y = field_point.y - current_pose.position.y
-        cosine = math.cos(current_pose.heading_rad)
-        sine = math.sin(current_pose.heading_rad)
-        return GroundPoint(
-            cosine * delta_x + sine * delta_y,
-            -sine * delta_x + cosine * delta_y,
-        )
-
-    def _field_point_for_target(self, target: TrackedTarget) -> FieldPoint | None:
-        point = target.ground_point
-        if point is None:
-            return None
-        pose = self._pose_at(target.last_seen_timestamp_ns)
-        if pose is None:
-            return None
-        return self._field_point_from_pose(pose, point)
+            self._breakup_attempts.clear()
+            self._breakup_rejected_grasp_ids.clear()
+            self._breakup_failed_regions.clear()
+            self._cluster_search_angular_velocity_rad_s *= -1.0
+            self._cluster_search_progress_rad = 0.0
+            self._cluster_search_last_heading = heading
 
     @staticmethod
     def _directional_delta(previous: float, current: float, angular_velocity: float) -> float:
@@ -2784,137 +2458,6 @@ class MatchSequence:
         if angular_velocity < 0.0:
             delta = -delta
         return max(0.0, delta)
-
-    def _reset_rotation_budget(self) -> None:
-        """一次决策预算的起点：真正执行过动作，或确认场上没有可收集信息。"""
-
-        self._cluster_search_last_heading = None
-        self._cluster_search_progress_rad = 0.0
-        self._rotation_budget_commit_diagnostic = None
-
-    def _rotation_budget_text(self) -> str:
-        text = f"progress_rad={self._cluster_search_progress_rad:.2f}"
-        if self._rotation_budget_commit_diagnostic is None:
-            return text
-        return f"{text},{self._rotation_budget_commit_diagnostic}"
-
-    def _advance_cluster_search_sweep(
-        self,
-        timestamp_ns: int,
-        heading_rad: float | None,
-    ) -> MatchDecision | None:
-        """累计"上一次执行动作之后转过的角度"；预算用尽时返回提交决策。
-
-        预算按绝对转角累计，并且在搜索、对准、近场和重选之间连续：每个状态
-        切换都清零会让"转满一圈"永远不成立（现场 20260912_0053 从 63.3 s
-        转到 85.4 s，约两圈，计数器仍是 0），失败记忆因此只增不减。
-        """
-
-        if heading_rad is None:
-            return None
-        previous = self._cluster_search_last_heading
-        self._cluster_search_last_heading = heading_rad
-        if previous is None:
-            return None
-        self._cluster_search_progress_rad += abs(
-            normalize_angle(heading_rad - previous)
-        )
-        if (
-            self._cluster_search_progress_rad
-            < self.config.cluster_search_sweep_angle_rad
-        ):
-            return None
-        self._cluster_search_angular_velocity_rad_s *= -1.0
-        # 物理失败记忆不因原地转完一圈解除；一圈产出的是"必须落地"这个决定，
-        # 而不是"忘记失败"。只有"这个目标需要解团"的路由标记随整圈重开。
-        self._breakup_rejected_grasp_ids.clear()
-        return self._commit_after_rotation_budget(timestamp_ns)
-
-    def _commit_after_rotation_budget(self, timestamp_ns: int) -> MatchDecision | None:
-        """一圈用完仍未执行任何动作时，必须推进到合法动作或换位。
-
-        只有场上确实不再有蓝块以外的可收集信息时才允许继续扫描；否则先在
-        失败记忆有效的前提下选择其它合法计划，没有合法计划再执行有界换位。
-        """
-
-        self._reset_rotation_budget()
-        if not self._has_searchable_collectible_information():
-            self._rotation_budget_commit_diagnostic = "rotation_budget_empty_scan"
-            return None
-        blocked_failed_aims = len(self._breakup_failed_aims)
-        completed_attempts = len(self._breakup_attempts)
-        plan = self._choose_breakup_plan(
-            timestamp_ns,
-            approach=False,
-        )
-        if plan is None:
-            self._rotation_budget_commit_diagnostic = (
-                "rotation_budget_no_legal_target "
-                f"blocked_failed_aims={blocked_failed_aims} "
-                f"completed_attempts={completed_attempts}"
-            )
-            return self._start_rotation_budget_relocation(timestamp_ns)
-        self._rotation_budget_commit_diagnostic = (
-            "rotation_budget_commit_alternative "
-            f"aim_id={plan.aim_id} members={plan.member_ids} "
-            f"blocked_failed_aims={blocked_failed_aims} "
-            f"completed_attempts={completed_attempts}"
-        )
-        self._start_breakup_attempt(timestamp_ns, plan)
-        self._breakup_only = True
-        return self._decision(
-            timestamp_ns,
-            0.0,
-            0.0,
-            "rotation_budget_commit",
-            posture=GripperPosture.CLOSED,
-            soft_brake=True,
-        )
-
-    def _start_rotation_budget_relocation(self, timestamp_ns: int) -> MatchDecision:
-        """Use one bounded, statically checked translation when no legal aim remains.
-
-        This is a change of approach geometry, not permission to forget a
-        failed aim.  The failure records stay intact and are re-evaluated only
-        after the encoder-backed translation has actually changed the robot
-        pose.
-        """
-
-        heading = self._latest_heading_rad
-        distance_m = self.config.cluster_relocate_distance_m
-        path_clear = (
-            None
-            if heading is None
-            else self._near_field_segment_clear(heading, distance_m)
-        )
-        if path_clear is not True:
-            detail = "missing_path" if path_clear is None else "path_blocked"
-            self._rotation_budget_commit_diagnostic = (
-                f"rotation_budget_reselect_{detail}"
-            )
-            # This existing path-recovery route waits for a genuinely new
-            # frame; it does not clear failure memory or re-run the same frame.
-            return self._start_path_reselection(
-                timestamp_ns,
-                posture=GripperPosture.CLOSED,
-                reason=f"rotation_budget_reselect_{detail}",
-            )
-        self._begin_cluster_search()
-        self._breakup_only = True
-        self._relocate_forward_base_distance_m = self._latest_cumulative_distance_m
-        self.state = MatchState.RELOCATE_FORWARD
-        self._rotation_budget_commit_diagnostic = (
-            "rotation_budget_relocate "
-            f"distance_mm={distance_m * 1000.0:.1f}"
-        )
-        return self._decision(
-            timestamp_ns,
-            0.0,
-            0.0,
-            "rotation_budget_relocate_start",
-            posture=GripperPosture.CLOSED,
-            soft_brake=True,
-        )
 
     @staticmethod
     def _seconds_to_ns(seconds: float) -> int:
@@ -3174,22 +2717,6 @@ class MatchSequence:
                 self.config.cluster_relocate_distance_m
                 - (cumulative_distance_m - base),
             )
-            path_clear = self._near_field_segment_clear(heading, remaining)
-            if path_clear is None:
-                return replace(
-                    decision,
-                    linear_velocity_m_s=0.0,
-                    angular_velocity_rad_s=0.0,
-                    reason="breakup_safe_zone_guard_missing_pose_or_map",
-                    soft_brake=True,
-                )
-            if not path_clear:
-                return self._start_path_reselection(
-                    decision.timestamp_ns,
-                    posture=decision.gripper_posture,
-                    reason="target_path_intersects_safe_zone_stop_and_reselect",
-                )
-            return decision
         blocked = self._safe_zone_path_blocked(heading, remaining)
         if blocked is None:
             return replace(decision, linear_velocity_m_s=0.0, angular_velocity_rad_s=0.0,
@@ -3397,11 +2924,6 @@ class MatchSequence:
             and target.target_class is TargetClass.GREEN_SUPPLY
             and target.ever_confirmed
             and self._target_is_fresh(target, timestamp_ns)
-            # 已交付绿色同样不能作为首轮优先候选。
-            and not self._ground_in_safe_zone(
-                target.ground_point, target.last_seen_timestamp_ns
-            )
-            and not self._target_overlaps_safe_zone_bbox(target.box)
         )
 
     def _largest_ground_group(
@@ -3526,15 +3048,6 @@ class MatchSequence:
         self._cluster_selected_track_ids = ()
         self._breakup_only = False
         self._selected_green_ground = target.ground_point
-        self._green_target_field_point = self._field_point_for_target(target)
-        self._green_alignment_target_heading_rad = None
-        self._green_turn_start_heading_rad = None
-        self._green_turn_direction = 0.0
-        self._green_turn_budget_rad = 0.0
-        self._green_turn_progress_rad = 0.0
-        self._green_turn_attempts = 0
-        self._green_turn_active = False
-        self._green_alignment_wait_since_ns = None
         self._opportunistic_single_green = opportunistic
         self._near_field_group_preview = group_preview
         self._green_realign_pending = False
@@ -3803,6 +3316,13 @@ class MatchSequence:
                                                    opportunistic=direct, group_preview=not direct)
         if (
             not self._breakup_only
+            and self._single_green_side_neighbor_requires_breakup(timestamp_ns)
+        ):
+            # 单绿旁边纵向齐平地贴着蓝/橙，且没有可共同收拢的其它
+            # 绿/黑时，搜索态直接转入解团，不先接近到近场。
+            return self._enter_breakup_only_search(timestamp_ns)
+        if (
+            not self._breakup_only
             and self._first_green_forward_corridor_blocked(timestamp_ns)
         ):
             # 首轮最近绿块已经被前向走廊中的其它目标挡住时，直接进入
@@ -3820,9 +3340,7 @@ class MatchSequence:
                 )
         measurement = self._cluster_ground_measurement(timestamp_ns)
         if measurement is None:
-            committed = self._advance_cluster_search_sweep(timestamp_ns, heading_rad)
-            if committed is not None:
-                return committed
+            self._advance_cluster_search_sweep(heading_rad)
             rejection = self._last_cluster_rejection_reason
             self._last_cluster_rejection_reason = None
             reason = (
@@ -4111,15 +3629,10 @@ class MatchSequence:
                           f"preparation_capture_ns={None if preparation is None else preparation.capture_timestamp_ns},"
                           f"last_capture_ns={self._breakup_last_capture_ns},"
                           f"deadline_ns={self._breakup_observation_deadline_ns},"
-                          f"no_plan_since_ns={self._breakup_no_plan_since_ns},"
-                          f"no_plan_window_ms={self.config.breakup_no_plan_reobserve_ms},"
-                          f"failed_regions={len(self._breakup_failed_aims)},"
-                          f"rotation={self._rotation_budget_text()},"
+                          f"failed_regions={len(self._breakup_failed_regions)},"
                           f"{self._stationary_motion.diagnostic(timestamp_ns)},")
             if plan is None:
-                return (diagnostic
-                        + f"none,rejection={self._last_cluster_rejection_reason}"
-                        + f",rejected_candidates=[{';'.join(self._breakup_plan_rejections)}]")
+                return diagnostic + f"none,rejection={self._last_cluster_rejection_reason}"
             return (diagnostic + f"aim={plan.aim_id}@({plan.aim.x:.1f},{plan.aim.y:.1f}),"
                     f"members={plan.member_ids},contact={plan.contact_ids},attempt={plan.attempt},"
                     f"approach_mm={plan.approach_distance_mm:.1f},forward_mm={plan.forward_distance_mm:.1f},"
@@ -4160,7 +3673,6 @@ class MatchSequence:
             (target, group_size)
             for target in self._tracker.tracks
             if self._target_is_fresh(target, timestamp_ns)
-            and not self._target_attempt_blocked(target, timestamp_ns)
             for group_size in (
                 self._transport_group_size(target, timestamp_ns)
                 if self._near_field_pickup is not None
@@ -4217,7 +3729,6 @@ class MatchSequence:
             target
             for target in self._tracker.tracks
             if self._target_is_fresh(target, timestamp_ns)
-            and not self._target_attempt_blocked(target, timestamp_ns)
             and target.target_class is TargetClass.GREEN_SUPPLY
             and self._graspable_target_is_usable(target)
             and target.ground_point is not None
@@ -4281,7 +3792,6 @@ class MatchSequence:
             target
             for target in self._tracker.tracks
             if self._target_is_fresh(target, timestamp_ns)
-            and not self._target_attempt_blocked(target, timestamp_ns)
             and (not self._dynamic_breakup_enabled or target.track_id not in self._breakup_rejected_grasp_ids)
             and target.target_class in policy.allowed_classes
             and self._graspable_target_is_usable(target)
@@ -4329,7 +3839,6 @@ class MatchSequence:
             point = target.ground_point
             if (
                 not self._target_is_fresh(target, timestamp_ns)
-                or self._target_attempt_blocked(target, timestamp_ns)
                 or target.target_class not in policy.allowed_classes
                 or not self._graspable_target_is_usable(target)
                 or point is None
@@ -4428,25 +3937,9 @@ class MatchSequence:
                 first_green_corridor_forbidden
                 or side_neighbor_no_safe_plan
                 or any(
-                    (
-                        reason.startswith("blocked_target:")
-                        or (
-                            self._dynamic_breakup_enabled
-                            and (
-                                reason
-                                in {
-                                    "incidental_capacity_exceeded",
-                                    "maximum_opening_exceeded",
-                                }
-                                # 对准后仍够不到的目标（夹爪末端越不过中线、
-                                # 开口物理不够）不是数据问题，等下去也不会好，
-                                # 直接进入解团把目标分开再夹。
-                                or reason.startswith(
-                                    ("left_tip_y_mm", "right_tip_y_mm")
-                                )
-                            )
-                        )
-                    )
+                    (reason.startswith("blocked_target:") or (self._dynamic_breakup_enabled and reason in {
+                        "incidental_capacity_exceeded", "maximum_opening_exceeded",
+                    }))
                     for reason in rejection_reasons
                 )
             )
@@ -4480,7 +3973,6 @@ class MatchSequence:
                     if side_neighbor_no_safe_plan
                     else "geometric_blocked_target"
                 ),
-                timestamp_ns=timestamp_ns,
             )
             return route
         if plan is not None:
@@ -4497,10 +3989,8 @@ class MatchSequence:
                 rejection_reasons=rejection_reasons,
                 elapsed_ms=elapsed_ms,
             )
-        # 无方案等待用独立的短预算：车已停稳、场景静止，重复观测不会改变
-        # 门禁结果，等满提交预算只是空转。提交窗口的预算见
-        # ``_near_field_handoff_timeout_ms``，只用于停稳后当前帧的提交。
-        if elapsed_ms < self._near_field_no_plan_wait_ms():
+        timeout_ms = self._near_field_handoff_timeout_ms()
+        if elapsed_ms < timeout_ms:
             return None
         if self._near_field_far_reapproach_used:
             self._near_field_route = GraspRoute.RESELECT
@@ -4516,7 +4006,6 @@ class MatchSequence:
                 route,
                 preparation,
                 kind="confirmation_timeout_after_reapproach",
-                timestamp_ns=timestamp_ns,
             )
             return route
         far_target = (
@@ -4548,247 +4037,12 @@ class MatchSequence:
             route,
             preparation,
             kind="confirmation_timeout_reselect",
-            timestamp_ns=timestamp_ns,
         )
         return route
 
     def _near_field_handoff_timeout_ms(self) -> float:
         config = self._near_field_grasp_config
-        return (
-            NearFieldGraspConfig().alignment_timeout_ms
-            if config is None
-            else float(config.alignment_timeout_ms)
-        ) + (0.0 if self._near_field_pickup is None else self._near_field_pickup.alignment_motion_allowance_ns / 1e6)
-
-    def _near_field_no_plan_wait_ms(self) -> float:
-        """完全选不出方案时的等待上限；不影响停稳后当前帧的提交预算。"""
-
-        config = self._near_field_grasp_config
-        # 近场未启用时本路径不可达；与 NearFieldGraspConfig 默认值保持一致。
-        return (
-            NearFieldGraspConfig().no_plan_wait_ms
-            if config is None
-            else float(config.no_plan_wait_ms)
-        )
-
-    @staticmethod
-    def _near_field_confirmation_progress(
-        preparation: GraspPreparation | None,
-    ) -> str:
-        if preparation is None:
-            return "none"
-        return f"{preparation.confirmation_count}/{preparation.confirmation_required}"
-
-    @staticmethod
-    def _preparation_observation_age_ms(
-        preparation: GraspPreparation | None,
-        timestamp_ns: int,
-    ) -> str:
-        if preparation is None or timestamp_ns < preparation.capture_timestamp_ns:
-            return "none"
-        return f"{(timestamp_ns - preparation.capture_timestamp_ns) / 1_000_000.0:.1f}"
-
-    @staticmethod
-    def _preparation_result_age_ms(
-        preparation: GraspPreparation | None,
-        timestamp_ns: int,
-    ) -> str:
-        if preparation is None:
-            return "none"
-        prepared = preparation.prepared_timestamp_ns or preparation.result_timestamp_ns
-        if prepared is None or timestamp_ns < prepared:
-            return "none"
-        return f"{(timestamp_ns - prepared) / 1_000_000.0:.1f}"
-
-    def _failure_region_points(
-        self,
-        timestamp_ns: int,
-        preparation: GraspPreparation | None,
-    ) -> tuple[FieldPoint, ...]:
-        """Return physical field points for the failed action core/region."""
-
-        points: list[FieldPoint] = []
-        for member in self._failure_core_members(preparation):
-            ground = member.observation.ground_point
-            if ground is None:
-                continue
-            current = self._ground_point_at_now(
-                ground,
-                member.observation.capture_timestamp_ns,
-                timestamp_ns,
-            )
-            if current is None:
-                current = ground
-            field = self._field_point_from_ground(current)
-            if field is not None:
-                points.append(field)
-        # 计划成员已经给出物理核心时不再按主 tracker ID 追加第二个点：
-        # 两个编号空间不同，混入的 ID 点会无故扩大被封锁区域。
-        target = None if points else self._selected_target()
-        if target is not None:
-            current = self._current_ground_point_for_track(target, timestamp_ns)
-            if current is not None:
-                field = self._field_point_from_ground(current)
-                if field is not None:
-                    points.append(field)
-        if not points and self._near_field_handoff_prior is not None:
-            field = self._field_point_from_ground(
-                self._near_field_handoff_prior.ground_point
-            )
-            if field is not None:
-                points.append(field)
-        unique: list[FieldPoint] = []
-        for point in points:
-            if not any(
-                math.hypot(point.x - existing.x, point.y - existing.y) <= 1e-6
-                for existing in unique
-            ):
-                unique.append(point)
-        return tuple(unique)
-
-    def _failure_core_members(
-        self,
-        preparation: GraspPreparation | None,
-    ) -> tuple[GraspTarget, ...]:
-        """返回本次尝试实际指向的物理核心成员。
-
-        主 tracker 与近场会话各自编号，失败记录必须绑定计划成员的当前
-        几何；按 ID 回查主 tracker 可能取到另一个物理目标。
-        """
-
-        plan = None if preparation is None else (
-            preparation.selection.plan or preparation.selection.preview_plan
-        )
-        if plan is None and self._near_field_pickup is not None:
-            plan = self._near_field_pickup.active_plan
-        return () if plan is None else plan.members
-
-    def _remember_near_field_failure(
-        self,
-        timestamp_ns: int,
-        reason: str,
-        preparation: GraspPreparation | None = None,
-    ) -> None:
-        """Record a failure so a new session cannot retry unchanged geometry."""
-
-        core = self._failure_core_members(preparation)
-        relative = None
-        target_class = None
-        track_id = None
-        if core:
-            member = core[0]
-            target_class = member.observation.target_class
-            relative = member.observation.ground_point
-            current = (
-                None
-                if relative is None
-                else self._ground_point_at_now(
-                    relative,
-                    member.observation.capture_timestamp_ns,
-                    timestamp_ns,
-                )
-            )
-            relative = current if current is not None else relative
-            # 几何与 ID 取自同一物理成员：近场局部 ID 与主 tracker ID 不同源，
-            # 混用会让诊断指向另一个目标。
-            track_id = member.track_id
-        else:
-            target = self._selected_target()
-            if target is not None:
-                target_class = target.target_class
-                track_id = target.track_id
-                relative = self._current_ground_point_for_track(target, timestamp_ns)
-        if target_class is None and self._near_field_handoff_prior is not None:
-            target_class = self._near_field_handoff_prior.target_class
-            relative = self._near_field_handoff_prior.ground_point
-            track_id = self._near_field_handoff_prior.source_track_id
-        region_points = self._failure_region_points(timestamp_ns, preparation)
-        position = self.estimated_field_position
-        field_point = None if relative is None else self._field_point_from_ground(relative)
-        record = _AttemptFailureRecord(
-            target_class,
-            relative,
-            field_point,
-            position,
-            self._latest_heading_rad,
-            track_id,
-            reason,
-            timestamp_ns,
-            region_points,
-        )
-        if self._near_field_failures:
-            previous = self._near_field_failures[-1]
-            if (
-                previous.reason == reason
-                and previous.field_point == field_point
-                and timestamp_ns - previous.timestamp_ns < 1_000_000_000
-            ):
-                return
-        self._near_field_failures.append(record)
-        del self._near_field_failures[:-32]
-        region_text = "none" if not region_points else ";".join(
-            f"({point.x:.1f},{point.y:.1f})" for point in region_points
-        )
-        if self._near_field_last_failure_diagnostic is not None:
-            self._near_field_last_failure_diagnostic += (
-                f" track_id={track_id if track_id is not None else 'none'}"
-                f" target_class={target_class.value if target_class is not None else 'none'}"
-                f" region_field={region_text}"
-                f" failure_records={len(self._near_field_failures)}"
-            )
-
-    def _target_attempt_blocked(
-        self,
-        target: TrackedTarget,
-        timestamp_ns: int,
-    ) -> bool:
-        """Reject only unchanged physical attempts, independent of tracker ID."""
-
-        current = self._current_ground_point_for_track(target, timestamp_ns)
-        if current is None:
-            return False
-        current_field = self._field_point_from_ground(current)
-        for failure in self._near_field_failures:
-            same_region = False
-            if current_field is not None and failure.region_field_points:
-                same_region = any(
-                    math.hypot(
-                        current_field.x - point.x,
-                        current_field.y - point.y,
-                    )
-                    <= max(120.0, self.config.cluster_group_ground_mm)
-                    for point in failure.region_field_points
-                )
-            elif current_field is not None and failure.field_point is not None:
-                same_region = math.hypot(
-                    current_field.x - failure.field_point.x,
-                    current_field.y - failure.field_point.y,
-                ) <= max(120.0, self.config.cluster_group_ground_mm)
-            elif failure.relative_point is not None:
-                same_region = math.hypot(
-                    current.x - failure.relative_point.x,
-                    current.y - failure.relative_point.y,
-                ) <= max(120.0, self.config.cluster_group_ground_mm)
-            if not same_region:
-                continue
-            geometry_changed = (
-                current_field is not None and failure.field_point is not None
-                and math.hypot(current_field.x - failure.field_point.x,
-                               current_field.y - failure.field_point.y) >= 100.0
-            )
-            current_position = self.estimated_field_position
-            if (
-                not geometry_changed
-                and failure.robot_position is not None
-                and current_position is not None
-            ):
-                geometry_changed = math.hypot(
-                    current_position.x - failure.robot_position.x,
-                    current_position.y - failure.robot_position.y,
-                ) >= 100.0
-            if not geometry_changed:
-                return True
-        return False
+        return 8_000.0 if config is None else float(config.alignment_timeout_ms)
 
     def _record_near_field_route_failure(
         self,
@@ -4796,7 +4050,6 @@ class MatchSequence:
         preparation: GraspPreparation | None,
         *,
         kind: str,
-        timestamp_ns: int | None = None,
     ) -> None:
         """保留近场路由失败的细节，供状态切换后的终端日志输出。"""
 
@@ -4813,17 +4066,6 @@ class MatchSequence:
             if preparation is None or preparation.checked_member_ids is None
             else ",".join(str(item) for item in preparation.checked_member_ids)
         )
-        attempt_deadline_ns = (
-            None
-            if self._near_field_confirmation_started_ns is None
-            else self._near_field_confirmation_started_ns
-            + round(self._near_field_handoff_timeout_ms() * 1_000_000.0)
-        )
-        failure_timestamp_ns = (
-            (self._last_timestamp_ns or 0)
-            if timestamp_ns is None
-            else timestamp_ns
-        )
         self._near_field_last_failure_diagnostic = (
             "near_field_confirmation_failure "
             f"kind={kind} session={self._near_field_session_id} "
@@ -4834,62 +4076,14 @@ class MatchSequence:
             f"handoff_prior_class={prior_class} "
             f"handoff_prior_match_ids="
             f"{','.join(str(item) for item in matched_ids) or 'none'} "
-            f"rejections={rejection} "
-            f"confirmation_progress={self._near_field_confirmation_progress(preparation)} "
-            f"observation_age_ms={self._preparation_observation_age_ms(preparation, failure_timestamp_ns)} "
-            f"preparation_age_ms={self._preparation_result_age_ms(preparation, failure_timestamp_ns)} "
-            f"attempt_deadline_ns={attempt_deadline_ns if attempt_deadline_ns is not None else 'none'}"
+            f"rejections={rejection}"
         )
-        self._remember_near_field_failure(
-            failure_timestamp_ns,
-            kind,
-            preparation,
-        )
-
-    def _breakup_plan_for_this_frame(self, timestamp_ns: int) -> BreakupPlan | None:
-        """同一输入帧最多求一次接触计划，逐控制周期重复跑边界搜索不改变结果。"""
-
-        perception = self._latest_perception
-        key = (
-            None
-            if perception is None
-            else (perception.frame_sequence, perception.capture_timestamp_ns)
-        )
-        if key is not None and key == self._breakup_search_frame:
-            return None
-        self._breakup_search_frame = key
-        return self._choose_breakup_plan(timestamp_ns)
 
     def _enter_breakup_only_search(self, timestamp_ns: int) -> MatchDecision:
         """近场没有安全方案时只进入解团搜索，禁止同帧重入机会抓取。"""
 
         if self._greedy_active:
             return self._finish_greedy_pickup(timestamp_ns, "no_direct_plan")
-        plan = (
-            self._breakup_plan_for_this_frame(timestamp_ns)
-            if self._dynamic_breakup_enabled
-            else None
-        )
-        if self._dynamic_breakup_enabled and plan is None:
-            # 当前帧已经明确选不出合法接触计划：停车、停稳和重观测窗口都不会
-            # 改变这个结论，按失败记忆带原因重选，不为不可能的动作停下。
-            return self._return_to_near_field_search(
-                timestamp_ns,
-                "breakup_no_contact_plan",
-            )
-        if (
-            self._near_field_last_failure_diagnostic is None
-            or f"session={self._near_field_session_id}" not in self._near_field_last_failure_diagnostic
-        ):
-            self._near_field_last_failure_diagnostic = (
-                "near_field_route_failure "
-                f"kind=near_field_geometric_block_breakup session={self._near_field_session_id}"
-            )
-        self._remember_near_field_failure(
-            timestamp_ns,
-            "near_field_geometric_block_breakup",
-            self._breakup_grasp_preparation,
-        )
         if self._dynamic_breakup_enabled and self._selected_track_id is not None:
             self._breakup_rejected_grasp_ids.add(self._selected_track_id)
         self._near_field_route = GraspRoute.BREAKUP
@@ -4903,11 +4097,6 @@ class MatchSequence:
         self._begin_cluster_search()
         self._breakup_only = True
         self.state = MatchState.SEARCH_CLUSTER
-        if self._dynamic_breakup_enabled:
-            assert plan is not None
-            self._start_breakup_attempt(timestamp_ns, plan)
-            self._breakup_only = True
-            return self._decision(timestamp_ns, 0.0, 0.0, "near_field_route:breakup", posture=GripperPosture.CLOSED, soft_brake=True)
         return self._decision(
             timestamp_ns,
             0.0,
@@ -4925,11 +4114,6 @@ class MatchSequence:
 
         if self._greedy_active:
             return self._finish_greedy_pickup(timestamp_ns, reason)
-        self._remember_near_field_failure(
-            timestamp_ns,
-            reason,
-            self._breakup_grasp_preparation,
-        )
         self._near_field_handoff_prior = None
         if self._near_field_pickup is not None:
             self._near_field_pickup.reset()
@@ -5154,9 +4338,6 @@ class MatchSequence:
         橙色邻近隔离只约束单橙目标；绿/黑候选不因橙色侧邻被拒绝。
         """
 
-        if target.target_class in {TargetClass.GREEN_SUPPLY, TargetClass.BLACK_CORE}:
-            # The near-field planner checks actual swept geometry including blue extent.
-            return None
         point = target.ground_point
         if point is None:
             return None
@@ -5200,6 +4381,75 @@ class MatchSequence:
                 return other
         return None
 
+    def _transport_adjacent_supply_target(
+        self,
+        target: TrackedTarget,
+        timestamp_ns: int,
+        *,
+        tracks: tuple[TrackedTarget, ...] | None = None,
+    ) -> TrackedTarget | None:
+        """返回预测抓取方向下横向邻近的其它绿/黑物资。"""
+
+        point = target.ground_point
+        if point is None:
+            return None
+        config = self._near_field_grasp_config
+        longitudinal_margin = (
+            60.0
+            if config is None
+            else config.side_neighbor_longitudinal_margin_mm
+        )
+        lateral_margin = (
+            90.0
+            if config is None
+            else config.side_neighbor_lateral_margin_mm
+        )
+        target_range_mm = math.hypot(point.x, point.y)
+        source_tracks = self._tracker.tracks if tracks is None else tuple(tracks)
+        for other in source_tracks:
+            if (
+                other.track_id == target.track_id
+                or not self._target_is_fresh(other, timestamp_ns)
+                or other.target_class
+                not in {TargetClass.GREEN_SUPPLY, TargetClass.BLACK_CORE}
+                or other.ground_point is None
+            ):
+                continue
+            relative = self._target_aligned_coordinates(
+                point,
+                other.ground_point,
+            )
+            if relative is None:
+                continue
+            forward_mm, lateral_mm = relative
+            if (
+                abs(forward_mm - target_range_mm) <= longitudinal_margin
+                and 1e-6 < abs(lateral_mm) <= lateral_margin
+            ):
+                return other
+        return None
+
+    def _single_green_side_neighbor_requires_breakup(
+        self,
+        timestamp_ns: int,
+    ) -> bool:
+        """判断单绿侧邻蓝且没有可增益绿黑时是否应先解团。"""
+
+        for target in self._tracker.tracks:
+            if (
+                not self._target_is_fresh(target, timestamp_ns)
+                or target.target_class is not TargetClass.GREEN_SUPPLY
+                or not self._graspable_target_is_usable(target)
+                or target.ground_point is None
+                or not self._point_in_transport_corridor(target.ground_point)
+            ):
+                continue
+            if self._transport_side_neighbor_target(target, timestamp_ns) is None:
+                continue
+            if self._transport_adjacent_supply_target(target, timestamp_ns) is None:
+                return True
+        return False
+
     def _transport_group_size(
         self,
         target: TrackedTarget,
@@ -5221,17 +4471,6 @@ class MatchSequence:
             or self._candidate_path_blocked(point, breakup=False)
         ):
             return None
-        stowed_limit = (
-            self._greedy_new_target_min_x_mm()
-            if self._greedy_active
-            else None
-        )
-        if (
-            stowed_limit is not None
-            and target.target_class is not TargetClass.BLUE_DANGER
-            and point.x <= stowed_limit
-        ):
-            return None
         policy = self.near_field_policy
         member_count = 1
         if target.target_class not in policy.allowed_classes:
@@ -5249,14 +4488,6 @@ class MatchSequence:
                 continue
             other_point = other.ground_point
             if other_point is None:
-                continue
-            if (
-                stowed_limit is not None
-                and other.target_class is not TargetClass.BLUE_DANGER
-                and other_point.x <= stowed_limit
-            ):
-                # Carried/delivered material is not a new member for capacity,
-                # but it remains in the scene for the eventual sweep check.
                 continue
             if not self._point_in_transport_corridor(
                 other_point,
@@ -5312,9 +4543,9 @@ class MatchSequence:
         """判断目标接近走廊是否为空，坐标均为机器人地面系 mm。
 
         普通绿色接近要求目标在车前方；预闭爪重新对准可显式放宽这一条件。
-        其它新鲜目标投影到“机器人到目标”的相对坐标后，只要满足
-        ``0 <= aligned_forward < target_range`` 且横向中心距不超过
-        ``_path_block_half_width_mm`` 即视为阻挡。
+        其它新鲜目标投影到“机器人到目标”的相对坐标后，
+        只要满足 ``0 <= aligned_forward < target_range`` 且
+        ``abs(aligned_lateral) <= green_path_half_width_mm`` 即视为阻挡。
         没有地面坐标的其它目标按保守策略拒绝，因为无法证明走廊为空。
         """
 
@@ -5341,16 +4572,13 @@ class MatchSequence:
         机器人左/右侧时，仍能正确判断其前方是否有其它物块。预闭爪候选重选
         阶段不主动转向搜索；候选进入通用对准动作后，可用 ``allow_behind=True``
         接受车后目标。
-
-        横向阻挡门限按两块实体的内切半径之和加实际夹爪余量计算
-        （见 ``_path_block_half_width_mm``）：固定半宽和外接半径会把只是
-        近旁、并不在夹取路径上的异类目标当成阻挡，制造不必要的解团。
-        调用方可用 ``lateral_half_width_mm`` 显式指定固定包络门限。
         """
 
         if not self._graspable_target_is_usable(target):
             return False
-        if lateral_half_width_mm is not None and (
+        if lateral_half_width_mm is None:
+            lateral_half_width_mm = self.config.green_path_half_width_mm
+        elif (
             isinstance(lateral_half_width_mm, bool)
             or not isinstance(lateral_half_width_mm, (int, float))
             or not math.isfinite(float(lateral_half_width_mm))
@@ -5382,43 +4610,12 @@ class MatchSequence:
             if relative is None:
                 return False
             other_forward_mm, other_lateral_mm = relative
-            if not 0.0 <= other_forward_mm < target_range_mm:
-                continue
-            threshold_mm = (
-                lateral_half_width_mm
-                if lateral_half_width_mm is not None
-                else self._path_block_half_width_mm(
-                    target.target_class,
-                    other.target_class,
-                )
-            )
-            if abs(other_lateral_mm) <= threshold_mm:
+            if (
+                0.0 <= other_forward_mm < target_range_mm
+                and abs(other_lateral_mm) <= lateral_half_width_mm
+            ):
                 return False
         return True
-
-    def _path_block_half_width_mm(
-        self,
-        reference_class: TargetClass,
-        other_class: TargetClass,
-    ) -> float:
-        """返回其它目标算作“位于夹取路径上”的横向中心距门限，单位 mm。
-
-        只按两块实体的内切半径之和叠加实际夹爪余量：目标包络外侧的一半
-        ``clearance_mm`` 加近场走廊横向安全余量。外接半径和固定半宽会把
-        只是近旁、并不在夹取路径上的异类目标当成阻挡，使搜索提前进入解团；
-        内切半径是两块实体确实可能接触的距离，因此门限内才真正需要阻挡。
-        缺少目标物理尺寸配置的纯逻辑调用方回退到
-        ``green_path_half_width_mm``。
-        """
-
-        geometry = self._breakup_target_geometry
-        if geometry is None:
-            return float(self.config.green_path_half_width_mm)
-        return (
-            physical_radii(geometry.geometry_for(reference_class))[0]
-            + physical_radii(geometry.geometry_for(other_class))[0]
-            + self._path_corridor_margin_mm
-        )
 
     @staticmethod
     def _target_aligned_coordinates(
@@ -5442,13 +4639,8 @@ class MatchSequence:
         reference: GroundPoint | None,
         other: TrackedTarget,
         timestamp_ns: int,
-        reference_class: TargetClass | None = None,
     ) -> tuple[str, bool]:
-        """格式化相对走廊中的其它目标，并返回实际几何阻挡标记。
-
-        门限与 ``_green_path_is_clear_for_point`` 使用同一个按实体尺寸计算的
-        数值，日志里的 ``threshold_lateral_mm`` 就是当时实际采用的门限。
-        """
+        """格式化相对走廊中的其它目标，并返回实际几何阻挡标记。"""
 
         fresh = self._target_is_fresh(other, timestamp_ns)
         consumed = (
@@ -5470,11 +4662,6 @@ class MatchSequence:
 
         geometrically_blocked = False
         unknown_ground = fresh and point is None and not consumed
-        threshold_mm = (
-            self._path_block_half_width_mm(reference_class, other.target_class)
-            if reference_class is not None
-            else self.config.green_path_half_width_mm
-        )
         if (
             fresh
             and not consumed
@@ -5484,7 +4671,7 @@ class MatchSequence:
             reference_range_mm = math.hypot(reference.x, reference.y)
             geometrically_blocked = (
                 0.0 <= relative[0] < reference_range_mm
-                and abs(relative[1]) <= threshold_mm
+                and abs(relative[1]) <= self.config.green_path_half_width_mm
             )
         blocked_text = (
             "not_applicable_no_ground"
@@ -5495,7 +4682,6 @@ class MatchSequence:
             f"track={other.track_id},class={other.target_class.value},"
             f"xy={point_text},fresh={fresh},"
             f"aligned_forward={forward_text},aligned_lateral={lateral_text},"
-            f"threshold_lateral_mm={threshold_mm:.1f},"
             f"consumed={consumed},"
             f"blocked={blocked_text}",
             geometrically_blocked,
@@ -5505,7 +4691,7 @@ class MatchSequence:
         """返回绿色候选及所有其它目标的相对走廊诊断。
 
         保留原方法名以兼容日志调用方，但现在每个其它目标都会输出类别、原始
-        GroundPoint、新鲜度、目标对齐坐标、实际门限和阻挡结果。
+        GroundPoint、新鲜度、目标对齐坐标和阻挡结果。
         """
 
         tracks = self._tracker.tracks
@@ -5513,6 +4699,9 @@ class MatchSequence:
             target
             for target in tracks
             if target.target_class is TargetClass.GREEN_SUPPLY
+        )
+        threshold_prefix = (
+            f"threshold_lateral_mm={self.config.green_path_half_width_mm:.1f};"
         )
         if not green_tracks:
             other_entries = ",".join(
@@ -5524,7 +4713,7 @@ class MatchSequence:
                 )
                 for other in tracks
             )
-            return "green=none;others=" + (other_entries or "none")
+            return threshold_prefix + "green=none;others=" + (other_entries or "none")
 
         entries: list[str] = []
         for target in green_tracks:
@@ -5551,7 +4740,6 @@ class MatchSequence:
                         point,
                         other,
                         timestamp_ns,
-                        target.target_class,
                     )
                     other_entries.append(detail)
                     if reason == "path_clear" and blocked:
@@ -5561,7 +4749,7 @@ class MatchSequence:
                 f"xy={point_text},fresh={fresh},status={target.status.value},"
                 f"path={reason},others=[{'|'.join(other_entries) or 'none'}]"
             )
-        return ";".join(entries)
+        return threshold_prefix + ";".join(entries)
 
     def green_target_diagnostic(self, timestamp_ns: int) -> str:
         """返回绿/黑物资轨迹、选中标记及实时坐标和新鲜度。"""
@@ -5780,12 +4968,6 @@ class MatchSequence:
     ) -> MatchDecision:
         """按编码器距离接近绿色目标，并在闭爪前复核近距离绿色物块。"""
 
-        if self._near_field_pickup is not None:
-            return self._step_formal_green_approach(
-                timestamp_ns,
-                cumulative_distance_m,
-            )
-
         settling = self._consume_action_settle(
             timestamp_ns,
             "green_before_approach",
@@ -5901,373 +5083,8 @@ class MatchSequence:
             posture=GripperPosture.TRANSPORT,
         )
 
-    def _current_ground_point_for_track(
-        self,
-        target: TrackedTarget,
-        timestamp_ns: int,
-    ) -> GroundPoint | None:
-        point = target.ground_point
-        if point is None or not self._target_is_fresh(target, timestamp_ns):
-            return None
-        if target.last_seen_timestamp_ns == timestamp_ns:
-            return point
-        return self._ground_point_at_now(
-            point,
-            target.last_seen_timestamp_ns,
-            timestamp_ns,
-        )
-
-    def _green_path_is_clear_at_now(
-        self,
-        target: TrackedTarget,
-        point: GroundPoint,
-        timestamp_ns: int,
-    ) -> bool:
-        """Check the approach corridor using capture-time pose alignment."""
-
-        if point.x <= 0.0 or self._candidate_path_blocked(point, breakup=False):
-            return False
-        target_range_mm = math.hypot(point.x, point.y)
-        if target_range_mm <= 1e-6:
-            return False
-        position = self.estimated_field_position
-        if self._green_target_field_point is None:
-            self._formal_green_target_heading(timestamp_ns, point)
-        target_field = self._green_target_field_point
-        if position is None or target_field is None:
-            return False
-        approach_distance_mm = max(
-            0.0,
-            target_range_mm - self._near_field_handoff_range_mm(),
-        )
-        bearing = math.atan2(
-            target_field.y - position.y,
-            target_field.x - position.x,
-        )
-        endpoint = FieldPoint(
-            position.x + approach_distance_mm * math.cos(bearing),
-            position.y + approach_distance_mm * math.sin(bearing),
-        )
-        low_x, high_x, low_y, high_y = self._breakup_allowed_field_bounds()
-        margin = self._breakup_clearance_mm
-        if not (
-            low_x + margin <= position.x <= high_x - margin
-            and low_y + margin <= position.y <= high_y - margin
-            and low_x + margin <= endpoint.x <= high_x - margin
-            and low_y + margin <= endpoint.y <= high_y - margin
-        ):
-            return False
-        for other in self._tracker.tracks:
-            if (
-                other.track_id == target.track_id
-                or other.track_id in self._green_preclose_consumed_track_ids
-                or not self._target_is_fresh(other, timestamp_ns)
-            ):
-                continue
-            other_point = self._current_ground_point_for_track(other, timestamp_ns)
-            if other_point is None:
-                if other.target_class in {TargetClass.BLUE_DANGER}:
-                    return False
-                continue
-            relative = self._target_aligned_coordinates(point, other_point)
-            if relative is None:
-                return False
-            if 0.0 <= relative[0] < target_range_mm and abs(relative[1]) <= (
-                self._path_block_half_width_mm(
-                    target.target_class,
-                    other.target_class,
-                )
-            ):
-                return False
-        return True
-
-    def _formal_green_target_heading(
-        self,
-        timestamp_ns: int,
-        point: GroundPoint,
-    ) -> float | None:
-        """Return the field heading to the target from measured pose."""
-
-        position = self.estimated_field_position
-        if position is None:
-            return None
-        if self._green_target_field_point is None:
-            pose = self._pose_at(timestamp_ns)
-            if pose is None:
-                # A caller may provide a current-frame diagnostic reference
-                # without a capture history.  It is safe to anchor that one
-                # point at the current pose; later stale captures still return
-                # ``None`` and cannot be time-compensated.
-                if self._latest_heading_rad is None:
-                    return None
-                position = self.estimated_field_position
-                if position is None:
-                    return None
-                self._green_target_field_point = FieldPoint(
-                    position.x
-                    + math.cos(self._latest_heading_rad) * point.x
-                    - math.sin(self._latest_heading_rad) * point.y,
-                    position.y
-                    + math.sin(self._latest_heading_rad) * point.x
-                    + math.cos(self._latest_heading_rad) * point.y,
-                )
-            else:
-                self._green_target_field_point = self._field_point_from_pose(
-                    pose,
-                    point,
-                )
-        return math.atan2(
-            self._green_target_field_point.y - position.y,
-            self._green_target_field_point.x - position.x,
-        )
-
-    def _begin_formal_green_approach(
-        self,
-        timestamp_ns: int,
-        point: GroundPoint,
-        target_heading_rad: float,
-    ) -> MatchDecision:
-        self._green_alignment_target_heading_rad = target_heading_rad
-        self._green_turn_active = False
-        self._green_alignment_wait_since_ns = None
-        self._green_approach_base_distance_m = self._latest_cumulative_distance_m
-        self._green_approach_distance_m = max(
-            0.0,
-            (math.hypot(point.x, point.y) - self._near_field_handoff_range_mm())
-            / 1000.0,
-        )
-        self._green_realign_pending = False
-        self._green_realign_done = True
-        self.state = MatchState.TRANSPORT_APPROACH_GREEN
-        self._begin_action_settle(timestamp_ns, "green_before_approach")
-        return self._decision(
-            timestamp_ns,
-            0.0,
-            0.0,
-            "green_aligned_start_imu_approach",
-            posture=GripperPosture.TRANSPORT,
-        )
-
-    def _step_formal_green_align(self, timestamp_ns: int) -> MatchDecision:
-        """Coarsely align with IMU feedback until the gripper can reach the target."""
-
-        for phase, reason in (
-            ("green_reference", "green_waiting_before_current_geometry"),
-            ("green_realign", "green_waiting_after_bounded_turn"),
-            ("green_preclose_realign", "green_waiting_before_bounded_turn"),
-        ):
-            settling = self._consume_action_settle(
-                timestamp_ns,
-                phase,
-                posture=GripperPosture.TRANSPORT,
-                reason=reason,
-            )
-            if settling is not None:
-                return settling
-
-        target = self._selected_target()
-        point = None if target is None else self._selected_green_point(timestamp_ns)
-        if point is None and target is None and self._green_reference is not None:
-            # This fallback serves pure-logic callers that seed a reference
-            # directly.  Production match always has a selected tracker target.
-            point = self._green_reference
-        if point is None:
-            return self._hold_or_restart_green_target(timestamp_ns)
-        if self._near_field_pickup is not None and math.hypot(point.x, point.y) <= self._near_field_handoff_range_mm():
-            return self._begin_near_field_grasp(
-                timestamp_ns,
-                handoff_prior=self._selected_handoff_prior(timestamp_ns),
-            )
-        if target is not None and not self._green_path_is_clear_at_now(target, point, timestamp_ns):
-            if self._dynamic_breakup_enabled and not self._candidate_path_blocked(point, breakup=False):
-                return self._enter_breakup_only_search(timestamp_ns)
-            self._selected_track_id = None
-            self._selected_green_ground = None
-            self._begin_cluster_search()
-            self.state = MatchState.SEARCH_CLUSTER
-            return self._decision(
-                timestamp_ns,
-                0.0,
-                self._cluster_search_angular_velocity_rad_s,
-                "green_current_path_blocked_restart_search",
-                posture=GripperPosture.CLOSED,
-            )
-        current_heading = self._latest_heading_rad
-        if current_heading is None:
-            return self._decision(
-                timestamp_ns,
-                0.0,
-                0.0,
-                "green_alignment_waiting_for_imu_heading",
-                posture=GripperPosture.TRANSPORT,
-            )
-        target_heading = self._formal_green_target_heading(timestamp_ns, point)
-        if target_heading is None:
-            return self._decision(
-                timestamp_ns,
-                0.0,
-                0.0,
-                "green_alignment_waiting_for_pose_history",
-                posture=GripperPosture.TRANSPORT,
-            )
-        self._green_alignment_target_heading_rad = target_heading
-        self._green_reference = point
-        self._green_reference_heading_rad = target_heading
-        self._green_reference_distance_m = max(
-            0.0,
-            (math.hypot(point.x, point.y) - self._near_field_handoff_range_mm())
-            / 1000.0,
-        )
-        heading_error = normalize_angle(target_heading - current_heading)
-        range_mm = math.hypot(point.x, point.y)
-        tolerance_rad = math.atan2(
-            self.config.green_alignment_tolerance_mm,
-            max(range_mm, 1e-6),
-        )
-        if abs(point.y) <= self.config.green_alignment_tolerance_mm or abs(heading_error) <= tolerance_rad:
-            return self._begin_formal_green_approach(
-                timestamp_ns,
-                point,
-                target_heading,
-            )
-
-        if self._green_turn_active:
-            if self._green_turn_start_heading_rad is not None:
-                self._green_turn_progress_rad = self._directional_delta(
-                    self._green_turn_start_heading_rad,
-                    current_heading,
-                    self._green_turn_direction,
-                )
-            if math.copysign(1.0, heading_error) != math.copysign(1.0, self._green_turn_direction):
-                self._green_turn_active = False
-                if self._green_turn_attempts >= 2:
-                    return self._return_to_near_field_search(
-                        timestamp_ns,
-                        "alignment_direction_changed_after_bounded_turn",
-                    )
-            elif self._green_turn_progress_rad >= self._green_turn_budget_rad - 1e-3:
-                self._green_turn_active = False
-                self._green_alignment_wait_since_ns = timestamp_ns
-                if self._green_turn_attempts >= 2:
-                    return self._return_to_near_field_search(
-                        timestamp_ns,
-                        "alignment_bounded_turn_exhausted",
-                    )
-                return self._decision(
-                    timestamp_ns,
-                    0.0,
-                    0.0,
-                    "green_bounded_turn_complete_wait_current_geometry",
-                    posture=GripperPosture.TRANSPORT,
-                    soft_brake=True,
-                )
-
-        if not self._green_turn_active:
-            if self._green_turn_attempts >= 2:
-                return self._return_to_near_field_search(
-                    timestamp_ns,
-                    "alignment_attempt_budget_exhausted",
-                )
-            self._green_turn_attempts += 1
-            self._green_turn_direction = math.copysign(1.0, heading_error)
-            self._green_turn_start_heading_rad = current_heading
-            self._green_turn_budget_rad = min(abs(heading_error), math.pi / 2.0)
-            self._green_turn_progress_rad = 0.0
-            self._green_turn_active = True
-        angular = _clamp(
-            self.config.green_alignment_kp_rad_s * heading_error,
-            -self.config.green_alignment_max_angular_velocity_rad_s,
-            self.config.green_alignment_max_angular_velocity_rad_s,
-        )
-        return self._decision(
-            timestamp_ns,
-            0.0,
-            angular,
-            "green_coarse_align_imu_closed_loop"
-            if self._green_turn_attempts == 1
-            else "green_correction_align_imu_closed_loop",
-            posture=GripperPosture.TRANSPORT,
-            min_wheel_velocity_m_s=self.config.green_alignment_min_wheel_velocity_m_s,
-        )
-
-    def _step_formal_green_approach(
-        self,
-        timestamp_ns: int,
-        cumulative_distance_m: float | None,
-    ) -> MatchDecision:
-        settling = self._consume_action_settle(
-            timestamp_ns,
-            "green_before_approach",
-            posture=GripperPosture.TRANSPORT,
-            reason="green_waiting_after_alignment",
-        )
-        if settling is not None:
-            return settling
-        if cumulative_distance_m is None:
-            return self._decision(
-                timestamp_ns,
-                0.0,
-                0.0,
-                "green_approach_waiting_for_odometry",
-                posture=GripperPosture.TRANSPORT,
-            )
-        target = self._selected_target()
-        point = None if target is None else self._selected_green_point(timestamp_ns)
-        if point is None and target is None and self._green_reference is not None:
-            point = self._green_reference
-            if self._green_approach_base_distance_m is not None and self._green_approach_distance_m is not None:
-                if cumulative_distance_m is not None and cumulative_distance_m - self._green_approach_base_distance_m >= self._green_approach_distance_m - 1e-9:
-                    return self._begin_near_field_grasp(timestamp_ns)
-        if point is None:
-            return self._hold_or_restart_green_target(timestamp_ns)
-        if target is not None and not self._green_path_is_clear_at_now(target, point, timestamp_ns):
-            if self._dynamic_breakup_enabled and not self._candidate_path_blocked(point, breakup=False):
-                return self._enter_breakup_only_search(timestamp_ns)
-            return self._start_path_reselection(
-                timestamp_ns,
-                posture=GripperPosture.TRANSPORT,
-                reason="green_current_path_blocked_restart_search",
-            )
-        range_mm = math.hypot(point.x, point.y)
-        remaining_m = max(
-            0.0,
-            (range_mm - self._near_field_handoff_range_mm()) / 1000.0,
-        )
-        self._green_approach_distance_m = remaining_m
-        self._green_approach_base_distance_m = cumulative_distance_m
-        if remaining_m <= 1e-6:
-            return self._begin_near_field_grasp(
-                timestamp_ns,
-                handoff_prior=self._selected_handoff_prior(timestamp_ns),
-            )
-        target_heading = self._formal_green_target_heading(timestamp_ns, point)
-        if target_heading is None or self._latest_heading_rad is None:
-            return self._decision(
-                timestamp_ns,
-                0.0,
-                0.0,
-                "green_approach_waiting_for_pose_history",
-                posture=GripperPosture.TRANSPORT,
-            )
-        heading_error = normalize_angle(target_heading - self._latest_heading_rad)
-        angular = _clamp(
-            self.config.green_alignment_kp_rad_s * heading_error,
-            -self.config.green_alignment_max_angular_velocity_rad_s,
-            self.config.green_alignment_max_angular_velocity_rad_s,
-        )
-        return self._decision(
-            timestamp_ns,
-            min(self.config.green_approach_speed_m_s, max(0.005, remaining_m)),
-            angular,
-            "approach_green_with_capture_pose_alignment",
-            posture=GripperPosture.TRANSPORT,
-        )
-
     def _step_align_green(self, timestamp_ns: int) -> MatchDecision:
         """停车取 10 帧均值后做阻挡判断，再对准绿色目标。"""
-
-        if self._near_field_pickup is not None:
-            return self._step_formal_green_align(timestamp_ns)
 
         settling = self._consume_action_settle(
             timestamp_ns,
@@ -6673,37 +5490,6 @@ class MatchSequence:
         distance_m = plan.forward_distance_mm / 1000.0
         return self._near_field_segment_clear(plan_heading, distance_m)
 
-    def _preparation_with_current_alignment(
-        self,
-        preparation: GraspPreparation | None,
-        timestamp_ns: int,
-    ) -> tuple[GraspPreparation | None, bool]:
-        """Express a delayed plan angle relative to the current IMU heading.
-
-        The plan's opening geometry remains tied to its capture frame and is
-        still age/stop validated before opening.  Only the remaining heading
-        error is updated from the recorded capture pose, so a delayed result
-        cannot command the old visual angle after the vehicle has moved.
-        """
-
-        if preparation is None or preparation.selection.plan is None:
-            return preparation, False
-        plan = preparation.selection.plan
-        if abs(plan.alignment_angle_rad) <= 1e-9:
-            return preparation, True
-        capture_pose = self._pose_at(plan.capture_timestamp_ns)
-        current_pose = self._pose_at(timestamp_ns)
-        if capture_pose is None or current_pose is None:
-            return preparation, False
-        remaining = normalize_angle(
-            capture_pose.heading_rad
-            + plan.alignment_angle_rad
-            - current_pose.heading_rad
-        )
-        updated_plan = replace(plan, alignment_angle_rad=remaining)
-        updated_selection = replace(preparation.selection, plan=updated_plan)
-        return replace(preparation, selection=updated_selection), True
-
     def _near_field_segment_clear(
         self,
         heading_rad: float,
@@ -6782,49 +5568,12 @@ class MatchSequence:
             reason=f"greedy_return:{reason}",
         )
 
-    def _greedy_scan_angular_velocity_rad_s(self) -> float:
-        """返回补夹扫描的当前角速度，单位 rad/s。
-
-        当前帧没有可作为新物资的绿/黑信息（只有蓝色、已收拢或已交付物资）时
-        使用全局空场搜索的快速角速度，避免在空场上慢速转满预算；出现可补夹
-        信息后回到闭爪扫描角速度，不快速掠过刚出现的候选。方向沿用闭爪扫描
-        方向，扫描过程中不换向。
-        """
-
-        perception = self._latest_perception
-        stowed_limit_mm = self._greedy_new_target_min_x_mm()
-        allowed_classes = self.near_field_policy.allowed_classes
-        has_supply_information = perception is not None and any(
-            observation.target_class in allowed_classes
-            and self._observation_is_selectable(
-                observation,
-                stowed_limit_mm,
-                perception,
-            )
-            for observation in perception.observations
-        )
-        magnitude = abs(
-            self.config.close_gripper_spin_angular_velocity_rad_s
-            if has_supply_information
-            else self.config.cluster_search_empty_angular_velocity_rad_s
-        )
-        return math.copysign(
-            magnitude,
-            self.config.close_gripper_spin_angular_velocity_rad_s,
-        )
-
     def _step_greedy_scan(
         self, timestamp_ns: int, heading_rad: float | None,
     ) -> MatchDecision:
-        angular = self._greedy_scan_angular_velocity_rad_s()
-        # 转速随当前帧信息量变化，时间上限必须按两者中较慢的一个计算，
-        # 否则慢速段会被上限提前截断；完成仍以实际转角进度为准。
-        slowest_angular_velocity_rad_s = min(
-            abs(self.config.close_gripper_spin_angular_velocity_rad_s),
-            abs(self.config.cluster_search_empty_angular_velocity_rad_s),
-        )
+        angular = self.config.close_gripper_spin_angular_velocity_rad_s
         timeout_ns = round(
-            (self.config.spin_angle_rad / slowest_angular_velocity_rad_s
+            (self.config.spin_angle_rad / abs(angular)
              + self._near_field_handoff_timeout_ms() / 1000.0) * 1e9
         )
         if timestamp_ns - self._greedy_started_ns >= timeout_ns:
@@ -6849,7 +5598,7 @@ class MatchSequence:
             and self._greedy_new_target_min_x_mm() < target.ground_point.x
             and math.hypot(target.ground_point.x, target.ground_point.y)
             <= self._near_field_handoff_range_mm()
-            and not self._target_attempt_blocked(target, timestamp_ns)
+            and self._transport_group_size(target, timestamp_ns) is not None
         )
         target = min(
             candidates,
@@ -6857,11 +5606,7 @@ class MatchSequence:
             default=None,
         )
         if target is not None:
-            # 命中即进入全局夹取前置链：与搜索阶段找到目标走同一条
-            # 对准—接近—近场唯一确认窗口，目标同时成为近场交接先验，
-            # 由实际几何决定所需转角（需要反向时反向），不再重开一次
-            # 自由选组会话。
-            return self._begin_green_transport(timestamp_ns, target)
+            return self._begin_near_field_grasp(timestamp_ns)
         return self._decision(
             timestamp_ns, 0.0, angular, "greedy_scan_supplies",
             posture=GripperPosture.CLOSED,
@@ -6894,13 +5639,6 @@ class MatchSequence:
                 self._transport_target_classes + picked_classes
                 if self._greedy_active else picked_classes
             )
-            if self._greedy_active:
-                # 补夹扫描已经命中并完成一次收拢：直接携已有物资返程，
-                # 不再重复整圈扫描。剩余容量交由下一趟搜索决定。
-                return self._finish_greedy_pickup(
-                    timestamp_ns,
-                    "supplementary_pickup_complete",
-                )
             if self._can_greedy_pickup():
                 return self._begin_greedy_scan(timestamp_ns)
             self._greedy_active = False
@@ -6955,33 +5693,6 @@ class MatchSequence:
             min_wheel_velocity_m_s=decision.min_wheel_velocity_m_s,
         )
 
-    def _near_field_plan_has_delivered_member(
-        self,
-        plan: NearFieldGraspPlan | None,
-    ) -> bool:
-        """返回近场计划是否包含已经放入安全区的物资。
-
-        蓝色危险证据不参与本判定：危险物进入安全区仍然要能阻挡夹爪扫掠。
-        """
-
-        if plan is None:
-            return False
-        stowed_limit = (
-            self._greedy_new_target_min_x_mm()
-            if self._greedy_active
-            else None
-        )
-        return any(
-            member.observation.target_class is not TargetClass.BLUE_DANGER
-            and member.observation.model_target_class is not TargetClass.BLUE_DANGER
-            and not self._observation_is_selectable(
-                member.observation,
-                stowed_limit,
-                self._latest_perception,
-            )
-            for member in plan.members
-        )
-
     def _step_near_field_grasp(
         self,
         timestamp_ns: int,
@@ -7000,17 +5711,6 @@ class MatchSequence:
             return settling
         if preparation is not None and preparation.session_id != self._near_field_session_id:
             preparation = None
-        if preparation is not None and self._near_field_plan_has_delivered_member(
-            preparation.selection.plan
-        ):
-            # 送入 worker 的观测过滤基于采集时刻位姿；消费层再按当前位姿
-            # 复核一次。已交付物资不能重新成为候选，也不能冻结成执行计划。
-            if self._greedy_active:
-                return self._finish_greedy_pickup(
-                    timestamp_ns,
-                    "carried_or_delivered_member",
-                )
-            preparation = None
         if self._greedy_active and preparation is not None:
             plan = preparation.selection.plan
             if plan is not None and (
@@ -7018,11 +5718,7 @@ class MatchSequence:
                 or any(
                     member.observation.target_class not in self.near_field_policy.allowed_classes
                     or member.observation.ground_point is None
-                    or not self._observation_is_selectable(
-                        member.observation,
-                        self._greedy_new_target_min_x_mm(),
-                        self._latest_perception,
-                    )
+                    or member.observation.ground_point.x <= self._greedy_new_target_min_x_mm()
                     for member in plan.members
                 )
             ):
@@ -7070,10 +5766,6 @@ class MatchSequence:
                 timestamp_ns,
                 "confirmation_timeout",
             )
-        step_preparation, pose_aligned = self._preparation_with_current_alignment(
-            step_preparation,
-            timestamp_ns,
-        )
         plan = step_preparation.selection.plan if step_preparation is not None else None
         if (
             plan is not None
@@ -7104,42 +5796,7 @@ class MatchSequence:
             step_preparation,
             cumulative_distance_m=cumulative_distance_m,
             path_clear=True if path_clear is None else path_clear,
-            heading_rad=(self._latest_heading_rad if pose_aligned else None),
         )
-        if (
-            decision.state is GripperWidthPickupState.ABORTED
-            and decision.reason != "near_field_path_blocked"
-        ):
-            self._near_field_last_failure_diagnostic = (
-                "near_field_motion_failure "
-                f"session={self._near_field_session_id} "
-                f"reason={decision.reason} "
-                f"progress_mm={self._near_field_pickup.progress_mm(cumulative_distance_m):.1f} "
-                f"observation_age_ms={self._preparation_observation_age_ms(step_preparation, timestamp_ns)} "
-                f"preparation_age_ms={self._preparation_result_age_ms(step_preparation, timestamp_ns)}"
-            )
-            if decision.reason in {
-                "critical_odometry_unavailable",
-                "encoder_direction_mismatch",
-                "encoder_no_forward_progress",
-            }:
-                self._remember_near_field_failure(
-                    timestamp_ns,
-                    decision.reason,
-                    step_preparation,
-                )
-                self.state = MatchState.TERMINAL_STOP
-                return self._decision(
-                    timestamp_ns,
-                    0.0,
-                    0.0,
-                    f"near_field_motion_failure:{decision.reason}",
-                    posture=GripperPosture.CLOSED,
-                )
-            return self._return_to_near_field_search(
-                timestamp_ns,
-                f"pickup_aborted:{decision.reason}",
-            )
         if decision.reason == "near_field_path_blocked":
             plan_heading = (
                 None if plan is None or self._latest_heading_rad is None
@@ -7176,9 +5833,6 @@ class MatchSequence:
                     "blocked_target:",
                     "side_adjacent_incompatible",
                     "orange_not_isolated_track:",
-                    "maximum_opening_exceeded",
-                    "left_tip_y_mm",
-                    "right_tip_y_mm",
                 )
             )
             return self._route_after_near_field_failure(
@@ -7238,15 +5892,7 @@ class MatchSequence:
         )
 
     def _selected_green_point(self, timestamp_ns: int) -> GroundPoint | None:
-        """Return the selected target in the current robot frame.
-
-        A target observation is expressed at its camera capture time.  When
-        there is enough recorded encoder/IMU history, transform it through
-        that capture pose and the current pose.  If the history does not cover
-        the interval, return no compensated point; callers then hold or use a
-        bounded action and wait for a fresh frame instead of fabricating a
-        time compensation.
-        """
+        """只返回已选目标当前新鲜的地面点，不用旧坐标继续驱动车辆。"""
 
         target = self._selected_target()
         if target is None:
@@ -7256,39 +5902,8 @@ class MatchSequence:
             and self._selected_green_is_usable(target)
             and target.ground_point is not None
         ):
-            current = self._ground_point_at_now(
-                target.ground_point,
-                target.last_seen_timestamp_ns,
-                timestamp_ns,
-            )
-            if current is None:
-                current_pose = self._pose_at(timestamp_ns)
-                if self._green_target_field_point is not None and current_pose is not None:
-                    delta_x = self._green_target_field_point.x - current_pose.position.x
-                    delta_y = self._green_target_field_point.y - current_pose.position.y
-                    cosine = math.cos(current_pose.heading_rad)
-                    sine = math.sin(current_pose.heading_rad)
-                    current = GroundPoint(
-                        cosine * delta_x + sine * delta_y,
-                        -sine * delta_x + cosine * delta_y,
-                    )
-            if current is None:
-                # A capture at this exact control time is valid even when the
-                # history has only one sample; no motion compensation is then
-                # needed.
-                if target.last_seen_timestamp_ns == timestamp_ns:
-                    current = target.ground_point
-                else:
-                    return None
-            self._selected_green_ground = current
-            if self._green_target_field_point is None:
-                pose = self._pose_at(target.last_seen_timestamp_ns)
-                if pose is not None:
-                    self._green_target_field_point = self._field_point_from_pose(
-                        pose,
-                        target.ground_point,
-                    )
-            return current
+            self._selected_green_ground = target.ground_point
+            return target.ground_point
         return None
 
     def _step_transport_close(self, timestamp_ns: int) -> MatchDecision:
@@ -7740,24 +6355,18 @@ class MatchSequence:
         self,
         target: FieldPoint,
         start: FieldPoint | None,
-        tolerance_mm: float | None = None,
     ) -> bool:
         """判断直线目标是否命中容差，或沿计划方向已经越过目标。
 
         直线起点已经落在阈值内的坐标不参与判断，避免某一坐标在直线起点
         已经达标时提前结束。车辆偏航导致一次采样跨过二维容差窗口时，
-        使用起点到目标向量的投影进度触发越过保护。``tolerance_mm`` 缺省
-        时使用 ``transport_align_tolerance_mm``，供变体开场自定义到达容差。
+        使用起点到目标向量的投影进度触发越过保护。
         """
 
         position = self._fallback_field_position
         if position is None or start is None:
             return False
-        tolerance = (
-            self.config.transport_align_tolerance_mm
-            if tolerance_mm is None
-            else tolerance_mm
-        )
+        tolerance = self.config.transport_align_tolerance_mm
         x_needed = abs(start.x - target.x) > tolerance
         y_needed = abs(start.y - target.y) > tolerance
         x_reached = not x_needed or abs(position.x - target.x) <= tolerance
@@ -8838,7 +7447,6 @@ class MatchSequence:
             self._return_phase = "idle"
             self._search_frame_floor = None
             self._begin_cluster_search()
-            self._reset_rotation_budget()
             self.state = MatchState.SEARCH_CLUSTER
             return self._decision(
                 timestamp_ns,
@@ -9185,12 +7793,1176 @@ class MatchSequence:
         )
         return timestamp_ns - self._safe_zone_stop_since_ns >= confirm_time_ns
 
+    # ------------------------------------------------------------------
+    # strategy 专用流程
+    # ------------------------------------------------------------------
+
+    def _strategy_startup_turn_velocity(self) -> float:
+        """返回当前冲刺腿的转向速度；第一腿右转，第二腿左转。"""
+
+        magnitude = abs(self.config.startup_turn_angular_velocity_rad_s)
+        return -magnitude if self._strategy_startup_leg == 1 else magnitude
+
+    def _step_startup_turn(
+        self,
+        timestamp_ns: int,
+        heading_rad: float | None,
+    ) -> MatchDecision:
+        """执行 strategy 的两次等角度启动转向。"""
+
+        angular_velocity = self._strategy_startup_turn_velocity()
+        side = "right" if angular_velocity < 0.0 else "left"
+        if heading_rad is None:
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                f"strategy_startup_{side}_turn_waiting_for_heading",
+            )
+        previous = self._startup_turn_last_heading
+        self._startup_turn_last_heading = heading_rad
+        if previous is None:
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                angular_velocity,
+                f"strategy_startup_{side}_turn",
+            )
+        self._startup_turn_progress_rad += self._directional_delta(
+            previous,
+            heading_rad,
+            angular_velocity,
+        )
+        if self._startup_turn_progress_rad >= self.config.startup_turn_angle_rad - 1e-9:
+            self.state = MatchState.STARTUP_TURN_SETTLE
+            self._settle_until_ns = timestamp_ns + self._seconds_to_ns(
+                self.config.startup_turn_settle_time_s
+            )
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                f"strategy_startup_{side}_turn_complete_wait",
+            )
+        return self._decision(
+            timestamp_ns,
+            0.0,
+            angular_velocity,
+            f"strategy_startup_{side}_turn",
+        )
+
+    def _step_startup_forward(
+        self,
+        timestamp_ns: int,
+        cumulative_distance_m: float | None,
+        left_speed_feedback_m_s: float | None,
+        right_speed_feedback_m_s: float | None,
+    ) -> MatchDecision:
+        """执行第一腿 150 cm 短冲或第二腿 1 m 前冲。"""
+
+        leg = self._strategy_startup_leg
+        distance_m = (
+            self.config.startup_forward_distance_m
+            if leg == 1
+            else self.config.cluster_relocate_distance_m
+        )
+        speed_m_s = (
+            self.config.startup_forward_speed_m_s
+            if leg == 1
+            else self.config.cluster_relocate_speed_m_s
+        )
+        if cumulative_distance_m is None:
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                f"strategy_startup_forward_leg_{leg}_waiting_for_odometry",
+            )
+        if self._startup_forward_base_distance_m is None:
+            self._startup_forward_base_distance_m = cumulative_distance_m
+        travelled = cumulative_distance_m - self._startup_forward_base_distance_m
+        if travelled >= distance_m - 1e-9:
+            self.state = MatchState.STARTUP_FORWARD_SETTLE
+            self._settle_until_ns = timestamp_ns + self._seconds_to_ns(
+                self.config.startup_forward_settle_time_s
+            )
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                f"strategy_startup_forward_leg_{leg}_complete_wait",
+            )
+        return self._decision(
+            timestamp_ns,
+            speed_m_s,
+            self._straight_pid_output(
+                timestamp_ns,
+                left_speed_feedback_m_s,
+                right_speed_feedback_m_s,
+            ),
+            f"strategy_startup_forward_leg_{leg}",
+        )
+
+    def _step_strategy_startup_forward_settle(
+        self,
+        timestamp_ns: int,
+    ) -> MatchDecision:
+        """在两腿启动冲刺之间切换，第二腿结束后进入蓝色目标搜索。"""
+
+        if timestamp_ns < self._settle_until_ns:
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "strategy_startup_waiting_after_forward",
+            )
+        if self._strategy_startup_leg == 1:
+            self._strategy_startup_leg = 2
+            self._startup_turn_last_heading = None
+            self._startup_turn_progress_rad = 0.0
+            self._startup_forward_base_distance_m = None
+            self._reset_straight_pid()
+            self.state = MatchState.STARTUP_TURN_RIGHT
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "strategy_startup_short_forward_settled_start_left_turn",
+            )
+        self._begin_cluster_search()
+        self.state = MatchState.SEARCH_CLUSTER
+        return self._decision(
+            timestamp_ns,
+            0.0,
+            self._cluster_search_angular_velocity_rad_s,
+            "strategy_startup_long_forward_settled_start_blue_search",
+        )
+
+    @staticmethod
+    def _strategy_blue_target_is_usable(target: TrackedTarget) -> bool:
+        """蓝色危险物块的直接夹取/解团接触证据门禁。"""
+
+        if (
+            target.target_class is not TargetClass.BLUE_DANGER
+            or target.status is not TrackStatus.CONFIRMED
+            or not target.ever_confirmed
+            or target.ground_point is None
+        ):
+            return False
+        return not any(
+            quality
+            in {
+                ObservationQuality.COLOR_EVIDENCE_INSUFFICIENT,
+                ObservationQuality.COLOR_EVIDENCE_AMBIGUOUS,
+                ObservationQuality.POSE_COLOR_CONFLICT,
+            }
+            for quality in target.quality
+        )
+
+    def _strategy_blue_target(self, timestamp_ns: int) -> TrackedTarget | None:
+        """按当前机器人坐标返回最近的可靠蓝色物块。"""
+
+        candidates = tuple(
+            target
+            for target in self._tracker.tracks
+            if self._target_is_fresh(target, timestamp_ns)
+            and self._strategy_blue_target_is_usable(target)
+            and target.ground_point is not None
+            and target.ground_point.x > 0.0
+        )
+        return min(
+            candidates,
+            key=lambda target: (
+                math.hypot(target.ground_point.x, target.ground_point.y),
+                abs(target.ground_point.y),
+                target.track_id,
+            ),
+            default=None,
+        )
+
+    def _strategy_blue_current_target(
+        self,
+        timestamp_ns: int,
+        *,
+        expected_range_mm: float | None = None,
+    ) -> TrackedTarget | None:
+        """优先保留锁定 ID；跟踪器换 ID 时用同帧蓝块恢复身份。"""
+
+        selected = self._selected_target()
+        if (
+            selected is not None
+            and self._target_is_fresh(selected, timestamp_ns)
+            and self._strategy_blue_target_is_usable(selected)
+        ):
+            return selected
+        candidates = tuple(
+            target
+            for target in self._tracker.tracks
+            if self._target_is_fresh(target, timestamp_ns)
+            and self._strategy_blue_target_is_usable(target)
+            and target.ground_point is not None
+            and target.ground_point.x > 0.0
+        )
+        return min(
+            candidates,
+            key=lambda target: (
+                (
+                    abs(
+                        math.hypot(
+                            target.ground_point.x,
+                            target.ground_point.y,
+                        )
+                        - expected_range_mm
+                    )
+                    if expected_range_mm is not None
+                    else 0.0
+                ),
+                abs(target.ground_point.y),
+                math.hypot(target.ground_point.x, target.ground_point.y),
+                target.track_id,
+            ),
+            default=None,
+        )
+
+    def _strategy_blue_path_clear(
+        self,
+        target: TrackedTarget,
+        timestamp_ns: int,
+        *,
+        reference: GroundPoint | None = None,
+        ignored_track_ids: frozenset[int] = frozenset(),
+        tracks: tuple[TrackedTarget, ...] | None = None,
+    ) -> bool:
+        """检查蓝色物块的直接接近走廊和同团门禁。"""
+
+        point = target.ground_point if reference is None else reference
+        if (
+            not self._strategy_blue_target_is_usable(target)
+            or point is None
+            or point.x <= 0.0
+            or math.hypot(point.x, point.y) <= 1e-6
+            or self.estimated_field_position is None
+            or self._latest_heading_rad is None
+            or self._candidate_path_blocked(point, breakup=False)
+        ):
+            return False
+        target_range_mm = math.hypot(point.x, point.y)
+        lateral_half_width_mm = self._transport_corridor_half_width_mm
+        source_tracks = self._tracker.tracks if tracks is None else tuple(tracks)
+        for other in source_tracks:
+            if (
+                other.track_id == target.track_id
+                or other.track_id in ignored_track_ids
+                or other.track_id in self._green_preclose_consumed_track_ids
+                or not self._target_is_fresh(other, timestamp_ns)
+            ):
+                continue
+            if other.ground_point is None:
+                # 当前仍有效但没有 K0 的目标不能证明直接夹取走廊为空。
+                return False
+            if (
+                other.target_class is TargetClass.BLUE_DANGER
+                and math.hypot(
+                    other.ground_point.x - point.x,
+                    other.ground_point.y - point.y,
+                )
+                <= self.config.cluster_group_ground_mm
+            ):
+                return False
+            relative = self._target_aligned_coordinates(point, other.ground_point)
+            if relative is None:
+                return False
+            forward_mm, lateral_mm = relative
+            if (
+                0.0 <= forward_mm < target_range_mm
+                and abs(lateral_mm) <= lateral_half_width_mm
+            ):
+                return False
+        return True
+
+    def _step_strategy_search_cluster(
+        self,
+        timestamp_ns: int,
+        heading_rad: float | None,
+    ) -> MatchDecision:
+        """只搜索最近蓝色物块：可直夹则直夹，否则进入动态解团。"""
+
+        if self._path_recovery:
+            if not self._safe_zone_vehicle_stopped(timestamp_ns):
+                self._path_recovery_stopped_ns = None
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    0.0,
+                    "strategy_search_waiting_for_recovery_stop",
+                    posture=self._path_recovery_posture,
+                )
+            if self._path_recovery_stopped_ns is None:
+                self._path_recovery_stopped_ns = timestamp_ns
+                self._reset_tracker_for_new_preview_epoch()
+                self._last_tracker_frame_sequence = None
+            perception = self._latest_perception
+            if (
+                perception is None
+                or not self._fresh_perception(perception, timestamp_ns)
+                or perception.capture_timestamp_ns <= self._path_recovery_stopped_ns
+            ):
+                self._reset_tracker_for_new_preview_epoch()
+                self._last_tracker_frame_sequence = None
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    0.0,
+                    "strategy_search_waiting_for_recovery_new_frame",
+                    posture=self._path_recovery_posture,
+                )
+            self._path_recovery = False
+            self._path_recovery_stopped_ns = None
+            self._safe_zone_stop_since_ns = None
+
+        self._cluster_search_angular_velocity_rad_s = math.copysign(
+            abs(self.config.cluster_search_empty_angular_velocity_rad_s),
+            self._cluster_search_angular_velocity_rad_s,
+        )
+        target = self._strategy_blue_target(timestamp_ns)
+        if target is not None and self._strategy_blue_path_clear(target, timestamp_ns):
+            return self._begin_strategy_blue_transport(timestamp_ns, target)
+        if target is not None:
+            plan = self._choose_breakup_plan(
+                timestamp_ns,
+                approach=False,
+                required_aim_id=target.track_id,
+            )
+            if plan is not None:
+                self._start_breakup_attempt(timestamp_ns, plan)
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    0.0,
+                    f"strategy_blue_group_seen_start_breakup:{plan.aim_id}",
+                    soft_brake=True,
+                )
+
+        self._advance_cluster_search_sweep(heading_rad)
+        direction = "right" if self._cluster_search_angular_velocity_rad_s < 0.0 else "left"
+        return self._decision(
+            timestamp_ns,
+            0.0,
+            self._cluster_search_angular_velocity_rad_s,
+            f"strategy_search_blue_{direction}",
+        )
+
+    def _begin_strategy_blue_transport(
+        self,
+        timestamp_ns: int,
+        target: TrackedTarget,
+    ) -> MatchDecision:
+        """锁定一个蓝色物块，复用现有相对对准和安全区运输状态。"""
+
+        if not self._strategy_blue_target_is_usable(target):
+            raise ValueError("strategy blue transport requires a usable blue target.")
+        pickup = self._strategy_saved_near_field_pickup
+        if pickup is None:
+            raise RuntimeError(
+                "Strategy blue grasp requires the match pickup sequence."
+            )
+        self._near_field_pickup = pickup
+        pickup.reset()
+        self._strategy_blue_last_preparation = None
+        self._strategy_blue_preparation_key = None
+        self._strategy_blue_confirmation_count = 0
+        self._strategy_blue_confirmation_last_frame = None
+        self._strategy_blue_confirmation_ids = None
+        self._strategy_blue_transport = True
+        self._strategy_blue_grasp_phase = "approach_handoff"
+        self._strategy_delivery_slot = self._transport_count
+        self._selected_track_id = target.track_id
+        self._cluster_selected_track_ids = ()
+        self._breakup_only = False
+        self._selected_green_ground = target.ground_point
+        self._opportunistic_single_green = False
+        self._near_field_group_preview = False
+        self._green_realign_pending = False
+        self._green_realign_done = False
+        self._green_preclose_consumed_track_ids.clear()
+        self._green_preclose_carried_count = 0
+        self._green_preclose_realign_active = False
+        self._green_preclose_frame_floor = None
+        self._green_preclose_recheck_started_ns = None
+        self._green_align_lost_since_ns = None
+        self._green_approach_base_distance_m = None
+        self._green_approach_distance_m = None
+        self._green_reference_samples = []
+        self._green_reference_last_seen_ns = None
+        self._green_reference = None
+        self._green_reference_heading_rad = None
+        self._green_reference_distance_m = None
+        self._reset_green_alignment_gate()
+        self.state = MatchState.TRANSPORT_ALIGN_GREEN
+        self._begin_action_settle(timestamp_ns, "green_reference")
+        return self._decision(
+            timestamp_ns,
+            0.0,
+            0.0,
+            f"strategy_blue_direct_grasp_selected:{target.track_id}",
+            posture=GripperPosture.TRANSPORT,
+        )
+
+    def _strategy_blue_current_observation(
+        self,
+        target: TrackedTarget,
+    ):
+        """从当前 perception 中取出与 tracker 目标对应的原始观测。"""
+
+        perception = self._latest_perception
+        if (
+            perception is None
+            or target.last_seen_timestamp_ns != perception.capture_timestamp_ns
+            or target.frame_sequence != perception.frame_sequence
+        ):
+            return None
+        return next(
+            (
+                observation
+                for observation in perception.observations
+                if observation.target_class is TargetClass.BLUE_DANGER
+                and observation.box == target.box
+                and observation.k0 == target.k0
+            ),
+            None,
+        )
+
+    def _strategy_blue_grasp_preparation(
+        self,
+        timestamp_ns: int,
+    ) -> GraspPreparation | None:
+        """用绿色近场几何/状态机为一个蓝块生成同构执行计划。"""
+
+        selector = self._strategy_blue_selector
+        projector = self._strategy_blue_projector
+        pickup = self._near_field_pickup
+        if selector is None or projector is None or pickup is None:
+            return None
+        target = self._strategy_blue_current_target(
+            timestamp_ns,
+            expected_range_mm=self._near_field_handoff_range_mm(),
+        )
+        if target is None or target.ground_point is None:
+            return self._strategy_blue_last_preparation
+        observation = self._strategy_blue_current_observation(target)
+        if observation is None:
+            return self._strategy_blue_last_preparation
+        preparation_key = (
+            target.track_id,
+            observation.frame_sequence,
+            observation.capture_timestamp_ns,
+        )
+        if preparation_key == self._strategy_blue_preparation_key:
+            return self._strategy_blue_last_preparation
+        self._strategy_blue_preparation_key = preparation_key
+        try:
+            envelope = measure_target_envelope(
+                observation,
+                projector,
+                min_mask_pixels=selector.config.min_mask_pixels,
+            )
+            if envelope is None:
+                return self._strategy_blue_last_preparation
+            member = GraspTarget(
+                target.track_id,
+                observation,
+                envelope,
+                True,
+                True,
+                observed=True,
+            )
+            geometry = selector._group_geometry(
+                (member,),
+                alignment_tolerance_mm=selector.config.center_tolerance_mm,
+                range_limit_mm=selector.config.max_range_mm,
+            )
+        except (TypeError, ValueError):
+            return self._strategy_blue_last_preparation
+        if geometry.reasons:
+            return self._strategy_blue_last_preparation
+
+        bounds = (
+            GroundPoint(geometry.x0_mm, geometry.y0_mm),
+            GroundPoint(geometry.x1_mm, geometry.y0_mm),
+            GroundPoint(geometry.x1_mm, geometry.y1_mm),
+            GroundPoint(geometry.x0_mm, geometry.y1_mm),
+        )
+        plan = NearFieldGraspPlan(
+            observation.frame_sequence,
+            observation.capture_timestamp_ns,
+            (member,),
+            geometry.center,
+            geometry.angle_rad,
+            bounds,
+            geometry.opening_width_mm,
+            selector.maximum_opening_mm,
+            geometry.opening_servo_angles_deg,
+            geometry.forward_distance_mm,
+            0.0,
+            GraspScore(1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            selector._regions(
+                geometry.angle_rad,
+                geometry.forward_distance_mm,
+                geometry.left_tip_y_mm,
+                geometry.right_tip_y_mm,
+            ),
+        )
+        member_ids = plan.member_ids
+        if self._strategy_blue_confirmation_ids != member_ids:
+            self._strategy_blue_confirmation_ids = member_ids
+            self._strategy_blue_confirmation_count = 0
+            self._strategy_blue_confirmation_last_frame = None
+        if geometry.angle_rad != 0.0:
+            self._strategy_blue_confirmation_count = 0
+            self._strategy_blue_confirmation_last_frame = None
+        elif (
+            self._strategy_blue_confirmation_last_frame
+            != observation.frame_sequence
+        ):
+            self._strategy_blue_confirmation_last_frame = (
+                observation.frame_sequence
+            )
+            self._strategy_blue_confirmation_count = min(
+                selector.config.confirmation_frames,
+                self._strategy_blue_confirmation_count + 1,
+            )
+        required = selector.config.confirmation_frames
+        preparation = GraspPreparation(
+            observation.capture_timestamp_ns,
+            GraspSelection(plan, ()),
+            (member,),
+            ready=self._strategy_blue_confirmation_count >= required,
+            checked_member_ids=pickup.locked_ids,
+            session_id=self._near_field_session_id,
+            confirmation_count=self._strategy_blue_confirmation_count,
+            confirmation_required=required,
+            prepared_timestamp_ns=timestamp_ns,
+            result_timestamp_ns=observation.result_timestamp_ns,
+        )
+        self._strategy_blue_last_preparation = preparation
+        return preparation
+
+    def _begin_near_field_grasp(
+        self,
+        timestamp_ns: int,
+        *,
+        handoff_prior: NearFieldHandoffPrior | None = None,
+    ) -> MatchDecision:
+        if self._strategy_formal_phase:
+            return _SharedMatchSequence._begin_near_field_grasp(
+                self,
+                timestamp_ns,
+                handoff_prior=handoff_prior,
+            )
+        del handoff_prior
+        if not self._strategy_blue_transport:
+            return _SharedMatchSequence._begin_near_field_grasp(
+                self,
+                timestamp_ns,
+                handoff_prior=None,
+            )
+        pickup = self._near_field_pickup
+        if pickup is None:
+            raise RuntimeError("Strategy blue grasp pickup sequence is missing.")
+        self._near_field_session_id += 1
+        pickup.reset()
+        self._near_field_handoff_prior = None
+        self._near_field_last_failure_diagnostic = None
+        self._near_field_route = GraspRoute.DECIDING
+        self._near_field_confirmation_started_ns = None
+        self._near_field_route_rejections = ()
+        self._near_field_route_elapsed_ms = 0.0
+        self._near_field_route_candidate_count = 0
+        self._strategy_blue_grasp_phase = "near_field"
+        self._strategy_blue_last_preparation = None
+        self._strategy_blue_preparation_key = None
+        self._strategy_blue_confirmation_count = 0
+        self._strategy_blue_confirmation_last_frame = None
+        self._strategy_blue_confirmation_ids = None
+        self.state = MatchState.TRANSPORT_NEAR_FIELD_GRASP
+        self._begin_action_settle(timestamp_ns, "near_field_grasp")
+        return self._decision(
+            timestamp_ns,
+            0.0,
+            0.0,
+            "strategy_blue_near_field_handoff_started",
+            posture=GripperPosture.CLOSED,
+            soft_brake=True,
+        )
+
+    def _step_near_field_grasp(
+        self,
+        timestamp_ns: int,
+        cumulative_distance_m: float | None,
+        preparation: GraspPreparation | None,
+        path_clear: bool | None,
+    ) -> MatchDecision:
+        if self._strategy_formal_phase:
+            return _SharedMatchSequence._step_near_field_grasp(
+                self,
+                timestamp_ns,
+                cumulative_distance_m,
+                preparation,
+                path_clear,
+            )
+        if not self._strategy_blue_transport:
+            return _SharedMatchSequence._step_near_field_grasp(
+                self,
+                timestamp_ns,
+                cumulative_distance_m,
+                preparation,
+                path_clear,
+            )
+        del preparation, path_clear
+        current_preparation = self._strategy_blue_grasp_preparation(timestamp_ns)
+        plan = (
+            None
+            if current_preparation is None
+            else current_preparation.selection.plan
+        )
+        current_path_clear: bool | None = None
+        if plan is not None and plan.alignment_angle_rad == 0.0:
+            current_path_clear = self._near_field_path_clear(
+                plan,
+                self._latest_heading_rad,
+            )
+        return _SharedMatchSequence._step_near_field_grasp(
+            self,
+            timestamp_ns,
+            cumulative_distance_m,
+            current_preparation,
+            current_path_clear,
+        )
+
+    @property
+    def near_field_enabled(self) -> bool:
+        # 蓝色近场计划在控制线程内直接生成，避免共用 worker 按正式规则
+        # 把 blue_danger 当作不可抓目标；恢复正式 match 后重新启用 worker。
+        if not self._strategy_formal_phase:
+            return False
+        return self._near_field_pickup is not None
+
+    def _graspable_target_is_usable(self, target: TrackedTarget) -> bool:
+        """策略入口允许蓝色危险物块作为单目标接触证据。"""
+
+        if self._strategy_formal_phase:
+            return _SharedMatchSequence._graspable_target_is_usable(target)
+        if target.target_class is TargetClass.BLUE_DANGER:
+            return MatchSequence._strategy_blue_target_is_usable(target)
+        return False
+
+    def _selected_green_is_usable(self, target: TrackedTarget) -> bool:
+        if self._strategy_formal_phase:
+            return _SharedMatchSequence._selected_green_is_usable(self, target)
+        if not self._strategy_blue_transport:
+            return False
+        return self._strategy_blue_target_is_usable(target)
+
+    def _green_path_is_clear_for_point(
+        self,
+        target: TrackedTarget,
+        point: GroundPoint,
+        timestamp_ns: int,
+        *,
+        ignored_track_ids: frozenset[int] = frozenset(),
+        allow_behind: bool = False,
+        lateral_half_width_mm: float | None = None,
+        tracks: tuple[TrackedTarget, ...] | None = None,
+    ) -> bool:
+        if self._strategy_formal_phase:
+            return _SharedMatchSequence._green_path_is_clear_for_point(
+                self,
+                target,
+                point,
+                timestamp_ns,
+                ignored_track_ids=ignored_track_ids,
+                allow_behind=allow_behind,
+                lateral_half_width_mm=lateral_half_width_mm,
+                tracks=tracks,
+            )
+        del allow_behind, lateral_half_width_mm
+        if target.target_class is not TargetClass.BLUE_DANGER:
+            return False
+        return self._strategy_blue_path_clear(
+            target,
+            timestamp_ns,
+            reference=point,
+            ignored_track_ids=ignored_track_ids,
+            tracks=tracks,
+        )
+
+    def _step_approach_green(
+        self,
+        timestamp_ns: int,
+        cumulative_distance_m: float | None,
+    ) -> MatchDecision:
+        """按 match 的远场接近逻辑到近场，再交给同一套夹取状态机。"""
+
+        if self._strategy_formal_phase:
+            return _SharedMatchSequence._step_approach_green(
+                self,
+                timestamp_ns,
+                cumulative_distance_m,
+            )
+        settling = self._consume_action_settle(
+            timestamp_ns,
+            "green_before_approach",
+            posture=GripperPosture.TRANSPORT,
+            reason="strategy_blue_waiting_after_alignment",
+        )
+        if settling is not None:
+            return settling
+        if cumulative_distance_m is None or self._green_approach_distance_m is None:
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "strategy_blue_approach_waiting_for_odometry",
+                posture=GripperPosture.TRANSPORT,
+            )
+        target = self._strategy_blue_current_target(
+            timestamp_ns,
+            expected_range_mm=self._near_field_handoff_range_mm(),
+        )
+        if target is not None:
+            self._selected_track_id = target.track_id
+        target_point = None if target is None else target.ground_point
+        if target is None or target_point is None:
+            if self._green_align_lost_since_ns is None:
+                self._green_align_lost_since_ns = timestamp_ns
+            if timestamp_ns - self._green_align_lost_since_ns < self._green_align_hold_ns:
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    0.0,
+                    "strategy_blue_approach_waiting_for_current_ground_point",
+                    posture=GripperPosture.TRANSPORT,
+                )
+            self._strategy_blue_transport = False
+            self._strategy_blue_grasp_phase = "idle"
+            self._selected_track_id = None
+            self._begin_cluster_search()
+            self.state = MatchState.SEARCH_CLUSTER
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                self._cluster_search_angular_velocity_rad_s,
+                "strategy_blue_target_lost_restart_search",
+                posture=GripperPosture.TRANSPORT,
+            )
+        self._green_align_lost_since_ns = None
+        if self._green_approach_base_distance_m is None:
+            self._green_approach_base_distance_m = cumulative_distance_m
+        travelled = cumulative_distance_m - self._green_approach_base_distance_m
+        if travelled >= self._green_approach_distance_m - 1e-9:
+            return self._begin_near_field_grasp(timestamp_ns)
+        angular = self._heading_hold_angular_velocity(
+            self._green_reference_heading_rad,
+            kp_rad_s=self.config.green_alignment_kp_rad_s,
+            max_angular_velocity_rad_s=(
+                self.config.green_alignment_max_angular_velocity_rad_s
+            ),
+            tolerance_rad=math.atan2(
+                self.config.green_alignment_tolerance_mm,
+                max(
+                    math.hypot(
+                        self._green_reference.x,
+                        self._green_reference.y,
+                    )
+                    if self._green_reference is not None
+                    else self._near_field_handoff_range_mm(),
+                    1e-6,
+                ),
+            ),
+        )
+        if angular is None:
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "strategy_blue_approach_waiting_for_heading",
+                posture=GripperPosture.TRANSPORT,
+            )
+        return self._decision(
+            timestamp_ns,
+            self.config.green_approach_speed_m_s,
+            angular,
+            "strategy_blue_approach_to_near_field_handoff",
+            posture=GripperPosture.TRANSPORT,
+        )
+    def _step_transport_close(self, timestamp_ns: int) -> MatchDecision:
+        if self._strategy_formal_phase:
+            return _SharedMatchSequence._step_transport_close(self, timestamp_ns)
+        if self._strategy_blue_transport:
+            if not self._gripper_action_completed(timestamp_ns):
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    0.0,
+                    "strategy_blue_closing_gripper",
+                    posture=GripperPosture.CLOSED,
+                )
+            self._strategy_blue_transport = False
+            self._transport_target_classes = (TargetClass.BLUE_DANGER,)
+            self._strategy_delivery_slot = self._transport_count
+            return self._start_safe_zone_transport(
+                timestamp_ns,
+                transport_opened=False,
+                posture=GripperPosture.CLOSED,
+                reason="strategy_blue_gripper_closed_start_d2_transport",
+            )
+        return self._decision(
+            timestamp_ns,
+            0.0,
+            0.0,
+            "strategy_close_without_blue_target",
+            posture=GripperPosture.CLOSED,
+        )
+
+    def _choose_breakup_plan(
+        self,
+        timestamp_ns: int,
+        *,
+        approach: bool = False,
+        required_ids: frozenset[int] | None = None,
+        required_aim_id: int | None = None,
+    ) -> BreakupPlan | None:
+        """为蓝色目标选择可接触的动态解团计划；全蓝团也在此路径。"""
+
+        if self._strategy_formal_phase:
+            return _SharedMatchSequence._choose_breakup_plan(
+                self,
+                timestamp_ns,
+                approach=approach,
+                required_ids=required_ids,
+                required_aim_id=required_aim_id,
+            )
+        origin = self.estimated_field_position
+        heading = self._latest_heading_rad
+        if (
+            origin is None
+            or heading is None
+            or self._breakup_static_map is None
+            or self._breakup_target_geometry is None
+        ):
+            self._last_cluster_rejection_reason = (
+                "strategy_blue_breakup_missing_pose_map_or_geometry"
+            )
+            return None
+        targets = self._breakup_targets(timestamp_ns)
+        blue_ids = {
+            target.track_id
+            for target in targets
+            if target.target_class is TargetClass.BLUE_DANGER
+        }
+        if required_aim_id is not None and required_aim_id not in blue_ids:
+            self._last_cluster_rejection_reason = "strategy_blue_aim_not_current"
+            return None
+        candidates = plan_breakup(
+            targets,
+            config=self.config,
+            origin=origin,
+            heading_rad=heading,
+            static_map=self._breakup_static_map,
+            field_bounds=self._breakup_allowed_field_bounds(),
+            front_mm=GripperKinematics().left_tip_position(0).x,
+            allowed_classes=frozenset((TargetClass.BLUE_DANGER,)),
+            approach=approach,
+            required_ids=required_ids,
+            required_aim_id=required_aim_id,
+        )
+        tried_groups: set[tuple[int, ...]] = set()
+        for candidate in candidates:
+            if candidate.aim_id not in blue_ids:
+                continue
+            if any(
+                same_local_group(
+                    region,
+                    candidate.member_field_points,
+                    self.config.cluster_group_ground_mm,
+                )
+                for region in self._breakup_failed_regions
+            ):
+                continue
+            if candidate.member_ids in tried_groups:
+                continue
+            tried_groups.add(candidate.member_ids)
+            history = [
+                plan
+                for plan in self._breakup_attempts
+                if same_local_group(
+                    plan.member_field_points,
+                    candidate.member_field_points,
+                    self.config.cluster_group_ground_mm
+                    + self.config.breakup_retry_penetration_mm,
+                )
+            ]
+            if len(history) >= self.config.breakup_max_attempts:
+                continue
+            if not history:
+                return candidate
+            previous = history[-1]
+            retries = plan_breakup(
+                targets,
+                config=self.config,
+                origin=origin,
+                heading_rad=heading,
+                static_map=self._breakup_static_map,
+                field_bounds=self._breakup_allowed_field_bounds(),
+                front_mm=GripperKinematics().left_tip_position(0).x,
+                allowed_classes=frozenset((TargetClass.BLUE_DANGER,)),
+                approach=approach,
+                required_ids=frozenset(candidate.member_ids),
+                required_aim_id=candidate.aim_id,
+                attempt=len(history) + 1,
+                previous_aim=previous.aim_field,
+                previous_penetration_mm=previous.penetration_mm,
+            )
+            for retry in retries:
+                if retry.aim_id in blue_ids:
+                    return retry
+        self._last_cluster_rejection_reason = "strategy_blue_breakup_no_safe_plan"
+        return None
+
+    def _breakup_geometric_block(self, timestamp_ns: int) -> bool:
+        if self._strategy_formal_phase:
+            return _SharedMatchSequence._breakup_geometric_block(
+                self,
+                timestamp_ns,
+            )
+        target = self._strategy_blue_target(timestamp_ns)
+        return target is not None and not self._strategy_blue_path_clear(
+            target,
+            timestamp_ns,
+        )
+
+    def _try_dynamic_grasp(self, timestamp_ns: int) -> MatchDecision | None:
+        if self._strategy_formal_phase:
+            return _SharedMatchSequence._try_dynamic_grasp(self, timestamp_ns)
+        # 解团合爪后的复核阶段如果已露出可直接夹取的蓝色物块，立即转入
+        # 单目标路径；不把绿/黑/橙策略带入本入口。
+        if self.state is MatchState.CLOSE_GRIPPER_SPIN:
+            target = self._strategy_blue_target(timestamp_ns)
+            if target is not None and self._strategy_blue_path_clear(target, timestamp_ns):
+                return self._begin_strategy_blue_transport(timestamp_ns, target)
+        return None
+
+    def green_target_diagnostic(self, timestamp_ns: int) -> str:
+        """记录策略蓝块的当前 K0、距离和夹取阶段，便于复盘实车失败。"""
+
+        if self._strategy_formal_phase:
+            return _SharedMatchSequence.green_target_diagnostic(
+                self,
+                timestamp_ns,
+            )
+        targets = tuple(
+            target
+            for target in self._tracker.tracks
+            if target.target_class is TargetClass.BLUE_DANGER
+        )
+        if not targets:
+            return f"blue=none,grasp_phase={self._strategy_blue_grasp_phase}"
+        entries: list[str] = []
+        for target in targets:
+            point = target.ground_point
+            point_text = (
+                "unknown"
+                if point is None
+                else f"({point.x:.1f},{point.y:.1f})"
+            )
+            selected = "*" if target.track_id == self._selected_track_id else ""
+            entries.append(
+                f"{selected}track={target.track_id},xy_mm={point_text},"
+                f"fresh={self._target_is_fresh(target, timestamp_ns)},"
+                f"status={target.status.value}"
+            )
+        target_final_x_mm = (
+            135.0
+            if self._near_field_grasp_config is None
+            else self._near_field_grasp_config.target_final_x_mm
+        )
+        active_plan = (
+            None
+            if self._near_field_pickup is None
+            else self._near_field_pickup.active_plan
+        )
+        forward_distance_mm = (
+            None if active_plan is None else active_plan.forward_distance_mm
+        )
+        forward_text = (
+            "none"
+            if forward_distance_mm is None
+            else f"{forward_distance_mm:.1f}"
+        )
+        return (
+            ";".join(entries)
+            + f",grasp_phase={self._strategy_blue_grasp_phase}"
+            + f",handoff_range_mm={self._near_field_handoff_range_mm():.1f}"
+            + f",target_final_x_mm={target_final_x_mm:.1f}"
+            + f",active_plan_opening_angles={None if active_plan is None else active_plan.opening_servo_angles_deg}"
+            + f",planned_forward_mm={forward_text}"
+        )
+
+    def _own_safe_zone_observation(self):
+        """策略将目标安全区设为启动侧的对面安全区。"""
+
+        if self._strategy_formal_phase:
+            return _SharedMatchSequence._own_safe_zone_observation(self)
+        perception = self._latest_perception
+        if (
+            perception is None
+            or perception.dropped_stale_age_ms is not None
+            or perception.field_features is None
+        ):
+            return None
+        expected = self._strategy_safe_zone_color
+        if expected is None:
+            expected = (
+                SafeZoneColor.BLUE
+                if self._team_color is TeamColor.RED
+                else SafeZoneColor.RED
+            )
+        candidates = tuple(
+            zone
+            for zone in perception.field_features.safe_zones
+            if zone.physical_color is expected
+        )
+        return max(candidates, key=lambda zone: zone.confidence, default=None)
+
+    def _safe_zone_transport_endpoint(self) -> FieldPoint:
+        """第一趟使用对面安全区左侧 D2，第二趟使用右侧 D2。"""
+
+        if self._strategy_formal_phase:
+            return _SharedMatchSequence._safe_zone_transport_endpoint(self)
+        if self._strategy_delivery_slot == 0:
+            return self.config.safe_zone_fallback_target_field
+        return self.config.safe_zone_injured_target_field
+
+    def _safe_zone_d2_target(self) -> FieldPoint:
+        """策略配置的左右航点就是最终 D2 对齐点，不再向内偏移。"""
+
+        if self._strategy_formal_phase:
+            return _SharedMatchSequence._safe_zone_d2_target(self)
+        return self._safe_zone_braking_compensated_target(
+            self._safe_zone_transport_endpoint()
+        )
+
+    def _safe_zone_final_target_y_mm(self) -> float:
+        """策略在 D2 完成释放，不再向安全区深处二次推进。"""
+
+        if self._strategy_formal_phase:
+            return _SharedMatchSequence._safe_zone_final_target_y_mm(self)
+        return self._safe_zone_d2_target().y
+
+    def _begin_formal_match_after_strategy(
+        self,
+        timestamp_ns: int,
+    ) -> MatchDecision:
+        """蓝色两趟完成后恢复 match 的绿块首趟流程。"""
+
+        own_y_sign = -1.0 if self._team_color is TeamColor.BLUE else 1.0
+        fallback = self.config.safe_zone_fallback_target_field
+        injured = self.config.safe_zone_injured_target_field
+        self.config = replace(
+            self.config,
+            # strategy 配置的两个航点位于对面；后续 match 流程改回己方
+            # 安全区，并重新打开正式流程的机会抓取入口。
+            safe_zone_fallback_target_field=FieldPoint(
+                fallback.x,
+                own_y_sign * abs(fallback.y),
+            ),
+            safe_zone_injured_target_field=FieldPoint(
+                injured.x,
+                own_y_sign * abs(injured.y),
+            ),
+            opportunistic_single_green_enabled=True,
+        )
+        self._strategy_formal_phase = True
+        self._near_field_pickup = self._strategy_saved_near_field_pickup
+        self._strategy_safe_zone_color = None
+        self._safe_zone_forward_y_sign = own_y_sign
+        self._strategy_blue_transport = False
+        self._strategy_blue_grasp_phase = "idle"
+        self._strategy_delivery_slot = 0
+        self._transport_count = 0
+        self._transport_target_classes = ()
+        self._breakup_plan = None
+        self._breakup_proposal = None
+        self._breakup_attempts.clear()
+        self._breakup_rejected_grasp_ids.clear()
+        self._breakup_failed_regions.clear()
+        self._breakup_only = False
+        self._selected_track_id = None
+        self._selected_green_ground = None
+        self._green_reference_samples = []
+        self._green_reference_last_seen_ns = None
+        self._green_reference = None
+        self._green_reference_heading_rad = None
+        self._green_reference_distance_m = None
+        self._green_approach_base_distance_m = None
+        self._green_approach_distance_m = None
+        self._reset_green_alignment_gate()
+
+        # 复用正式 match 的退出后视觉纠偏，再用纠偏后的新帧进入绿色搜索。
+        self._safe_zone_calibration_after_exit = True
+        self._safe_zone_phase = "searching_safe_zone_keypoints"
+        self._safe_zone_key_samples = []
+        self._safe_zone_key_last_frame = None
+        self._safe_zone_key_reobserve_until_ns = None
+        self._safe_zone_key_reobserve_frame_floor = None
+        self._safe_zone_keypoint_scan_until_ns = None
+        self._safe_zone_keypoint_scan_frame_floor = None
+        self._safe_zone_keypoint_scan_attempted = False
+        self._safe_zone_keypoint_reverse_base_distance_m = None
+        self._safe_zone_keypoint_reverse_attempted = False
+        self._safe_zone_calibration_snapshot = None
+        self._safe_zone_calibration_zone = None
+        self._safe_zone_calibration_last_failure = None
+        self._safe_zone_bbox_turn_direction = None
+        self._safe_zone_reacquire_frame_floor = None
+        self._reset_safe_zone_turn_gate()
+        self._safe_zone_stop_since_ns = None
+        self._return_phase = "calibrating_after_exit"
+        self.state = MatchState.TRANSPORT_RELEASE
+        return self._decision(
+            timestamp_ns,
+            0.0,
+            0.0,
+            "strategy_blue_tasks_complete_start_match_green_search",
+            posture=GripperPosture.OPEN,
+        )
+
+    def _step_return_backup(
+        self,
+        timestamp_ns: int,
+        cumulative_distance_m: float | None,
+    ) -> MatchDecision:
+        if self._strategy_formal_phase:
+            return _SharedMatchSequence._step_return_backup(
+                self,
+                timestamp_ns,
+                cumulative_distance_m,
+            )
+        decision = _SharedMatchSequence._step_return_backup(
+            self,
+            timestamp_ns,
+            cumulative_distance_m,
+        )
+        if decision.state is MatchState.FINISH_STOP:
+            return self._begin_formal_match_after_strategy(timestamp_ns)
+        return decision
+
 
 def main() -> None:
     from rescue_vision.app.match_runtime import _run_hardware
 
     parser = argparse.ArgumentParser(
-        description="Run the formal rescue match flow."
+        description="Run the blue-danger transport strategy."
     )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument(
@@ -9231,6 +9003,10 @@ def main() -> None:
         observer_image_interval_s=args.observer_image_interval_seconds,
         log_dir=args.log_dir,
         start_area=MatchStartArea.parse(args.start_area),
+        sequence_factory=MatchSequence.from_app_config,
+        mode_name="match_strategy",
+        log_file_prefix="strategy_",
+        preview_title="Match strategy perception",
     )
 
 

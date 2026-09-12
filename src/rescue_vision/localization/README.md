@@ -10,6 +10,8 @@
 | --- | --- |
 | `CenterCrossLocalizer` | 双轴十字产生四向候选；单 K0 在新鲜航向先验下只产生位置观测 |
 | `SafeZoneCornerLocalizer` | 枚举红/蓝身份和 K1/K2 世界角点对应，用 K0/K1/K2 连线估计航向并做长度门控 |
+| `SafeZoneCornerLocalization` | 一次安全区角点定位的结果；`observation` 与 `rejection` 恰有其一 |
+| `SafeZoneCornerRejectionReason` | 被拒原因：观测年龄门、先验缺失或 K0/K1/K2 三点几何不通过 |
 | `StaticFieldLandmarkTracker` | 有界确认、地图搜索提示和旧帧去重辅助 |
 | `VisualLocalizationPipeline` | 同帧选择并保证每个帧序最多提交一次视觉更新 |
 | `FieldPositionObservation` | 不含航向测量的中心十字位置证据 |
@@ -80,6 +82,31 @@ if visual is not None and snapshot is not None and snapshot.field_features is no
 - 安全区颜色未知时枚举 red/blue；对每种身份再枚举 K1/K2 两种世界对应。
   无先验时对称解保持歧义，不提交纠偏。
 - 同帧同时得到十字和安全区全位姿时只提交一项，避免相关证据重复压缩方差。
+- `SafeZoneCornerLocalizer.localize()` 在观测年龄超过
+  `localization.safe_zone_corners.max_observation_age_ms` 时直接拒绝，且该判定
+  在几何门之前；两个门限都只影响是否准入，不做运动补偿。该门限必须不小于
+  该阶段实测的 `capture_to_result`，否则每次校准都会在年龄门被拒。诊断时应把
+  `observation_stale` 与 `k0_corner_distance_mismatch` 等几何原因分开处理。
+
+单帧诊断或流程自建绝对位姿（例如安全区停稳后的三点视觉纠偏）直接调用定位器时，
+必须区分观测与拒绝原因。`config` 来自上文「配置和装配」代码段，`snapshot` 来自
+「连续融合调用顺序」的取帧段：
+
+```python
+localizer = config.build_safe_zone_corner_localizer()
+localization = localizer.localize(
+    snapshot.field_features,
+    prior_pose=fusion.pose_at(snapshot.capture_timestamp_ns).pose,
+    # 年龄门比较该时刻与观测采集时刻；省略则退化为 result 时刻。
+    current_timestamp_ns=time.monotonic_ns(),
+)
+if localization.observation is None:
+    # observation_stale 表示观测太旧，三点几何根本没被评估；
+    # 其余取值（如 k0_corner_distance_mismatch）才是几何不通过。
+    print(f"safe_zone_calibration_rejected={localization.rejection.value}")
+else:
+    field_pose = localization.observation.pose
+```
 
 解团推撞等编码器把滑移误记为行进的事件结束后，先注入一次扰动协方差再继续
 常驻纠偏；否则模型不确定度仍偏小，随后到达的真锚会被创新门限当作离群值

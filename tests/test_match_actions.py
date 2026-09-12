@@ -301,6 +301,9 @@ def test_startup_straight_pid_outputs_right_correction_for_right_wheel_excess() 
 
 def test_breakup_moves_forward_one_meter_then_backward_twenty_centimeters() -> None:
     sequence = make_sequence()
+    # This fixture exercises the legacy fixed-action helper directly; formal
+    # match execution supplies a BreakupPlan before entering the state.
+    sequence._dynamic_breakup_enabled = False
     start_sequence(sequence)
     sequence._started = True
     sequence.state = MatchState.BREAKUP_FORWARD
@@ -366,7 +369,7 @@ def test_breakup_moves_forward_one_meter_then_backward_twenty_centimeters() -> N
 
 
 
-def test_no_isolated_green_has_no_attempt_counter_and_loops_to_search() -> None:
+def test_no_isolated_green_keeps_attempt_budget_and_loops_to_search() -> None:
     sequence = make_sequence()
     start_sequence(sequence)
     sequence._started = True
@@ -390,7 +393,7 @@ def test_no_isolated_green_has_no_attempt_counter_and_loops_to_search() -> None:
         safety=SafetySignals.nominal(10),
     )
     assert result.state is MatchState.SEARCH_CLUSTER
-    assert not hasattr(sequence, "_breakup_attempts")
+    assert sequence._breakup_attempts == []
 
 
 

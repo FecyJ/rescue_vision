@@ -2,16 +2,29 @@
 
 from __future__ import annotations
 
+import json
+import math
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
 from manual_tests.keyboard_drive import (
+    KeyboardDriveLogWriter,
+    KeyboardDriveCommand,
+    KeyboardDriveTelemetry,
+    LiveReplayFeedback,
     KeyDriveState,
     _command_label,
     _draw_gyro_overlay,
+    apply_keyboard_drive_target,
+    build_replay_reference,
+    closed_loop_wheel_targets,
     compute_twist,
     decode_keys,
     gripper_angles_for,
+    interpolate_replay_reference,
+    load_keyboard_drive_log,
 )
 from rescue_vision.motion import GripperCalibration, OdometryImu, SensorFlags
 
@@ -79,6 +92,8 @@ def test_decode_keys_incomplete_csi_resolves_across_polls():
         (frozenset({"turn_right"}), (0.0, -0.60)),
         (frozenset({"forward", "turn_left"}), (0.10, 0.60)),
         (frozenset({"forward", "turn_right"}), (0.10, -0.60)),
+        (frozenset({"backward", "turn_left"}), (-0.10, 0.60)),
+        (frozenset({"backward", "turn_right"}), (-0.10, -0.60)),
         # 相对的两个键同按：该轴归零。
         (frozenset({"forward", "backward"}), (0.0, 0.0)),
         (frozenset({"turn_left", "turn_right"}), (0.0, 0.0)),
@@ -113,18 +128,28 @@ def test_command_label(keys, expected):
 
 
 class TestKeyDriveState:
-    def test_hold_and_timeout(self):
+    def test_linear_direction_is_latched(self):
         state = KeyDriveState(hold_timeout_ns=100)
         state.apply(["forward"], now_ns=0)
         assert state.active_keys(now_ns=50) == frozenset({"forward"})
-        assert state.active_keys(now_ns=100) == frozenset({"forward"})
-        assert state.active_keys(now_ns=101) == frozenset()
+        assert state.active_keys(now_ns=10_000) == frozenset({"forward"})
 
-    def test_auto_repeat_keeps_held(self):
+    def test_turn_auto_repeat_combines_with_latched_linear(self):
         state = KeyDriveState(hold_timeout_ns=100)
         state.apply(["forward"], now_ns=0)
-        state.apply(["forward"], now_ns=80)
-        assert state.active_keys(now_ns=150) == frozenset({"forward"})
+        state.apply(["turn_right"], now_ns=80)
+        assert state.active_keys(now_ns=150) == frozenset(
+            {"forward", "turn_right"}
+        )
+        assert state.active_keys(now_ns=181) == frozenset({"forward"})
+
+    def test_opposite_direction_replaces_axis(self):
+        state = KeyDriveState(hold_timeout_ns=100)
+        state.apply(["forward", "backward"], now_ns=0)
+        state.apply(["turn_left", "turn_right"], now_ns=0)
+        assert state.active_keys(now_ns=0) == frozenset(
+            {"backward", "turn_right"}
+        )
 
     def test_stop_is_edge_triggered_and_clears_drive(self):
         state = KeyDriveState(hold_timeout_ns=100)
@@ -161,6 +186,266 @@ class TestKeyDriveState:
             KeyDriveState(hold_timeout_ns=-1)
         with pytest.raises(ValueError):
             KeyDriveState(hold_timeout_ns=True)  # type: ignore[arg-type]
+
+
+def _fake_controller(*, wheel_track_m: float = 0.30):
+    return SimpleNamespace(
+        limits=SimpleNamespace(
+            wheel_track_m=wheel_track_m,
+            max_linear_velocity_m_s=0.4,
+            max_angular_velocity_rad_s=1.2,
+            max_wheel_velocity_m_s=0.5,
+            min_wheel_velocity_m_s=0.02,
+            max_wheel_acceleration_m_s2=1.0,
+            left_wheel_speed_weight=1.0,
+            right_wheel_speed_weight=1.0,
+        )
+    )
+
+
+def _fake_calibration(*, left_radius_mm: float = 50.0):
+    return SimpleNamespace(
+        encoder_counts_per_revolution=1000,
+        left_wheel_radius_mm=left_radius_mm,
+        right_wheel_radius_mm=50.0,
+        gyro_z_sign=1,
+    )
+
+
+def _log_odometry(sequence: int, sample_us: int, count: int) -> OdometryImu:
+    return OdometryImu(
+        uart_sequence=sequence,
+        received_timestamp_ns=1_000 + sample_us * 1000,
+        telemetry_sequence=sequence,
+        sample_timestamp_us=sample_us,
+        left_encoder_count=count,
+        right_encoder_count=count,
+        gyro_x_urad_s=0,
+        gyro_y_urad_s=0,
+        gyro_z_urad_s=100_000,
+        accel_x_mm_s2=0,
+        accel_y_mm_s2=0,
+        accel_z_mm_s2=9807,
+        imu_temperature_cdeg=2500,
+        sensor_flags=(
+            SensorFlags.LEFT_ENCODER_VALID
+            | SensorFlags.RIGHT_ENCODER_VALID
+            | SensorFlags.IMU_VALID
+        ),
+    )
+
+
+def test_keyboard_drive_log_round_trip(tmp_path) -> None:
+    path = tmp_path / "drive.jsonl"
+    controller = _fake_controller()
+    calibration = _fake_calibration()
+    with KeyboardDriveLogWriter(
+        path, controller, calibration, started_ns=1_000
+    ) as writer:
+        assert writer.record(
+            1_000,
+            linear_velocity_m_s=0.0,
+            angular_velocity_rad_s=0.0,
+            target_wheel_speeds_m_s=(0.0, 0.0),
+        )
+        assert writer.record(
+            11_000,
+            linear_velocity_m_s=0.1,
+            angular_velocity_rad_s=-0.6,
+            target_wheel_speeds_m_s=(0.19, 0.01),
+        )
+        assert not writer.record(
+            12_000,
+            linear_velocity_m_s=0.1,
+            angular_velocity_rad_s=-0.6,
+            target_wheel_speeds_m_s=(0.19, 0.01),
+        )
+        assert writer.record(
+            21_000,
+            linear_velocity_m_s=0.0,
+            angular_velocity_rad_s=0.0,
+            target_wheel_speeds_m_s=(0.0, 0.0),
+            force=True,
+        )
+        writer.record_telemetry(_log_odometry(1, 10, 0))
+        writer.record_telemetry(_log_odometry(2, 20, 10))
+
+    recording = load_keyboard_drive_log(path, controller, calibration)
+    commands = recording.commands
+
+    assert [command.elapsed_ns for command in commands] == [0, 10_000, 20_000]
+    assert commands[1].linear_velocity_m_s == pytest.approx(0.1)
+    assert commands[1].angular_velocity_rad_s == pytest.approx(-0.6)
+    assert commands[1].left_target_m_s == pytest.approx(0.19)
+    assert len(recording.telemetry) == 2
+
+
+def test_apply_keyboard_drive_target_does_not_reuse_pre_command_time() -> None:
+    class Controller:
+        target_wheel_speeds_m_s = (0.07, 0.13)
+
+        def __init__(self) -> None:
+            self.update_now_values = []
+
+        def drive_wheel_limited(self, linear, angular):
+            # The real method updates internally before installing the target.
+            return linear, angular
+
+        def update(self, *, now_ns=None):
+            self.update_now_values.append(now_ns)
+
+    class Log:
+        def __init__(self) -> None:
+            self.records = []
+
+        def record(self, now_ns, **values):
+            self.records.append((now_ns, values))
+
+    controller = Controller()
+    command_log = Log()
+
+    applied = apply_keyboard_drive_target(
+        controller,
+        command_log,  # type: ignore[arg-type]
+        requested_linear_m_s=0.1,
+        requested_angular_rad_s=0.2,
+    )
+
+    assert applied == (0.1, 0.2)
+    assert controller.update_now_values == [None]
+    assert command_log.records[0][1]["target_wheel_speeds_m_s"] == (0.07, 0.13)
+
+
+def test_keyboard_drive_log_rejects_config_mismatch(tmp_path) -> None:
+    path = tmp_path / "drive.jsonl"
+    controller = _fake_controller()
+    calibration = _fake_calibration()
+    with KeyboardDriveLogWriter(
+        path, controller, calibration, started_ns=0
+    ) as writer:
+        writer.record(
+            0,
+            linear_velocity_m_s=0.0,
+            angular_velocity_rad_s=0.0,
+            target_wheel_speeds_m_s=(0.0, 0.0),
+        )
+        writer.record(
+            1,
+            linear_velocity_m_s=0.0,
+            angular_velocity_rad_s=0.0,
+            target_wheel_speeds_m_s=(0.0, 0.0),
+            force=True,
+        )
+        writer.record_telemetry(_log_odometry(1, 10, 0))
+        writer.record_telemetry(_log_odometry(2, 20, 0))
+
+    with pytest.raises(ValueError, match="does not match"):
+        load_keyboard_drive_log(
+            path,
+            _fake_controller(wheel_track_m=0.31),
+            calibration,
+        )
+
+
+def test_keyboard_drive_log_rejects_nonzero_final_command(tmp_path) -> None:
+    path = tmp_path / "drive.jsonl"
+    controller = _fake_controller()
+    calibration = _fake_calibration()
+    with KeyboardDriveLogWriter(
+        path, controller, calibration, started_ns=0
+    ) as writer:
+        writer.record(
+            0,
+            linear_velocity_m_s=0.0,
+            angular_velocity_rad_s=0.0,
+            target_wheel_speeds_m_s=(0.0, 0.0),
+        )
+        writer.record(
+            1,
+            linear_velocity_m_s=0.1,
+            angular_velocity_rad_s=0.0,
+            target_wheel_speeds_m_s=(0.1, 0.1),
+        )
+        writer.record_telemetry(_log_odometry(1, 10, 0))
+        writer.record_telemetry(_log_odometry(2, 20, 10))
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [record for record in records if record["record_type"] == "command"][-1][
+        "left_target_m_s"
+    ] == 0.1
+
+    with pytest.raises(ValueError, match="end with a zero-speed"):
+        load_keyboard_drive_log(path, controller, calibration)
+
+
+def test_replay_reference_interpolates_encoder_distance_and_gyro_heading() -> None:
+    calibration = _fake_calibration()
+    valid_flags = int(
+        SensorFlags.LEFT_ENCODER_VALID
+        | SensorFlags.RIGHT_ENCODER_VALID
+        | SensorFlags.IMU_VALID
+    )
+    samples = (
+        KeyboardDriveTelemetry(0, 1, 0, 100, 200, 100_000, valid_flags),
+        KeyboardDriveTelemetry(
+            100_000_000, 2, 100_000, 200, 300, 100_000, valid_flags
+        ),
+        KeyboardDriveTelemetry(
+            200_000_000, 3, 200_000, 300, 400, 100_000, valid_flags
+        ),
+    )
+
+    points = build_replay_reference(samples, calibration)
+    midpoint = interpolate_replay_reference(points, 0.15)
+
+    assert midpoint.left_distance_m == pytest.approx(0.15 * math.pi * 0.1)
+    assert midpoint.right_distance_m == pytest.approx(0.15 * math.pi * 0.1)
+    assert midpoint.heading_rad == pytest.approx(0.015)
+
+
+def test_closed_loop_targets_correct_position_and_heading_error() -> None:
+    controller = _fake_controller()
+    feedback = LiveReplayFeedback(_fake_calibration())
+    feedback.left_distance_m = 0.08
+    feedback.right_distance_m = 0.09
+    feedback.heading_rad = 0.05
+    feedback.heading_available = True
+    reference = SimpleNamespace(
+        left_distance_m=0.10,
+        right_distance_m=0.10,
+        heading_rad=0.10,
+    )
+    feedforward = KeyboardDriveCommand(0, 0.1, 0.0, 0.1, 0.1)
+
+    left, right, left_error, right_error = closed_loop_wheel_targets(
+        controller,
+        reference,
+        feedback,
+        feedforward,
+    )
+
+    assert left_error == pytest.approx(0.02)
+    assert right_error == pytest.approx(0.01)
+    assert right > left  # 正航向误差应增加逆时针差速。
+    assert max(abs(left), abs(right)) <= controller.limits.max_wheel_velocity_m_s
+
+
+def test_live_replay_feedback_uses_encoder_baseline_and_integrates_gyro() -> None:
+    calibration = _fake_calibration()
+    feedback = LiveReplayFeedback(calibration)
+    first = _log_odometry(1, 10_000, 100)
+    second = _log_odometry(2, 110_000, 200)
+
+    feedback.observe(first)
+    feedback.observe(second)
+
+    expected_distance = 100 * math.pi * 0.1 / 1000.0
+    assert feedback.left_distance_m == pytest.approx(expected_distance)
+    assert feedback.right_distance_m == pytest.approx(expected_distance)
+    assert feedback.heading_rad == pytest.approx(0.01)
+    assert feedback.heading_available is True
+    feedback.require_recent(second.received_timestamp_ns + 199_000_000)
+    with pytest.raises(RuntimeError, match="stale"):
+        feedback.require_recent(second.received_timestamp_ns + 201_000_000)
 
 
 def _gripper_calibration(*, with_transport: bool = True) -> GripperCalibration:

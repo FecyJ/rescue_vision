@@ -12,8 +12,10 @@ from rescue_vision.localization import (
     CenterCrossPoseObservation,
     CenterCrossSelectionSource,
     FieldPose2D,
+    SafeZoneCornerLocalization,
     SafeZoneCornerLocalizer,
     SafeZoneCornerPoseObservation,
+    SafeZoneCornerRejectionReason,
     StaticFieldLandmarkTracker,
     StaticLandmarkTrackingConfig,
     angular_distance,
@@ -247,7 +249,8 @@ def test_safe_zone_corner_pair_recovers_unique_pose() -> None:
         1, 1_000_000, 1_100_000, (640, 480), (zone,), None
     )
 
-    observation = SafeZoneCornerLocalizer(static_map()).localize(result, prior_pose=pose)
+    localization = SafeZoneCornerLocalizer(static_map()).localize(result, prior_pose=pose)
+    observation = localization.observation
 
     assert observation is not None
     assert observation.pose.position.x == pytest.approx(pose.position.x, abs=1e-6)
@@ -268,10 +271,11 @@ def test_safe_zone_k0_and_one_corner_can_recover_pose() -> None:
         1, 1_000_000, 1_100_000, (640, 480), (zone,), None
     )
 
-    observation = SafeZoneCornerLocalizer(static_map()).localize(
+    localization = SafeZoneCornerLocalizer(static_map()).localize(
         result,
         prior_pose=pose,
     )
+    observation = localization.observation
 
     assert observation is not None
     assert observation.pose.position.x == pytest.approx(pose.position.x, abs=1e-6)
@@ -300,10 +304,67 @@ def test_safe_zone_rejects_position_when_k0_corner_lengths_do_not_match() -> Non
         1, 1_000_000, 1_100_000, (640, 480), (bad_zone,), None
     )
 
-    assert SafeZoneCornerLocalizer(static_map()).localize(
+    localization = SafeZoneCornerLocalizer(static_map()).localize(
         result,
         prior_pose=pose,
-    ) is None
+    )
+
+    assert localization.observation is None
+    assert (
+        localization.rejection
+        is SafeZoneCornerRejectionReason.K0_CORNER_DISTANCE_MISMATCH
+    )
+
+
+def test_safe_zone_rejects_stale_observation_before_geometry() -> None:
+    """观测超龄必须报年龄门，而不是落进几何类原因。"""
+
+    pose = FieldPose2D(FieldPoint(120.0, -240.0), math.radians(23.0))
+    zone = _safe_zone_from_pose(pose)
+    result = FieldFeatureDetectionResult(
+        1, 1_000_000, 1_100_000, (640, 480), (zone,), None
+    )
+
+    localization = SafeZoneCornerLocalizer(static_map()).localize(
+        result,
+        prior_pose=pose,
+        current_timestamp_ns=1_000_000 + 250_000_001,
+    )
+
+    assert localization.observation is None
+    assert localization.rejection is SafeZoneCornerRejectionReason.OBSERVATION_STALE
+
+
+def test_safe_zone_observation_at_age_limit_still_localizes() -> None:
+    """门限是闭区间：正好等于 max_observation_age_ms 的观测仍然可用。"""
+
+    pose = FieldPose2D(FieldPoint(120.0, -240.0), math.radians(23.0))
+    zone = _safe_zone_from_pose(pose)
+    result = FieldFeatureDetectionResult(
+        1, 1_000_000, 1_100_000, (640, 480), (zone,), None
+    )
+
+    localization = SafeZoneCornerLocalizer(static_map()).localize(
+        result,
+        prior_pose=pose,
+        current_timestamp_ns=1_000_000 + 250_000_000,
+    )
+
+    assert localization.observation is not None
+    assert localization.rejection is None
+
+
+def test_safe_zone_localization_requires_exactly_one_outcome() -> None:
+    with pytest.raises(ValueError, match="exactly one"):
+        SafeZoneCornerLocalization()
+    with pytest.raises(ValueError, match="exactly one"):
+        SafeZoneCornerLocalization(
+            observation=corner_pose_observation(
+                FieldPose2D(FieldPoint(0.0, 0.0), 0.0),
+                confidence=0.9,
+            ),
+            rejection=SafeZoneCornerRejectionReason.NO_PRIOR_POSE,
+        )
 
 
 def test_safe_zone_k1_k2_without_k0_cannot_correct_position() -> None:
@@ -317,10 +378,16 @@ def test_safe_zone_k1_k2_without_k0_cannot_correct_position() -> None:
         1, 1_000_000, 1_100_000, (640, 480), (zone,), None
     )
 
-    assert SafeZoneCornerLocalizer(static_map()).localize(
+    localization = SafeZoneCornerLocalizer(static_map()).localize(
         result,
         prior_pose=pose,
-    ) is None
+    )
+
+    assert localization.observation is None
+    assert (
+        localization.rejection
+        is SafeZoneCornerRejectionReason.GROUND_ANCHOR_MISSING
+    )
 
 
 def test_safe_zone_single_corner_cannot_create_pose() -> None:
@@ -336,9 +403,15 @@ def test_safe_zone_single_corner_cannot_create_pose() -> None:
     result = FieldFeatureDetectionResult(
         2, 2_000_000, 2_100_000, (640, 480), (zone,), None
     )
-    assert SafeZoneCornerLocalizer(static_map()).localize(
+    localization = SafeZoneCornerLocalizer(static_map()).localize(
         result, prior_pose=FieldPose2D(FieldPoint(0.0, 0.0), 0.0)
-    ) is None
+    )
+
+    assert localization.observation is None
+    assert (
+        localization.rejection
+        is SafeZoneCornerRejectionReason.INSUFFICIENT_CORRESPONDENCES
+    )
 
 
 def test_safe_zone_image_order_hypotheses_use_prior() -> None:
@@ -348,7 +421,8 @@ def test_safe_zone_image_order_hypotheses_use_prior() -> None:
         3, 3_000_000, 3_100_000, (640, 480), (zone,), None
     )
 
-    observation = SafeZoneCornerLocalizer(static_map()).localize(result, prior_pose=pose)
+    localization = SafeZoneCornerLocalizer(static_map()).localize(result, prior_pose=pose)
+    observation = localization.observation
 
     assert observation is not None
     assert observation.pose.position.x == pytest.approx(pose.position.x, abs=1e-6)

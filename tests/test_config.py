@@ -118,7 +118,6 @@ world:
   opponent_max_age_ms: 500.0
   danger_confirm_threshold: 0.6
   danger_suspect_threshold: 0.15
-  unknown_suspect_threshold: 0.5
   team_color: unknown
   static_map:
     center_cross:
@@ -615,7 +614,6 @@ def test_color_classifier_config_is_loaded_from_perception(tmp_path) -> None:
 
     assert config.perception.detection_threshold == pytest.approx(0.25)
     assert config.perception.k0_threshold == pytest.approx(0.5)
-    assert config.perception.unknown_override_confidence_threshold == pytest.approx(0.8)
     classifier = config.perception.color_classifier
     assert classifier.green_supply[0].lower == (35, 70, 71)
     assert len(classifier.orange_injured) == 2
@@ -815,7 +813,6 @@ def test_perception_supports_partial_nested_overrides(tmp_path) -> None:
         "  lens_position: 1.0\n"
         "perception:\n"
         "  detection_threshold: 0.4\n"
-        "  unknown_override_confidence_threshold: 0.9\n"
         "  color_classifier:\n"
         "    min_color_fraction: 0.22\n",
         encoding="utf-8",
@@ -825,7 +822,6 @@ def test_perception_supports_partial_nested_overrides(tmp_path) -> None:
 
     assert config.perception.detection_threshold == pytest.approx(0.4)
     assert config.perception.k0_threshold == pytest.approx(0.5)
-    assert config.perception.unknown_override_confidence_threshold == pytest.approx(0.9)
     assert config.perception.color_classifier.min_color_fraction == pytest.approx(0.22)
     assert config.perception.color_classifier.morphology_kernel_size == 3
 
@@ -1249,7 +1245,7 @@ def test_near_field_grasp_config_weights_and_strict_keys(tmp_path) -> None:
     config = load_runtime_config(path)
     assert config.near_field_grasp.orange_priority_weight == 0.7
     assert config.near_field_grasp.target_final_x_mm == 105
-    assert config.near_field_grasp.orange_target_final_x_mm == 210
+    assert config.near_field_grasp.orange_target_final_x_mm == 142
     assert config.near_field_grasp.max_targets == 3
     path.write_text(config_text(extra="near_field_grasp:\n  typo_weight: 1\n"), encoding="utf-8")
     with pytest.raises(ValueError, match="Unknown keys"):
@@ -1277,3 +1273,20 @@ def test_removed_match_near_field_keys_are_rejected(tmp_path, removed_key) -> No
     )
     with pytest.raises(ValueError, match="Unknown keys"):
         load_runtime_config(path)
+
+
+def test_strategy_safe_zone_corner_gate_is_not_tighter_than_pipeline() -> None:
+    """strategy 的安全区三点年龄门必须覆盖实测感知延迟，且不超过快照门。
+
+    logs/strategy/strategy_20260911_1021.log 实测该阶段 capture_to_result p50
+    中位数约 343 ms、观测年龄最大 638 ms；沿用默认 250 ms 会让每一次三点校准
+    都在年龄门被拒（现场表现为 calibration_failure=observation_stale）。上限取
+    processing.max_observation_age_ms，因为主循环的快照门已经按该值丢弃旧帧，
+    写更大的门限不会生效。
+    """
+
+    config = load_runtime_config("configs/runtime.strategy.yaml")
+    corners = config.build_safe_zone_corner_localizer().config
+
+    assert corners.max_observation_age_ms <= config.processing.max_observation_age_ms
+    assert corners.max_observation_age_ms >= 500.0
