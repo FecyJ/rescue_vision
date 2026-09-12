@@ -498,6 +498,68 @@ def test_preparation_session_uses_handoff_prior_for_first_tentative_frame():
     assert result.selection.plan is not None
 
 
+def test_required_handoff_keeps_supplementary_target_in_the_plan():
+    planner = selector(max_range_mm=600.0)
+    worker = GraspPreparationSession(
+        GraspTargetTracker(
+            TrackingConfig(1, 80, .1, 500, 1, .1).build_tracker(),
+            projector(),
+            planner.config,
+        ),
+        planner,
+    )
+    handoff = target(1, x=300.0, y=-230.0)
+    alternative_a = target(2, x=300.0, y=190.0, cls=BLACK)
+    alternative_b = target(3, x=300.0, y=235.0, cls=BLACK)
+    result = worker.update(
+        snapshot(0, (handoff, alternative_a, alternative_b)),
+        locked_ids=None,
+        handoff_prior=NearFieldHandoffPrior(
+            TargetClass.GREEN_SUPPLY,
+            GroundPoint(300.0, -230.0),
+            source_track_id=74,
+        ),
+        require_handoff=True,
+    )
+
+    assert result.selection.plan is not None
+    assert any(member.handoff_matched for member in result.selection.plan.members)
+
+
+def test_required_handoff_reports_disappearance_instead_of_switching_plan():
+    planner = selector(max_range_mm=600.0)
+    worker = GraspPreparationSession(
+        GraspTargetTracker(
+            TrackingConfig(1, 80, .1, 500, 1, .1).build_tracker(),
+            projector(),
+            planner.config,
+        ),
+        planner,
+    )
+    prior = NearFieldHandoffPrior(
+        TargetClass.GREEN_SUPPLY,
+        GroundPoint(300.0, 0.0),
+        source_track_id=74,
+    )
+    first = worker.update(
+        snapshot(0, (target(1, x=300.0, y=0.0),)),
+        locked_ids=None,
+        handoff_prior=prior,
+        require_handoff=True,
+    )
+    assert first.selection.plan is not None
+
+    missing = worker.update(
+        snapshot(1, (target(2, x=300.0, y=100.0, cls=BLACK),)),
+        locked_ids=None,
+        handoff_prior=prior,
+        require_handoff=True,
+    )
+
+    assert missing.selection.plan is None
+    assert missing.selection.rejections == ("handoff_target_missing",)
+
+
 def test_preparation_session_uses_current_servo_reach_without_alignment_plan():
     planner = selector(confirmation_frames=1)
     worker = GraspPreparationSession(
@@ -1141,3 +1203,42 @@ def test_excluded_index_survives_locked_identity_remap():
     assert not locked.selectable
     assert remapped.selection.plan is None
     assert remapped.selection.rejections == ("locked_member_not_selectable",)
+
+
+@pytest.mark.parametrize('poll_ns', [5_000_000, 10_000_000])
+@pytest.mark.parametrize('latency_ns,frame_interval_ns', [(300_000_000,250_000_000),(600_000_000,400_000_000)])
+def test_opening_overlap_advances_without_new_frames_and_counts_distance_once(poll_ns, latency_ns, frame_interval_ns):
+    seq = sequence(cruise_speed_scale=1.5, gripper_full_travel_time_s=1.0)
+    plan = selector().select((target(1,x=440,y=-70), target(2,x=440,y=70,cls=BLACK))).plan
+    assert plan is not None
+    start(seq, plan)
+    distance = 0.0
+    saw_overlap = False
+    closing_at = None
+    # Published perception may lag 300–600 ms and repeat across 5–10 ms polls.
+    for now in range(poll_ns, 12_000_000_000, poll_ns):
+        capture = (max(0, now-latency_ns) // frame_interval_ns) * frame_interval_ns
+        stale = prep(plan, capture)
+        decision = seq.step(now, stale, cumulative_distance_m=distance)
+        if decision.state is State.OPENING and decision.linear_velocity_m_s > 0:
+            saw_overlap = True
+            assert not decision.soft_brake
+            assert decision.min_wheel_velocity_m_s == 0.0
+        if decision.state is State.CLOSING:
+            closing_at = distance
+            break
+        distance += decision.linear_velocity_m_s * poll_ns / 1e9
+    assert saw_overlap
+    assert closing_at is not None
+    assert closing_at == pytest.approx(plan.forward_distance_mm/1000, abs=.001)
+
+
+def test_opening_overlap_rejects_close_target_and_missing_odometry():
+    seq = sequence(cruise_speed_scale=1.5, gripper_full_travel_time_s=1.0)
+    plan = selector().select((target(x=190),)).plan
+    start(seq, plan)
+    decision = seq.step(10_000_000, None, cumulative_distance_m=0)
+    assert decision.linear_velocity_m_s == 0 and decision.soft_brake
+    decision = seq.step(20_000_000, None, cumulative_distance_m=None)
+    assert decision.linear_velocity_m_s == 0
+    assert 'critical_odometry_unavailable' in decision.reason

@@ -131,8 +131,9 @@ rescue-vision-gripper-width \
 
 ### 选组与试验几何
 
-配置权威为 `near_field_grasp`，代码默认近场半径和最大行程均为 450 mm；正式 match 配置
-可按现场标定调整（当前配置均为 450 mm），最多 3 个物资。
+配置权威为 `near_field_grasp`，近场半径是单次实际收拢的接管条件，不是补夹的全场发现半径；
+正式 match 可按现场标定调整，最多 3 个物资。远场补夹目标先沿正常入口接近，进入该半径后
+再由近场收拢接管。
 为限制后台枚举量，最多从最近 12 个可选物资建立组合（可配置为不超过 20 个）；
 其余所有检测仍参加障碍检查或顺带纳入，不会因候选截断而被忽略。
 
@@ -162,6 +163,12 @@ rescue-vision-gripper-width \
 团中心只用于诊断，不作为撞击点；计划选择能够被夹爪前向扫掠实际接触的成员，并把
 蓝色危险成员纳入连带推移和场界/安全区检查。全蓝团跳过，含蓝混合团在存在合法
 抓取阻挡时可以处理。计划包含尝试编号、碰撞成员、前进/后退距离、穿入量和采集时间。
+`plan_breakup(field_bounds=...)` 必须传物理场界；`_physical_field_bounds()` 从当前静态地图
+读取该边界，车体/夹爪取覆盖两者的最大半径再加一次安全余量，物块只扣自身实体半径
+与推移余量。正式接近、近场路径、动态解团规划及执行使用相同的物理场界，不能把旧的
+`_breakup_allowed_field_bounds()`（已经扣夹爪偏移的点检查边界）再送入实体扫掠检查。
+拒绝日志记录 `blocked_path`、实体类别、起终点和实际余量；已有入口计划但复核失败时
+同样输出 `rejected_candidates`。
 已经放入安全区的物资由 `_ground_in_safe_zone()` 按当前位姿排除在成团和瞄准点候选
 之外（`plan_breakup(..., non_contact_ids=...)`），但它们仍留在目标集合里参加推移净空
 检查，不能被碰撞也不能被忽略。同一判定也用在首轮优先绿色候选和 CC/联调入口的团选择上。
@@ -171,10 +178,13 @@ rescue-vision-gripper-width \
 `_graspable_target_is_usable()`、成团 `non_contact_ids` 和补夹候选过滤上，不引入第二套
 场地阈值。
 
-正式动态解团只有一个确认闭环：发现需要解团后保持零速，等待真实编码器/IMU停稳；
+正式动态解团只有一个确认闭环：先通过采集位姿历史把 K0 补偿到当前机器人系，
+按物理接触射线完成 IMU 对准，再等待真实编码器/IMU停稳；
 停稳后的当前帧选择一个可靠接触核心，并用当前目标一次完成危险、场界、安全区和机器人
 包络检查。随后用 `match.breakup_confirmation_frames` 个不同有效帧确认同一物理核心，
-确认成功立即冻结当前计划；不再单独旋转、接近、接触后重新取第二轮参考，也不等待近场
+同团排名改变优先保持原物理瞄准点，停稳帧更新方向时先修正再确认；角容差随接触盘
+半径/距离收紧。确认成功立即冻结当前计划，连续推进到穿入终点（1 mm 行程容差），
+刹车余量保留在路径外扩中，不再从物料穿入量扣除。不在团前重新停车观察，也不等待近场
 抓取准备器。最小推进门槛取 `breakup_min_penetration_mm + breakup_braking_margin_mm`
 与局部接触集自身跨度的较小值，浅团只要能整段推穿就成立，行程不足以推穿时仍按当时
 门槛淘汰。入口时冻结的待确认计划不算数：执行计划必须由停稳后的当前帧重新生成。
@@ -241,10 +251,12 @@ tracker 仍保留短时历史，明确危险证据也继续在轨迹存续期内
 
 橙色从候选生成阶段起只形成单目标方案；绿/黑只彼此组合。橙色落入绿黑走廊、或绿黑落入
 橙色走廊时都只作为阻挡物，不能顺带加入另一类方案。远场 handoff prior 只唯一匹配关联门限内
-K0 最近的局部目标；首轮单绿把该目标作为排他候选。一般阶段先按规则分和单橙优先级排序，
-再在同一规则层内优先选择包含该目标的合法组合，最后比较净空、行程和对准角：绿色 5 分、黑色 10 分、橙色 15 分；规则总分较高者优先。同为 15 分时，
-单橙优先权重必须大于其余次级权重之和，因此单橙严格优先于三绿或一绿一黑。只有规则总分和
-单橙层级相同时，才继续比较成员数量、净空、行程和对准角。
+K0 最近的局部目标；首轮单绿优先合法交接目标，也可选择其它合法单绿。一般阶段在通过
+容量、机械开度和完整扫掠检查的组合中，依次优先成员数量、黑色数量、规则总分、单橙优先级、
+交接匹配及净空/行程/对准代价。绿黑并列可共同收拢时优先多抓，橙色仍严格单独转运。
+补夹阶段的 handoff prior 则是锁定入口目标：全场绿/黑候选按机器人地面距离优先，目标确认
+后不因新出现的更近目标改选；锁定目标失观或本次动作明确失败后才接管下一个候选，并重新走同一对准、接近
+和近场确认链。
 
 | 次级特征 | 默认权重 | 特征值 |
 | --- | ---: | --- |
@@ -273,6 +285,8 @@ K0 最近的局部目标；首轮单绿把该目标作为排他候选。一般�
 不可交付目标空转到超时；一般阶段继续由
 选择器按规则分值选择绿/黑组合或单橙。确认期间同一 ID 的最新有效几何更新开口和行程，
 出现明确危险或不合法组合才使确认失效，短暂漏检只等待当前 ID 的新证据。
+正式补夹要求近场计划保留 handoff prior 对应的入口目标；目标仍被观测但几何不合法时不换组，
+锁定前目标确实失观，或本次动作明确失败后才选择下一个全场绿/黑目标；失败保留物理记录与原扫描预算。
 一般阶段交接目标旁有当前可选但尚未完成局部轨迹确认的绿/黑物资时，先在原有有界
 窗口内等待相邻物资确认，再选组锁定；首轮单绿不使用此等待。无关候选的拒绝诊断
 不清空合法计划的确认。静态场界/安全区路径失败返回搜索重选，不触发解团；入口
@@ -311,7 +325,7 @@ NearFieldGraspConfig 提供通用默认值，正式 match 的 YAML 是权威档�
 `GraspTargetTracker(config.tracking.build_tracker(), projector, config.near_field_grasp)`、
 `NearFieldGraspSelector` 和 `GraspPreparationSession`。后两者不打开硬件。准备器放在
 单个后台线程串行调用 `update(snapshot, locked_ids=..., handoff_prior=...,
-excluded_observation_indices=...)`；索引只改变候选资格，不从 `targets` 删除观测，
+require_handoff=..., excluded_observation_indices=...)`；索引只改变候选资格，不从 `targets` 删除观测，
 因此已携带/已交付物资和蓝色危险仍参加扫掠障碍检查。索引在同帧去重和锁定 ID
 空间映射后仍绑定对应物理观测。
 队列只保留最新一帧。全候选诊断独立线程使用一个最新结果槽，最多每秒计算一次；
@@ -463,7 +477,9 @@ rescue-vision-grab-transport \
 - 首次运输限制为单个绿色普通物资；首次交付后允许绿色/黑色物资 1～3 个，或单独转运 1 个橙色伤员。蓝色、
   蓝色危险和缺几何目标在当前帧有可靠地面点时按实际扫掠判定，缺少 K0 的当前危险目标不能被当作安全而会阻止提交；橙色隔离半径内的邻居需要按实际包络复核；危险或扫掠侵入仍拒绝橙色计划，缺少 K0 的无关合法目标不参与距离推定。
   候选方向的走廊横向门限按两块实体内切半径之和加实际夹爪余量逐目标计算；只是近旁、不在夹取路径上的异类目标不否决候选，蓝块实体仍参与扫掠阻挡。
-- 正式 match 一般阶段绿/黑收拢后进入 `TRANSPORT_GREEDY_SCAN`，闭爪按 `match.spin_angle_rad`（正式配置 270°）扫描：当前帧没有可补夹的绿/黑信息时用 `match.cluster_search_empty_angular_velocity_rad_s` 快速转动，出现可补夹信息后回到 `match.close_gripper_spin_angular_velocity_rad_s`。扫描命中即进入与搜索阶段相同的全局夹取前置链（对准→接近→近场唯一确认窗口）并成为近场交接先验；每命中一次就累计容量并直接携已有物资返程，不再重复整圈扫描（最多 3 个）。无候选、超时或路径受阻同样返程。首趟、单橙、CC 和单绿联调保持各自规则。近处已收拢区观测继续参与障碍检查，详见[正式流程设计](../../../docs/正式流程设计.md)。
+- 正式 match 一般阶段绿/黑收拢后进入 `TRANSPORT_GREEDY_SCAN`，闭爪按 `match.spin_angle_rad`（正式配置 270°）扫描：当前帧没有可补夹的绿/黑信息时用 `match.cluster_search_empty_angular_velocity_rad_s` 快速转动，出现可补夹信息后回到 `match.close_gripper_spin_angular_velocity_rad_s`。扫描命中即进入与搜索阶段相同的全局夹取前置链（对准→接近→近场唯一确认窗口）并成为近场交接先验；每命中一次就累计容量并直接携已有物资返程，不再重复整圈扫描（最多 3 个）。失败候选留下物理失败记录，在原扫描预算内继续寻找其它近场或远场目标；预算耗尽后返程。首趟、单橙、CC 和单绿联调保持各自规则。近处已收拢区观测继续参与障碍检查，详见[正式流程设计](../../../docs/正式流程设计.md)。
+- 补夹候选范围为全场绿/黑，不受 `near_field_grasp.max_range_mm` 截断，按机器人地面距离优先；
+  目标确认后保持交接目标不变，目标失观或动作明确失败后才接管下一个补夹目标，并重新走正常对准、接近和近场确认链。
 - 抓取结果为橙色时路线使用 `match.safe_zone_injured_target_field_mm`；绿/黑使用 `match.safe_zone_fallback_target_field_mm`。
   选择 `--start-area 3` 时这些终点和 d1/d2 直线会相对中心十字对称到负 y 侧，动作切换由零速保持和陀螺仪航向保持保护。
 - 夹取后若 y 已沿己方方向越过 d1，则原地开始纠偏，否则沿 d1 直线前进。先按误差比例限速旋转到安全区
@@ -488,24 +504,14 @@ flow = config.build_match_sequence()
 `config.build_grab_transport_sequence()`。它覆盖初始场地位置和航向，仍复用正式流程
 配置、跟踪器、夹爪标定和安全区视觉纠偏。
 
-无解团变体为 `MatchNBSequence` 与 `config.build_match_nb_sequence()`，对应入口
-`rescue-vision-match-nb`。它与 `MatchSequence` 唯一区别是开场：用 `match.nb_opening_*`
-配置的绝对场地坐标直线航点（前进→张爪→前进→倒车）替代固定启动转向+定距直行，
-倒车回退到回退航点后进入正常解团流程。开场航点按启动区域 2 坐标书写，不提供区域 3
-中心对称。
+`MatchNBSequence` 与 `config.build_match_nb_sequence()` 对应
+`rescue-vision-match-nb`。它直接继承当前 `MatchSequence`，只替换区域 2 开场：原地转向并
+前进到 `(100,800)`，张爪，原地转向并前进到 `(100,-900)`，保持当前朝向倒车到
+`(100,0)`，随后进入正式目标团搜索。该入口不提供区域 3 中心对称。
 
-每段开场直线的执行顺序是**先原地对准航向、再平移**。起始航向误差可达 60° 以上，
-如果一边转向一边前进，实际轨迹是一条弧线，终点会横向偏出数百 mm，并且会靠
-`_safe_zone_line_coordinate_threshold_reached` 的投影越界分支在明显偏离目标时
-提前结束。对准用 `nb_opening_align_angular_velocity_rad_s`（未对准时的原地角速度上限），
-对准后直线段用 `nb_opening_heading_max_angular_velocity_rad_s` 做小幅保持修正；两者
-分开配置，前者通常需要比后者大。航向长时间对不准（例如陀螺仪符号或比例异常）时按
-`nb_opening_align_timeout_s` 保守进入 `TERMINAL_STOP`，不会持续旋转。
-
-每个航点到位后按 `nb_opening_settle_time_s` 零速停稳，停稳结束才从新位姿重新起算
-下一段的起点和航向（同 `_refresh_forward_segment_after_settle` 的既有做法），
-因此刹车残余位移不会串入下一段。到达判据为 `nb_opening_align_tolerance_mm` 的二维
-容差或沿计划方向越过；沿直线接近时会在容差盒边界停下，需要更贴近航点时收紧该值。
+两段前进各只在起步前转向一次，倒车前不再转向。每段航向在起步时按当前场地估计固定，
+行驶中仅做普通 IMU 航向保持；不做横向前视、制动提前量或途中重新停车对准。每个航点
+到位后只保留 `nb_opening_settle_time_s` 的短暂停稳，用于切换动作。
 
 配置字段（`match` 节，全部可独立配置）：
 
@@ -515,21 +521,21 @@ flow = config.build_match_sequence()
 | `nb_opening_gripper_left_deg` / `nb_opening_gripper_right_deg` | deg | 第一航点到位后的张爪左右角度 |
 | `nb_opening_second_target_field_mm` / `nb_opening_second_speed_m_s` | mm / m/s | 第二航点坐标与推进速度 |
 | `nb_opening_reverse_target_field_mm` / `nb_opening_reverse_speed_m_s` | mm / m/s | 倒车回退航点坐标与倒车速度 |
-| `nb_opening_align_tolerance_mm` | mm | 航点到达二维容差 |
-| `nb_opening_heading_tolerance_rad` | rad | 航向容差；也是“未对准/已对准”的判据 |
-| `nb_opening_heading_kp_rad_s` | rad/s per rad | 航向误差比例增益 |
-| `nb_opening_heading_max_angular_velocity_rad_s` | rad/s | 已对准后直线保持的角速度上限 |
-| `nb_opening_align_angular_velocity_rad_s` | rad/s | 未对准时原地对准的角速度上限 |
+| `nb_opening_align_tolerance_mm` | mm | 航点到达容差 |
+| `nb_opening_heading_tolerance_rad` | rad | 起步转向完成门限 |
+| `nb_opening_heading_kp_rad_s` | rad/s per rad | 转向与行驶航向保持的比例增益 |
+| `nb_opening_heading_max_angular_velocity_rad_s` | rad/s | 行驶航向保持的角速度上限 |
+| `nb_opening_align_angular_velocity_rad_s` | rad/s | 起步原地转向的角速度上限 |
 | `nb_opening_settle_time_s` | s | 每个航点到位后的零速停稳时间 |
-| `nb_opening_align_timeout_s` | s | 航向对准超时，超时保守停车 |
+| `nb_opening_align_timeout_s` | s | 起步转向超时后停车 |
 
 车端诊断：`MatchNBSequence.nb_opening_route_phase` 返回当前开场阶段，`nb_opening_diagnostic`
 返回一行「阶段 / 目标航点 / 估计位置 / 剩余误差 / 航向」。`match_runtime` 在阶段变化时
 打印一次，例如：
 
 ```
-nb_opening=phase=first_arrived_open_gripper target=(+130,+800)mm \
-  position=(+158,+784)mm error=(-28,+16)mm heading=-154.6deg
+nb_opening=phase=turn_and_move_to_first target=(+100,+800)mm \
+  position=(+1350,+1350)mm error=(-1250,-550)mm heading=-90.0deg
 ```
 
 `error` 是现场判断“车辆实际落点是否偏离航点”的唯一读数：只看 state/reason 横幅无法
@@ -591,3 +597,18 @@ nb_opening=phase=first_arrived_open_gripper target=(+130,+800)mm \
 橙色中心后方，横向完全位于夹爪扫掠宽度及配置余量之外，且两物体包络距离大于
 `clearance_mm`。蓝色危险、缺几何、质量异常、缺包络或侵入者不使用例外。
 这修正的是圆形邻近区把侧后方物资误判成混运的工程策略，不改变伤员单独运输规则。
+
+### 现场 20260912 停等、空转与组合抓取回归
+
+近场交接清空主选中 ID 后，受阻重选仍从 handoff prior 保存原目标身份和物理失败核心，
+不会重新选择同一未变化目标。远场接近目标丢失或重新编号时优先接管当前合法候选；
+旧参考点不再反复重置编码器起点。接近复核复用选组入口的可共同收拢绿黑成员规则，
+最终开爪仍由近场选择器按实际包络、剩余容量和完整危险扫掠决定。首次仍为单绿，
+一般阶段可抓取绿绿、绿黑、黑黑及容量内更大组合；侧邻蓝块不单独否决单绿。
+
+一圈无有效动作后，即使当前视野为空或只剩蓝块也尝试有界换位。当前方向不通时保留
+耗尽预算继续找方向；同帧不重复规划。换位前和运动中检查场界、安全区、车体与夹爪
+实体前伸、制动余量和目标实体。详细行为与时间语义见[正式流程设计](../../../docs/正式流程设计.md)。
+这些回归为无硬件逻辑验证，实际抓取成功率及目标设备端到端时延仍未验证。
+
+搜索候选的场界与路径检查使用采集位姿补偿后的当前 K0；换位途中可交接合法目标。近场锁组前对尚未确认的绿黑同伴使用实际开度和行程检查共同收拢可能性，仍保留原确认截止时间与完整扫掠门禁。

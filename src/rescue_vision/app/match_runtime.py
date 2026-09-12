@@ -983,13 +983,16 @@ def _run_hardware(
                             and observation_window_open
                             and sequence.near_field_active_plan is None
                         ):
+                            planning_snapshot = sequence.planning_perception(latest_snapshot)
+                            assert planning_snapshot is not None
                             near_field_worker.submit(
-                                latest_snapshot,
-                                excluded_observation_indices=sequence.grasp_excluded_observation_indices(latest_snapshot),
+                                planning_snapshot,
+                                excluded_observation_indices=sequence.grasp_excluded_observation_indices(planning_snapshot),
                                 session_id=session_id,
                                 policy=sequence.near_field_policy,
                                 locked_ids=sequence.near_field_locked_ids,
                                 handoff_prior=sequence.near_field_handoff_prior,
+                                require_handoff=sequence.near_field_handoff_required,
                             )
                         near_field_preparation = near_field_worker.latest(session_id)
                         near_field_selection = (

@@ -142,6 +142,11 @@ def segment_clear(static_map: StaticFieldMap, start: FieldPoint, end: FieldPoint
                for p in (start, end)) and safe_zone_intersection(static_map, start, end, margin_mm) is False
 
 
+def robot_clearance_mm(config: MatchRuntimeConfig, front_mm: float) -> float:
+    """Radius enclosing the body and jaw reach, plus one safety allowance."""
+    return max(config.robot_footprint_radius_mm, config.breakup_gripper_offset_mm, front_mm) + config.safety_margin_mm
+
+
 def connected_groups(targets: tuple[BreakupTarget, ...], distance_mm: float) -> tuple[tuple[BreakupTarget, ...], ...]:
     remaining = {t.track_id: t for t in targets}
     groups = []
@@ -185,6 +190,7 @@ def plan_breakup(
 
     Conservative disk/swept-segment checks are predictions, not a physical sliding bound.
     Unknown objects may belong to a group and its safety checks, never define a contact ray.
+    field_bounds are physical field edges, without prior jaw/body insets.
 
     ``rejections`` 是可选的诊断收集器：每个被淘汰的候选按组/瞄准点追加一行
     具体原因和当时的关键数值。没有它，现场只能看到"选不出计划"这一个结论，
@@ -257,12 +263,24 @@ def plan_breakup(
             direction = heading_rad + bearing
             def endpoint(start: FieldPoint, distance: float) -> FieldPoint:
                 return FieldPoint(start.x+distance*math.cos(direction), start.y+distance*math.sin(direction))
+            blocked_path = "none"
+            def path_clear(start: FieldPoint, end: FieldPoint, margin: float, label: str) -> bool:
+                nonlocal blocked_path
+                if segment_clear(static_map, start, end, field_bounds, margin):
+                    return True
+                xmin, xmax, ymin, ymax = field_bounds
+                boundary = any(not (xmin+margin < p.x < xmax-margin
+                                    and ymin+margin < p.y < ymax-margin) for p in (start, end))
+                blocked_path = (f"{label}:{'field_boundary' if boundary else 'safe_zone_or_missing_map'}"
+                                f":start=({start.x:.1f},{start.y:.1f})"
+                                f":end=({end.x:.1f},{end.y:.1f}):margin_mm={margin:.1f}")
+                return False
             def clear(depth: float) -> bool:
                 forward = gap+depth
                 end = endpoint(origin, approach_mm+forward+config.breakup_braking_margin_mm)
                 retreat_end = endpoint(origin, approach_mm+gap-config.breakup_retreat_clearance_mm-config.breakup_braking_margin_mm)
-                margin = config.robot_footprint_radius_mm+config.safety_margin_mm
-                if not segment_clear(static_map, origin, end, field_bounds, margin) or not segment_clear(static_map, end, retreat_end, field_bounds, margin):
+                margin = robot_clearance_mm(config, front_mm)
+                if not path_clear(origin, end, margin, "robot_forward") or not path_clear(end, retreat_end, margin, "robot_retreat"):
                     return False
                 # All members may transmit a push. Do not discard blue/unknown or peripheral members.
                 displacement = depth+config.breakup_push_margin_mm+config.breakup_braking_margin_mm
@@ -270,15 +288,17 @@ def plan_breakup(
                             if t.track_id in ids or (
                                 0 < c*t.center.x+s*t.center.y <= near+depth+t.safety_radius_mm
                                 and abs(-s*t.center.x+c*t.center.y) <= config.robot_footprint_radius_mm+t.safety_radius_mm)]
-                return all(segment_clear(static_map, p, endpoint(p, max(displacement,
+                return all(path_clear(p, endpoint(p, max(displacement,
                                near+depth-(c*t.center.x+s*t.center.y)+t.safety_radius_mm)),
-                               field_bounds, t.safety_radius_mm+config.breakup_push_margin_mm)
+                               t.safety_radius_mm+config.breakup_push_margin_mm,
+                               f"target_{t.track_id}_{t.target_class.value}")
                            for t, p in affected)
             if max_penetration <= 0 or not clear(0):
                 skip("local_push_not_clear_or_no_penetration", aim.track_id,
                      near_mm=f"{near:.1f}", gap_mm=f"{gap:.1f}",
                      penetration_mm=f"{penetration:.1f}",
-                     max_penetration_mm=f"{max_penetration:.1f}")
+                     max_penetration_mm=f"{max_penetration:.1f}", blocked_path=blocked_path,
+                     physical_field_bounds=field_bounds)
                 continue
             depth = max_penetration
             if not clear(max_penetration):
@@ -300,7 +320,7 @@ def plan_breakup(
             if depth < minimum_depth or (repeated and depth <= previous_penetration_mm+1e-6):
                 skip("penetration_below_minimum", aim.track_id,
                      depth_mm=f"{depth:.1f}", minimum_mm=f"{minimum_depth:.1f}",
-                     repeated=repeated)
+                     repeated=repeated, blocked_path=blocked_path)
                 continue
             forward = gap+depth
             hit_ids = tuple(t.track_id for t, x0, _ in contact if x0 <= near+depth)

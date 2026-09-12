@@ -583,10 +583,10 @@ def test_config_uses_configured_gripper_and_transport_values() -> None:
         0.35
     )
     assert config.match.safe_zone_d2_to_final_speed_m_s == pytest.approx(
-        0.45
+        0.38
     )
     assert config.match.safe_zone_orange_d2_to_final_speed_m_s == pytest.approx(
-        0.45
+        0.42
     )
     assert (
         config.match.safe_zone_d2_to_final_max_wheel_acceleration_m_s2
@@ -668,7 +668,7 @@ def test_config_uses_configured_gripper_and_transport_values() -> None:
     assert config.match.breakup_gripper_offset_mm == pytest.approx(
         200.0
     )
-    assert config.match.safe_zone_exit_distance_m == pytest.approx(0.5)
+    assert config.match.safe_zone_exit_distance_m == pytest.approx(0.3)
     assert config.match.cluster_search_empty_angular_velocity_rad_s == pytest.approx(-0.8)
     assert config.match.safe_zone_key_search_angular_velocity_rad_s == pytest.approx(0.8)
     assert config.match.safe_zone_bbox_turn_kp_rad_s == pytest.approx(0.8)

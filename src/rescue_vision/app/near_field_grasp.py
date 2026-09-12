@@ -1052,7 +1052,12 @@ class NearFieldGraspSelector:
         )
         if not math.isfinite(range_limit) or range_limit <= 0.0:
             raise ValueError("range_limit_mm must be finite and positive.")
-        if any(point.x <= 0.0 or math.hypot(point.x, point.y) > range_limit for point in centers):
+        # 近场半径是进入一次收拢的条件，不是逐成员裁剪线。绿黑组合只需
+        # 有一个成员已进入近场；其它成员仍由完整开度和最大前进行程约束。
+        supply_group = len(members) > 1 and all(
+            member.observation.target_class in SUPPLIES for member in members)
+        outside = [math.hypot(point.x, point.y) > range_limit for point in centers]
+        if any(point.x <= 0.0 for point in centers) or (all(outside) if supply_group else any(outside)):
             reasons.append("outside_near_field")
         # ``alignment_tolerance_mm`` remains accepted for callers of the
         # historical API, but it is no longer a centring gate.  Physical
@@ -1340,6 +1345,7 @@ class NearFieldGraspSelector:
         policy: NearFieldGraspPolicy | None = None,
         align: bool = True,
         alignment_tolerance_mm: float | None = None,
+        require_handoff: bool = False,
     ) -> GraspSelection:
         targets = tuple(targets)
         if not all(isinstance(target, GraspTarget) for target in targets):
@@ -1350,6 +1356,8 @@ class NearFieldGraspSelector:
             raise TypeError("policy must be a NearFieldGraspPolicy or None.")
         if not isinstance(align, bool):
             raise ValueError("align must be a boolean.")
+        if not isinstance(require_handoff, bool):
+            raise ValueError("require_handoff must be a boolean.")
         if alignment_tolerance_mm is not None:
             alignment_tolerance_mm = self._validate_alignment_tolerance(
                 alignment_tolerance_mm
@@ -1383,6 +1391,14 @@ class NearFieldGraspSelector:
                 rejections.append(rejection)
                 continue
             isolated_candidates.append(candidate)
+        require_handoff = require_handoff and locked_ids is None
+        if require_handoff and not any(
+            candidate.handoff_matched for candidate in isolated_candidates
+        ):
+            # A supplementary target may change only after the selected
+            # handoff has actually disappeared.  An observed but geometrically
+            # invalid handoff must not be replaced in the same session.
+            return GraspSelection(None, ("handoff_target_missing",))
         # 首轮比赛规则要求恰好一个绿色物资。远场交接目标只作为排序偏好
         # （见上方候选排序与 ``_plan_rank``），不再独占候选：每个可选绿色
         # 各自形成一个单目标计划，由排名决定实际抓取哪一个。交接目标在
@@ -1422,6 +1438,12 @@ class NearFieldGraspSelector:
                 policy.max_targets,
             )
             groups = [*orange_groups, *supply_groups]
+        if require_handoff:
+            groups = [
+                group
+                for group in groups
+                if any(member.handoff_matched for member in group)
+            ]
         if locked_ids is not None and (
             not groups
             or tuple(sorted(t.track_id for t in groups[0])) != locked_ids
@@ -1457,9 +1479,9 @@ class NearFieldGraspSelector:
                         ),
                     )
                     preview_plans.append(self._score_plan(plan, clearance=0.0))
-                    side_rejection = self._side_neighbor_rejection(plan, targets)
-                    if side_rejection is not None:
-                        raise ValueError(side_rejection)
+                    # 舵机开度由当前目标包络直接求解，左右相邻物块不再作为
+                    # 独立门禁。前后方向的实体阻挡仍由下方扫掠走廊检查，
+                    # 因而仅允许侧向边界轻微接触而不会放行前方障碍。
                     # 对准前也检查预测旋转后的走廊。已知危险目标不应
                     # 把车辆引入一个随后必然失败的旋转计划。
                     extra = []
@@ -1529,16 +1551,18 @@ class NearFieldGraspSelector:
                     or other.observation.target_class not in SUPPLIES
                 ):
                     continue
-                assert other.envelope is not None
-                if any(
-                    abs(other.envelope.center.x - member.envelope.center.x)
-                    <= self.config.side_neighbor_longitudinal_margin_mm
-                    and abs(other.envelope.center.y - member.envelope.center.y)
-                    <= self.config.side_neighbor_lateral_margin_mm
-                    for member in best.members
-                    if member.envelope is not None
-                ):
-                    return GraspSelection(None, ("waiting_adjacent_supply_confirmation",), best)
+                # A fixed centre-distance box can split a reachable row. Use
+                # the same opening, travel and range constraints as selection.
+                try:
+                    self._build(
+                        (*best.members, replace(other, confirmed=True)),
+                        align=False,
+                        alignment_tolerance_mm=alignment_tolerance_mm,
+                        policy=policy,
+                    )
+                except ValueError:
+                    continue
+                return GraspSelection(None, ("waiting_adjacent_supply_confirmation",), best)
         preview = best or (
             min(preview_plans, key=self._plan_rank) if preview_plans else None
         )
@@ -1591,7 +1615,13 @@ class NearFieldGraspSelector:
 
     @staticmethod
     def _plan_rank(plan: NearFieldGraspPlan) -> tuple[object, ...]:
+        black_count = sum(
+            member.observation.target_class is TargetClass.BLACK_CORE
+            for member in plan.members
+        )
         return (
+            -len(plan.members),
+            -black_count,
             -plan.score.rule_points,
             -plan.score.orange_priority,
             not any(member.handoff_matched for member in plan.members),

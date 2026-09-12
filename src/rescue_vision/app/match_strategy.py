@@ -1009,7 +1009,7 @@ class MatchSequence(_SharedMatchSequence):
             remaining = -(self._breakup_retreat_mm-((distance_m if base is None else base)-distance_m)*1000)
         remaining += math.copysign(self.config.breakup_braking_margin_mm, remaining)
         end = FieldPoint(origin.x+remaining*math.cos(heading), origin.y+remaining*math.sin(heading))
-        if not segment_clear(self._breakup_static_map, origin, end, self._breakup_allowed_field_bounds(), self._breakup_clearance_mm):
+        if not segment_clear(self._breakup_static_map, origin, end, self._physical_field_bounds(), self._robot_path_clearance_mm()):
             return self._start_path_reselection(decision.timestamp_ns, posture=decision.gripper_posture,
                                                reason="target_path_intersects_safe_zone_stop_and_reselect")
         return decision
@@ -5369,7 +5369,7 @@ class MatchSequence(_SharedMatchSequence):
             origin=origin,
             heading_rad=heading,
             static_map=self._breakup_static_map,
-            field_bounds=self._breakup_allowed_field_bounds(),
+            field_bounds=self._physical_field_bounds(),
             front_mm=GripperKinematics().left_tip_position(0).x,
             allowed_classes=frozenset((TargetClass.BLUE_DANGER,)),
             approach=approach,

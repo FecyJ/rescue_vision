@@ -66,9 +66,10 @@ grab_transport = config.build_grab_transport_sequence()
 `cluster_search_empty_angular_velocity_rad_s` 是没有可搜索的绿/黑/橙目标时的同向快速扫描
 速度；如果当前帧所有有效非蓝目标的 bbox 中心都落在任一安全区 bbox 内，也使用该速度。它必须
 不慢于 `cluster_search_angular_velocity_rad_s`。同一速度也用于合爪后的补夹扫描
-（`TRANSPORT_GREEDY_SCAN`）：当前帧没有可补夹的绿/黑信息时快速转动，出现可补夹信息后回到
+（`TRANSPORT_GREEDY_SCAN`）：补夹候选为全场绿/黑，不受 `near_field_grasp.max_range_mm` 截断，
+按机器人地面距离优先。当前帧没有可补夹的绿/黑信息时快速转动，出现可补夹信息后回到
 `close_gripper_spin_angular_velocity_rad_s`，两条速度共用 `spin_angle_rad` 作为本次扫描的
-旋转预算。目标方向走廊的横向阻挡门限按两块实体的内切半径之和加
+旋转预算；目标一旦确认不因新目标出现而换组，目标失观时才接管下一个候选。目标方向走廊的横向阻挡门限按两块实体的内切半径之和加
 `near_field_grasp.clearance_mm / 2 + corridor_lateral_margin_mm` 逐目标计算，
 `green_path_half_width_mm` 只是缺少目标物理尺寸配置时的回退值；近场蓝块净空同样使用内切半径，
 外接半径不再把只是近旁的蓝块当成阻挡。安全区运输参数分为夹取→d1、

@@ -11,6 +11,8 @@ from rescue_vision.app.near_field_grasp import (
     GraspSelection, GraspTarget, GraspTargetTracker, NearFieldGraspPlan,
     NearFieldGraspPolicy, NearFieldGraspSelector, NearFieldHandoffPrior,
 )
+from rescue_vision.motion.approach_speed import approach_speed_m_s
+from rescue_vision.motion.gripper_kinematics import GripperKinematics
 from rescue_vision.motion.protocol import OdometryImu
 from rescue_vision.motion.stationary import StationaryMotionEvidence
 from rescue_vision.localization import normalize_angle
@@ -369,7 +371,8 @@ class GraspPreparationSession:
                policy: NearFieldGraspPolicy | None = None,
                session_id: int = 0,
                handoff_prior: NearFieldHandoffPrior | None = None,
-               excluded_observation_indices: frozenset[int] = frozenset()) -> GraspPreparation:
+               excluded_observation_indices: frozenset[int] = frozenset(),
+               require_handoff: bool = False) -> GraspPreparation:
         if not isinstance(snapshot, PerceptionSnapshot):
             raise TypeError("snapshot must be a PerceptionSnapshot.")
         _validate_candidate_exclusions(snapshot, excluded_observation_indices)
@@ -379,6 +382,8 @@ class GraspPreparationSession:
             policy = self.selector.default_policy
         if not isinstance(policy, NearFieldGraspPolicy):
             raise TypeError("policy must be a NearFieldGraspPolicy or None.")
+        if not isinstance(require_handoff, bool):
+            raise ValueError("require_handoff must be a boolean.")
         if isinstance(session_id, bool) or not isinstance(session_id, int) or session_id < 0:
             raise ValueError("session_id must be a non-negative integer.")
         if snapshot.frame_sequence == self._last_frame_sequence:
@@ -444,6 +449,7 @@ class GraspPreparationSession:
             targets,
             locked_ids=locked_ids,
             policy=policy,
+            require_handoff=require_handoff,
             # 先在当前朝向检查左右末端的物理可达性；只有边界确实越过
             # 一侧行程时才生成一次 ALIGNING 计划，不能因中心偏离就旋转。
             align=True,
@@ -601,6 +607,7 @@ class GraspPreparationWorker:
             int,
             NearFieldHandoffPrior | None,
             frozenset[int],
+            bool,
         ] | None = None
         self._latest: GraspPreparation | None = None
         self._stopping = False
@@ -653,6 +660,7 @@ class GraspPreparationWorker:
         locked_ids: tuple[int, ...] | None,
         handoff_prior: NearFieldHandoffPrior | None = None,
         excluded_observation_indices: frozenset[int] = frozenset(),
+        require_handoff: bool = False,
     ) -> None:
         if not isinstance(snapshot, PerceptionSnapshot):
             raise TypeError("snapshot must be a PerceptionSnapshot.")
@@ -667,6 +675,8 @@ class GraspPreparationWorker:
             raise TypeError(
                 "handoff_prior must be a NearFieldHandoffPrior or None."
             )
+        if not isinstance(require_handoff, bool):
+            raise ValueError("require_handoff must be a boolean.")
         with self._condition:
             if session_id != getattr(self, "_requested_session_id", session_id):
                 return
@@ -680,6 +690,7 @@ class GraspPreparationWorker:
                 session_id,
                 handoff_prior,
                 excluded_observation_indices,
+                require_handoff,
             )
             self._condition.notify_all()
 
@@ -705,6 +716,7 @@ class GraspPreparationWorker:
                     session_id,
                     handoff_prior,
                     excluded_observation_indices,
+                    require_handoff,
                 ) = request
                 if self._worker_session_id != session_id:
                     self.session.reset()
@@ -717,6 +729,7 @@ class GraspPreparationWorker:
                         session_id=session_id,
                         handoff_prior=handoff_prior,
                         excluded_observation_indices=excluded_observation_indices,
+                        require_handoff=require_handoff,
                     )
                 except Exception as exc:
                     with self._condition:
@@ -856,9 +869,13 @@ class GripperWidthPickupSequence:
                  grasp_commit_max_observation_age_ms: float = 150.0,
                  stationary_max_gyro_rad_s: float = 0.03,
                  fine_alignment_zone_rad: float = 0.08,
-                 fine_alignment_min_wheel_velocity_m_s: float = 0.0):
+                 fine_alignment_min_wheel_velocity_m_s: float = 0.0,
+                 cruise_speed_scale: float = 1.0,
+                 deceleration_m_s2: float = 0.5):
         self.travel_ns = round(_positive(gripper_full_travel_time_s, "gripper_full_travel_time_s") * 1e9)
         self.speed = _positive(forward_speed_m_s, "forward_speed_m_s")
+        self.cruise_speed_scale = _positive(cruise_speed_scale, "cruise_speed_scale")
+        self.deceleration_m_s2 = _positive(deceleration_m_s2, "deceleration_m_s2")
         self.age_ns = round(_positive(max_observation_age_ms, "max_observation_age_ms") * 1e6)
         # 对准续转窗口宽于单帧观测年龄：感知慢于一帧时不中断旋转。
         self.alignment_continue_ns = round(
@@ -1097,7 +1114,7 @@ class GripperWidthPickupSequence:
             min_wheel_velocity_m_s=(
                 minimum
                 if self.state is GripperWidthPickupState.ALIGNING
-                else None
+                else (0.0 if speed > 0.0 else None)
             ),
         )
 
@@ -1436,7 +1453,12 @@ class GripperWidthPickupSequence:
         if self.state is GripperWidthPickupState.OPENING:
             elapsed_ns = now - self._phase_ns
             if elapsed_ns < self.travel_ns:
-                return self._decision(now, "opening_gripper", brake=True)
+                if cumulative_distance_m is None:
+                    return self._abort(now, "critical_odometry_unavailable", current_prep)
+                if self._distance_start is not None and cumulative_distance_m < self._distance_start - 0.005:
+                    return self._abort(now, "encoder_direction_mismatch", current_prep)
+                speed = self._opening_advance_speed(plan, cumulative_distance_m)
+                return self._decision(now, "opening_gripper_while_advancing" if speed > 0 else "opening_gripper", speed=speed, brake=speed == 0)
 
             # 走廊证据只在静止确认时检查；开爪完成后按冻结执行计划开环前进。
             if cumulative_distance_m is None:
@@ -1465,8 +1487,37 @@ class GripperWidthPickupSequence:
                 return self._decision(now, "distance_reached_close_gripper", angles=self.closed_angles, brake=True)
             # 速度仍受剩余定距限制，但不受视觉观测年龄/退化状态降速。
             remaining_m = (plan.forward_distance_mm - self.progress_mm(cumulative_distance_m)) / 1000
-            return self._decision(now, "forward_open_loop", speed=min(self.speed, max(0.005, remaining_m)))
+            return self._decision(now, "forward_open_loop", speed=approach_speed_m_s(remaining_m, self.speed, self.cruise_speed_scale, self.deceleration_m_s2, precision_approach=True))
         return self._abort(now, "invalid_pickup_state", current_prep)
+
+    def _opening_advance_speed(self, plan: NearFieldGraspPlan, distance_m: float) -> float:
+        # Enable alongside cruise acceleration only. Do not consume frozen K0
+        # distance twice: _distance_start remains the original commit odometry.
+        if self.cruise_speed_scale <= 1.0:
+            return 0.0
+        mechanics = GripperKinematics()
+        front = mechanics.pivot_x_mm + math.hypot(mechanics.tip_offset_x_mm, mechanics.tip_offset_y_mm)
+        # A closed-to-open arm stays laterally inside its final opening for
+        # relative angles <= 90 degrees. Reject other calibrated sweeps.
+        left = self.closed_angles[0] - plan.opening_servo_angles_deg[0]
+        right = plan.opening_servo_angles_deg[1] - self.closed_angles[1]
+        if not (0 <= left <= 90 and 0 <= right <= 90):
+            return 0.0
+        # Existing checked corridor must also contain the entire moving arm.
+        if len(plan.regions) != 1 or abs(plan.alignment_angle_rad) > 1e-6:
+            return 0.0
+        region = plan.regions[0]
+        if min(p.y for p in region) > -mechanics.pivot_half_spacing_mm or max(p.y for p in region) < mechanics.pivot_half_spacing_mm:
+            return 0.0
+        available_mm = min(min(p.x for p in plan.bounds) - front,
+                           max(p.x for p in region) - front,
+                           plan.forward_distance_mm) - 20.0
+        remaining = (available_mm - self.progress_mm(distance_m)) / 1000.0
+        if remaining <= 0:
+            return 0.0
+        # Slow to a halt before contact even if servo travel takes its full time.
+        return min(self.speed * self.cruise_speed_scale, remaining,
+                   math.sqrt(2 * self.deceleration_m_s2 * max(0.0, remaining - 0.02)))
 
     def _angular(self, plan: NearFieldGraspPlan) -> float:
         return max(-self.max_angular, min(self.max_angular, self.kp * plan.alignment_angle_rad))

@@ -66,7 +66,7 @@ def test_cluster_inside_the_safe_zone_is_not_a_breakup_target():
     """已放入安全区的物资不能再被选中去接近或解团。"""
 
     def observe_and_plan(y_mm):
-        seq = sequence(initial_field_position=FieldPoint(0.0, 1000.0))
+        seq = sequence(initial_field_position=FieldPoint(0.0, 980.0))
         seq._latest_heading_rad = 0.0
         for frame, ms in ((1, 10), (2, 20), (3, 30)):
             ns = int(ms * 1e6)
@@ -82,8 +82,8 @@ def test_cluster_inside_the_safe_zone_is_not_a_breakup_target():
             )
         return seq
 
-    # 车在场地 (0,1000) 朝 +x：机器人系 y=300 对应场地 y=1300，落在红色安全区。
-    delivered = observe_and_plan(300.0)
+    # 车在场地 (0,980) 朝 +x：机器人系 y=320 对应场地 y=1300，落在红色安全区。
+    delivered = observe_and_plan(320.0)
     assert delivered._choose_breakup_plan(int(30e6)) is None
     assert delivered._last_cluster_rejection_reason == (
         "breakup_no_contact_plan_or_retry_exhausted"
@@ -91,7 +91,7 @@ def test_cluster_inside_the_safe_zone_is_not_a_breakup_target():
     # 安全区内成员在成组前就被排除，不会留下"距离/净空"类拒绝。
     assert delivered._breakup_plan_rejections == ()
 
-    # 同一对物资在安全区外（场地 y=900）仍可解团。
+    # 同一对物资在安全区外（场地 y=880）仍可解团。
     reachable = observe_and_plan(-100.0)
     assert reachable._choose_breakup_plan(int(30e6)) is not None
 
@@ -206,22 +206,22 @@ def test_forward_stops_before_open_and_retreat_uses_actual_travel():
     moving=tick(seq,1,10,distance=.05,speed=.1,observations=())
     slow=tick(seq,2,20,distance=.175,speed=.1,observations=())
     assert 0 < slow.linear_velocity_m_s < moving.linear_velocity_m_s
-    braking=tick(seq,3,30,distance=.19,speed=.1,observations=())
+    braking=tick(seq,3,30,distance=.1995,speed=.1,observations=())
     assert braking.gripper_posture is GripperPosture.CLOSED
     assert braking.soft_brake
-    tick(seq,4,40,distance=.195,observations=())
-    opened=tick(seq,5,60,distance=.195,observations=())
+    tick(seq,4,40,distance=.200,observations=())
+    opened=tick(seq,5,60,distance=.200,observations=())
     assert opened.state is MatchState.OPEN_GRIPPER_SETTLE
     assert opened.gripper_posture is GripperPosture.OPEN
-    # 后退距离 = 实际前进行程(195 mm) + 退出净空 + 刹车余量，跟着配置算。
+    # 后退距离 = 实际前进行程(200 mm) + 退出净空 + 刹车余量，跟着配置算。
     assert seq._breakup_retreat_mm == pytest.approx(
-        195.0 - (seq._breakup_plan.forward_distance_mm - seq._breakup_plan.penetration_mm)
+        200.0 - (seq._breakup_plan.forward_distance_mm - seq._breakup_plan.penetration_mm)
         + seq.config.breakup_retreat_clearance_mm
         + seq.config.breakup_braking_margin_mm
     )
     assert len(seq._breakup_attempts)==1
-    assert tick(seq,6,70,distance=.195,observations=()).state is MatchState.OPEN_GRIPPER_SETTLE
-    assert tick(seq,7,1100,distance=.195,observations=()).state is MatchState.BREAKUP_BACKWARD
+    assert tick(seq,6,70,distance=.200,observations=()).state is MatchState.OPEN_GRIPPER_SETTLE
+    assert tick(seq,7,1100,distance=.200,observations=()).state is MatchState.BREAKUP_BACKWARD
 
 
 def test_retry_budget_is_only_consumed_by_completed_pushes():

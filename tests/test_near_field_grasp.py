@@ -392,7 +392,7 @@ def test_first_single_green_falls_back_when_handoff_target_has_no_envelope():
     assert result.plan.member_ids == (5,)
 
 
-def test_multi_target_planning_prefers_a_group_containing_handoff_target():
+def test_larger_supply_group_beats_single_handoff_target():
     aligned = replace(
         target(1, x=300.0, y=-230.0, cls=BLACK),
         handoff_matched=True,
@@ -407,7 +407,7 @@ def test_multi_target_planning_prefers_a_group_containing_handoff_target():
     )
 
     assert result.plan is not None
-    assert aligned.track_id in result.plan.member_ids
+    assert result.plan.member_ids == (2, 3)
 
 
 def test_handoff_waits_for_adjacent_supply_before_freezing_singleton():
@@ -740,7 +740,7 @@ def test_rule_score_is_primary_and_weights_rank_equal_score_plans_deterministica
         (GREEN, BLACK),
     ),
 )
-def test_single_orange_strictly_wins_equal_fifteen_point_supply_plan(supplies):
+def test_more_members_win_equal_fifteen_point_supply_plan(supplies):
     orange = target(1, x=300, y=-150, cls=ORANGE, width=40)
     supply_targets = tuple(
         target(index + 2, x=300, y=50 + index * 45, cls=cls)
@@ -749,9 +749,9 @@ def test_single_orange_strictly_wins_equal_fifteen_point_supply_plan(supplies):
     result = selector(max_range_mm=600).select((orange, *supply_targets))
 
     assert result.plan is not None
-    assert result.plan.member_ids == (1,)
+    assert result.plan.member_ids == tuple(range(2, len(supplies)+2))
     assert result.plan.score.rule_points == 15
-    assert result.plan.score.orange_priority == 1
+    assert result.plan.score.orange_priority == 0
 
 
 def test_handoff_supply_does_not_override_single_orange_priority():
@@ -894,3 +894,33 @@ def test_orange_side_rear_supply_whose_envelope_reaches_sweep_is_rejected():
     orange = target(12,x=312.6,y=-144.5,cls=ORANGE,depth=80)
     neighbor = target(13,x=378.4,y=-94.2,width=140)
     assert s._orange_isolation_rejection(orange,(orange,neighbor)) is not None
+
+
+@pytest.mark.parametrize("classes", [(GREEN,GREEN),(GREEN,BLACK),(BLACK,BLACK)])
+def test_group_crossing_near_field_entry_radius_is_grabbed_together(classes):
+    members = (target(1,x=416.7,y=12.4,cls=classes[0]),
+               target(2,x=459.7,y=57.5,cls=classes[1]))
+    result = selector().select(members)
+    assert result.plan is not None, result.rejections
+    assert result.plan.member_ids == (1,2)
+    assert result.plan.forward_distance_mm <= selector().config.max_forward_distance_mm
+
+
+def test_group_entry_exception_does_not_allow_excessive_forward_travel():
+    result = selector().select((target(1,x=400,y=0),target(2,x=650,y=50)))
+    assert result.plan is None or result.plan.member_ids != (1,2)
+    assert any("forward_distance_exceeded" in reason for reason in result.rejections)
+
+
+def test_three_greens_beat_two_blacks_when_both_groups_are_reachable():
+    members = (target(1,x=300,y=-170,cls=BLACK),target(2,x=300,y=-125,cls=BLACK),
+               target(3,x=300,y=40),target(4,x=300,y=85),target(5,x=300,y=130))
+    result = selector(max_range_mm=600).select(members)
+    assert result.plan is not None, result.rejections
+    assert len(result.plan.members) == 3
+
+
+def test_outside_group_still_requires_a_near_field_entry_member():
+    result = selector().select((target(1,x=500,y=0),target(2,x=500,y=45)))
+    assert result.plan is None
+    assert "outside_near_field" in result.rejections

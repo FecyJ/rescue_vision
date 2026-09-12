@@ -459,11 +459,14 @@ def test_one_full_rotation_must_commit_an_action():
     relocation_ms = None
     moved = False
     unchanged_target_plan = None
-    for ms in range(0, int((lap_s + 4.0) * 1000) + 1, 5):
+    for ms in range(0, int((lap_s + 2.0 + seq.config.cluster_relocate_distance_m / seq.config.cluster_relocate_speed_m_s) * 1000) + 1, 5):
         now = ms * 1_000_000
         if ms % 300 == 0:
             frame = ms // 300 + 1
-            capture_ns, members = feed(seq, frame, (frame - 1) * 300, GROUP_SPECS, heading)
+            position = seq.estimated_field_position
+            moved_specs = tuple((x-position.x, y-position.y, cls, box)
+                                for x,y,cls,box in GROUP_SPECS)
+            capture_ns, members = feed(seq, frame, (frame - 1) * 300, moved_specs, heading)
             latest = snapshot(frame, capture_ns, *members)
         seq.observe_grasp_motion(motion_sample(now))
         decision = seq.step(
@@ -492,7 +495,7 @@ def test_one_full_rotation_must_commit_an_action():
     assert relocation_ms is not None, "一圈内没有选择有界换位"
     assert relocation_ms / 1000.0 <= lap_s + 2.0
     assert moved, "没有发生实际非零换位动作"
-    assert distance >= seq.config.cluster_relocate_distance_m - 1e-6
+    assert distance >= seq.config.cluster_relocate_distance_m - 1e-6, (decision.reason, seq.estimated_field_position, heading, ms)
     assert seq.state is MatchState.SEARCH_CLUSTER
     assert unchanged_target_plan is None
     assert any(
@@ -533,8 +536,8 @@ def test_effective_relocation_reopens_the_same_physical_aim():
     assert reopened.aim_field.y == pytest.approx(plan.aim_field.y)
 
 
-def test_rotation_budget_only_scans_again_when_nothing_but_blue_remains():
-    """只剩蓝块时允许继续扫描，不误触发强制提交。"""
+def test_rotation_budget_relocates_when_nothing_but_blue_remains():
+    """只剩蓝块也必须在避开蓝块后换位，不能反复整圈扫描。"""
 
     seq = sequence()
     seq._latest_heading_rad = 0.0
@@ -566,8 +569,9 @@ def test_rotation_budget_only_scans_again_when_nothing_but_blue_remains():
         heading += decision.angular_velocity_rad_s * 0.005
 
     assert "rotation_budget_commit" not in seen_reasons
-    assert seq.state is MatchState.SEARCH_CLUSTER
-    assert seq._rotation_budget_commit_diagnostic == "rotation_budget_empty_scan"
+    assert "rotation_budget_relocate_start" in seen_reasons
+    assert "relocate_forward" in seen_reasons
+    assert seq.state is MatchState.RELOCATE_FORWARD
 
 
 def test_failed_attempts_do_not_bleed_into_a_neighbouring_group():
@@ -746,7 +750,7 @@ def test_old_breakup_frame_cannot_consume_another_confirmation_slot():
         perception=snapshot(
             9,
             first_capture,
-            *scene(9, first_capture, GROUP_SPECS),
+            *scene(9, first_capture, ((450., 0., TargetClass.GREEN_SUPPLY, 10.), (480., 0., TargetClass.BLUE_DANGER, 40.))),
         ),
         heading_rad=0.0,
         cumulative_distance_m=0.0,
@@ -759,7 +763,7 @@ def test_old_breakup_frame_cannot_consume_another_confirmation_slot():
     fresh = snapshot(
         10,
         fresh_capture,
-        *scene(10, fresh_capture, GROUP_SPECS),
+        *scene(10, fresh_capture, ((450., 0., TargetClass.GREEN_SUPPLY, 10.), (480., 0., TargetClass.BLUE_DANGER, 40.))),
     )
     seq.step(
         fresh_capture,
@@ -776,7 +780,7 @@ def test_old_breakup_frame_cannot_consume_another_confirmation_slot():
     old = snapshot(
         9,
         old_capture,
-        *scene(9, old_capture, GROUP_SPECS),
+        *scene(9, old_capture, ((450., 0., TargetClass.GREEN_SUPPLY, 10.), (480., 0., TargetClass.BLUE_DANGER, 40.))),
     )
     decision = seq.step(
         110_000_000,
@@ -828,3 +832,83 @@ def test_telemetry_loss_keeps_breakup_stationary_gate_closed():
     assert seq.state is MatchState.BREAKUP_SETTLE
     assert decision.linear_velocity_m_s == 0.0
     assert "waiting_stationarity" in decision.reason
+
+
+@pytest.mark.parametrize('delay_ms,period_ms,poll_ms', [(300,250,5), (600,400,10)])
+def test_empty_scan_near_safe_zone_moves_with_delayed_frames(delay_ms, period_ms, poll_ms):
+    seq = sequence(initial_field_position=FieldPoint(-171,543))
+    seq._breakup_only = False
+    heading = -2.6
+    latest = None
+    moved = False
+    for ms in range(0, 16000, poll_ms):
+        now = ms*1_000_000
+        if ms >= delay_ms and (ms-delay_ms) % period_ms == 0:
+            capture = now-delay_ms*1_000_000
+            latest = snapshot((ms-delay_ms)//period_ms+1, capture)
+        seq.observe_grasp_motion(motion_sample(now))
+        decision = seq.step(now, perception=latest, heading_rad=heading,
+            cumulative_distance_m=0., left_speed_feedback_m_s=0., right_speed_feedback_m_s=0.)
+        heading += decision.angular_velocity_rad_s*poll_ms/1000.
+        if decision.linear_velocity_m_s > 0:
+            moved = True
+            assert decision.state is MatchState.RELOCATE_FORWARD
+            break
+    assert moved, decision.reason
+
+
+@pytest.mark.parametrize('point', [GroundPoint(450,0), GroundPoint(500,180), None])
+def test_relocation_rejects_danger_in_full_gripper_sweep_or_missing_geometry(point):
+    seq = sequence()
+    seq._latest_heading_rad = 0.
+    seq._record_pose_history(0, 0., 0.)
+    seq._latest_perception = snapshot(1,0,observation(1,0,point,target_class=TargetClass.BLUE_DANGER))
+    assert seq._relocation_path_clear(0,0.,0.3) is not True
+
+
+def test_relocation_rechecks_new_danger_before_next_forward_command():
+    seq = sequence()
+    seq.state = MatchState.RELOCATE_FORWARD
+    seq._relocate_forward_base_distance_m = 0.
+    decision = seq.step(0, perception=snapshot(1,0,observation(1,0,GroundPoint(400,0),
+        target_class=TargetClass.BLUE_DANGER)), heading_rad=0., cumulative_distance_m=0.)
+    assert decision.linear_velocity_m_s == 0.
+    assert decision.state is MatchState.SEARCH_CLUSTER
+
+
+@pytest.mark.parametrize('cls', list(TargetClass))
+def test_safe_zone_bbox_objects_are_removed_from_planning_input(cls):
+    seq = near_field_sequence(transports=1)
+    inside = observation(1,0,GroundPoint(300,0),target_class=cls,box_x=10)
+    outside = observation(1,0,GroundPoint(700,100),box_x=60)
+    raw = with_safe_zone(1,0,UndistortedBoundingBox(0,0,40,40),(inside,outside))
+    filtered = seq.planning_perception(raw)
+    assert filtered.observations == (outside,)
+    assert raw.observations == (inside,outside)
+    assert filtered.field_features is raw.field_features
+    assert seq.planning_perception(filtered) is filtered
+
+
+@pytest.mark.parametrize('delay_ms,period_ms', [(300,250),(600,400)])
+def test_breakup_search_still_approaches_far_collectible(delay_ms,period_ms):
+    seq = near_field_sequence(transports=1)
+    seq._started = True
+    seq.config = replace(seq.config, green_max_age_ms=1000,
+                         opportunistic_single_green_enabled=True)
+    seq.state = MatchState.SEARCH_CLUSTER
+    seq._breakup_only = True
+    latest = None
+    progressed = False
+    for ms in range(0, 2500, 5):
+        now = ms*1_000_000
+        if ms >= delay_ms and (ms-delay_ms)%period_ms == 0:
+            frame = (ms-delay_ms)//period_ms+1
+            capture = now-delay_ms*1_000_000
+            latest = snapshot(frame,capture,observation(frame,capture,GroundPoint(700,0)))
+        decision = seq.step(now,perception=latest,heading_rad=0.,cumulative_distance_m=0.,
+            left_speed_feedback_m_s=0.,right_speed_feedback_m_s=0.)
+        if decision.linear_velocity_m_s > 0:
+            progressed = True
+            assert decision.state is MatchState.TRANSPORT_APPROACH_GREEN
+            break
+    assert progressed, decision.reason

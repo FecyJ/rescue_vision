@@ -130,7 +130,7 @@ match:
   startup_turn_settle_time_s: 0.1
   # 启动直行距离和速度，单位 m、m/s。
   startup_forward_distance_m: 1.5
-  startup_forward_speed_m_s: 0.5
+  startup_forward_speed_m_s: 0.6
   startup_forward_settle_time_s: 0.1
   # 启动直行的左右轮速 PID；现场先调 P，I/D 通常保持 0。
   startup_straight_pid_kp_rad_s_per_m_s: 1.5
@@ -205,7 +205,7 @@ match:
   # cluster_search_empty_angular_velocity_rad_s 快速转动；两条速度共用
   # spin_angle_rad 作为本次扫描的旋转预算（原 2*pi，现改为 270 度），单位
   # rad/s、rad。扫描命中即进入全局对准链，完成一次补夹后直接返程。
-  close_gripper_spin_angular_velocity_rad_s: -0.4
+  close_gripper_spin_angular_velocity_rad_s: -0.6
   spin_angle_rad: 4.712388980384690
   # 走廊横向阻挡门限的回退半宽，单位 mm。正式远场搜索按两块实体的内切
   # 半径之和加近场夹爪余量（clearance_mm/2 + corridor_lateral_margin_mm）
@@ -230,6 +230,8 @@ match:
   green_alignment_timeout_ms: 6000.0
   # 单帧达带即进入接近，识别到目标后不再等待多帧确认。
   green_alignment_stable_frames: 1
+  # 中段提速；夹取末端与 d1/d2 停车前恢复基准速度，最终投递不缩放。
+  pickup_cruise_speed_scale: 1.5
   green_approach_speed_m_s: 0.15
   # 安全区扫描/地标搜索原地转速，单位 rad/s。
   transport_rotate_angular_velocity_rad_s: 0.5
@@ -252,9 +254,9 @@ match:
   # d1→d2 的推进速度，单位 m/s。
   safe_zone_d1_to_d2_speed_m_s: 0.35
   # d2 张爪、转向、闭爪后到安全区末端的推进速度，单位 m/s。
-  safe_zone_d2_to_final_speed_m_s: 0.45
+  safe_zone_d2_to_final_speed_m_s: 0.38
   # 单橙色伤员 d2→安全区末端的独立速度，单位 m/s；当前先与通用末段一致，按实测单独调节。
-  safe_zone_orange_d2_to_final_speed_m_s: 0.45
+  safe_zone_orange_d2_to_final_speed_m_s: 0.42
   # d2 闭爪推进后末段的固定刹车过冲提前量，正值沿己方安全区方向在终点前停车，单位 mm。
   safe_zone_d2_to_final_braking_overrun_mm: 70.0
   # 单橙色伤员 d2→安全区末端的独立刹车过冲提前量，单位 mm；当前先与通用末段一致。
@@ -283,7 +285,7 @@ match:
   safe_zone_calibration_stop_speed_threshold_m_s: 0.02
   safe_zone_calibration_stop_confirm_time_s: 0.3
   # 到达末段终点后停稳并倒车退出的距离，单位 m。
-  safe_zone_exit_distance_m: 0.5
+  safe_zone_exit_distance_m: 0.3
   # 解团前停车后的稳定等待时间，单位 s。
   breakup_settle_time_s: 0.1
   # 每个转向/直行动作切换前保持零速，避免加速度限制下残余运动串入下一动作。
@@ -336,7 +338,7 @@ near_field_grasp:
   # 已锁定候选的退出半径为 max_range_mm + 此滞回，避免 450 mm 边界抖动换组。
   range_hysteresis_mm: 50.0
   # 单次收拢允许的底盘最大前进行程，单位 mm。
-  max_forward_distance_mm: 450.0
+  max_forward_distance_mm: 600
   # 绿/黑组前进结束时，最远目标 K0 希望保留在机器人前方的距离，单位 mm。
   target_final_x_mm: 142.0
   # 单个橙色目标按最近端加半个纵向跨度计算，终点参考距离，单位 mm。

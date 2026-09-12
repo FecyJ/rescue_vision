@@ -847,6 +847,7 @@ class MatchRuntimeConfig:
     green_alignment_max_angular_velocity_rad_s: float = 0.35
     # 绿色目标及近场组精对准的单轮最低速度；普通动作继续使用 motion 下限。
     green_alignment_min_wheel_velocity_m_s: float = 0.01
+    pickup_cruise_speed_scale: float = 1.0
     green_approach_speed_m_s: float = 0.08
     # 以下旧纯逻辑夹具字段同样不再由 YAML 解析，正式流程不读取。
     green_grab_offset_mm: float = 60.0
@@ -919,20 +920,21 @@ class MatchRuntimeConfig:
     # 的直线航点序列。坐标为 mm、速度为 m/s、夹爪角度为 deg；由 match_nb
     # 子类读取，正式 match 不读取这些字段。默认值与
     # configs/runtime.match_nb.yaml 的区域 2 示例一致。
-    nb_opening_first_target_field: FieldPoint = FieldPoint(130.0, 800.0)
-    nb_opening_first_speed_m_s: float = 0.15
+    nb_opening_first_target_field: FieldPoint = FieldPoint(100.0, 800.0)
+    nb_opening_first_speed_m_s: float = 0.60
     nb_opening_gripper_left_deg: float = 50.0
     nb_opening_gripper_right_deg: float = 130.0
-    nb_opening_second_target_field: FieldPoint = FieldPoint(130.0, -900.0)
-    nb_opening_second_speed_m_s: float = 0.15
-    nb_opening_reverse_target_field: FieldPoint = FieldPoint(130.0, 0.0)
-    nb_opening_reverse_speed_m_s: float = 0.15
+    nb_opening_second_target_field: FieldPoint = FieldPoint(100.0, -900.0)
+    nb_opening_second_speed_m_s: float = 0.60
+    nb_opening_reverse_target_field: FieldPoint = FieldPoint(100.0, 0.0)
+    nb_opening_reverse_speed_m_s: float = 0.60
     nb_opening_align_tolerance_mm: float = 30.0
-    nb_opening_heading_tolerance_rad: float = 0.02
-    nb_opening_heading_kp_rad_s: float = 1.0
+    # 原地转向与行驶航向保持共用一套简单门限和比例增益。
+    nb_opening_heading_tolerance_rad: float = 0.08
+    nb_opening_heading_kp_rad_s: float = 3.0
     nb_opening_heading_max_angular_velocity_rad_s: float = 0.30
-    # 未对准时的原地对准角速度上限，单位 rad/s；与直线保持上限分开配置。
-    nb_opening_align_angular_velocity_rad_s: float = 0.50
+    # 两段前进前的原地转向角速度上限；倒车前不再重新转向。
+    nb_opening_align_angular_velocity_rad_s: float = 1.20
     # 每个航点到位后的零速停稳时间，单位 s；必须大于等于 0。
     nb_opening_settle_time_s: float = 0.30
     # 航向对准的最长持续时间，单位 s；超时保守停车而不是持续旋转。
@@ -996,6 +998,7 @@ class MatchRuntimeConfig:
             "green_alignment_kp_rad_s",
             "green_alignment_max_angular_velocity_rad_s",
             "green_alignment_min_wheel_velocity_m_s",
+            "pickup_cruise_speed_scale",
             "green_approach_speed_m_s",
             "green_grab_offset_mm",
             "green_preclose_recheck_range_mm",
@@ -1693,7 +1696,7 @@ class AppConfig:
         return GrabTransportSequence.from_app_config(self)
 
     def build_match_nb_sequence(self) -> MatchNBSequence:
-        """装配无解团变体流程；开场改为绝对坐标直线航点，其余复用正式流程。"""
+        """装配当前 match 的简化开场变体。"""
 
         if not self.match.enabled:
             raise RuntimeError(
@@ -2474,6 +2477,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         "green_alignment_kp_rad_s",
         "green_alignment_max_angular_velocity_rad_s",
         "green_alignment_min_wheel_velocity_m_s",
+        "pickup_cruise_speed_scale",
         "green_approach_speed_m_s",
         "transport_rotate_angular_velocity_rad_s",
         "safe_zone_key_search_angular_velocity_rad_s",
@@ -2619,13 +2623,13 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         )
 
     nb_opening_first_target_field = nb_field_point(
-        "nb_opening_first_target_field_mm", [130.0, 800.0]
+        "nb_opening_first_target_field_mm", [100.0, 800.0]
     )
     nb_opening_second_target_field = nb_field_point(
-        "nb_opening_second_target_field_mm", [130.0, -900.0]
+        "nb_opening_second_target_field_mm", [100.0, -900.0]
     )
     nb_opening_reverse_target_field = nb_field_point(
-        "nb_opening_reverse_target_field_mm", [130.0, 0.0]
+        "nb_opening_reverse_target_field_mm", [100.0, 0.0]
     )
 
     match = MatchRuntimeConfig(
@@ -2777,6 +2781,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         green_alignment_min_wheel_velocity_m_s=match_float(
             "green_alignment_min_wheel_velocity_m_s", 0.01
         ),
+        pickup_cruise_speed_scale=match_float("pickup_cruise_speed_scale", 1.0),
         green_approach_speed_m_s=match_float(
             "green_approach_speed_m_s", 0.08
         ),
@@ -2898,23 +2903,23 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "return_backup_speed_m_s", 0.08
         ),
         nb_opening_first_target_field=nb_opening_first_target_field,
-        nb_opening_first_speed_m_s=match_float("nb_opening_first_speed_m_s", 0.15),
+        nb_opening_first_speed_m_s=match_float("nb_opening_first_speed_m_s", 0.60),
         nb_opening_gripper_left_deg=match_float("nb_opening_gripper_left_deg", 50.0),
         nb_opening_gripper_right_deg=match_float("nb_opening_gripper_right_deg", 130.0),
         nb_opening_second_target_field=nb_opening_second_target_field,
-        nb_opening_second_speed_m_s=match_float("nb_opening_second_speed_m_s", 0.15),
+        nb_opening_second_speed_m_s=match_float("nb_opening_second_speed_m_s", 0.60),
         nb_opening_reverse_target_field=nb_opening_reverse_target_field,
-        nb_opening_reverse_speed_m_s=match_float("nb_opening_reverse_speed_m_s", 0.15),
+        nb_opening_reverse_speed_m_s=match_float("nb_opening_reverse_speed_m_s", 0.60),
         nb_opening_align_tolerance_mm=match_float("nb_opening_align_tolerance_mm", 30.0),
         nb_opening_heading_tolerance_rad=match_float(
-            "nb_opening_heading_tolerance_rad", 0.02
+            "nb_opening_heading_tolerance_rad", 0.08
         ),
-        nb_opening_heading_kp_rad_s=match_float("nb_opening_heading_kp_rad_s", 1.0),
+        nb_opening_heading_kp_rad_s=match_float("nb_opening_heading_kp_rad_s", 3.0),
         nb_opening_heading_max_angular_velocity_rad_s=match_float(
             "nb_opening_heading_max_angular_velocity_rad_s", 0.30
         ),
         nb_opening_align_angular_velocity_rad_s=match_float(
-            "nb_opening_align_angular_velocity_rad_s", 0.50
+            "nb_opening_align_angular_velocity_rad_s", 1.20
         ),
         nb_opening_settle_time_s=match_nonnegative_float(
             "nb_opening_settle_time_s", 0.30
@@ -2937,6 +2942,10 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             if abs(getattr(match_cc, name)) > motion.max_angular_velocity_rad_s:
                 raise ValueError(f"match_cc.{name} exceeds motion.max_angular_velocity_rad_s.")
     if match.enabled:
+        for name in ("green_approach_speed_m_s", "safe_zone_grab_to_d1_speed_m_s", "safe_zone_d1_to_d2_speed_m_s"):
+            scaled = getattr(match, name) * match.pickup_cruise_speed_scale
+            if scaled > min(motion.max_linear_velocity_m_s, motion.max_wheel_velocity_m_s):
+                raise ValueError(f"match.{name} scaled speed {scaled!r} exceeds motion limits.")
         for name in (
             "startup_forward_speed_m_s",
             "breakup_forward_speed_m_s",
