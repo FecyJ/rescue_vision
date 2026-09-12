@@ -6268,6 +6268,14 @@ class MatchSequence:
 
         if self._near_field_pickup is not None:
             return self._step_formal_green_align(timestamp_ns)
+        return self._align_green_legacy(timestamp_ns)
+
+    def _align_green_legacy(self, timestamp_ns: int) -> MatchDecision:
+        """无近场序列时的历史对准路径。
+
+        变体的蓝色运输在真机验证过这条路径，因此保留为可显式调用的方法，
+        而不是让它被 ``_step_formal_green_align`` 静默替换。
+        """
 
         settling = self._consume_action_settle(
             timestamp_ns,
