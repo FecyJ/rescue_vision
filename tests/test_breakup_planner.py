@@ -84,9 +84,9 @@ def test_shallow_contact_span_is_plannable_within_its_own_span():
     assert result
     plan = result[0]
     assert plan.contact_ids == (1,)
-    assert plan.penetration_mm < floor_mm
-    assert math.isclose(plan.penetration_mm, 2 * items[0].contact_radius_mm,
-                        rel_tol=1e-6)
+    assert 2 * items[0].contact_radius_mm < floor_mm
+    assert plan.penetration_mm >= 2 * items[0].contact_radius_mm
+    assert plan.forward_distance_mm == 500
     # 整段推穿：前推行程覆盖接触跨度，不是被门槛截断的部分推进。
     assert plan.forward_distance_mm >= plan.penetration_mm
 
@@ -151,7 +151,7 @@ def test_dense_core_and_blue_mixed_group_are_candidates():
     assert result[0].contact_ids == (1, 2, 3)
     runtime = load_runtime_config("configs/runtime.match.yaml")
     assert runtime.match.breakup_min_penetration_mm <= result[0].penetration_mm
-    assert result[0].penetration_mm <= runtime.match.breakup_penetration_mm
+    assert result[0].penetration_mm <= result[0].forward_distance_mm == 500
     assert not plans([target(1, 450, 0, TargetClass.BLUE_DANGER), target(2, 480, 0, TargetClass.BLUE_DANGER)])
 
 
@@ -175,16 +175,12 @@ def test_distance_is_rotated_and_bounded():
     cfg = load_runtime_config('configs/runtime.match.yaml').match
     p = plans(items)[0]
     assert p.approach_distance_mm == pytest.approx(math.hypot(350, 350)-20-260)
-    assert p.forward_distance_mm < cfg.breakup_forward_distance_m * 1000
-    # 后退距离 = 前进行程 + 退出净空 + 刹车余量，跟着配置算。
-    assert p.backward_distance_mm == pytest.approx(
-        p.penetration_mm
-        + cfg.breakup_retreat_clearance_mm
-        + cfg.breakup_braking_margin_mm
-    )
+    assert p.forward_distance_mm == cfg.breakup_forward_distance_m * 1000
+    assert p.backward_distance_mm == cfg.breakup_backward_distance_m * 1000
     q = plans([target(1, 250, 0), target(2, 280, 0)], approach=False)[0]
     assert q.approach_distance_mm == 0
-    assert q.forward_distance_mm < p.forward_distance_mm
+    assert q.forward_distance_mm == p.forward_distance_mm
+    assert q.penetration_mm != p.penetration_mm
 
 
 def test_boundaries_and_both_safe_zones_reject_push():
@@ -212,19 +208,17 @@ def test_spatial_identity_survives_id_reset_but_not_distant_group():
     assert not same_local_group(a, (FieldPoint(900, 0), FieldPoint(950, 0)), 100)
 
 
-@pytest.mark.parametrize('name,value', [('breakup_penetration_mm', float('nan')), ('breakup_min_penetration_mm', True), ('breakup_max_attempts', 5), ('breakup_retry_penetration_mm', 20)])
+@pytest.mark.parametrize('name,value', [('breakup_forward_distance_m', float('nan')), ('breakup_min_penetration_mm', True), ('breakup_max_attempts', 5), ('breakup_backward_distance_m', -1)])
 def test_invalid_configuration(name, value):
     with pytest.raises(ValueError):
         replace(load_runtime_config('configs/runtime.match.yaml').match, **{name: value})
 
 
-def test_reverse_limit_applies_to_penetration_not_contact_approach_gap():
+def test_reverse_distance_is_independent_of_contact_approach_gap():
     cfg = replace(load_runtime_config('configs/runtime.match.yaml').match,
                   breakup_backward_distance_m=0.12)
     candidates = plans([target(1, 500, 0), target(2, 500, 60)], config=cfg, approach=False)
     assert candidates
     plan = candidates[0]
     assert plan.forward_distance_mm > 300
-    assert plan.backward_distance_mm <= 120
-    assert plan.backward_distance_mm == pytest.approx(
-        plan.penetration_mm + cfg.breakup_retreat_clearance_mm + cfg.breakup_braking_margin_mm)
+    assert plan.backward_distance_mm == 120

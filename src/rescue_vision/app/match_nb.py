@@ -1,11 +1,8 @@
-"""正式 ``match`` 的简单开场变体。
+"""正式 ``match`` 的相对动作序列开场变体。
 
-除开场外全部复用当前 :class:`MatchSequence`。区域 2 开场固定为：转向并前进到
-``FieldPoint(100, 800)``，张爪，转向并前进到 ``FieldPoint(100, -900)``，
-保持朝向倒车到 ``FieldPoint(100, 0)``，随后进入正式目标团搜索。
-
-每段只在起步前确定一次直线航向，行驶中只做普通 IMU 航向保持；不做横向
-前视、制动提前量或途中重复停车校准。
+除开场外全部复用当前 :class:`MatchSequence`。开场从当前位姿出发，按配置中的
+``turn`` / ``straight`` 动作顺序执行；转向使用 IMU 航向进度，直行使用编码器
+累计路程。动作之间只保留一个短暂零速切换，不根据场地点反复重算目标。
 """
 
 from __future__ import annotations
@@ -24,8 +21,17 @@ from rescue_vision.app.match import (
     MatchState,
 )
 from rescue_vision.app.match_runtime import _run_hardware
-from rescue_vision.geometry.types import FieldPoint
+from rescue_vision.config import NBOpeningAction, NBOpeningStraight, NBOpeningTurn
 from rescue_vision.localization import normalize_angle
+from rescue_vision.motion import (
+    MotionAccelerationOverrides,
+    RelativeActionCommand,
+    RelativeActionController,
+    RelativeActionFeedback,
+    RelativeActionKind,
+    RelativeActionProfile,
+    WHEEL_COMMAND_REFRESH_S,
+)
 
 if TYPE_CHECKING:
     from rescue_vision.app.gripper_width_sequence import GraspPreparation
@@ -36,15 +42,138 @@ if TYPE_CHECKING:
 class MatchNBSequence(MatchSequence):
     """只替换开场动作，其余行为始终委托给当前正式流程。"""
 
+    # The motion limit is a command slew limit, not a measured vehicle
+    # stopping capability.  Until a true-car measurement is supplied, use a
+    # conservative NB profile so the route starts braking before the target.
+    _DEFAULT_LINEAR_DECELERATION_M_S2 = 2.0
+    _DEFAULT_ANGULAR_DECELERATION_RAD_S2 = 2.0
+
+    @classmethod
+    def _profile_from_match_config(
+        cls,
+        config: AppConfig,
+        *,
+        linear_deceleration_m_s2: float,
+        angular_deceleration_rad_s2: float,
+    ) -> RelativeActionProfile:
+        runtime = config.match
+        effective_linear_deceleration = min(
+            linear_deceleration_m_s2,
+            runtime.nb_opening_effective_linear_deceleration_m_s2
+            if runtime.nb_opening_effective_linear_deceleration_m_s2 is not None
+            else cls._DEFAULT_LINEAR_DECELERATION_M_S2,
+        )
+        effective_angular_deceleration = min(
+            angular_deceleration_rad_s2,
+            runtime.nb_opening_effective_angular_deceleration_rad_s2
+            if runtime.nb_opening_effective_angular_deceleration_rad_s2 is not None
+            else angular_deceleration_rad_s2,
+        )
+        return RelativeActionProfile(
+            linear_deceleration_m_s2=effective_linear_deceleration,
+            angular_deceleration_rad_s2=effective_angular_deceleration,
+            command_wait_s=WHEEL_COMMAND_REFRESH_S,
+            execution_response_s=runtime.nb_opening_execution_response_s,
+            max_telemetry_age_s=runtime.nb_opening_max_telemetry_age_ms / 1000.0,
+            fine_linear_speed_m_s=runtime.nb_opening_fine_linear_speed_m_s,
+            fine_angular_velocity_rad_s=(
+                runtime.nb_opening_fine_angular_velocity_rad_s
+            ),
+            stop_wheel_speed_m_s=runtime.nb_opening_stop_wheel_speed_m_s,
+            stop_angular_velocity_rad_s=(
+                runtime.nb_opening_stop_angular_velocity_rad_s
+            ),
+            heading_kp_rad_s=runtime.nb_opening_heading_kp_rad_s,
+            heading_max_angular_velocity_rad_s=(
+                runtime.nb_opening_heading_max_angular_velocity_rad_s
+            ),
+            correction_max_distance_m=runtime.nb_opening_correction_max_distance_m,
+            correction_max_angle_rad=runtime.nb_opening_correction_max_angle_rad,
+            correction_timeout_s=runtime.nb_opening_correction_timeout_s,
+            action_timeout_s=runtime.nb_opening_turn_timeout_s,
+            stationary_confirm_time_s=runtime.nb_opening_settle_time_s,
+        )
+
+    @classmethod
+    def from_app_config(
+        cls,
+        config: AppConfig,
+        *,
+        start_area: MatchStartArea | str | int = MatchStartArea.AREA_2,
+    ) -> MatchNBSequence:
+        sequence = super().from_app_config(config, start_area=start_area)
+        if not isinstance(sequence, cls):
+            raise TypeError("MatchNBSequence factory returned an unexpected type.")
+        sequence._nb_motion_profile = cls._profile_from_match_config(
+            config,
+            linear_deceleration_m_s2=config.motion.max_linear_deceleration_m_s2,
+            angular_deceleration_rad_s2=config.motion.max_angular_deceleration_rad_s2,
+        )
+        return sequence
+
+    @property
+    def motion_acceleration_limits(self) -> MotionAccelerationOverrides | None:
+        """让 NB 规划使用与底层控制器相同的有效减速度。"""
+
+        if self.state is not MatchState.NB_OPENING_SEQUENCE:
+            return super().motion_acceleration_limits
+        profile = getattr(self, "_nb_motion_profile", None)
+        if profile is None:
+            return super().motion_acceleration_limits
+        return MotionAccelerationOverrides(
+            linear_deceleration_m_s2=profile.linear_deceleration_m_s2,
+            angular_deceleration_rad_s2=profile.angular_deceleration_rad_s2,
+        )
+
     def start(self, timestamp_ns: int) -> MatchDecision:
         super().start(timestamp_ns)
-        self._nb_reset_leg()
-        self._nb_leg_arrived = False
-        self._nb_settle_until_ns: int | None = None
-        self._nb_reverse_heading_rad: float | None = None
-        self._nb_turn_settle_until_ns: int | None = None
-        self.state = MatchState.NB_OPENING_TO_FIRST
+        if not hasattr(self, "_nb_motion_profile"):
+            self._nb_motion_profile = self._profile_from_runtime_config()
+        self._nb_action_index = 0
+        self._nb_action_started_ns: int | None = None
+        self._nb_action_start_heading_rad: float | None = None
+        self._nb_turn_last_heading_rad: float | None = None
+        self._nb_turn_progress_rad = 0.0
+        self._nb_action_start_distance_m: float | None = None
+        self._nb_route_heading_rad: float | None = None
+        self._nb_action_controller: RelativeActionController | None = None
+        self._nb_last_action_command: RelativeActionCommand | None = None
+        self._nb_gripper_opened = False
+        self.state = MatchState.NB_OPENING_SEQUENCE
         return self._decision(timestamp_ns, 0.0, 0.0, "nb_opening_started")
+
+    def _profile_from_runtime_config(self) -> RelativeActionProfile:
+        """Build the testable default when no full AppConfig was provided."""
+
+        runtime = self.config
+        return RelativeActionProfile(
+            linear_deceleration_m_s2=(
+                runtime.nb_opening_effective_linear_deceleration_m_s2
+                or self._DEFAULT_LINEAR_DECELERATION_M_S2
+            ),
+            angular_deceleration_rad_s2=(
+                runtime.nb_opening_effective_angular_deceleration_rad_s2
+                or self._DEFAULT_ANGULAR_DECELERATION_RAD_S2
+            ),
+            command_wait_s=WHEEL_COMMAND_REFRESH_S,
+            execution_response_s=runtime.nb_opening_execution_response_s,
+            max_telemetry_age_s=runtime.nb_opening_max_telemetry_age_ms / 1000.0,
+            fine_linear_speed_m_s=runtime.nb_opening_fine_linear_speed_m_s,
+            fine_angular_velocity_rad_s=(
+                runtime.nb_opening_fine_angular_velocity_rad_s
+            ),
+            stop_wheel_speed_m_s=runtime.nb_opening_stop_wheel_speed_m_s,
+            stop_angular_velocity_rad_s=runtime.nb_opening_stop_angular_velocity_rad_s,
+            heading_kp_rad_s=runtime.nb_opening_heading_kp_rad_s,
+            heading_max_angular_velocity_rad_s=(
+                runtime.nb_opening_heading_max_angular_velocity_rad_s
+            ),
+            correction_max_distance_m=runtime.nb_opening_correction_max_distance_m,
+            correction_max_angle_rad=runtime.nb_opening_correction_max_angle_rad,
+            correction_timeout_s=runtime.nb_opening_correction_timeout_s,
+            action_timeout_s=runtime.nb_opening_turn_timeout_s,
+            stationary_confirm_time_s=runtime.nb_opening_settle_time_s,
+        )
 
     def _dispatch_state(
         self,
@@ -58,14 +187,16 @@ class MatchNBSequence(MatchSequence):
         near_field_preparation: GraspPreparation | None,
         near_field_path_clear: bool | None,
     ) -> MatchDecision:
-        if self.state is MatchState.NB_OPENING_TO_FIRST:
-            return self._step_nb_to_first(timestamp_ns)
+        if self.state is MatchState.NB_OPENING_SEQUENCE:
+            return self._step_nb_sequence(
+                timestamp_ns,
+                heading_rad=heading_rad,
+                cumulative_distance_m=cumulative_distance_m,
+                left_speed_feedback_m_s=left_speed_feedback_m_s,
+                right_speed_feedback_m_s=right_speed_feedback_m_s,
+            )
         if self.state is MatchState.NB_OPENING_GRIPPER_OPEN:
             return self._step_nb_gripper_open(timestamp_ns)
-        if self.state is MatchState.NB_OPENING_TO_SECOND:
-            return self._step_nb_to_second(timestamp_ns)
-        if self.state is MatchState.NB_OPENING_REVERSE:
-            return self._step_nb_reverse(timestamp_ns)
         return super()._dispatch_state(
             timestamp_ns,
             perception=perception,
@@ -77,45 +208,135 @@ class MatchNBSequence(MatchSequence):
             near_field_path_clear=near_field_path_clear,
         )
 
-    def _nb_active_leg(self) -> tuple[str, FieldPoint] | None:
-        if self.state is MatchState.NB_OPENING_TO_FIRST:
-            return "turn_and_move_to_first", self.config.nb_opening_first_target_field
-        if self.state is MatchState.NB_OPENING_GRIPPER_OPEN:
-            return "open_gripper", self.config.nb_opening_first_target_field
-        if self.state is MatchState.NB_OPENING_TO_SECOND:
-            return "turn_and_move_to_second", self.config.nb_opening_second_target_field
-        if self.state is MatchState.NB_OPENING_REVERSE:
-            return "reverse", self.config.nb_opening_reverse_target_field
-        return None
+    def _nb_active_action(self) -> NBOpeningAction | None:
+        if self._nb_action_index >= len(self.config.nb_opening_actions):
+            return None
+        return self.config.nb_opening_actions[self._nb_action_index]
 
     @property
     def nb_opening_route_phase(self) -> str | None:
-        leg = self._nb_active_leg()
-        return None if leg is None else leg[0]
+        if self.state is MatchState.NB_OPENING_GRIPPER_OPEN:
+            return "open_gripper"
+        if self.state is not MatchState.NB_OPENING_SEQUENCE:
+            return None
+        action = self._nb_active_action()
+        if action is None:
+            return None
+        kind = "turn" if isinstance(action, NBOpeningTurn) else "straight"
+        return (
+            f"action_{self._nb_action_index + 1}_"
+            f"{len(self.config.nb_opening_actions)}_{kind}"
+        )
 
     @property
     def nb_opening_diagnostic(self) -> str | None:
-        leg = self._nb_active_leg()
-        if leg is None:
+        if self.state is MatchState.NB_OPENING_GRIPPER_OPEN:
+            return "action=gripper_open"
+        if self.state is not MatchState.NB_OPENING_SEQUENCE:
             return None
-        phase, target = leg
-        position = self._fallback_field_position
+        action = self._nb_active_action()
+        if action is None:
+            return None
         heading = self._latest_heading_rad
         heading_text = (
             "unavailable"
             if heading is None
             else f"{math.degrees(normalize_angle(heading)):+.1f}deg"
         )
-        if position is None:
-            return (
-                f"phase={phase} target=({target.x:+.0f},{target.y:+.0f})mm "
-                f"position=unavailable heading={heading_text}"
+        if isinstance(action, NBOpeningTurn):
+            direction = 1.0 if action.angle_rad > 0.0 else -1.0
+            progress = direction * self._nb_turn_progress_rad
+            detail = (
+                f"angle={action.angle_rad:+.3f}rad "
+                f"progress={progress:.3f}/{abs(action.angle_rad):.3f}rad "
+                f"speed={action.angular_velocity_rad_s:.3f}rad/s"
+            )
+        else:
+            progress = None
+            if (
+                self._nb_action_start_distance_m is not None
+                and self._latest_cumulative_distance_m is not None
+            ):
+                direction = 1.0 if action.distance_m > 0.0 else -1.0
+                progress = direction * (
+                    self._latest_cumulative_distance_m
+                    - self._nb_action_start_distance_m
+                )
+            progress_text = "unavailable" if progress is None else f"{progress:.3f}"
+            detail = (
+                f"distance={action.distance_m:+.3f}m "
+                f"progress={progress_text}/{abs(action.distance_m):.3f}m "
+                f"speed={action.speed_m_s:.3f}m/s"
+            )
+        command = self._nb_last_action_command
+        command_text = (
+            "command=none"
+            if command is None
+            else (
+                f"phase={command.phase.value} "
+                f"error={command.position_error:+.4f} "
+                f"brake={command.braking_distance:.4f} "
+                f"delay={command.telemetry_delay_s:.3f}"
+            )
+        )
+        timing_text = self._nb_action_diagnostic_context(
+            self._latest_motion_timestamp_ns(),
+            confirmation_progress=(
+                "geometry_pending" if command is None else "geometry_checked"
+            ),
+        )
+        return (
+            f"action={self._nb_action_index + 1}/"
+            f"{len(self.config.nb_opening_actions)} {detail} "
+            f"heading={heading_text} "
+            f"cumulative_distance_m={self._latest_cumulative_distance_m} "
+            f"{command_text} {timing_text}"
+        )
+
+    def _latest_motion_timestamp_ns(self) -> int:
+        latest = self._stationary_motion.latest
+        if latest is None:
+            return self._last_timestamp_ns or 0
+        return max(self._last_timestamp_ns or latest.received_timestamp_ns,
+                   latest.received_timestamp_ns)
+
+    def _nb_action_diagnostic_context(
+        self,
+        timestamp_ns: int,
+        *,
+        confirmation_progress: str,
+    ) -> str:
+        started = self._nb_action_started_ns
+        if started is None:
+            elapsed_ms = "none"
+            deadline = "none"
+        else:
+            elapsed_ms = f"{max(0, timestamp_ns - started) / 1e6:.1f}"
+            deadline = str(
+                started + self._seconds_to_ns(self.config.nb_opening_turn_timeout_s)
             )
         return (
-            f"phase={phase} target=({target.x:+.0f},{target.y:+.0f})mm "
-            f"position=({position.x:+.0f},{position.y:+.0f})mm "
-            f"error=({target.x - position.x:+.0f},{target.y - position.y:+.0f})mm "
-            f"heading={heading_text}"
+            f"elapsed_ms={elapsed_ms} action_started_ns={started} "
+            f"action_deadline_ns={deadline} "
+            f"confirmation_progress={confirmation_progress} "
+            f"preparation_age_ms=none "
+            f"{self._stationary_motion.diagnostic(timestamp_ns)}"
+        )
+
+    def _nb_waiting_reason(
+        self,
+        base_reason: str,
+        timestamp_ns: int,
+        *,
+        heading_rad: float | None,
+        cumulative_distance_m: float | None,
+    ) -> str:
+        return (
+            f"{base_reason}:heading={'available' if heading_rad is not None else 'missing'} "
+            f"distance={'available' if cumulative_distance_m is not None else 'missing'} "
+            f"{self._nb_action_diagnostic_context(
+                timestamp_ns, confirmation_progress='not_started'
+            )}"
         )
 
     def _nb_gripper_angles_deg(self) -> tuple[float, float]:
@@ -124,261 +345,164 @@ class MatchNBSequence(MatchSequence):
             self.config.nb_opening_gripper_right_deg,
         )
 
-    def _nb_reset_leg(self) -> None:
-        self._nb_leg_start_position: FieldPoint | None = None
-        self._nb_leg_heading_rad: float | None = None
-        self._nb_turn_complete = False
-        self._nb_turn_started_ns: int | None = None
-
-    def _nb_start_leg(
-        self,
-        timestamp_ns: int,
-        target: FieldPoint,
-        *,
-        reverse: bool,
-    ) -> bool:
-        position = self._fallback_field_position
-        if position is None:
-            return False
-        self._nb_leg_start_position = position
-        if reverse and self._nb_reverse_heading_rad is not None:
-            self._nb_leg_heading_rad = self._nb_reverse_heading_rad
-        elif reverse:
-            self._nb_leg_heading_rad = math.atan2(
-                position.y - target.y,
-                position.x - target.x,
-            )
-        else:
-            self._nb_leg_heading_rad = math.atan2(
-                target.y - position.y,
-                target.x - position.x,
-            )
-        self._nb_turn_started_ns = timestamp_ns
-        return True
-
     def _nb_posture(
         self,
-        gripper_open: bool,
     ) -> tuple[GripperPosture, tuple[float, float] | None]:
-        if gripper_open:
+        if self._nb_gripper_opened:
             return GripperPosture.OPEN, self._nb_gripper_angles_deg()
         return GripperPosture.CLOSED, None
 
-    def _nb_finish_leg(
+    def _nb_begin_action(
         self,
         timestamp_ns: int,
         *,
-        next_state: MatchState,
-        arrive_reason: str,
-        posture: GripperPosture,
-        angles: tuple[float, float] | None,
-    ) -> MatchDecision:
-        if not self._nb_leg_arrived:
-            self._nb_leg_arrived = True
-            self._nb_settle_until_ns = timestamp_ns + self._seconds_to_ns(
-                self.config.nb_opening_settle_time_s
+        heading_rad: float | None,
+        cumulative_distance_m: float | None,
+    ) -> bool:
+        action = self._nb_active_action()
+        assert action is not None
+        if self._nb_action_started_ns is None:
+            self._nb_action_started_ns = timestamp_ns
+        if isinstance(action, NBOpeningTurn):
+            if heading_rad is None:
+                return False
+            self._nb_action_start_heading_rad = heading_rad
+            self._nb_turn_last_heading_rad = heading_rad
+            self._nb_turn_progress_rad = 0.0
+            if self._nb_route_heading_rad is None:
+                self._nb_route_heading_rad = heading_rad
+            self._nb_route_heading_rad = normalize_angle(
+                self._nb_route_heading_rad + action.angle_rad
             )
-            return self._decision(
-                timestamp_ns,
-                0.0,
-                0.0,
-                f"{arrive_reason}_wait",
-                posture=posture,
-                gripper_angles_deg=angles,
+            self._nb_action_controller = RelativeActionController(
+                self._nb_motion_profile
             )
-        assert self._nb_settle_until_ns is not None
-        if timestamp_ns < self._nb_settle_until_ns:
-            return self._decision(
-                timestamp_ns,
-                0.0,
-                0.0,
-                "nb_opening_waypoint_settle",
-                posture=posture,
-                gripper_angles_deg=angles,
+            self._nb_action_controller.set_tolerances(
+                position_tolerance=self.config.nb_opening_turn_tolerance_rad,
+                heading_tolerance=self.config.nb_opening_heading_tolerance_rad,
             )
-        if next_state is MatchState.NB_OPENING_REVERSE:
-            # 倒车严格沿用第二段前进航向，不在第二航点重新计算或转向。
-            self._nb_reverse_heading_rad = self._nb_leg_heading_rad
-        self._nb_leg_arrived = False
-        self._nb_settle_until_ns = None
-        self._nb_reset_leg()
-        self.state = next_state
-        if next_state is MatchState.SEARCH_CLUSTER:
-            self._begin_cluster_search()
-        return self._decision(
-            timestamp_ns,
-            0.0,
-            0.0,
-            arrive_reason,
-            posture=posture,
-            gripper_angles_deg=angles,
-        )
+            self._nb_action_controller.begin(
+                RelativeActionKind.TURN,
+                action.angle_rad,
+                start_heading_rad=heading_rad,
+                timestamp_ns=timestamp_ns,
+                cruise_speed=action.angular_velocity_rad_s,
+                target_heading_rad=self._nb_route_heading_rad,
+            )
+        else:
+            if cumulative_distance_m is None or heading_rad is None:
+                return False
+            self._nb_action_start_distance_m = cumulative_distance_m
+            if self._nb_route_heading_rad is None:
+                # The first straight action has no previous route heading.
+                # Later straight actions retain the intended heading from the
+                # preceding turn rather than accepting a turn's measured error
+                # as a new reference.
+                self._nb_route_heading_rad = heading_rad
+            self._nb_action_controller = RelativeActionController(
+                self._nb_motion_profile
+            )
+            self._nb_action_controller.set_tolerances(
+                position_tolerance=self.config.nb_opening_distance_tolerance_m,
+                heading_tolerance=self.config.nb_opening_heading_tolerance_rad,
+            )
+            self._nb_action_controller.begin(
+                RelativeActionKind.STRAIGHT,
+                action.distance_m,
+                start_heading_rad=heading_rad,
+                timestamp_ns=timestamp_ns,
+                cruise_speed=action.speed_m_s,
+                target_heading_rad=self._nb_route_heading_rad,
+            )
+        return True
 
-    def _nb_drive_leg(
+    def _nb_motion_feedback(
         self,
         timestamp_ns: int,
         *,
-        target: FieldPoint,
-        speed_m_s: float,
-        reverse: bool,
-        turn_before_drive: bool,
-        gripper_open: bool,
-        next_state: MatchState,
-        turn_reason: str,
-        drive_reason: str,
-        arrive_reason: str,
-    ) -> MatchDecision:
-        posture, angles = self._nb_posture(gripper_open)
-        if self._nb_leg_start_position is None and not self._nb_start_leg(
-            timestamp_ns,
-            target,
-            reverse=reverse,
-        ):
-            return self._decision(
-                timestamp_ns,
-                0.0,
-                0.0,
-                f"{drive_reason}_waiting_position",
-                posture=posture,
-                gripper_angles_deg=angles,
-            )
-
-        start = self._nb_leg_start_position
-        desired_heading = self._nb_leg_heading_rad
-        current_heading = self._latest_heading_rad
-        assert start is not None
-        assert desired_heading is not None
-        if current_heading is None:
-            return self._decision(
-                timestamp_ns,
-                0.0,
-                0.0,
-                f"{drive_reason}_waiting_heading",
-                posture=posture,
-                gripper_angles_deg=angles,
-            )
-
-        if self._safe_zone_line_coordinate_threshold_reached(
-            target,
-            start,
-            tolerance_mm=self.config.nb_opening_align_tolerance_mm,
-        ):
-            return self._nb_finish_leg(
-                timestamp_ns,
-                next_state=next_state,
-                arrive_reason=arrive_reason,
-                posture=posture,
-                angles=angles,
-            )
-
-        if turn_before_drive and not self._nb_turn_complete:
-            heading_error = normalize_angle(desired_heading - current_heading)
-            if abs(heading_error) <= self.config.nb_opening_heading_tolerance_rad:
-                self._nb_turn_complete = True
-                self._nb_turn_settle_until_ns = timestamp_ns + self._seconds_to_ns(
-                    self.config.nb_opening_settle_time_s
-                )
-                return self._decision(
-                    timestamp_ns,
-                    0.0,
-                    0.0,
-                    f"{turn_reason}_settle",
-                    posture=posture,
-                    gripper_angles_deg=angles,
-                )
-            else:
-                assert self._nb_turn_started_ns is not None
-                if timestamp_ns - self._nb_turn_started_ns >= self._seconds_to_ns(
-                    self.config.nb_opening_align_timeout_s
-                ):
-                    self.state = MatchState.TERMINAL_STOP
-                    return self._decision(
-                        timestamp_ns,
-                        0.0,
-                        0.0,
-                        "nb_opening_turn_timeout_stop",
-                        posture=posture,
-                        gripper_angles_deg=angles,
-                    )
-                angular = self._heading_hold_angular_velocity(
-                    desired_heading,
-                    kp_rad_s=self.config.nb_opening_heading_kp_rad_s,
-                    max_angular_velocity_rad_s=(
-                        self.config.nb_opening_align_angular_velocity_rad_s
-                    ),
-                    tolerance_rad=self.config.nb_opening_heading_tolerance_rad,
-                )
-                return self._decision(
-                    timestamp_ns,
-                    0.0,
-                    0.0 if angular is None else angular,
-                    turn_reason,
-                    posture=posture,
-                    gripper_angles_deg=angles,
-                )
-
-        if turn_before_drive and self._nb_turn_settle_until_ns is not None:
-            if timestamp_ns < self._nb_turn_settle_until_ns:
-                return self._decision(
-                    timestamp_ns,
-                    0.0,
-                    0.0,
-                    f"{turn_reason}_settle",
-                    posture=posture,
-                    gripper_angles_deg=angles,
-                )
-            self._nb_turn_settle_until_ns = None
-            # 释放转向惯性后才允许前进；只有此时仍明显偏离才重开一次转向。
-            if (
-                abs(normalize_angle(desired_heading - current_heading))
-                > self.config.nb_opening_heading_tolerance_rad
-            ):
-                self._nb_turn_complete = False
-                self._nb_turn_started_ns = timestamp_ns
-                return self._decision(
-                    timestamp_ns,
-                    0.0,
-                    0.0,
-                    f"{turn_reason}_settle_realign",
-                    posture=posture,
-                    gripper_angles_deg=angles,
-                )
-
-        angular = self._heading_hold_angular_velocity(
-            desired_heading,
-            kp_rad_s=self.config.nb_opening_heading_kp_rad_s,
-            max_angular_velocity_rad_s=(
-                self.config.nb_opening_heading_max_angular_velocity_rad_s
+        progress: float,
+        heading_rad: float | None,
+        left_speed_feedback_m_s: float | None,
+        right_speed_feedback_m_s: float | None,
+    ) -> RelativeActionFeedback:
+        latest = self._stationary_motion.latest
+        telemetry_age_s: float | None = None
+        stationary_latest_ns: int | None = None
+        angular_velocity_rad_s: float | None = None
+        if latest is not None:
+            stationary_latest_ns = latest.received_timestamp_ns
+            if latest.received_timestamp_ns <= timestamp_ns:
+                telemetry_age_s = (
+                    timestamp_ns - latest.received_timestamp_ns
+                ) / 1_000_000_000.0
+            if math.isfinite(latest.gyro_z_rad_s):
+                # Only the magnitude is used for the stopping/braking gate;
+                # turn direction comes from the unwrapped IMU heading.  This
+                # keeps the calibrated gyro sign in the existing heading path.
+                angular_velocity_rad_s = latest.gyro_z_rad_s
+        return RelativeActionFeedback(
+            timestamp_ns=timestamp_ns,
+            progress=progress,
+            heading_rad=heading_rad,
+            left_wheel_velocity_m_s=left_speed_feedback_m_s,
+            right_wheel_velocity_m_s=right_speed_feedback_m_s,
+            angular_velocity_rad_s=angular_velocity_rad_s,
+            telemetry_age_s=telemetry_age_s,
+            stationary_since_ns=self._stationary_motion.stationary_since(
+                timestamp_ns
             ),
-            # 起步后直接保持本段固定航向，不再引入第二套行驶校准门限。
-            tolerance_rad=0.0,
-        )
-        return self._decision(
-            timestamp_ns,
-            -speed_m_s if reverse else speed_m_s,
-            0.0 if angular is None else angular,
-            drive_reason,
-            posture=posture,
-            gripper_angles_deg=angles,
+            stationary_latest_ns=stationary_latest_ns,
         )
 
-    def _step_nb_to_first(self, timestamp_ns: int) -> MatchDecision:
-        return self._nb_drive_leg(
+    def _nb_finish_action(
+        self,
+        timestamp_ns: int,
+        *,
+        reason: str,
+    ) -> MatchDecision:
+        posture, angles = self._nb_posture()
+        completed_index = self._nb_action_index + 1
+        self._nb_action_index += 1
+        self._nb_action_started_ns = None
+        self._nb_action_start_heading_rad = None
+        self._nb_turn_last_heading_rad = None
+        self._nb_turn_progress_rad = 0.0
+        self._nb_action_start_distance_m = None
+        self._nb_action_controller = None
+        self._nb_last_action_command = None
+        if self.config.nb_opening_gripper_after_action == completed_index:
+            self._nb_gripper_opened = True
+            self.state = MatchState.NB_OPENING_GRIPPER_OPEN
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "nb_opening_gripper_opened",
+                posture=GripperPosture.OPEN,
+                gripper_angles_deg=self._nb_gripper_angles_deg(),
+            )
+        if self._nb_action_index >= len(self.config.nb_opening_actions):
+            self.state = MatchState.SEARCH_CLUSTER
+            self._begin_cluster_search()
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "nb_opening_sequence_complete",
+                posture=posture,
+                gripper_angles_deg=angles,
+            )
+        return self._decision(
             timestamp_ns,
-            target=self.config.nb_opening_first_target_field,
-            speed_m_s=self.config.nb_opening_first_speed_m_s,
-            reverse=False,
-            turn_before_drive=True,
-            gripper_open=False,
-            next_state=MatchState.NB_OPENING_GRIPPER_OPEN,
-            turn_reason="nb_opening_turn_to_first",
-            drive_reason="nb_opening_to_first",
-            arrive_reason="nb_opening_first_reached_open_gripper",
+            0.0,
+            0.0,
+            "nb_opening_action_advanced",
+            posture=posture,
+            gripper_angles_deg=angles,
         )
 
     def _step_nb_gripper_open(self, timestamp_ns: int) -> MatchDecision:
-        self.state = MatchState.NB_OPENING_TO_SECOND
-        self._nb_reset_leg()
+        self.state = MatchState.NB_OPENING_SEQUENCE
         return self._decision(
             timestamp_ns,
             0.0,
@@ -388,45 +512,176 @@ class MatchNBSequence(MatchSequence):
             gripper_angles_deg=self._nb_gripper_angles_deg(),
         )
 
-    def _step_nb_to_second(self, timestamp_ns: int) -> MatchDecision:
-        return self._nb_drive_leg(
-            timestamp_ns,
-            target=self.config.nb_opening_second_target_field,
-            speed_m_s=self.config.nb_opening_second_speed_m_s,
-            reverse=False,
-            turn_before_drive=True,
-            gripper_open=True,
-            next_state=MatchState.NB_OPENING_REVERSE,
-            turn_reason="nb_opening_turn_to_second",
-            drive_reason="nb_opening_to_second",
-            arrive_reason="nb_opening_second_reached_start_reverse",
-        )
+    def _step_nb_sequence(
+        self,
+        timestamp_ns: int,
+        *,
+        heading_rad: float | None,
+        cumulative_distance_m: float | None,
+        left_speed_feedback_m_s: float | None,
+        right_speed_feedback_m_s: float | None,
+    ) -> MatchDecision:
+        action = self._nb_active_action()
+        posture, angles = self._nb_posture()
+        if action is None:
+            self.state = MatchState.SEARCH_CLUSTER
+            self._begin_cluster_search()
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "nb_opening_sequence_complete",
+                posture=posture,
+                gripper_angles_deg=angles,
+            )
+        if (
+            self._nb_action_controller is None
+        ):
+            if not self._nb_begin_action(
+                timestamp_ns,
+                heading_rad=heading_rad,
+                cumulative_distance_m=cumulative_distance_m,
+            ):
+                assert self._nb_action_started_ns is not None
+                kind = "turn" if isinstance(action, NBOpeningTurn) else "straight"
+                if timestamp_ns - self._nb_action_started_ns >= self._seconds_to_ns(
+                    self.config.nb_opening_turn_timeout_s
+                ):
+                    self.state = MatchState.TERMINAL_STOP
+                    return self._decision(
+                        timestamp_ns,
+                        0.0,
+                        0.0,
+                        f"nb_opening_{kind}_timeout_stop_waiting_feedback",
+                        posture=posture,
+                        gripper_angles_deg=angles,
+                    )
+                waiting_reason = self._nb_waiting_reason(
+                    (
+                        "nb_opening_turn_waiting_heading"
+                        if isinstance(action, NBOpeningTurn)
+                        else "nb_opening_straight_waiting_heading_or_distance"
+                    ),
+                    timestamp_ns,
+                    heading_rad=heading_rad,
+                    cumulative_distance_m=cumulative_distance_m,
+                )
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    0.0,
+                    waiting_reason,
+                    posture=posture,
+                    gripper_angles_deg=angles,
+                )
 
-    def _step_nb_reverse(self, timestamp_ns: int) -> MatchDecision:
-        return self._nb_drive_leg(
+        if isinstance(action, NBOpeningTurn):
+            if heading_rad is None:
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    0.0,
+                    self._nb_waiting_reason(
+                        "nb_opening_turn_waiting_heading",
+                        timestamp_ns,
+                        heading_rad=heading_rad,
+                        cumulative_distance_m=cumulative_distance_m,
+                    ),
+                    posture=posture,
+                    gripper_angles_deg=angles,
+                )
+            assert self._nb_turn_last_heading_rad is not None
+            self._nb_turn_progress_rad += normalize_angle(
+                heading_rad - self._nb_turn_last_heading_rad
+            )
+            self._nb_turn_last_heading_rad = heading_rad
+            direction = 1.0 if action.angle_rad > 0.0 else -1.0
+            progress = direction * self._nb_turn_progress_rad
+        else:
+            if cumulative_distance_m is None:
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    0.0,
+                    self._nb_waiting_reason(
+                        "nb_opening_straight_waiting_distance",
+                        timestamp_ns,
+                        heading_rad=heading_rad,
+                        cumulative_distance_m=cumulative_distance_m,
+                    ),
+                    posture=posture,
+                    gripper_angles_deg=angles,
+                )
+            assert self._nb_action_start_distance_m is not None
+            direction = 1.0 if action.distance_m > 0.0 else -1.0
+            progress = direction * (
+                cumulative_distance_m - self._nb_action_start_distance_m
+            )
+        controller = self._nb_action_controller
+        assert controller is not None
+        feedback = self._nb_motion_feedback(
             timestamp_ns,
-            target=self.config.nb_opening_reverse_target_field,
-            speed_m_s=self.config.nb_opening_reverse_speed_m_s,
-            reverse=True,
-            turn_before_drive=False,
-            gripper_open=True,
-            next_state=MatchState.SEARCH_CLUSTER,
-            turn_reason="nb_opening_reverse_turn_unused",
-            drive_reason="nb_opening_reverse",
-            arrive_reason="nb_opening_reverse_reached_start_search",
+            progress=progress,
+            heading_rad=heading_rad,
+            left_speed_feedback_m_s=left_speed_feedback_m_s,
+            right_speed_feedback_m_s=right_speed_feedback_m_s,
+        )
+        command = controller.update(feedback)
+        self._nb_last_action_command = command
+        action_number = self._nb_action_index + 1
+        kind = "turn" if isinstance(action, NBOpeningTurn) else "straight"
+        if command.timed_out:
+            self.state = MatchState.TERMINAL_STOP
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                f"nb_opening_{kind}_{action_number}_timeout:{command.reason}:"
+                f"{self._nb_action_diagnostic_context(
+                    timestamp_ns, confirmation_progress='timeout'
+                )}",
+                posture=posture,
+                gripper_angles_deg=angles,
+            )
+        if command.complete:
+            return self._nb_finish_action(
+                timestamp_ns,
+                reason=(
+                    f"nb_opening_action_{action_number}_complete"
+                    f":{command.reason}"
+                ),
+            )
+        return self._decision(
+            timestamp_ns,
+            command.linear_velocity_m_s,
+            command.angular_velocity_rad_s,
+            f"nb_opening_{kind}_{action_number}_{command.phase.value}"
+            f":{command.reason}:"
+            f"{self._nb_action_diagnostic_context(
+                timestamp_ns,
+                confirmation_progress=(
+                    "stationary_wait" if command.phase.value == "settle"
+                    else "geometry_checked"
+                ),
+            )}",
+            posture=posture,
+            gripper_angles_deg=angles,
+            min_wheel_velocity_m_s=(
+                0.0 if command.use_zero_min_wheel_velocity else None
+            ),
         )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run current match with the simple area-2 waypoint opening."
+        description="Run current match with a configurable relative action opening."
     )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument(
         "--start-area",
         choices=(MatchStartArea.AREA_2.value,),
         default=MatchStartArea.AREA_2.value,
-        help="本入口只支持区域 2；开场航点按区域 2 场地坐标配置。",
+        help="本入口只支持区域 2；开场动作从当前起点按相对配置执行。",
     )
     parser.add_argument(
         "--supervised-physical-stop-ready",

@@ -264,6 +264,9 @@ def _run_session(
     pickup_sequence = GripperWidthPickupSequence(
         gripper_full_travel_time_s=gripper.full_travel_time_s,
         forward_speed_m_s=runtime_config.match.green_approach_speed_m_s,
+        terminal_speed_gain_s_inv=(
+            runtime_config.match.pickup_terminal_speed_gain_s_inv
+        ),
         closed_servo_angles_deg=(gripper.closed_left_angle_deg, gripper.closed_right_angle_deg),
         max_observation_age_ms=runtime_config.processing.max_observation_age_ms,
         alignment_kp_rad_s=runtime_config.match.green_alignment_kp_rad_s,
@@ -425,15 +428,17 @@ def _run_session(
                     if worker.error is not None and worker.error != last_diagnostic:
                         worker.log(f"sidecar_error={worker.error}", flush=True)
                         last_diagnostic = worker.error
-                    snapshot = renderer.latest_fresh_snapshot(
-                        now_ns,
-                        runtime_config.processing.max_observation_age_ms,
-                    )
+                    snapshot = renderer.latest_snapshot()
                     # 进入动作后冻结静止阶段形成的计划；避免运动模糊触发
                     # 走廊重检，也避免规划线程继续消耗实时链路预算。
                     if (
                         snapshot is not None
                         and pickup_sequence.active_plan is None
+                        and pickup_sequence.motion_evidence.capture_valid(
+                            snapshot.capture_timestamp_ns, now_ns,
+                            max_age_ns=pickup_sequence.alignment_timeout_ns,
+                        )
+                        and 0 <= now_ns - snapshot.result_timestamp_ns <= pickup_sequence.age_ns
                     ):
                         capture_distance = next((distance for stamp, distance in reversed(odometry_history)
                                                  if stamp <= snapshot.capture_timestamp_ns), None)

@@ -174,7 +174,7 @@ def test_formal_match_opens_and_advances_for_current_heading_reachable_target() 
     )
 
     assert opening.reason == "near_field_opening:open_group_width"
-    assert forward.reason == "near_field_forward:forward_open_loop"
+    assert forward.reason == "near_field_forward:forward_encoder_heading_hold"
     assert forward.linear_velocity_m_s > 0.0
 
 
@@ -367,43 +367,51 @@ def test_async_preparation_without_new_camera_frame_opens_and_moves(poll_ms, del
 @pytest.mark.parametrize('delay_ms,period_ms,poll_ms', [(300,250,5), (600,400,10)])
 def test_rejected_handoff_selects_another_physical_target_without_session_loop(delay_ms, period_ms, poll_ms):
     from rescue_vision.app.near_field_grasp import NearFieldHandoffPrior
-    from rescue_vision.app.gripper_width_sequence import GraspPreparation, GraspSelection
+    from test_gripper_width_sequence import motion_sample, snapshot_at
 
     seq = _sequence(max_observation_age_ms=1000.0)
     seq.config = replace(seq.config, green_max_age_ms=1000.0)
     seq._started = True
     seq._latest_heading_rad = 0.0
     seq._latest_cumulative_distance_m = 0.0
-    # 日志中首先反复选中侧方近块，正前方另一单绿始终得不到机会。
     points = (GroundPoint(265, -176), GroundPoint(427, -2))
-    observations = tuple(observation(0, 0, p, box_x=40*i) for i,p in enumerate(points))
-    tracks = seq._tracker.update(0, observations)
-    first, other = tracks
-    seq._begin_near_field_grasp(0, handoff_prior=NearFieldHandoffPrior(
-        TargetClass.GREEN_SUPPLY, points[0], first.track_id))
-    assert seq._selected_track_id is None
+    members = tuple(target(i+1, x=p.x, y=p.y, timestamp=100_000_000)
+                    for i, p in enumerate(points))
+    latest = snapshot_at(1, 100_000_000, members)
+    first, other = seq._tracker.update(100_000_000, latest.observations)
+    prior = NearFieldHandoffPrior(TargetClass.GREEN_SUPPLY, points[0], first.track_id)
+    seq._begin_near_field_grasp(0, handoff_prior=prior)
     initial_session = seq.near_field_session_id
-    latest = snapshot(0, 0, *observations)
-    routed = None
-    for ms in range(0, delay_ms + period_ms + 100, poll_ms):
+    initial_task = seq.grasp_task
+    deadline = initial_task.deadline_ns
+    planner = selector(confirmation_frames=1)
+    session = GraspPreparationSession(
+        GraspTargetTracker(TrackingConfig(1,80,.1,500,1,.1).build_tracker(),
+                           projector(), planner.config), planner)
+    prepared = routed = None
+    for ms in range(0, 100+delay_ms+period_ms+100, poll_ms):
         now = ms * 1_000_000
-        # 异步规划结果先返回，同一图像没有再更新。
-        preparation = None if ms < delay_ms else GraspPreparation(
-            0, GraspSelection(None, ('left_tip_y_mm_unreachable',)), (),
-            session_id=initial_session, prepared_timestamp_ns=now, result_timestamp_ns=now)
-        decision = seq.step(now, perception=latest, heading_rad=0., cumulative_distance_m=0.,
-            near_field_preparation=preparation, near_field_path_clear=True,
-            left_speed_feedback_m_s=0., right_speed_feedback_m_s=0.)
-        if decision.reason.startswith('near_field_route:far_reapproach'):
+        seq.observe_grasp_motion(motion_sample(now))
+        if ms == 100+delay_ms:
+            result = session.update(latest, locked_ids=None, handoff_prior=prior,
+                                    session_id=initial_session, policy=seq.near_field_policy)
+            prepared = replace(result, prepared_timestamp_ns=now, result_timestamp_ns=now)
+            assert prepared.ready
+            assert prepared.selection.plan.alignment_angle_rad == 0
+            assert prepared.selection.plan.members[0].observation.ground_point == points[1]
+        decision = seq.step(now, perception=latest if prepared else None,
+                            heading_rad=0., cumulative_distance_m=0.,
+                            near_field_preparation=prepared, near_field_path_clear=True)
+        if decision.gripper_angles_deg is not None and prepared is not None:
             routed = decision
             break
     assert routed is not None
     assert seq.selected_track_id == other.track_id
     assert seq._target_attempt_blocked(first, now)
     assert not seq._target_attempt_blocked(other, now)
-    # 主 tracker 重新编号也不能解除同一物理失败。
     assert seq._target_attempt_blocked(replace(first, track_id=100), now)
     assert seq.near_field_session_id == initial_session
+    assert seq.grasp_task is initial_task and seq.grasp_task.deadline_ns == deadline
 
 
 @pytest.mark.parametrize('classes', [

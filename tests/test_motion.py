@@ -22,6 +22,7 @@ from rescue_vision.motion import (
     CarSystemStatus,
     CommandResult,
     GripperCalibration,
+    MotionAccelerationLimits,
     MotionController,
     MotionControlTimingError,
     MotionStallError,
@@ -96,7 +97,10 @@ def limits() -> MotionLimits:
         max_linear_velocity_m_s=0.30,
         max_angular_velocity_rad_s=2.0,
         max_wheel_velocity_m_s=0.40,
-        max_wheel_acceleration_m_s2=0.50,
+        max_linear_acceleration_m_s2=0.50,
+        max_linear_deceleration_m_s2=0.50,
+        max_angular_acceleration_rad_s2=5,
+        max_angular_deceleration_rad_s2=5,
         max_remote_command_valid_for_ms=500,
     )
 
@@ -318,7 +322,10 @@ def test_motion_functions_encode_differential_drive_and_stops() -> None:
         max_linear_velocity_m_s=0.30,
         max_angular_velocity_rad_s=2.0,
         max_wheel_velocity_m_s=0.40,
-        max_wheel_acceleration_m_s2=10.0,
+        max_linear_acceleration_m_s2=10.0,
+        max_linear_deceleration_m_s2=10.0,
+        max_angular_acceleration_rad_s2=100,
+        max_angular_deceleration_rad_s2=100,
         max_remote_command_valid_for_ms=500,
     )
     controller = MotionController(channel, fast_limits, monotonic_ns=clock)
@@ -402,7 +409,10 @@ def test_drive_applies_per_wheel_speed_weights() -> None:
         max_linear_velocity_m_s=0.30,
         max_angular_velocity_rad_s=2.0,
         max_wheel_velocity_m_s=0.40,
-        max_wheel_acceleration_m_s2=10.0,
+        max_linear_acceleration_m_s2=10.0,
+        max_linear_deceleration_m_s2=10.0,
+        max_angular_acceleration_rad_s2=100,
+        max_angular_deceleration_rad_s2=100,
         max_remote_command_valid_for_ms=500,
         left_wheel_speed_weight=1.05,
         right_wheel_speed_weight=0.95,
@@ -426,7 +436,10 @@ def test_wheel_limited_drive_scales_weighted_wheels_to_limit() -> None:
         max_linear_velocity_m_s=0.30,
         max_angular_velocity_rad_s=2.0,
         max_wheel_velocity_m_s=0.30,
-        max_wheel_acceleration_m_s2=10.0,
+        max_linear_acceleration_m_s2=10.0,
+        max_linear_deceleration_m_s2=10.0,
+        max_angular_acceleration_rad_s2=100,
+        max_angular_deceleration_rad_s2=100,
         max_remote_command_valid_for_ms=500,
         left_wheel_speed_weight=1.2,
         right_wheel_speed_weight=1.0,
@@ -447,7 +460,10 @@ def test_motion_limits_reject_non_positive_wheel_weight() -> None:
             max_linear_velocity_m_s=0.30,
             max_angular_velocity_rad_s=2.0,
             max_wheel_velocity_m_s=0.40,
-            max_wheel_acceleration_m_s2=0.50,
+            max_linear_acceleration_m_s2=0.50,
+            max_linear_deceleration_m_s2=0.50,
+            max_angular_acceleration_rad_s2=5,
+            max_angular_deceleration_rad_s2=5,
             max_remote_command_valid_for_ms=500,
             left_wheel_speed_weight=0.0,
         )
@@ -460,7 +476,10 @@ def test_motion_limits_reject_minimum_above_maximum_wheel_velocity() -> None:
             max_linear_velocity_m_s=0.30,
             max_angular_velocity_rad_s=2.0,
             max_wheel_velocity_m_s=0.04,
-            max_wheel_acceleration_m_s2=0.50,
+            max_linear_acceleration_m_s2=0.50,
+            max_linear_deceleration_m_s2=0.50,
+            max_angular_acceleration_rad_s2=5,
+            max_angular_deceleration_rad_s2=5,
             max_remote_command_valid_for_ms=500,
             min_wheel_velocity_m_s=0.05,
             stall_guard_min_command_speed_m_s=0.01,
@@ -530,6 +549,91 @@ def test_wheel_targets_are_slew_limited_across_acceleration_and_reversal() -> No
         encode_wheel_speed_command(2, 0.0, 0.0),
         encode_wheel_speed_command(3, -0.05, 0.05),
     ]
+
+
+def test_linear_acceleration_and_deceleration_are_independent() -> None:
+    channel = FakeCarChannel()
+    clock = FakeClock()
+    custom_limits = MotionLimits(
+        wheel_track_m=0.20,
+        max_linear_velocity_m_s=0.30,
+        max_angular_velocity_rad_s=2.0,
+        max_wheel_velocity_m_s=0.40,
+        max_linear_acceleration_m_s2=0.20,
+        max_linear_deceleration_m_s2=0.50,
+        max_angular_acceleration_rad_s2=1.0,
+        max_angular_deceleration_rad_s2=3.0,
+        max_remote_command_valid_for_ms=500,
+    )
+    controller = MotionController(channel, custom_limits, monotonic_ns=clock)
+
+    controller.forward(0.30)
+    for _ in range(4):
+        clock.advance(0.10)
+        controller.update()
+    assert controller.commanded_wheel_speeds_m_s == pytest.approx((0.08, 0.08))
+
+    controller.forward(0.0)
+    clock.advance(0.10)
+    controller.update()
+    assert controller.commanded_wheel_speeds_m_s == pytest.approx((0.03, 0.03))
+
+
+def test_angular_acceleration_and_deceleration_are_independent() -> None:
+    channel = FakeCarChannel()
+    clock = FakeClock()
+    custom_limits = MotionLimits(
+        wheel_track_m=0.20,
+        max_linear_velocity_m_s=0.30,
+        max_angular_velocity_rad_s=2.0,
+        max_wheel_velocity_m_s=0.40,
+        max_linear_acceleration_m_s2=0.20,
+        max_linear_deceleration_m_s2=0.50,
+        max_angular_acceleration_rad_s2=1.0,
+        max_angular_deceleration_rad_s2=3.0,
+        max_remote_command_valid_for_ms=500,
+    )
+    controller = MotionController(channel, custom_limits, monotonic_ns=clock)
+
+    controller.turn_left(2.0)
+    for _ in range(4):
+        clock.advance(0.10)
+        controller.update()
+    assert controller.commanded_wheel_speeds_m_s == pytest.approx((-0.04, 0.04))
+
+    controller.turn_left(0.0)
+    clock.advance(0.10)
+    controller.update()
+    assert controller.commanded_wheel_speeds_m_s == pytest.approx((-0.01, 0.01))
+
+
+def test_direction_reversal_decelerates_to_zero_before_accelerating() -> None:
+    channel = FakeCarChannel()
+    clock = FakeClock()
+    custom_limits = MotionLimits(
+        wheel_track_m=0.20,
+        max_linear_velocity_m_s=0.30,
+        max_angular_velocity_rad_s=2.0,
+        max_wheel_velocity_m_s=0.40,
+        max_linear_acceleration_m_s2=0.20,
+        max_linear_deceleration_m_s2=0.50,
+        max_angular_acceleration_rad_s2=1.0,
+        max_angular_deceleration_rad_s2=3.0,
+        max_remote_command_valid_for_ms=500,
+    )
+    controller = MotionController(channel, custom_limits, monotonic_ns=clock)
+
+    controller.forward(0.30)
+    for _ in range(4):
+        clock.advance(0.10)
+        controller.update()
+    controller.backward(0.30)
+    clock.advance(0.20)
+    controller.update()
+
+    # 0.16 s is consumed braking 0.08 m/s to zero; only the remaining
+    # 0.04 s accelerates backward at 0.20 m/s².
+    assert controller.commanded_wheel_speeds_m_s == pytest.approx((-0.008, -0.008))
 
 
 def test_unchanged_wheel_target_is_refreshed_for_firmware_watchdog() -> None:
@@ -758,35 +862,53 @@ def test_soft_brake_clears_pending_acceleration_target() -> None:
     ]
 
 
-def test_temporary_wheel_acceleration_limit_is_applied_and_restored() -> None:
+def test_temporary_acceleration_limits_are_applied_and_restored() -> None:
     channel = FakeCarChannel()
     clock = FakeClock()
     controller = MotionController(channel, limits(), monotonic_ns=clock)
 
-    controller.set_wheel_acceleration_limit_m_s2(0.10)
+    controller.set_acceleration_limits(
+        linear_acceleration_m_s2=0.10,
+        linear_deceleration_m_s2=0.20,
+        angular_acceleration_rad_s2=1.0,
+        angular_deceleration_rad_s2=2.0,
+    )
     controller.forward(0.30)
     clock.advance(0.1)
     controller.update()
 
-    assert controller.wheel_acceleration_limit_m_s2 == pytest.approx(0.10)
+    assert controller.acceleration_limits == MotionAccelerationLimits(
+        linear_acceleration_m_s2=0.10,
+        linear_deceleration_m_s2=0.20,
+        angular_acceleration_rad_s2=1.0,
+        angular_deceleration_rad_s2=2.0,
+    )
     assert controller.commanded_wheel_speeds_m_s == pytest.approx((0.01, 0.01))
 
-    controller.set_wheel_acceleration_limit_m_s2(None)
+    controller.set_acceleration_limits()
     clock.advance(0.1)
     controller.update()
 
-    assert controller.wheel_acceleration_limit_m_s2 == pytest.approx(0.50)
+    assert controller.acceleration_limits == MotionAccelerationLimits(
+        linear_acceleration_m_s2=0.50,
+        linear_deceleration_m_s2=0.50,
+        angular_acceleration_rad_s2=5.0,
+        angular_deceleration_rad_s2=5.0,
+    )
     assert controller.commanded_wheel_speeds_m_s == pytest.approx((0.06, 0.06))
 
 
-def test_temporary_wheel_acceleration_limit_can_exceed_global_limit() -> None:
+def test_temporary_acceleration_limit_can_exceed_global_limit() -> None:
     controller = MotionController(FakeCarChannel(), limits())
 
-    controller.set_wheel_acceleration_limit_m_s2(0.51)
-    assert controller.wheel_acceleration_limit_m_s2 == pytest.approx(0.51)
+    controller.set_acceleration_limits(linear_acceleration_m_s2=0.51)
+    assert (
+        controller.acceleration_limits.linear_acceleration_m_s2
+        == pytest.approx(0.51)
+    )
 
-    with pytest.raises(ValueError, match="acceleration_m_s2"):
-        controller.set_wheel_acceleration_limit_m_s2(0.0)
+    with pytest.raises(ValueError, match="linear_acceleration_m_s2"):
+        controller.set_acceleration_limits(linear_acceleration_m_s2=0.0)
 
 
 def test_motion_limits_reject_instead_of_clamping() -> None:
@@ -826,7 +948,10 @@ def test_wheel_limited_drive_preserves_curvature_at_joystick_diagonal(
             max_linear_velocity_m_s=0.25,
             max_angular_velocity_rad_s=1.0,
             max_wheel_velocity_m_s=0.30,
-            max_wheel_acceleration_m_s2=0.50,
+            max_linear_acceleration_m_s2=0.50,
+            max_linear_deceleration_m_s2=0.50,
+            max_angular_acceleration_rad_s2=5,
+            max_angular_deceleration_rad_s2=5,
             max_remote_command_valid_for_ms=500,
         ),
     )
@@ -1074,7 +1199,7 @@ def test_remote_twist_executes_and_expiry_uses_receive_clock() -> None:
     assert channel.sent == []
     clock.advance(0.1)
     assert controller.update()
-    assert channel.sent == [encode_wheel_speed_command(0, 0.05, 0.05)]
+    assert channel.sent == [encode_wheel_speed_command(0, 0.025, 0.075)]
     assert not executor.check_timeout(now_ns=1_199_999_999)
     assert executor.next_wait_s(
         0.05,
@@ -1082,7 +1207,7 @@ def test_remote_twist_executes_and_expiry_uses_receive_clock() -> None:
     ) == pytest.approx(0.01)
     assert executor.check_timeout(now_ns=1_200_000_000)
     assert channel.sent == [
-        encode_wheel_speed_command(0, 0.05, 0.05),
+        encode_wheel_speed_command(0, 0.025, 0.075),
         encode_soft_brake_command(1),
     ]
 
@@ -1096,7 +1221,10 @@ def test_remote_twist_scales_coupled_wheel_limit_instead_of_stopping() -> None:
             max_linear_velocity_m_s=0.25,
             max_angular_velocity_rad_s=1.0,
             max_wheel_velocity_m_s=0.30,
-            max_wheel_acceleration_m_s2=0.50,
+            max_linear_acceleration_m_s2=0.50,
+            max_linear_deceleration_m_s2=0.50,
+            max_angular_acceleration_rad_s2=5,
+            max_angular_deceleration_rad_s2=5,
             max_remote_command_valid_for_ms=500,
         ),
     )
@@ -1550,7 +1678,7 @@ def test_remote_loop_drains_uart_and_stops_on_exit() -> None:
     assert executor.controller.invalid_received_frames == 1
     assert channel.sent == [
         encode_wheel_speed_command(0, 0.0, 0.0),
-        encode_wheel_speed_command(1, 0.05, 0.05),
+        encode_wheel_speed_command(1, 0.025, 0.075),
         encode_soft_brake_command(2),
     ]
 

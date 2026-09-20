@@ -1,9 +1,14 @@
 """正式流程和夹取—运送联调共用的硬件生命周期与控制循环。"""
 from __future__ import annotations
 import math
+import select
+import sys
+import time
 from pathlib import Path
 from typing import Callable, TYPE_CHECKING
+from rescue_vision.camera.frame import CameraFrame
 from rescue_vision.app.match import (
+    MatchDecision,
     MatchPreflight,
     MatchStartArea,
     MatchSequence,
@@ -13,15 +18,80 @@ from rescue_vision.app.match import (
 )
 from rescue_vision.app.match_observers import _LocalPreview, _publish_remote_match_state
 from rescue_vision.app.session_log import _begin_time_named_log, _end_time_named_log
+from rescue_vision.exception_notes import add_exception_note
 from rescue_vision.geometry.types import FieldPoint
 from rescue_vision.localization import normalize_angle
 from rescue_vision.perception.types import UndistortedBoundingBox
 if TYPE_CHECKING:
+    from rescue_vision.motion import MotionController
     from rescue_vision.config import AppConfig
-    from rescue_vision.camera.frame import CameraFrame
     from rescue_vision.app.gripper_width_sequence import GraspPreparation
     from rescue_vision.app.near_field_grasp import NearFieldGraspSelector
 _PREFLIGHT_RETRY_WINDOW_NS = 5_000_000_000
+_START_GATE_POLL_S = 0.005
+
+
+def _stdin_enter_pressed(timeout_s: float) -> bool:
+    """Return true only for a blank terminal line received within ``timeout_s``."""
+
+    readable, _, _ = select.select((sys.stdin,), (), (), timeout_s)
+    if not readable:
+        return False
+    line = sys.stdin.readline()
+    if line == "":
+        raise RuntimeError("Standard input closed while waiting for Enter.")
+    if line in {"\n", "\r\n"}:
+        return True
+    print("启动未放行：请直接按 Enter，不要输入其他字符。", flush=True)
+    return False
+
+
+def _wait_for_enter_start(
+    *,
+    service: Callable[[], None],
+    should_stop: Callable[[], bool],
+) -> int | None:
+    """Keep the prepared hardware alive until the operator presses Enter."""
+
+    print("start_gate=ready", flush=True)
+    print("准备完成，车辆保持制动；确认赛道安全后按 Enter 立即出发。", flush=True)
+    while not should_stop():
+        if _stdin_enter_pressed(_START_GATE_POLL_S):
+            timestamp_ns = time.monotonic_ns()
+            print(
+                f"start_gate=released timestamp_ns={timestamp_ns}",
+                flush=True,
+            )
+            return timestamp_ns
+        service()
+    print("start_gate=cancelled", flush=True)
+    return None
+
+
+def _apply_match_motion(
+    controller: MotionController,
+    decision: MatchDecision,
+    *,
+    braking: bool,
+) -> bool:
+    """Apply one intent; diagnostics/state changes do not restart an ongoing brake.
+
+    The caller keeps servicing controller.update() and UART while braking, so
+    zero wheel-speed heartbeats continue after the initial SOFT_BRAKE.
+    """
+    should_brake = decision.soft_brake or decision.state in {
+        MatchState.FINISH_STOP, MatchState.TERMINAL_STOP,
+    }
+    if should_brake:
+        if not braking:
+            controller.soft_brake()
+    else:
+        controller.drive_wheel_limited(
+            decision.linear_velocity_m_s,
+            decision.angular_velocity_rad_s,
+            min_wheel_velocity_m_s=decision.min_wheel_velocity_m_s,
+        )
+    return should_brake
 
 
 def _age_ms_text(age_ns: int | None, *, digits: int = 1) -> str:
@@ -362,6 +432,7 @@ def _run_hardware(
     d2_telemetry_logger = None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     stop_requested = False
+    runtime_phase = "assembly"
 
     try:
         from rescue_vision.app.cluster_breakup import (
@@ -487,6 +558,10 @@ def _run_hardware(
             f"{config.near_field_grasp.max_range_mm:g} "
             "near_field_max_targets="
             f"{config.near_field_grasp.max_targets} "
+            "near_field_target_final_x_mm="
+            f"{config.near_field_grasp.target_final_x_mm:g} "
+            "near_field_greedy_target_final_x_mm="
+            f"{config.near_field_grasp.greedy_target_final_x_mm:g} "
             "near_field_direct_current_heading=true "
             "near_field_commit_timeout_ms="
             f"{config.near_field_grasp.alignment_timeout_ms:g} "
@@ -502,10 +577,15 @@ def _run_hardware(
             f"{sequence.transport_corridor_half_width_mm:g} "
             "transport_corridor_effective_half_width_mm="
             f"{sequence.transport_corridor_effective_half_width_mm:g} "
-            f"safe_zone_d1_mm={config.match.safe_zone_calibration_start_offset_mm:g} "
+            "safe_zone_d1_offset_bounds_mm="
+            f"({config.match.safe_zone_calibration_min_offset_mm:g},"
+            f"{config.match.safe_zone_calibration_start_offset_mm:g}) "
             f"safe_zone_d2_mm={config.match.safe_zone_open_offset_mm:g} "
-            "safe_zone_d2_to_final_max_wheel_acceleration_m_s2="
-            f"{config.match.safe_zone_d2_to_final_max_wheel_acceleration_m_s2} "
+            "safe_zone_d2_to_final_acceleration_limits="
+            f"({config.match.safe_zone_d2_to_final_max_linear_acceleration_m_s2},"
+            f"{config.match.safe_zone_d2_to_final_max_linear_deceleration_m_s2},"
+            f"{config.match.safe_zone_d2_to_final_max_angular_acceleration_rad_s2},"
+            f"{config.match.safe_zone_d2_to_final_max_angular_deceleration_rad_s2}) "
             f"safe_zone_braking_overrun_mm=({config.match.safe_zone_d2_braking_overrun_x_mm:g},"
             f"{config.match.safe_zone_d2_braking_overrun_y_mm:g}) "
             f"action_settle_time_s={config.match.action_settle_time_s:g} "
@@ -749,9 +829,25 @@ def _run_hardware(
             if latest_status is not None and latest_status.emergency_stop_latched:
                 raise RuntimeError("STM32 emergency stop is latched during startup.")
 
-        def apply_motion_acceleration_limit() -> None:
-            controller.set_wheel_acceleration_limit_m_s2(
-                sequence.motion_acceleration_limit_m_s2
+        def apply_motion_acceleration_limits() -> None:
+            overrides = sequence.motion_acceleration_limits
+            controller.set_acceleration_limits(
+                linear_acceleration_m_s2=(
+                    None if overrides is None
+                    else overrides.linear_acceleration_m_s2
+                ),
+                linear_deceleration_m_s2=(
+                    None if overrides is None
+                    else overrides.linear_deceleration_m_s2
+                ),
+                angular_acceleration_rad_s2=(
+                    None if overrides is None
+                    else overrides.angular_acceleration_rad_s2
+                ),
+                angular_deceleration_rad_s2=(
+                    None if overrides is None
+                    else overrides.angular_deceleration_rad_s2
+                ),
             )
 
         class _MotionChannelContext:
@@ -760,10 +856,22 @@ def _run_hardware(
                 return channel
 
             def __exit__(self, exc_type, exc_value, traceback):
-                try:
-                    controller.soft_brake()
-                finally:
-                    channel.stop()
+                error = exc_value
+                for name, cleanup in (
+                    ("soft_brake", controller.soft_brake),
+                    ("uart_stop", channel.stop),
+                ):
+                    try:
+                        cleanup()
+                    except BaseException as cleanup_error:
+                        if error is None:
+                            error = cleanup_error
+                        else:
+                            add_exception_note(
+                                error, f"{name} also failed: {cleanup_error!r}"
+                            )
+                if exc_value is None and error is not None:
+                    raise error
                 return False
 
         signal.signal(signal.SIGTERM, request_stop)
@@ -788,19 +896,29 @@ def _run_hardware(
         try:
             if remote_transport is not None:
                 remote_transport.start()
+            runtime_phase = "uart_open"
             with _MotionChannelContext():
+                runtime_phase = "camera_start"
                 camera_start_thread = camera_pump.start_in_background()
                 if preview is not None:
                     preview.start()
+                runtime_phase = "uart_synchronize"
                 sync_deadline_ns = time.monotonic_ns() + 5_000_000_000
+                sync_attempt = 0
                 while True:
+                    sync_attempt += 1
                     try:
                         controller.synchronize(
                             timeout_s=config.motion.synchronization_timeout_s,
                             on_message=consume,
                         )
                         break
-                    except MotionSynchronizationError:
+                    except MotionSynchronizationError as exc:
+                        print(
+                            f"uart_sync_attempt={sync_attempt} error={exc} "
+                            f"deadline_ns={sync_deadline_ns}",
+                            flush=True,
+                        )
                         if latest_status is not None and latest_status.emergency_stop_latched:
                             raise RuntimeError(
                                 "STM32 emergency stop is latched during startup."
@@ -808,12 +926,14 @@ def _run_hardware(
                         if time.monotonic_ns() >= sync_deadline_ns:
                             raise
                         time.sleep(0.02)
+                runtime_phase = "camera_wait"
                 camera_pump.wait_until_started(
                     camera_start_thread,
                     on_wait=service_uart_during_startup,
                 )
                 camera_started = True
                 controller.query_state()
+                runtime_phase = "first_perception"
                 while latest_snapshot is None and not stop_requested:
                     controller.update(now_ns=time.monotonic_ns())
                     for message in controller.drain_messages():
@@ -826,6 +946,7 @@ def _run_hardware(
                     time.sleep(0.005)
                 if latest_snapshot is None:
                     raise RuntimeError("No fresh perception snapshot before start.")
+                runtime_phase = "preflight"
                 preflight_deadline_ns = time.monotonic_ns() + _PREFLIGHT_RETRY_WINDOW_NS
                 while True:
                     checks = MatchPreflight(
@@ -848,14 +969,109 @@ def _run_hardware(
                 preflight = sequence.preflight(time.monotonic_ns(), checks)
                 if preflight.state is MatchState.TERMINAL_STOP:
                     raise RuntimeError(preflight.reason)
-                process_started_timestamp_ns = time.monotonic_ns()
+
+                runtime_phase = "start_gate"
+                start_gate_observer_errors: set[str] = set()
+
+                def service_start_gate() -> None:
+                    nonlocal latest_snapshot, stop_requested
+
+                    now_ns = time.monotonic_ns()
+                    apply_motion_acceleration_limits()
+                    controller.update(now_ns=now_ns)
+                    for message in controller.drain_messages():
+                        consume(message)
+                    if (
+                        latest_status is not None
+                        and latest_status.emergency_stop_latched
+                    ):
+                        raise RuntimeError(
+                            "STM32 emergency stop was latched while waiting to start."
+                        )
+                    if not controller.motion_synchronized:
+                        raise RuntimeError(
+                            "STM32 motion synchronization was lost while waiting to start."
+                        )
+                    camera_pump.check_health()
+                    fresh_snapshot = renderer.latest_fresh_snapshot(
+                        now_ns,
+                        config.processing.max_observation_age_ms,
+                    )
+                    if fresh_snapshot is not None:
+                        latest_snapshot = fresh_snapshot
+                    rendered = renderer.latest()
+                    if preview is not None:
+                        try:
+                            preview.check_health()
+                            preview.submit(
+                                rendered,
+                                state_text=sequence.state.value,
+                                reason_text="ready_press_enter",
+                                localization_lines=(
+                                    _format_match_preview_localization(
+                                        sequence, preview_heading_rad()
+                                    )
+                                ),
+                            )
+                            stop_requested = (
+                                stop_requested or preview.user_requested_stop
+                            )
+                        except Exception as exc:
+                            error = f"local_preview:{exc}"
+                            if "local_preview" not in start_gate_observer_errors:
+                                start_gate_observer_errors.add("local_preview")
+                                print(f"start_gate_side_path_error={error}", flush=True)
+                    if remote_transport is not None:
+                        try:
+                            _publish_remote_match_state(
+                                remote_transport,
+                                pose=None,
+                                timestamp_ns=now_ns,
+                                rendered=rendered,
+                            )
+                        except Exception as exc:
+                            error = f"remote_observer:{exc}"
+                            if "remote_observer" not in start_gate_observer_errors:
+                                start_gate_observer_errors.add("remote_observer")
+                                print(f"start_gate_side_path_error={error}", flush=True)
+
+                process_started_timestamp_ns = _wait_for_enter_start(
+                    service=service_start_gate,
+                    should_stop=lambda: stop_requested,
+                )
+                if process_started_timestamp_ns is None:
+                    return
+                controller.update(now_ns=process_started_timestamp_ns)
+                for message in controller.drain_messages():
+                    consume(message)
+                if (
+                    latest_status is not None
+                    and latest_status.emergency_stop_latched
+                ):
+                    raise RuntimeError(
+                        "STM32 emergency stop was latched before start."
+                    )
+                camera_pump.check_health()
+                latest_snapshot = renderer.latest_fresh_snapshot(
+                    process_started_timestamp_ns,
+                    config.processing.max_observation_age_ms,
+                )
+                if latest_snapshot is None:
+                    raise RuntimeError(
+                        "No fresh perception snapshot when Enter was pressed."
+                    )
+                if not controller.motion_synchronized:
+                    raise RuntimeError(
+                        "STM32 motion synchronization was lost before start."
+                    )
                 sequence.start(process_started_timestamp_ns)
+                runtime_phase = "control"
                 if d2_telemetry_logger is not None:
                     d2_telemetry_logger.set_process_start_timestamp_ns(
                         process_started_timestamp_ns
                     )
                 last_gripper_angles = None
-                last_soft_brake_key = None
+                braking = False
                 near_field_worker_session_id: int | None = None
                 near_field_last_error: str | None = None
                 near_field_last_failure_reported: str | None = None
@@ -877,7 +1093,7 @@ def _run_hardware(
                             (now_ns - last_control_tick_ns) / 1_000_000.0
                         )
                     last_control_tick_ns = now_ns
-                    apply_motion_acceleration_limit()
+                    apply_motion_acceleration_limits()
                     controller.update(now_ns=now_ns)
                     branch_error: str | None = None
                     try:
@@ -906,10 +1122,7 @@ def _run_hardware(
                             branch_error = branch_error or f"local_preview:{exc}"
                     fresh_snapshot = None
                     try:
-                        fresh_snapshot = renderer.latest_fresh_snapshot(
-                            now_ns,
-                            config.processing.max_observation_age_ms,
-                        )
+                        fresh_snapshot = renderer.latest_snapshot()
                     except Exception as exc:
                         branch_error = branch_error or f"perception_renderer:{exc}"
                     latest_snapshot = fresh_snapshot
@@ -939,15 +1152,9 @@ def _run_hardware(
                                 localization_lines=_format_match_preview_localization(
                                     sequence, preview_heading_rad()
                                 ),
-                                process_timestamp_ms=frame_process_timestamp_ms(
-                                    rendered
-                                ),
+                                process_timestamp_ms=frame_process_timestamp_ms(rendered),
                             )
                             stop_requested = stop_requested or preview.user_requested_stop
-                        print(f"side_path_hold={branch_error}", flush=True)
-                        controller.drive_wheel_limited(0.0, 0.0)
-                        time.sleep(0.005)
-                        continue
                     safety = SafetySignals.nominal(now_ns)
                     if stop_requested or (
                         latest_status is not None and latest_status.emergency_stop_latched
@@ -981,10 +1188,10 @@ def _run_hardware(
                         if (
                             latest_snapshot is not None
                             and observation_window_open
+                            and sequence.grasp_scene_capture_valid(latest_snapshot, now_ns)
                             and sequence.near_field_active_plan is None
                         ):
-                            planning_snapshot = sequence.planning_perception(latest_snapshot)
-                            assert planning_snapshot is not None
+                            planning_snapshot = latest_snapshot
                             near_field_worker.submit(
                                 planning_snapshot,
                                 excluded_observation_indices=sequence.grasp_excluded_observation_indices(planning_snapshot),
@@ -993,8 +1200,10 @@ def _run_hardware(
                                 locked_ids=sequence.near_field_locked_ids,
                                 handoff_prior=sequence.near_field_handoff_prior,
                                 require_handoff=sequence.near_field_handoff_required,
+                                recovery_context=sequence.grasp_recovery_context(planning_snapshot),
                             )
                         near_field_preparation = near_field_worker.latest(session_id)
+                        sequence.grasp_planning_pending = near_field_worker.pending(session_id)
                         near_field_selection = (
                             None
                             if near_field_preparation is None
@@ -1011,14 +1220,6 @@ def _run_hardware(
                                 if sequence.estimated_field_heading_rad is not None
                                 else gyro_heading_rad,
                             )
-                        if near_field_worker.error is not None and (
-                            near_field_worker.error != near_field_last_error
-                        ):
-                            print(
-                                f"near_field_worker_hold={near_field_worker.error}",
-                                flush=True,
-                            )
-                        near_field_last_error = near_field_worker.error
                     # 消费UART和准备结果后再取控制时刻，避免新结果看起来来自未来。
                     now_ns = time.monotonic_ns()
                     decision = sequence.step(
@@ -1036,24 +1237,8 @@ def _run_hardware(
                     # The action result is the control deadline.  Apply the
                     # wheel command before any observer-only image overlay,
                     # remote publication, or verbose diagnostic formatting.
-                    apply_motion_acceleration_limit()
-                    if decision.state in {
-                        MatchState.FINISH_STOP,
-                        MatchState.TERMINAL_STOP,
-                    }:
-                        controller.soft_brake()
-                    elif decision.soft_brake:
-                        brake_key = (decision.state, decision.reason)
-                        if brake_key != last_soft_brake_key:
-                            controller.soft_brake()
-                            last_soft_brake_key = brake_key
-                    else:
-                        last_soft_brake_key = None
-                        controller.drive_wheel_limited(
-                            decision.linear_velocity_m_s,
-                            decision.angular_velocity_rad_s,
-                            min_wheel_velocity_m_s=decision.min_wheel_velocity_m_s,
-                        )
+                    apply_motion_acceleration_limits()
+                    braking = _apply_match_motion(controller, decision, braking=braking)
 
                     if decision.gripper_angles_deg is not None:
                         angles = decision.gripper_angles_deg
@@ -1073,6 +1258,15 @@ def _run_hardware(
                             flush=True,
                         )
                         last_gripper_angles = angles
+
+                    if near_field_worker is not None:
+                        worker_error = near_field_worker.error
+                        if worker_error is not None and worker_error != near_field_last_error:
+                            print(f"near_field_worker_hold={worker_error}", flush=True)
+                        near_field_last_error = worker_error
+
+                    if branch_error is not None and now_ns >= next_observer_render_ns:
+                        print(f"side_path_error={branch_error}", flush=True)
 
                     # Selected-target/plan overlays are useful for supervision
                     # but are not control evidence.  Keep them in a bounded
@@ -1161,8 +1355,8 @@ def _run_hardware(
                     if state_changed:
                         _print_state_banner(decision.state, decision.reason)
                         last_state = decision.state
-                    # 变体入口可选的航点诊断：按阶段变化记录目标航点、估计位置和
-                    # 剩余误差，便于事后判断是策略不到位还是航位推算已漂移。
+                    # 变体入口可选的动作诊断：按动作变化记录配置量、实际进度和
+                    # 传感器状态，便于区分动作配置问题与执行器/航位误差。
                     opening_phase = getattr(
                         sequence, "nb_opening_route_phase", None
                     )
@@ -1254,6 +1448,8 @@ def _run_hardware(
                                 f"session={sequence.near_field_session_id},"
                                 f"policy={sorted(item.value for item in sequence.near_field_policy.allowed_classes)},"
                                 f"max_targets={sequence.near_field_policy.max_targets},"
+                                f"obstacle_extent_required={sequence.near_field_policy.obstacle_extent_required},"
+                                f"target_final_x_mm={sequence.near_field_target_final_x_mm:.1f},"
                                 f"locked_ids={sequence.near_field_locked_ids},"
                                 f"active_ids={None if near_log_plan is None else near_log_plan.member_ids},"
                                 f"progress_mm={sequence.near_field_progress_mm(encoder_tracker.distance_m):.1f},"
@@ -1264,16 +1460,19 @@ def _run_hardware(
                         print(
                             f"state={decision.state.value} "
                             f"reason={decision.reason} "
+                            f"carried_target_count={sequence.carried_target_count} "
+                            f"gripper_color=({sequence.gripper_color_diagnostic(now_ns)}) "
                             f"process_timestamp_ms={process_timestamp_ms(now_ns)} "
                             f"distance_m={encoder_tracker.distance_m} "
                             f"heading_rad={preview_heading_rad()} "
                             f"target_wheel_speeds={controller.target_wheel_speeds_m_s} "
                             f"commanded_wheel_speeds={controller.commanded_wheel_speeds_m_s} "
-                            f"wheel_acceleration_limit_m_s2={controller.wheel_acceleration_limit_m_s2} "
+                            f"acceleration_limits={controller.acceleration_limits} "
                             f"isolation={path_text} "
                             f"safe_zone={safe_zone_text} "
                             f"near_field={near_field_text} "
                             f"green_target={sequence.green_target_diagnostic(now_ns)} "
+                            f"approach_seed={sequence.approach_seed_diagnostic(now_ns)} "
                             f"cluster_target={sequence.cluster_diagnostic(now_ns)} "
                             f"green_angular_velocity_rad_s={decision.angular_velocity_rad_s} "
                             f"d2_telemetry_active={d2_telemetry_active} "
@@ -1329,6 +1528,22 @@ def _run_hardware(
                                     f"d2_telemetry_worker_error={worker_error}",
                                     flush=True,
                                 )
+    except BaseException as error:
+        add_exception_note(error, f"match runtime_phase={runtime_phase}")
+        if log_stream is not None:
+            # The interpreter prints the uncaught traceback only after the
+            # finally below restores stderr. Persist its chain before closing.
+            import traceback
+
+            try:
+                log_stream.write(f"runtime_phase={runtime_phase}\n")
+                traceback.print_exception(
+                    type(error), error, error.__traceback__, file=log_stream
+                )
+                log_stream.flush()
+            except Exception as log_error:
+                add_exception_note(error, f"exception logging failed: {log_error!r}")
+        raise
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
         _end_time_named_log(log_stream, original_stdout, original_stderr)

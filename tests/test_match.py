@@ -114,7 +114,7 @@ def safe_zone_snapshot(
     def keypoint(ground: GroundPoint | None) -> FieldPoseKeypoint:
         if ground is None:
             return FieldPoseKeypoint(None, None, 0.0)
-        return FieldPoseKeypoint(UndistortedPixel(50.0, 50.0), ground, 0.9)
+        return FieldPoseKeypoint(UndistortedPixel((box.x_min + box.x_max) / 2, 50.0), ground, 0.9)
 
     zone = SafeZoneObservation(
         box,
@@ -401,6 +401,7 @@ def test_transport_already_beyond_d1_calibrates_in_place(
     sequence = make_sequence(
         config=runtime_config(
             safe_zone_fallback_target_field=endpoint,
+            safe_zone_calibration_min_offset_mm=300.0,
             safe_zone_calibration_start_offset_mm=500.0,
         ),
         initial_field_position=position,
@@ -419,6 +420,121 @@ def test_transport_already_beyond_d1_calibrates_in_place(
     assert decision.state is MatchState.TRANSPORT_RELEASE
     assert decision.linear_velocity_m_s == 0.0
     assert sequence.safe_zone_route_phase == "stopping_before_calibration"
+
+
+@pytest.mark.parametrize(
+    ("team_color", "endpoint", "position", "minimum_target"),
+    [
+        (
+            TeamColor.RED,
+            FieldPoint(-165.0, 1137.0),
+            FieldPoint(80.0, 1000.0),
+            FieldPoint(-165.0, 837.0),
+        ),
+        (
+            TeamColor.BLUE,
+            FieldPoint(165.0, -1137.0),
+            FieldPoint(-80.0, -1000.0),
+            FieldPoint(165.0, -837.0),
+        ),
+    ],
+)
+def test_transport_too_close_to_safe_zone_repositions_to_minimum_d1(
+    team_color: TeamColor,
+    endpoint: FieldPoint,
+    position: FieldPoint,
+    minimum_target: FieldPoint,
+) -> None:
+    sequence = make_sequence(
+        config=runtime_config(
+            safe_zone_fallback_target_field=endpoint,
+            safe_zone_calibration_min_offset_mm=300.0,
+            safe_zone_calibration_start_offset_mm=500.0,
+        ),
+        initial_field_position=position,
+        team_color=team_color,
+    )
+    start_sequence(sequence)
+
+    decision = sequence._start_safe_zone_transport(
+        10,
+        transport_opened=False,
+        posture=GripperPosture.CLOSED,
+        reason="would_start_d1_line",
+    )
+
+    assert decision.reason == (
+        "gripper_closed_too_close_for_d1_calibration_reposition"
+    )
+    assert decision.state is MatchState.TRANSPORT_ALIGN_RED_ZONE
+    assert sequence.safe_zone_route_phase == "align_d1_line"
+    assert sequence._safe_zone_d1_target() == minimum_target
+
+    target_heading = math.atan2(
+        minimum_target.y - position.y,
+        minimum_target.x - position.x,
+    )
+    aligned = sequence.step(
+        20,
+        perception=None,
+        heading_rad=target_heading,
+        cumulative_distance_m=0.0,
+    )
+    assert aligned.reason == "safe_zone_d1_line_heading_reached_start_forward"
+    assert aligned.state is MatchState.TRANSPORT_FORWARD
+
+
+@pytest.mark.parametrize(
+    ("team_color", "endpoint", "position"),
+    [
+        (TeamColor.RED, FieldPoint(-165.0, 1137.0), FieldPoint(80.0, 837.0)),
+        (TeamColor.BLUE, FieldPoint(165.0, -1137.0), FieldPoint(-80.0, -837.0)),
+    ],
+)
+def test_transport_at_minimum_d1_offset_calibrates_in_place(
+    team_color: TeamColor,
+    endpoint: FieldPoint,
+    position: FieldPoint,
+) -> None:
+    sequence = make_sequence(
+        config=runtime_config(
+            safe_zone_fallback_target_field=endpoint,
+            safe_zone_calibration_min_offset_mm=300.0,
+            safe_zone_calibration_start_offset_mm=500.0,
+        ),
+        initial_field_position=position,
+        team_color=team_color,
+    )
+    start_sequence(sequence)
+
+    decision = sequence._start_safe_zone_transport(
+        10,
+        transport_opened=False,
+        posture=GripperPosture.CLOSED,
+        reason="would_start_d1_line",
+    )
+
+    assert decision.reason == "gripper_closed_already_beyond_d1_start_calibration"
+    assert decision.state is MatchState.TRANSPORT_RELEASE
+    assert sequence.safe_zone_route_phase == "stopping_before_calibration"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "safe_zone_calibration_min_offset_mm": 600.0,
+            "safe_zone_calibration_start_offset_mm": 500.0,
+        },
+        {
+            "safe_zone_open_offset_mm": 350.0,
+            "safe_zone_calibration_min_offset_mm": 300.0,
+        },
+    ],
+)
+def test_safe_zone_d1_offset_bounds_are_ordered(overrides: dict[str, float]) -> None:
+    with pytest.raises(ValueError, match="safe-zone offsets must satisfy"):
+        runtime_config(**overrides)
 
 
 def test_cluster_search_uses_fast_speed_until_collectible_information_appears() -> None:
@@ -589,7 +705,7 @@ def test_config_uses_configured_gripper_and_transport_values() -> None:
         0.42
     )
     assert (
-        config.match.safe_zone_d2_to_final_max_wheel_acceleration_m_s2
+        config.match.safe_zone_d2_to_final_max_linear_acceleration_m_s2
         == pytest.approx(4.0)
     )
     assert (
@@ -600,7 +716,14 @@ def test_config_uses_configured_gripper_and_transport_values() -> None:
         config.match.safe_zone_orange_d2_to_final_braking_overrun_mm
         == pytest.approx(80.0)
     )
-    assert config.match.breakup_max_wheel_acceleration_m_s2 == pytest.approx(4.0)
+    assert config.match.breakup_max_linear_acceleration_m_s2 == pytest.approx(4.0)
+    assert config.match.breakup_max_linear_deceleration_m_s2 == pytest.approx(4.0)
+    assert config.match.breakup_max_angular_acceleration_rad_s2 == pytest.approx(
+        34.0425531915
+    )
+    assert config.match.breakup_max_angular_deceleration_rad_s2 == pytest.approx(
+        34.0425531915
+    )
     assert config.match.breakup_confirmation_frames == 1
     assert config.match.startup_turn_settle_time_s == pytest.approx(
         0.1
@@ -635,7 +758,7 @@ def test_config_uses_configured_gripper_and_transport_values() -> None:
         0.0
     )
     assert config.near_field_grasp.orange_isolation_radius_mm == pytest.approx(
-        60.0
+        10.0
     )
     assert config.match.safe_zone_fallback_target_field == FieldPoint(
         -130.0, 1115.0
@@ -644,6 +767,7 @@ def test_config_uses_configured_gripper_and_transport_values() -> None:
         130.0, 1115.0
     )
     assert config.match.safe_zone_calibration_start_offset_mm == 700.0
+    assert config.match.safe_zone_calibration_min_offset_mm == 500.0
     assert config.match.safe_zone_open_offset_mm == 300.0
     assert (
         config.match.safe_zone_d2_braking_overrun_x_mm
@@ -671,13 +795,10 @@ def test_config_uses_configured_gripper_and_transport_values() -> None:
     assert config.match.safe_zone_exit_distance_m == pytest.approx(0.3)
     assert config.match.cluster_search_empty_angular_velocity_rad_s == pytest.approx(-0.8)
     assert config.match.safe_zone_key_search_angular_velocity_rad_s == pytest.approx(0.8)
-    assert config.match.safe_zone_bbox_turn_kp_rad_s == pytest.approx(0.8)
     assert config.match.safe_zone_bbox_turn_max_angular_velocity_rad_s == pytest.approx(0.25)
-    assert config.match.safe_zone_bbox_turn_deadband_ratio == pytest.approx(0.02)
-    assert config.match.safe_zone_bbox_turn_resume_ratio == pytest.approx(0.03)
     assert config.match.safe_zone_keypoint_reobserve_timeout_s == pytest.approx(0.8)
     assert config.match.safe_zone_keypoint_reverse_speed_m_s == pytest.approx(0.08)
-    assert config.match.safe_zone_keypoint_reverse_max_distance_m == pytest.approx(0.20)
+    assert config.match.safe_zone_keypoint_reverse_max_distance_m == pytest.approx(0.10)
     assert config.match.safe_zone_bbox_edge_margin_px == pytest.approx(12.0)
     assert isinstance(
         MatchSequence.from_app_config(config),
@@ -703,7 +824,10 @@ def test_d2_acceleration_limit_is_active_only_for_d2_route(
 ) -> None:
     sequence = make_sequence(
         config=runtime_config(
-            safe_zone_d2_to_final_max_wheel_acceleration_m_s2=0.12,
+            safe_zone_d2_to_final_max_linear_acceleration_m_s2=0.12,
+            safe_zone_d2_to_final_max_linear_deceleration_m_s2=0.23,
+            safe_zone_d2_to_final_max_angular_acceleration_rad_s2=1.2,
+            safe_zone_d2_to_final_max_angular_deceleration_rad_s2=2.3,
         )
     )
     start_sequence(sequence)
@@ -714,10 +838,15 @@ def test_d2_acceleration_limit_is_active_only_for_d2_route(
         else MatchState.TRANSPORT_RELEASE
     )
 
-    assert sequence.safe_zone_motion_acceleration_limit_m_s2 == pytest.approx(0.12)
+    limits = sequence.safe_zone_motion_acceleration_limits
+    assert limits is not None
+    assert limits.linear_acceleration_m_s2 == pytest.approx(0.12)
+    assert limits.linear_deceleration_m_s2 == pytest.approx(0.23)
+    assert limits.angular_acceleration_rad_s2 == pytest.approx(1.2)
+    assert limits.angular_deceleration_rad_s2 == pytest.approx(2.3)
 
     sequence._safe_zone_phase = "forward_d2_line"
-    assert sequence.safe_zone_motion_acceleration_limit_m_s2 is None
+    assert sequence.safe_zone_motion_acceleration_limits is None
 
 
 @pytest.mark.parametrize(
@@ -739,16 +868,26 @@ def test_breakup_acceleration_limit_is_active_for_breakup_states(
     state: MatchState,
 ) -> None:
     sequence = make_sequence(
-        config=runtime_config(breakup_max_wheel_acceleration_m_s2=0.12)
+        config=runtime_config(
+            breakup_max_linear_acceleration_m_s2=0.12,
+            breakup_max_linear_deceleration_m_s2=0.23,
+            breakup_max_angular_acceleration_rad_s2=1.2,
+            breakup_max_angular_deceleration_rad_s2=2.3,
+        )
     )
     sequence.state = state
 
-    assert sequence.breakup_motion_acceleration_limit_m_s2 == pytest.approx(0.12)
-    assert sequence.motion_acceleration_limit_m_s2 == pytest.approx(0.12)
+    limits = sequence.breakup_motion_acceleration_limits
+    assert limits is not None
+    assert limits.linear_acceleration_m_s2 == pytest.approx(0.12)
+    assert limits.linear_deceleration_m_s2 == pytest.approx(0.23)
+    assert limits.angular_acceleration_rad_s2 == pytest.approx(1.2)
+    assert limits.angular_deceleration_rad_s2 == pytest.approx(2.3)
+    assert sequence.motion_acceleration_limits == limits
 
     sequence.state = MatchState.SEARCH_CLUSTER
-    assert sequence.breakup_motion_acceleration_limit_m_s2 is None
-    assert sequence.motion_acceleration_limit_m_s2 is None
+    assert sequence.breakup_motion_acceleration_limits is None
+    assert sequence.motion_acceleration_limits is None
 
 
 def test_uses_configured_transport_endpoint_for_d1_and_d2() -> None:
@@ -756,6 +895,7 @@ def test_uses_configured_transport_endpoint_for_d1_and_d2() -> None:
     sequence = make_sequence(
         config=runtime_config(
             safe_zone_fallback_target_field=endpoint,
+            safe_zone_calibration_min_offset_mm=200.0,
             safe_zone_calibration_start_offset_mm=250.0,
             safe_zone_open_offset_mm=100.0,
             safe_zone_d2_braking_overrun_x_mm=15.0,
@@ -834,527 +974,119 @@ def test_d2_line_distance_uses_compensated_target() -> None:
     )
 
 
-def test_d1_bbox_search_rotates_until_keypoints_are_visible() -> None:
-    sequence = make_sequence(initial_field_position=FieldPoint(0.0, 0.0))
-    start_sequence(sequence)
-    sequence.state = MatchState.TRANSPORT_RELEASE
-    sequence._safe_zone_phase = "stopping_before_calibration"
-    bbox = UndistortedBoundingBox(0.0, 10.0, 40.0, 90.0)
-
-    bbox_only = safe_zone_snapshot(1, 10, None, None, None, box=bbox)
-    waiting_for_stop = sequence.step(
-        10,
-        perception=bbox_only,
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert waiting_for_stop.reason == "safe_zone_waiting_for_vehicle_stop_before_calibration"
-
-    search_started = sequence.step(
-        300_000_010,
-        perception=bbox_only,
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert search_started.reason == "safe_zone_center_full_bbox_before_keypoints"
-    assert search_started.angular_velocity_rad_s > 0.0
-
-    rotating = sequence.step(
-        300_000_011,
-        perception=bbox_only,
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert rotating.reason == "safe_zone_center_full_bbox_before_keypoints"
-    assert rotating.linear_velocity_m_s == 0.0
-    assert rotating.angular_velocity_rad_s > 0.0
-
-    keypoints_visible = sequence.step(
-        300_000_012,
-        perception=safe_zone_snapshot(
-            2,
-            300_000_012,
-            GroundPoint(400.0, 0.0),
-            GroundPoint(350.0, 50.0),
-            GroundPoint(350.0, -50.0),
-            box=UndistortedBoundingBox(10.0, 10.0, 90.0, 90.0),
-        ),
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert keypoints_visible.reason == "safe_zone_keypoints_seen_stop_before_calibration"
-
-    stopped_waiting = sequence.step(
-        300_000_013,
-        perception=None,
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert stopped_waiting.reason == "safe_zone_waiting_for_vehicle_stop_after_keypoints"
-
-    stopped = sequence.step(
-        600_000_013,
-        perception=None,
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert stopped.reason == "safe_zone_keypoints_stopped_start_calibration"
+@pytest.mark.parametrize('box,pair', [
+    (UndistortedBoundingBox(10, 10, 70, 90), (0, 2)),
+    (UndistortedBoundingBox(30, 10, 90, 90), (0, 1)),
+])
+def test_safe_zone_visible_opposite_pair_needs_no_centering(box, pair):
+    seq = make_sequence()
+    start_sequence(seq)
+    seq._safe_zone_phase = 'searching_safe_zone_keypoints'
+    snap = safe_zone_snapshot(1, 10, GroundPoint(400, 0),
+        GroundPoint(400, 330) if pair[1] == 1 else None,
+        GroundPoint(400, -330) if pair[1] == 2 else None, box=box)
+    seq._latest_perception = snap
+    assert seq._safe_zone_required_indices() == pair
+    decision = seq._step_safe_zone_bbox_key_search(10)
+    assert decision.angular_velocity_rad_s == decision.linear_velocity_m_s == 0
+    assert seq._safe_zone_phase == 'stopping_after_bbox_keypoints'
 
 
-def test_centered_missing_keypoints_reverses_until_they_appear() -> None:
-    sequence = make_sequence(initial_field_position=FieldPoint(0.0, 0.0))
-    start_sequence(sequence)
-    sequence.state = MatchState.TRANSPORT_RELEASE
-    sequence._safe_zone_phase = "searching_safe_zone_keypoints"
-
-    centered_partial = safe_zone_snapshot(
-        1,
-        10,
-        GroundPoint(400.0, 0.0),
-        GroundPoint(350.0, 50.0),
-        None,
-        box=UndistortedBoundingBox(40.0, 20.0, 60.0, 80.0),
-    )
-    started = sequence.step(
-        10,
-        perception=centered_partial,
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert started.reason == "safe_zone_keypoints_missing_start_reobserve"
-    assert started.linear_velocity_m_s == 0.0
-    assert started.angular_velocity_rad_s == 0.0
-    assert sequence._safe_zone_phase == "reobserving_safe_zone_keypoints"
-
-    reversing = sequence.step(
-        20,
-        perception=centered_partial,
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert reversing.reason == "safe_zone_keypoints_reobserve_waiting_for_new_frame"
-    assert reversing.linear_velocity_m_s == 0.0
-    assert reversing.angular_velocity_rad_s == 0.0
-
-    complete = sequence.step(
-        30,
-        perception=safe_zone_snapshot(
-            2,
-            30,
-            GroundPoint(450.0, 0.0),
-            GroundPoint(400.0, 50.0),
-            GroundPoint(400.0, -50.0),
-            box=UndistortedBoundingBox(40.0, 20.0, 60.0, 80.0),
-        ),
-        heading_rad=0.0,
-        cumulative_distance_m=-0.05,
-        left_speed_feedback_m_s=-0.05,
-        right_speed_feedback_m_s=-0.05,
-    )
-    assert complete.reason == "safe_zone_keypoints_reobserved_stop_before_calibration"
-    assert complete.linear_velocity_m_s == 0.0
-    assert complete.angular_velocity_rad_s == 0.0
-    assert sequence._safe_zone_phase == "stopping_after_bbox_keypoints"
+def test_safe_zone_unclipped_missing_points_waits_once_without_scanning():
+    seq = make_sequence()
+    start_sequence(seq)
+    seq._latest_perception = safe_zone_snapshot(1, 10, None, None, None)
+    seq._step_safe_zone_bbox_key_search(10)
+    assert seq._safe_zone_phase == 'reobserving_safe_zone_keypoints'
+    decision = seq._step_safe_zone_keypoint_reobserve(800_000_010)
+    assert decision.angular_velocity_rad_s == 0
+    assert seq._safe_zone_phase == 'align_d2_line'
+    assert not seq._safe_zone_keypoint_reverse_attempted
 
 
-def test_complete_keypoints_are_centered_before_calibration_stop() -> None:
-    sequence = make_sequence(initial_field_position=FieldPoint(0.0, 0.0))
-    start_sequence(sequence)
-    sequence.state = MatchState.TRANSPORT_RELEASE
-    sequence._safe_zone_phase = "searching_safe_zone_keypoints"
-
-    off_center = sequence.step(
-        10,
-        perception=safe_zone_snapshot(
-            1,
-            10,
-            GroundPoint(400.0, 0.0),
-            GroundPoint(350.0, 50.0),
-            GroundPoint(350.0, -50.0),
-            box=UndistortedBoundingBox(10.0, 10.0, 50.0, 90.0),
-        ),
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert off_center.reason == "safe_zone_center_full_bbox_before_keypoints"
-    assert off_center.angular_velocity_rad_s > 0.0
-    assert sequence._safe_zone_phase == "searching_safe_zone_keypoints"
-
-    centered = sequence.step(
-        20,
-        perception=safe_zone_snapshot(
-            2,
-            20,
-            GroundPoint(400.0, 0.0),
-            GroundPoint(350.0, 50.0),
-            GroundPoint(350.0, -50.0),
-            box=UndistortedBoundingBox(40.0, 10.0, 60.0, 90.0),
-        ),
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert centered.reason == "safe_zone_keypoints_seen_stop_before_calibration"
-    assert centered.linear_velocity_m_s == 0.0
-    assert centered.angular_velocity_rad_s == 0.0
-    assert sequence._safe_zone_phase == "stopping_after_bbox_keypoints"
+def test_safe_zone_both_edges_clipped_finishes_reverse_before_observing():
+    seq = make_sequence()
+    start_sequence(seq)
+    seq._latest_cumulative_distance_m = 0
+    seq._latest_heading_rad = 0
+    seq._latest_perception = safe_zone_snapshot(1, 10, None, None, None,
+        box=UndistortedBoundingBox(0, 10, 100, 90))
+    decision = seq._step_safe_zone_bbox_key_search(10)
+    assert decision.linear_velocity_m_s < 0
+    assert decision.angular_velocity_rad_s == 0
+    seq._latest_perception = safe_zone_snapshot_for_pose(2, 20,
+        FieldPose2D(FieldPoint(0, 700), math.pi/2))
+    seq._latest_cumulative_distance_m = -.05
+    decision = seq._step_safe_zone_keypoint_reverse(20)
+    assert decision.linear_velocity_m_s < 0  # Late image cannot truncate adjustment.
+    seq._latest_cumulative_distance_m = -.10
+    decision = seq._step_safe_zone_keypoint_reverse(30)
+    assert decision.linear_velocity_m_s == 0
+    assert seq._safe_zone_phase == 'stopping_after_bbox_keypoints'
 
 
-def test_collecting_partial_keypoints_restarts_bbox_search() -> None:
-    sequence = make_sequence(initial_field_position=FieldPoint(0.0, 0.0))
-    start_sequence(sequence)
-    sequence.state = MatchState.TRANSPORT_RELEASE
-    sequence._safe_zone_phase = "collecting_safe_zone_keys_closed"
-    bbox = UndistortedBoundingBox(0.0, 10.0, 40.0, 90.0)
-
-    decision = sequence.step(
-        10,
-        perception=safe_zone_snapshot(
-            1,
-            10,
-            GroundPoint(400.0, 0.0),
-            GroundPoint(350.0, 50.0),
-            None,
-            box=bbox,
-        ),
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-
-    assert sequence._safe_zone_phase == "reobserving_safe_zone_keypoints"
-    assert decision.reason == "safe_zone_keypoints_missing_start_reobserve"
-    assert decision.linear_velocity_m_s == 0.0
-    assert decision.angular_velocity_rad_s == 0.0
-
-    waiting = sequence.step(
-        100,
-        perception=sequence._latest_perception,
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert waiting.reason == "safe_zone_keypoints_reobserve_waiting_for_new_frame"
-    assert waiting.angular_velocity_rad_s == 0.0
-
-    expired = sequence.step(
-        800_000_011,
-        perception=sequence._latest_perception,
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert sequence._safe_zone_phase == "searching_safe_zone_keypoints"
-    assert expired.reason == "safe_zone_center_full_bbox_before_keypoints"
-    assert expired.angular_velocity_rad_s > 0.0
+def test_safe_zone_one_edge_scans_at_fixed_speed_until_bbox_is_fully_visible():
+    seq = make_sequence()
+    start_sequence(seq)
+    seq._latest_heading_rad = 0
+    seq._latest_perception = safe_zone_snapshot(1, 10, None, None, None,
+        box=UndistortedBoundingBox(0, 10, 40, 90))
+    first = seq._step_safe_zone_bbox_key_search(10)
+    assert first.angular_velocity_rad_s > 0
+    # Heading progress no longer ends the scan: the bbox gate is authoritative.
+    seq._latest_heading_rad = 1.0
+    seq._latest_perception = safe_zone_snapshot(2, 20, None, None, None,
+        box=UndistortedBoundingBox(60, 10, 100, 90))
+    assert seq._step_safe_zone_keypoint_scan(20).angular_velocity_rad_s > 0
+    seq._latest_perception = safe_zone_snapshot(3, 30, None, None, None,
+        box=UndistortedBoundingBox(10, 10, 90, 90))
+    assert seq._step_safe_zone_keypoint_scan(30).angular_velocity_rad_s == 0
+    assert seq._safe_zone_phase == 'stopping_after_bbox_keypoints'
 
 
-def test_safe_zone_bbox_turn_uses_proportional_speed_and_deadband() -> None:
-    sequence = make_sequence(initial_field_position=FieldPoint(0.0, 0.0))
-    start_sequence(sequence)
-    sequence.state = MatchState.TRANSPORT_RELEASE
-    sequence._safe_zone_phase = "searching_safe_zone_keypoints"
-    sequence._safe_zone_keypoint_scan_attempted = True
-    sequence._safe_zone_keypoint_reverse_attempted = True
-
-    centered = sequence.step(
-        10,
-        perception=safe_zone_snapshot(
-            1,
-            10,
-            None,
-            None,
-            None,
-            box=UndistortedBoundingBox(40.0, 20.0, 60.0, 80.0),
-        ),
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert centered.angular_velocity_rad_s == 0.0
-
-    small_error = sequence.step(
-        20,
-        perception=safe_zone_snapshot(
-            2,
-            20,
-            None,
-            None,
-            None,
-            box=UndistortedBoundingBox(41.0, 20.0, 61.0, 80.0),
-        ),
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert small_error.angular_velocity_rad_s == 0.0
-
-    large_error = sequence.step(
-        30,
-        perception=safe_zone_snapshot(
-            3,
-            30,
-            None,
-            None,
-            None,
-            box=UndistortedBoundingBox(60.0, 20.0, 80.0, 80.0),
-        ),
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert large_error.angular_velocity_rad_s == pytest.approx(-0.25)
-
-    near_error = sequence.step(
-        40,
-        perception=safe_zone_snapshot(
-            4,
-            40,
-            None,
-            None,
-            None,
-            box=UndistortedBoundingBox(47.5, 20.0, 67.5, 80.0),
-        ),
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert near_error.angular_velocity_rad_s == pytest.approx(-0.12)
+def test_safe_zone_missing_pair_requires_new_frame_and_does_not_extend_deadline():
+    seq = make_sequence()
+    start_sequence(seq)
+    seq._latest_perception = safe_zone_snapshot(1, 10, None, None, None)
+    seq._begin_safe_zone_keypoint_reobserve(10)
+    deadline = seq._safe_zone_observation_deadline_ns
+    for now in range(20, 800_000_000, 5_000_000):
+        decision = seq._step_safe_zone_keypoint_reobserve(now)
+        assert decision.angular_velocity_rad_s == 0
+        assert seq._safe_zone_observation_deadline_ns == deadline
+    seq._step_safe_zone_keypoint_reobserve(deadline)
+    assert seq._safe_zone_phase == 'align_d2_line'
 
 
-def test_safe_zone_bbox_reversal_waits_for_stop_and_new_frame() -> None:
-    sequence = make_sequence(initial_field_position=FieldPoint(0.0, 0.0))
-    start_sequence(sequence)
-    sequence.state = MatchState.TRANSPORT_RELEASE
-    sequence._safe_zone_phase = "searching_safe_zone_keypoints"
-
-    left = safe_zone_snapshot(
-        1,
-        10,
-        None,
-        None,
-        None,
-        box=UndistortedBoundingBox(20.0, 20.0, 40.0, 80.0),
-    )
-    right = safe_zone_snapshot(
-        2,
-        20,
-        None,
-        None,
-        None,
-        box=UndistortedBoundingBox(60.0, 20.0, 80.0, 80.0),
-    )
-    right_new = safe_zone_snapshot(
-        3,
-        500_000_000,
-        None,
-        None,
-        None,
-        box=UndistortedBoundingBox(60.0, 20.0, 80.0, 80.0),
-    )
-    first = sequence.step(
-        10,
-        perception=left,
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert first.angular_velocity_rad_s > 0.0
-
-    requested = sequence.step(
-        20,
-        perception=right,
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.1,
-        right_speed_feedback_m_s=-0.1,
-    )
-    assert requested.angular_velocity_rad_s == 0.0
-
-    waiting_stop = sequence.step(
-        100,
-        perception=right,
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert waiting_stop.reason == "safe_zone_waiting_for_vehicle_stop_before_reversal"
-
-    waiting_frame = sequence.step(
-        300_000_100,
-        perception=right,
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert waiting_frame.reason == "safe_zone_waiting_for_new_frame_before_reversal"
-
-    resumed = sequence.step(
-        500_000_000,
-        perception=right_new,
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert resumed.angular_velocity_rad_s < 0.0
-    assert resumed.reason == "safe_zone_center_full_bbox_before_keypoints"
+def test_safe_zone_reobserve_recovers_pair_without_turning():
+    seq = make_sequence()
+    start_sequence(seq)
+    seq._latest_perception = safe_zone_snapshot(1, 10, None, None, None)
+    seq._begin_safe_zone_keypoint_reobserve(10)
+    seq._latest_perception = safe_zone_snapshot_for_pose(2, 400_000_000,
+        FieldPose2D(FieldPoint(0, 700), math.pi/2))
+    decision = seq._step_safe_zone_keypoint_reobserve(400_000_000)
+    assert decision.angular_velocity_rad_s == 0
+    assert seq._safe_zone_phase == 'stopping_after_bbox_keypoints'
 
 
-def test_safe_zone_keypoint_reobserve_accepts_only_a_new_complete_frame() -> None:
-    sequence = make_sequence(initial_field_position=FieldPoint(0.0, 0.0))
-    start_sequence(sequence)
-    sequence.state = MatchState.TRANSPORT_RELEASE
-    sequence._safe_zone_phase = "collecting_safe_zone_keys_closed"
-    partial = safe_zone_snapshot(
-        1,
-        10,
-        GroundPoint(400.0, 0.0),
-        GroundPoint(350.0, 50.0),
-        None,
-    )
-    started = sequence.step(
-        10,
-        perception=partial,
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert started.reason == "safe_zone_keypoints_missing_start_reobserve"
-
-    duplicate = sequence.step(
-        100,
-        perception=partial,
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert duplicate.reason == "safe_zone_keypoints_reobserve_waiting_for_new_frame"
-
-    complete = sequence.step(
-        200,
-        perception=safe_zone_snapshot(
-            2,
-            200,
-            GroundPoint(400.0, 0.0),
-            GroundPoint(350.0, 50.0),
-            GroundPoint(350.0, -50.0),
-        ),
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert complete.reason == "safe_zone_keypoints_reobserved_stop_before_calibration"
-    assert sequence._safe_zone_phase == "stopping_after_bbox_keypoints"
-
-
-def test_safe_zone_centered_missing_keypoints_get_one_bounded_scan() -> None:
-    sequence = make_sequence(initial_field_position=FieldPoint(0.0, 0.0))
-    start_sequence(sequence)
-    sequence.state = MatchState.TRANSPORT_RELEASE
-    sequence._safe_zone_phase = "collecting_safe_zone_keys_closed"
-    centered_partial = safe_zone_snapshot(
-        1,
-        10,
-        GroundPoint(400.0, 0.0),
-        GroundPoint(350.0, 50.0),
-        None,
-        box=UndistortedBoundingBox(40.0, 20.0, 60.0, 80.0),
-    )
-    sequence.step(
-        10,
-        perception=centered_partial,
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    scanning = sequence.step(
-        800_000_011,
-        perception=centered_partial,
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert sequence._safe_zone_phase == "scanning_safe_zone_keypoints"
-    assert scanning.reason == "safe_zone_keypoint_reobserve_scan"
-    assert scanning.angular_velocity_rad_s == pytest.approx(0.25)
-
-    scan_done = sequence.step(
-        1_600_000_011,
-        perception=centered_partial,
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert sequence._safe_zone_phase == "reobserving_safe_zone_keypoints"
-    assert scan_done.reason == "safe_zone_keypoint_scan_complete_reobserve"
-
-
-def test_rejected_safe_zone_calibration_restarts_turning_search() -> None:
-    sequence = make_sequence(initial_field_position=FieldPoint(0.0, 0.0))
-    start_sequence(sequence)
-    sequence.state = MatchState.TRANSPORT_RELEASE
-    sequence._safe_zone_phase = "collecting_safe_zone_keys_closed"
-    triple = (
-        GroundPoint(400.0, 0.0),
-        GroundPoint(350.0, 50.0),
-        GroundPoint(350.0, -50.0),
-    )
-    sequence._safe_zone_key_samples = [triple] * 4
-    perception = safe_zone_snapshot(
-        1,
-        10,
-        *triple,
-        box=UndistortedBoundingBox(12.0, 10.0, 52.0, 90.0),
-    )
-
-    decision = sequence.step(
-        10,
-        perception=perception,
-        heading_rad=0.0,
-        cumulative_distance_m=0.0,
-    )
-
-    assert sequence._safe_zone_phase == "searching_safe_zone_keypoints"
-    assert decision.reason == "safe_zone_visual_calibration_rejected_rotate_for_keypoints"
-    assert decision.linear_velocity_m_s == 0.0
-    assert decision.angular_velocity_rad_s > 0.0
-    assert sequence._safe_zone_key_samples == []
+def test_safe_zone_bad_geometry_is_rejected_without_restarting_rotation():
+    seq = make_sequence()
+    start_sequence(seq)
+    seq.state = MatchState.TRANSPORT_RELEASE
+    seq._safe_zone_phase = 'collecting_safe_zone_keys_closed'
+    seq._safe_zone_stop_since_ns = 1
+    seq._latest_speed_feedback = (0., 0.)
+    seq._latest_heading_rad = seq._raw_heading_rad = math.pi/2
+    for frame in (1, 2):
+        now = 400_000_000 + frame
+        seq._latest_perception = safe_zone_snapshot(frame, now, GroundPoint(400, 0),
+            GroundPoint(400, 900), None)
+        decision = seq._step_transport_release(now)
+    assert decision.reason.startswith('safe_zone_calibration_rejected:')
+    assert decision.angular_velocity_rad_s == 0
+    assert seq.safe_zone_calibration_pose is None
+    assert seq._safe_zone_phase == 'reobserving_safe_zone_keypoints'
 
 
 def test_d1_without_bbox_rotates_toward_plus_90_until_keypoints_appear() -> None:
@@ -2034,6 +1766,32 @@ def test_safe_zone_forward_uses_segment_speeds(
     assert decision.angular_velocity_rad_s < 0.0
 
 
+def test_d1_to_d2_speed_ignores_pickup_cruise_scale() -> None:
+    sequence = make_sequence(
+        config=runtime_config(
+            pickup_cruise_speed_scale=1.5,
+            safe_zone_d1_to_d2_speed_m_s=0.5,
+        )
+    )
+    start_sequence(sequence)
+    sequence.state = MatchState.TRANSPORT_FORWARD
+    sequence._safe_zone_phase = "forward_d2_line"
+    sequence._transport_forward_base_distance_m = 0.0
+    sequence._transport_forward_distance_m = 1.0
+    sequence._d2_line_heading_rad = 0.0
+
+    decision = sequence.step(
+        10,
+        perception=None,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+    )
+
+    assert decision.reason == "safe_zone_forward_along_d1_d2_line"
+    assert decision.linear_velocity_m_s == pytest.approx(0.5)
+    assert decision.angular_velocity_rad_s == 0.0
+
+
 def test_final_forward_applies_braking_overrun() -> None:
     sequence = make_sequence(
         config=runtime_config(
@@ -2373,7 +2131,7 @@ def test_lost_green_target_restarts_search_after_bounded_wait() -> None:
         cumulative_distance_m=0.0,
     )
     assert restarted.state is MatchState.SEARCH_CLUSTER
-    assert restarted.reason == "green_target_timeout_restart_breakup_search"
+    assert restarted.reason == "near_field_route:reselect:target_geometry_lost"
 
 
 def test_cluster_alignment_aims_at_actual_member() -> None:
@@ -2808,6 +2566,7 @@ def test_preclose_rechecks_next_green_and_then_closes() -> None:
         )
     )
     start_sequence(sequence)
+    sequence._transport_count = 1  # 补夹只在已完成首次单绿后允许
 
     # Seed the already selected block and a second green block that will be
     # inside the 200 mm vehicle-origin range after the first approach.
@@ -2905,6 +2664,7 @@ def test_preclose_recheck_waits_for_new_neighbor_confirmation() -> None:
         )
     )
     start_sequence(sequence)
+    sequence._transport_count = 1  # 补夹只在已完成首次单绿后允许
 
     # The first block is already confirmed.  The second block is only exposed
     # after the vehicle reaches the grab offset, so its first post-stop frame
@@ -3168,7 +2928,7 @@ def test_d1_visual_calibration_uses_compensated_straight_line() -> None:
         right_speed_feedback_m_s=0.0,
     )
     assert keypoints_stop_waiting.reason == (
-        "safe_zone_waiting_for_vehicle_stop_after_keypoints"
+        "safe_zone_keypoints_stopped_start_calibration"
     )
 
     stopped = sequence.step(
@@ -3183,10 +2943,10 @@ def test_d1_visual_calibration_uses_compensated_straight_line() -> None:
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
     )
-    assert stopped.reason == "safe_zone_keypoints_stopped_start_calibration"
+    assert "safe_zone_wait:collecting" in stopped.reason
 
     calibration_result = None
-    for frame in range(4, 9):
+    for frame in range(4, 5):
         calibration_result = sequence.step(
             2_600_000_004 + frame,
             perception=safe_zone_snapshot_for_pose(
@@ -3671,99 +3431,23 @@ def test_exits_safe_zone_before_rearming_cluster_search() -> None:
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
     )
-    assert exit_stopped.reason == "safe_zone_exit_stopped_start_visual_calibration"
-    assert exit_stopped.state is MatchState.TRANSPORT_RELEASE
+    assert exit_stopped.reason == "safe_zone_exit_complete_start_search"
+    assert exit_stopped.state is MatchState.SEARCH_CLUSTER
     assert exit_stopped.gripper_posture is GripperPosture.OPEN
-    assert sequence._tracker.tracks != ()
-
-    corrected_pose = FieldPose2D(FieldPoint(-165.0, 800.0), math.pi / 2.0)
-    keypoints_seen = sequence.step(
-        1_920_000_026,
-        perception=safe_zone_snapshot_for_pose(11, 1_920_000_026, corrected_pose),
-        heading_rad=math.pi / 2.0,
-        cumulative_distance_m=-0.20,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert keypoints_seen.reason == "safe_zone_keypoints_seen_stop_before_calibration"
-    assert keypoints_seen.gripper_posture is GripperPosture.OPEN
-
-    calibration_stop_waiting = sequence.step(
-        1_920_000_027,
-        perception=safe_zone_snapshot_for_pose(12, 1_920_000_027, corrected_pose),
-        heading_rad=math.pi / 2.0,
-        cumulative_distance_m=-0.20,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert calibration_stop_waiting.reason == "safe_zone_waiting_for_vehicle_stop_after_keypoints"
-
-    calibration_started = sequence.step(
-        2_220_000_028,
-        perception=safe_zone_snapshot_for_pose(13, 2_220_000_028, corrected_pose),
-        heading_rad=math.pi / 2.0,
-        cumulative_distance_m=-0.20,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert calibration_started.reason == "safe_zone_keypoints_stopped_start_calibration"
-
-    calibrated = None
-    for frame in range(14, 19):
-        calibrated = sequence.step(
-            2_220_000_015 + frame,
-            perception=safe_zone_snapshot_for_pose(
-                frame,
-                2_220_000_015 + frame,
-                corrected_pose,
-            ),
-            heading_rad=math.pi / 2.0,
-            cumulative_distance_m=-0.20,
-            left_speed_feedback_m_s=0.0,
-            right_speed_feedback_m_s=0.0,
-        )
-    assert calibrated is not None
-    assert calibrated.reason == "safe_zone_exit_visual_calibrated_waiting_for_new_perception"
-    assert calibrated.state is MatchState.RETURN_BACKUP
-    assert calibrated.gripper_posture is GripperPosture.OPEN
+    assert exit_stopped.angular_velocity_rad_s != 0.0
     assert sequence._tracker.tracks == ()
-
-    same_frame = sequence.step(
-        2_220_000_034,
-        perception=safe_zone_snapshot_for_pose(18, 2_220_000_033, corrected_pose),
-        heading_rad=math.pi / 2.0,
-        cumulative_distance_m=-0.20,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert same_frame.state is MatchState.RETURN_BACKUP
-    assert same_frame.reason == "safe_zone_exit_waiting_for_new_perception"
-
-    fresh_frame = snapshot(19, 2_220_000_035)
-    search_started = sequence.step(
-        2_220_000_035,
-        perception=fresh_frame,
-        heading_rad=math.pi / 2.0,
-        cumulative_distance_m=-0.20,
-        left_speed_feedback_m_s=0.0,
-        right_speed_feedback_m_s=0.0,
-    )
-    assert search_started.state is MatchState.SEARCH_CLUSTER
-    assert search_started.reason == "safe_zone_exit_complete_start_search"
-
+    assert sequence.carried_target_count == 0
+    # 同一旧安全区帧不重新校准、不重新成为候选，也不阻止继续转向。
     search = sequence.step(
-        2_220_000_036,
-        perception=fresh_frame,
+        1_920_000_030,
+        perception=safe_zone_targets(10, 1_920_000_025),
         heading_rad=math.pi / 2.0,
         cumulative_distance_m=-0.20,
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
     )
     assert search.state is MatchState.SEARCH_CLUSTER
-    assert search.reason == "search_cluster_right"
-    assert search.angular_velocity_rad_s == pytest.approx(
-        sequence.config.cluster_search_empty_angular_velocity_rad_s
-    )
+    assert search.angular_velocity_rad_s != 0.0
     assert sequence._tracker.tracks == ()
 
 
@@ -3854,6 +3538,9 @@ def test_factory_wires_configured_guard_geometry() -> None:
         0.08
     )
     assert sequence._near_field_pickup.fine_alignment_min_wheel_velocity_m_s == 0.0
+    assert sequence._near_field_pickup.terminal_speed_gain_s_inv == pytest.approx(
+        config.match.pickup_terminal_speed_gain_s_inv
+    )
     assert sequence._breakup_static_map is config.world.static_map
     assert sequence._breakup_clearance_mm == pytest.approx(
         config.match.robot_footprint_radius_mm

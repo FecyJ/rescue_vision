@@ -7,6 +7,7 @@ import math
 from threading import Condition, Thread
 import time
 
+from rescue_vision.app.breakup_planner import BreakupPlan, BreakupSceneContext, BreakupTarget, physical_radii, plan_breakup
 from rescue_vision.app.near_field_grasp import (
     GraspSelection, GraspTarget, GraspTargetTracker, NearFieldGraspPlan,
     NearFieldGraspPolicy, NearFieldGraspSelector, NearFieldHandoffPrior,
@@ -82,6 +83,14 @@ class GripperWidthPickupState(str, Enum):
     ABORTED = "aborted"
 
 
+class GraspSceneAction(str, Enum):
+    GRASP = "grasp"
+    MOTION = "motion"
+    RECOVERY = "recovery"
+    OBSERVE = "observe"
+    EXIT = "exit"
+
+
 @dataclass(frozen=True, slots=True)
 class GraspPreparation:
     capture_timestamp_ns: int
@@ -96,6 +105,17 @@ class GraspPreparation:
     # 让提交门禁可以分别记录几何年龄和准备结果年龄。
     prepared_timestamp_ns: int | None = None
     result_timestamp_ns: int | None = None
+    recovery_plan: BreakupPlan | None = None
+    recovery_checked: bool = False
+
+    @property
+    def action(self) -> GraspSceneAction:
+        if self.selection.plan is not None:
+            return (GraspSceneAction.MOTION if self.selection.plan.alignment_angle_rad != 0
+                    else GraspSceneAction.GRASP)
+        if self.recovery_plan is not None:
+            return GraspSceneAction.RECOVERY
+        return GraspSceneAction.EXIT if self.recovery_checked else GraspSceneAction.OBSERVE
 
     def __post_init__(self) -> None:
         if isinstance(self.capture_timestamp_ns, bool) or not isinstance(self.capture_timestamp_ns, int) or self.capture_timestamp_ns < 0:
@@ -106,6 +126,12 @@ class GraspPreparation:
             raise ValueError("targets must contain GraspTarget values.")
         if not isinstance(self.ready, bool):
             raise ValueError("ready must be a boolean.")
+        if not isinstance(self.recovery_checked, bool):
+            raise ValueError(f"Invalid recovery_checked={self.recovery_checked!r}")
+        if self.recovery_plan is not None and not isinstance(self.recovery_plan, BreakupPlan):
+            raise TypeError(f"Invalid recovery_plan={self.recovery_plan!r}")
+        if self.selection.plan is not None and self.recovery_plan is not None:
+            raise ValueError("A scene cannot freeze both grasp and recovery actions.")
         if self.checked_member_ids is not None:
             if not isinstance(self.checked_member_ids, tuple) or len(set(self.checked_member_ids)) != len(self.checked_member_ids) or any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in self.checked_member_ids):
                 raise ValueError("checked_member_ids must contain unique positive integers.")
@@ -178,6 +204,9 @@ class GraspPreparationSession:
         self._last_frame_sequence: int | None = None
         self._last_preparation: GraspPreparation | None = None
         self._locked_member_points: dict[int, GroundPoint] = {}
+        self._recovery_plan: BreakupPlan | None = None
+        self._recovery_count = 0
+        self._frozen_scene_ids: set[int] = set()
 
     def reset(self) -> None:
         """清空确认窗口并重置近场 tracker。"""
@@ -192,11 +221,59 @@ class GraspPreparationSession:
         self._last_frame_sequence = None
         self._last_preparation = None
         self._locked_member_points.clear()
+        self._recovery_plan = None
+        self._recovery_count = 0
+        self._frozen_scene_ids.clear()
 
     def _clear_confirmation(self) -> None:
         self._confirmation_count = 0
         self._confirmation_last_frame_sequence = None
         self._confirmation_plan = None
+
+    def _freeze_distinct_scene_targets(
+        self,
+        targets: tuple[GraspTarget, ...],
+    ) -> tuple[GraspTarget, ...]:
+        """Promote a spatially distinct one-frame detection in this stopped scene."""
+
+        existing = [
+            target
+            for target in targets
+            if target.observed
+            and (
+                target.confirmed
+                or target.handoff_matched
+                or target.track_id in self._frozen_scene_ids
+            )
+        ]
+        promoted: list[GraspTarget] = []
+        for target in targets:
+            peers = tuple(
+                item for item in existing if item.track_id != target.track_id
+            )
+            if (
+                target.observed
+                and target.selectable
+                and target.envelope is not None
+                and not target.confirmed
+                and target.track_id not in self._frozen_scene_ids
+                and (
+                    not peers
+                    or max(
+                        target.observation.box.iou(item.observation.box)
+                        for item in peers
+                    )
+                    <= self.selector.config.stopped_scene_new_target_max_bbox_iou
+                )
+            ):
+                self._frozen_scene_ids.add(target.track_id)
+                existing.append(target)
+            promoted.append(
+                replace(target, confirmed=True)
+                if target.track_id in self._frozen_scene_ids
+                else target
+            )
+        return tuple(promoted)
 
     def _canonicalize_locked_targets(
         self,
@@ -372,10 +449,13 @@ class GraspPreparationSession:
                session_id: int = 0,
                handoff_prior: NearFieldHandoffPrior | None = None,
                excluded_observation_indices: frozenset[int] = frozenset(),
-               require_handoff: bool = False) -> GraspPreparation:
+               require_handoff: bool = False,
+               recovery_context: BreakupSceneContext | None = None) -> GraspPreparation:
         if not isinstance(snapshot, PerceptionSnapshot):
             raise TypeError("snapshot must be a PerceptionSnapshot.")
         _validate_candidate_exclusions(snapshot, excluded_observation_indices)
+        if locked_ids is None:
+            locked_ids = self._locked_ids
         if locked_ids is not None:
             locked_ids = tuple(locked_ids)
         if policy is None:
@@ -431,6 +511,7 @@ class GraspPreparationSession:
         )
         targets = self.tracker.update(snapshot.capture_timestamp_ns, snapshot.observations)
         targets = self._canonicalize_locked_targets(targets, locked_ids)
+        targets = self._freeze_distinct_scene_targets(targets)
         excluded = tuple(
             snapshot.observations[index]
             for index in excluded_observation_indices
@@ -456,6 +537,11 @@ class GraspPreparationSession:
         )
         self._last_selection = selection
         plan = selection.plan
+        # The scene decision owns its core and counts this very frame. The
+        # consumer never needs to return a lock before confirmation can begin.
+        if locked_ids is None and plan is not None:
+            locked_ids = plan.member_ids
+            self._locked_ids = locked_ids
         if (
             locked_ids is not None
             and self._locked_member_classes is None
@@ -578,9 +664,73 @@ class GraspPreparationSession:
             confirmation_required=self.selector.config.confirmation_frames,
             result_timestamp_ns=snapshot.result_timestamp_ns,
         )
+        if plan is None and recovery_context is not None:
+            result = self._prepare_recovery(result, recovery_context, policy, frozenset(
+                target.track_id for target in targets
+                if any(_same_frame_observation(target.observation, item) for item in excluded)))
         self._last_frame_sequence = snapshot.frame_sequence
         self._last_preparation = result
         return result
+
+    def _prepare_recovery(self, prepared: GraspPreparation, context: BreakupSceneContext,
+                          policy: NearFieldGraspPolicy, excluded: frozenset[int]) -> GraspPreparation:
+        # Missing contact or danger geometry is evidence to reobserve, never
+        # permission to push. Only concrete grasp obstruction invokes recovery.
+        blocked = any(reason.startswith(("blocked_target:", "maximum_opening_exceeded",
+                                         "left_tip_y_mm", "right_tip_y_mm", "locked_members_changed"))
+                      for reason in prepared.selection.rejections)
+        if not blocked:
+            return prepared
+        if any(item.observed and item.observation.target_class is TargetClass.BLUE_DANGER
+               and item.observation.ground_point is None for item in prepared.targets):
+            return prepared
+        targets = []
+        for item in prepared.targets:
+            observation = item.observation
+            if not item.observed or observation.ground_point is None:
+                continue
+            radius, safety_radius = physical_radii(self.selector.target_geometry.geometry_for(observation.target_class))
+            targets.append(BreakupTarget(item.track_id, prepared.capture_timestamp_ns,
+                                         observation.target_class, observation.ground_point,
+                                         radius, safety_radius))
+        previous = context.previous_plan
+        rejected: list[str] = []
+        candidates = plan_breakup(
+            tuple(targets), config=context.config, origin=context.origin,
+            heading_rad=context.heading_rad, static_map=context.static_map,
+            field_bounds=context.field_bounds, front_mm=context.front_mm,
+            allowed_classes=policy.allowed_classes, approach=False,
+            attempt=context.attempt, previous_aim=None if previous is None else previous.aim_field,
+            previous_penetration_mm=0.0 if previous is None else previous.penetration_mm,
+            non_contact_ids=frozenset(excluded),
+            rejection_reasons=prepared.selection.rejections, rejections=rejected,
+        )
+        if context.objective_field is not None:
+            objective = context.objective_field
+            candidates = tuple(candidate for candidate in candidates
+                               if any(math.hypot(point.x-objective.x, point.y-objective.y)
+                                      <= context.config.cluster_group_ground_mm
+                                      for point in candidate.member_field_points))
+        if self._recovery_plan is not None:
+            anchor = self._recovery_plan.aim_field
+            candidates = tuple(sorted(candidates, key=lambda item:
+                math.hypot(item.aim_field.x-anchor.x, item.aim_field.y-anchor.y)))
+        candidate = candidates[0] if candidates else None
+        if candidate is None:
+            self._recovery_count = 0
+            self._recovery_plan = None
+        else:
+            same = (self._recovery_plan is not None and
+                    math.hypot(candidate.aim_field.x-self._recovery_plan.aim_field.x,
+                               candidate.aim_field.y-self._recovery_plan.aim_field.y)
+                    <= context.config.cluster_group_ground_mm)
+            self._recovery_count = min(context.config.breakup_confirmation_frames,
+                                       self._recovery_count + 1 if same else 1)
+            self._recovery_plan = candidate
+        return replace(prepared, recovery_plan=candidate, recovery_checked=True,
+                       ready=candidate is not None and self._recovery_count >= context.config.breakup_confirmation_frames,
+                       confirmation_count=self._recovery_count,
+                       confirmation_required=context.config.breakup_confirmation_frames)
 
 
 class GraspPreparationWorker:
@@ -608,8 +758,10 @@ class GraspPreparationWorker:
             NearFieldHandoffPrior | None,
             frozenset[int],
             bool,
+            BreakupSceneContext | None,
         ] | None = None
         self._latest: GraspPreparation | None = None
+        self._computing_session_id: int | None = None
         self._stopping = False
         self._started = False
         self._last_submitted_timestamp_ns = -1
@@ -661,6 +813,7 @@ class GraspPreparationWorker:
         handoff_prior: NearFieldHandoffPrior | None = None,
         excluded_observation_indices: frozenset[int] = frozenset(),
         require_handoff: bool = False,
+        recovery_context: BreakupSceneContext | None = None,
     ) -> None:
         if not isinstance(snapshot, PerceptionSnapshot):
             raise TypeError("snapshot must be a PerceptionSnapshot.")
@@ -691,8 +844,14 @@ class GraspPreparationWorker:
                 handoff_prior,
                 excluded_observation_indices,
                 require_handoff,
+                recovery_context,
             )
             self._condition.notify_all()
+
+    def pending(self, session_id: int) -> bool:
+        with self._condition:
+            return (session_id == self._requested_session_id and
+                    (self._pending is not None or self._computing_session_id == session_id))
 
     def latest(self, session_id: int) -> GraspPreparation | None:
         with self._condition:
@@ -708,6 +867,7 @@ class GraspPreparationWorker:
                     if self._stopping:
                         return
                     request, self._pending = self._pending, None
+                    self._computing_session_id = self._requested_session_id
                 assert request is not None
                 (
                     snapshot,
@@ -717,6 +877,7 @@ class GraspPreparationWorker:
                     handoff_prior,
                     excluded_observation_indices,
                     require_handoff,
+                    recovery_context,
                 ) = request
                 if self._worker_session_id != session_id:
                     self.session.reset()
@@ -730,18 +891,21 @@ class GraspPreparationWorker:
                         handoff_prior=handoff_prior,
                         excluded_observation_indices=excluded_observation_indices,
                         require_handoff=require_handoff,
+                        recovery_context=recovery_context,
                     )
                 except Exception as exc:
                     with self._condition:
                         # 已完成的唯一确认窗口不能因旁路一次异常被抹掉；
                         # 动作层仍会检查其中计划的真实年龄。
                         self.error = f"planning:{type(exc).__name__}:{exc}"
+                        self._computing_session_id = None
                     continue
                 prepared = replace(
                     prepared,
                     prepared_timestamp_ns=time.monotonic_ns(),
                 )
                 with self._condition:
+                    self._computing_session_id = None
                     if session_id == getattr(self, "_requested_session_id", session_id):
                         self._latest = prepared
                         self.error = None
@@ -871,10 +1035,14 @@ class GripperWidthPickupSequence:
                  fine_alignment_zone_rad: float = 0.08,
                  fine_alignment_min_wheel_velocity_m_s: float = 0.0,
                  cruise_speed_scale: float = 1.0,
+                 terminal_speed_gain_s_inv: float = 1.0,
                  deceleration_m_s2: float = 0.5):
         self.travel_ns = round(_positive(gripper_full_travel_time_s, "gripper_full_travel_time_s") * 1e9)
         self.speed = _positive(forward_speed_m_s, "forward_speed_m_s")
         self.cruise_speed_scale = _positive(cruise_speed_scale, "cruise_speed_scale")
+        self.terminal_speed_gain_s_inv = _positive(
+            terminal_speed_gain_s_inv, "terminal_speed_gain_s_inv"
+        )
         self.deceleration_m_s2 = _positive(deceleration_m_s2, "deceleration_m_s2")
         self.age_ns = round(_positive(max_observation_age_ms, "max_observation_age_ms") * 1e6)
         # 对准续转窗口宽于单帧观测年龄：感知慢于一帧时不中断旋转。
@@ -922,10 +1090,12 @@ class GripperWidthPickupSequence:
         self.result: GripperWidthPickupResult | None = None
         self._last_ns = -1
         self._phase_ns = 0
+        self._forward_heading_rad: float | None = None
         self._distance_start: float | None = None
         self._last_progress_mm = 0.0
         self._progress_ns = 0
         self._abort_capture_ns = -1
+        self._rejected_capture_ns = -1
         self._abort_reason = ""
         self._alignment_plan: NearFieldGraspPlan | None = None
         self._alignment_started_ns: int | None = None
@@ -955,7 +1125,11 @@ class GripperWidthPickupSequence:
         plan = prep.selection.plan
         return (
             plan is not None
-            and self.motion_evidence.capture_valid(plan.capture_timestamp_ns, now_ns, max_age_ns=self.age_ns)
+            and self.motion_evidence.capture_valid(
+                plan.capture_timestamp_ns, now_ns, max_age_ns=self.alignment_timeout_ns
+            )
+            and (publication_age := prep.preparation_age_ns(now_ns)) is not None
+            and 0 <= publication_age <= self.age_ns
             # 缺失后缓存的确认计划不能借新快照/新发布时间续命。
             and plan.capture_timestamp_ns == prep.capture_timestamp_ns
             and self._current_plan_evidence_valid(prep)
@@ -990,6 +1164,7 @@ class GripperWidthPickupSequence:
         self._last_progress_mm = 0.0
         self._progress_ns = 0
         self._abort_capture_ns = -1
+        self._rejected_capture_ns = -1
         self._abort_reason = ""
         self._alignment_plan = None
         self._alignment_started_ns = None
@@ -1026,6 +1201,7 @@ class GripperWidthPickupSequence:
         """开爪前证据变化只解锁重选，并清空旧候选的对准计时。"""
 
         self.state = GripperWidthPickupState.SEARCH
+        self._rejected_capture_ns = now_ns
         self.active_plan = None
         self.locked_ids = None
         self._alignment_plan = None
@@ -1205,7 +1381,8 @@ class GripperWidthPickupSequence:
             return self._decision(now, "complete_capture_unconfirmed", brake=True)
         current_prep = (
             prep
-            if prep is not None and 0 <= now - prep.capture_timestamp_ns <= self.age_ns
+            if prep is not None and (0 <= now - prep.capture_timestamp_ns <= self.age_ns
+                                     or self._stationary_plan_valid(now, prep))
             else None
         )
         if (
@@ -1245,12 +1422,11 @@ class GripperWidthPickupSequence:
         if self.active_plan is None:
             plan = current_prep.selection.plan if current_prep is not None else None
             matching = current_prep is not None and current_prep.checked_member_ids == self.locked_ids
-            if (
-                self.locked_ids is None
-                and current_prep is not None
-                and current_prep.checked_member_ids is not None
-            ):
-                # 解锁后的后台迟到结果仍属于旧锁组，不能作为新的无锁方案接管。
+            if self.locked_ids is None and plan is not None and current_prep is not None:
+                matching = current_prep.checked_member_ids in (None, plan.member_ids)
+                if not matching:
+                    plan = None
+            if plan is not None and plan.capture_timestamp_ns <= self._rejected_capture_ns:
                 plan = None
             if self.locked_ids is not None and not matching:
                 plan = None
@@ -1294,14 +1470,15 @@ class GripperWidthPickupSequence:
                     # old visual angle.  The one bounded turn ends on measured
                     # IMU progress (or on the short fallback budget) and then
                     # waits for a new current-frame geometry check.
-                    if not self._alignment_turn_complete(now, heading_rad):
+                    if not self._alignment_finished and not self._alignment_turn_complete(now, heading_rad):
                         return self._decision(
                             now,
                             "alignment_recent_checked_plan",
                             angular=self._angular(self._alignment_plan),
                         )
-                    self._alignment_finished = True
-                    self._alignment_completed_ns = now
+                    if not self._alignment_finished:
+                        self._alignment_finished = True
+                        self._alignment_completed_ns = now
                     return self._decision(
                         now,
                         "waiting_locked_target_observation",
@@ -1314,6 +1491,10 @@ class GripperWidthPickupSequence:
                         brake=True,
                     )
                 return self._decision(now, "waiting_eligible_group", brake=True)
+            if (self.motion_evidence.latest is not None
+                    and self.state is not GripperWidthPickupState.ALIGNING
+                    and not self._stationary_plan_valid(now, current_prep)):
+                return self._decision(now, "waiting_stationary_scene", brake=True)
             self.locked_ids = plan.member_ids
             if plan.alignment_angle_rad != 0:
                 if (
@@ -1411,7 +1592,9 @@ class GripperWidthPickupSequence:
                 )
             if self.motion_evidence.latest is not None and not self._stationary_plan_valid(now, current_prep):
                 return self._decision(now, "confirmation_waiting_for_stationary_capture", brake=True)
-            if preparation_age_ns is None or preparation_age_ns > self.commit_age_ns:
+            if (preparation_age_ns is None or preparation_age_ns < 0
+                    or (preparation_age_ns > self.commit_age_ns
+                        and not self._stationary_plan_valid(now, current_prep))):
                 return self._decision(
                     now,
                     "confirmation_waiting_for_fresh_preparation",
@@ -1437,6 +1620,7 @@ class GripperWidthPickupSequence:
             self.result = None
             self._alignment_started_ns = None
             self._distance_start = cumulative_distance_m
+            self._forward_heading_rad = heading_rad
             self._phase_ns = now
             self.state = GripperWidthPickupState.OPENING
             return self._decision(now, "open_group_width", angles=plan.opening_servo_angles_deg, brake=True)
@@ -1458,7 +1642,7 @@ class GripperWidthPickupSequence:
                 if self._distance_start is not None and cumulative_distance_m < self._distance_start - 0.005:
                     return self._abort(now, "encoder_direction_mismatch", current_prep)
                 speed = self._opening_advance_speed(plan, cumulative_distance_m)
-                return self._decision(now, "opening_gripper_while_advancing" if speed > 0 else "opening_gripper", speed=speed, brake=speed == 0)
+                return self._decision(now, "opening_gripper_while_advancing" if speed > 0 else "opening_gripper", speed=speed, angular=self._forward_heading_correction(heading_rad, speed) if speed > 0 else 0.0, brake=speed == 0)
 
             # 走廊证据只在静止确认时检查；开爪完成后按冻结执行计划开环前进。
             if cumulative_distance_m is None:
@@ -1487,8 +1671,23 @@ class GripperWidthPickupSequence:
                 return self._decision(now, "distance_reached_close_gripper", angles=self.closed_angles, brake=True)
             # 速度仍受剩余定距限制，但不受视觉观测年龄/退化状态降速。
             remaining_m = (plan.forward_distance_mm - self.progress_mm(cumulative_distance_m)) / 1000
-            return self._decision(now, "forward_open_loop", speed=approach_speed_m_s(remaining_m, self.speed, self.cruise_speed_scale, self.deceleration_m_s2, precision_approach=True))
+            speed = approach_speed_m_s(remaining_m, self.speed, self.cruise_speed_scale,
+                                        self.deceleration_m_s2, precision_approach=True,
+                                        terminal_speed_gain_s_inv=self.terminal_speed_gain_s_inv)
+            return self._decision(now, "forward_encoder_heading_hold", speed=speed,
+                                  angular=self._forward_heading_correction(heading_rad, speed))
         return self._abort(now, "invalid_pickup_state", current_prep)
+
+    def _forward_heading_correction(self, heading_rad: float | None, speed_m_s: float) -> float:
+        # Keep the heading frozen at the checked opening pose, including servo
+        # travel and the very first encoder step; never recenter on a new image.
+        if heading_rad is None or self._forward_heading_rad is None:
+            return 0.0
+        error = normalize_angle(self._forward_heading_rad-heading_rad)
+        # Deceleration scales steering too: no last-millimetre pivot while
+        # the encoder endpoint is approached at a tiny forward speed.
+        scale = min(1.0, speed_m_s/self.speed)
+        return scale * max(-self.max_angular, min(self.max_angular, self.kp*error))
 
     def _opening_advance_speed(self, plan: NearFieldGraspPlan, distance_m: float) -> float:
         # Enable alongside cruise acceleration only. Do not consume frozen K0

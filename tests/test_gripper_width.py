@@ -25,7 +25,7 @@ from rescue_vision.perception import (
 
 def _observation(
     *,
-    center_x_mm: float = 230.0,
+    center_x_mm: float = 215.0,
     center_y_mm: float = 0.0,
     target_class: TargetClass = TargetClass.GREEN_SUPPLY,
     status: ColorSegmentationStatus = ColorSegmentationStatus.ACCEPTED,
@@ -93,10 +93,10 @@ def test_estimator_projects_mask_and_adds_clearance() -> None:
     # Pixel centers have v values 20.5, 21.5 and 22.5 for the mask above.
     assert measurement.left_y_mm == pytest.approx(22.5)
     assert measurement.right_y_mm == pytest.approx(20.5)
-    assert measurement.center_x_mm == pytest.approx(230.0)
-    assert measurement.front_x_mm == pytest.approx(237.5)
+    assert measurement.center_x_mm == pytest.approx(215.0)
+    assert measurement.front_x_mm == pytest.approx(222.5)
     assert measurement.center_to_front_mm == pytest.approx(7.5)
-    assert measurement.forward_distance_mm == pytest.approx(237.5)
+    assert measurement.forward_distance_mm == pytest.approx(222.5)
     assert measurement.width_mm == pytest.approx(2.0)
     assert measurement.opening_width_mm == pytest.approx(6.0)
     assert measurement.left_edge_pixel == UndistortedPixel(11.5, 22.5)
@@ -115,7 +115,7 @@ def test_estimator_keeps_extrema_from_disconnected_mask_components() -> None:
     assert measurement is not None
     assert measurement.left_y_mm == pytest.approx(23.5)
     assert measurement.right_y_mm == pytest.approx(20.5)
-    assert measurement.front_x_mm == pytest.approx(238.5)
+    assert measurement.front_x_mm == pytest.approx(223.5)
 
 
 @pytest.mark.parametrize("center_y_mm", [-5.0, 5.0, 8.0])
@@ -129,14 +129,14 @@ def test_estimator_uses_strict_center_gate(center_y_mm: float) -> None:
     )
 
 
-def test_estimator_rejects_unaccepted_color_segmentation() -> None:
-    assert (
-        estimate_gripper_width(
-            _observation(status=ColorSegmentationStatus.INSUFFICIENT),
-            GroundProjector(np.eye(3)),
-        )
-        is None
+def test_estimator_falls_back_to_bbox_for_unaccepted_color_segmentation() -> None:
+    measurement = estimate_gripper_width(
+        _observation(status=ColorSegmentationStatus.INSUFFICIENT),
+        GroundProjector(np.eye(3)),
     )
+    assert measurement is not None
+    assert measurement.right_edge_pixel == UndistortedPixel(10.0, 24.0)
+    assert measurement.left_edge_pixel == UndistortedPixel(10.0, 24.0)
 
 
 def test_estimator_config_validates_clearance_and_pixel_count() -> None:
@@ -192,10 +192,10 @@ def test_average_uses_only_valid_measurements() -> None:
     )
 
     assert averaged.frame_sequence == 10
-    assert averaged.center_x_mm == pytest.approx(230.0)
-    assert averaged.front_x_mm == pytest.approx(237.5)
+    assert averaged.center_x_mm == pytest.approx(215.0)
+    assert averaged.front_x_mm == pytest.approx(222.5)
     assert averaged.center_to_front_mm == pytest.approx(7.5)
-    assert averaged.forward_distance_mm == pytest.approx(237.5)
+    assert averaged.forward_distance_mm == pytest.approx(222.5)
     assert averaged.center_y_mm == pytest.approx(1.0)
     assert averaged.left_y_mm == pytest.approx(23.5)
     assert averaged.right_y_mm == pytest.approx(20.0)

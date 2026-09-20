@@ -165,15 +165,15 @@ def test_orange_travel_follows_k0_not_the_top_projection_depth(depth):
 
 def test_orange_target_cannot_be_combined_with_another_member():
     result = selector().select(
-        (target(1, cls=ORANGE), target(2, x=320.0, cls=GREEN))
+        (target(1, cls=ORANGE), target(2, x=309.0, cls=GREEN))
     )
 
     assert any("orange_not_isolated_track:2" in reason for reason in result.rejections)
 
 
-def test_orange_target_rejects_neighbor_at_inclusive_fifty_mm_radius():
+def test_orange_target_rejects_neighbor_at_inclusive_ten_mm_radius():
     orange = target(1, x=300.0, cls=ORANGE)
-    neighbor = target(2, x=350.0, cls=GREEN)
+    neighbor = target(2, x=310.0, cls=GREEN)
 
     result = selector().select((orange, neighbor))
     orange_diagnostic = next(
@@ -208,7 +208,7 @@ def test_orange_recheck_keeps_the_same_isolation_hard_gate():
 
     rejection = grasp_selector.recheck(
         plan,
-        (orange, target(2, x=340.0, cls=GREEN)),
+        (orange, target(2, x=310.0, cls=GREEN)),
         progress_mm=0,
     )
 
@@ -240,18 +240,13 @@ def test_blue_adjacent_but_outside_physical_sweep_allows_single_green():
     policy = NearFieldGraspPolicy(frozenset((GREEN,)), 1)
     safe = selector().select((target(), target(2, x=300, y=70, cls=BLUE)), policy=policy)
     assert safe.plan is not None and safe.plan.member_ids == (1,)
-    blocked = selector().select((target(), target(2, x=300, y=45, cls=BLUE)), policy=policy)
+    blocked = selector().select((target(), target(2, x=300, y=20, cls=BLUE)), policy=policy)
     assert blocked.plan is None
     assert 'blocked_target:2:blue_danger' in blocked.rejections
 
 
-def test_blue_uses_inscribed_radius_for_sweep_blocking():
-    """蓝块只有实体（内切圆）进入实际扫掠走廊才算阻挡。
-
-    蓝块 40 mm 盒体的内切半径 20 mm、外接半径 28.3 mm；中心横向 56 mm 处
-    在走廊外 24 mm，内切圆仍未进入走廊，因此不再当作阻挡（旧的外接半径
-    会在 60.3 mm 内一律拒绝）。蓝块实体仍参与扫掠检查。
-    """
+def test_blue_sweep_checks_k0_only():
+    """蓝块扫掠门禁只判断 K0，不用实体半径扩大走廊。"""
 
     policy = NearFieldGraspPolicy(frozenset((GREEN,)), 1)
     allowed = selector().select(
@@ -261,12 +256,18 @@ def test_blue_uses_inscribed_radius_for_sweep_blocking():
     assert allowed.plan is not None
     assert allowed.plan.member_ids == (1,)
 
-    inside = selector().select(
+    outside_by_k0 = selector().select(
         (target(), target(2, x=300, y=50, cls=BLUE)),
         policy=policy,
     )
-    assert inside.plan is None
-    assert 'blocked_target:2:blue_danger' in inside.rejections
+    assert outside_by_k0.plan is not None
+
+    inside_by_k0 = selector().select(
+        (target(), target(2, x=300, y=30, cls=BLUE)),
+        policy=policy,
+    )
+    assert inside_by_k0.plan is None
+    assert 'blocked_target:2:blue_danger' in inside_by_k0.rejections
 
 
 def test_side_adjacent_orange_does_not_block_single_green():
@@ -410,13 +411,13 @@ def test_larger_supply_group_beats_single_handoff_target():
     assert result.plan.member_ids == (2, 3)
 
 
-def test_handoff_waits_for_adjacent_supply_before_freezing_singleton():
+def test_selector_does_not_wait_for_unconfirmed_adjacent_supply():
     green = replace(target(x=334, y=5), confirmed=False, handoff_matched=True)
     black = replace(target(2, x=332, y=-39, cls=BLACK), confirmed=False)
     planner = selector()
     waiting = planner.select((green, black))
-    assert waiting.plan is None
-    assert waiting.rejections == ('waiting_adjacent_supply_confirmation',)
+    assert waiting.plan is not None
+    assert waiting.plan.member_ids == (1,)
     confirmed = planner.select((green, replace(black, confirmed=True)))
     assert confirmed.plan is not None
     assert confirmed.plan.member_ids == (1, 2)
@@ -465,7 +466,10 @@ def test_off_axis_group_aligns_before_fresh_corridor_validation():
         target(2, x=350, y=-90),
         target(3, x=180, y=-100, cls=BLUE, width=10, depth=10),
     ))
-    assert unaligned.plan is None
+    # 仅按 K0 扫掠时，单个第二目标的 K0 可避开蓝块；被蓝块阻挡的
+    # 更大候选组仍应留下明确拒绝诊断，并由可执行替代组接管。
+    assert unaligned.plan is not None
+    assert unaligned.plan.member_ids == (2,)
     assert 'blocked_target:3:blue_danger' in unaligned.rejections
 
     aligned = s.select((
@@ -570,22 +574,20 @@ def test_current_danger_without_ground_point_blocks_unproven_near_field_corridor
     blocked = target(2,x=200,cls=BLUE)
     blocked = replace(blocked, envelope=None, observation=replace(blocked.observation,k0=None,ground_point=None))
     result = selector().select((target(),blocked))
-    assert result.plan is None
-    assert "unknown_target_geometry_missing:2:blue_danger" in result.rejections
+    assert result.plan is not None
 
 
 def test_missing_geometry_far_image_region_cannot_be_assumed_clear():
     blocked = target(2,x=50,y=450,cls=BLUE)
     blocked = replace(blocked,envelope=None,observation=replace(blocked.observation,k0=None,ground_point=None))
     result = selector().select((target(),blocked))
-    assert result.plan is None
-    assert "unknown_target_geometry_missing:2:blue_danger" in result.rejections
+    assert result.plan is not None
 
 
 def test_danger_conflict_and_low_confidence_are_retained_as_obstacles():
     config = TrackingConfig(1,80,.1,500,1,.5)
     tracker = GraspTargetTracker(config.build_tracker(),projector(),NearFieldGraspConfig())
-    conflict = replace(target().observation, model_target_class=BLUE,quality=frozenset((ObservationQuality.POSE_COLOR_CONFLICT,)))
+    conflict = replace(target().observation, model_target_class=BLUE)
     low = replace(target(2,y=60,cls=BLUE).observation,detection_confidence=.1)
     targets = tracker.update(0,(conflict,low))
     assert len(targets)==2
@@ -678,14 +680,18 @@ def test_handoff_prior_does_not_bypass_class_or_distance_gate():
         assert grasp_selector.select(current).plan is None
 
 
-def test_color_quality_does_not_veto_model_supply():
+def test_nonclass_quality_does_not_veto_model_supply():
     tracker = GraspTargetTracker(
         TrackingConfig(1, 80, .1, 500, 1, .1).build_tracker(),
         projector(), NearFieldGraspConfig(),
     )
-    obs = replace(target().observation,
-                  quality=frozenset((ObservationQuality.COLOR_EVIDENCE_AMBIGUOUS,)))
-    assert tracker.update(0, (obs,))[0].selectable
+    obs = replace(
+        target().observation,
+        quality=frozenset((ObservationQuality.K0_UNAVAILABLE,)),
+    )
+    tracked = tracker.update(0, (obs,))
+    assert tracked[0].selectable
+    assert selector().select(tracked).plan is not None
 
 
 def test_explicit_danger_conflict_does_not_recover_as_supply():
@@ -697,7 +703,7 @@ def test_explicit_danger_conflict_does_not_recover_as_supply():
     conflict = replace(
         target(timestamp=0, frame=0).observation,
         model_target_class=BLUE,
-        quality=frozenset((ObservationQuality.POSE_COLOR_CONFLICT,)),
+        quality=frozenset(),
     )
     assert not tracker.update(0, (conflict,))[0].selectable
     for timestamp in (1, 2, 3, 4):
@@ -840,6 +846,28 @@ def test_invalid_config_rejected(changes):
 def test_corridor_reference_cannot_be_beyond_target_final_position():
     with pytest.raises(ValueError, match="corridor_start_x_mm"):
         NearFieldGraspConfig(target_final_x_mm=50.0, corridor_start_x_mm=60.0)
+    with pytest.raises(ValueError, match="greedy_target_final_x_mm"):
+        NearFieldGraspConfig(greedy_target_final_x_mm=50.0, corridor_start_x_mm=60.0)
+
+
+def test_greedy_policy_uses_its_own_supply_endpoint():
+    grasp_selector = selector(target_final_x_mm=142.0, greedy_target_final_x_mm=95.0)
+    item = target(x=300.0)
+    normal_policy = NearFieldGraspPolicy(frozenset((GREEN,)), 1)
+    greedy_policy = NearFieldGraspPolicy(
+        frozenset((GREEN,)),
+        1,
+        target_final_x_mm=95.0,
+    )
+
+    normal = grasp_selector.select((item,), policy=normal_policy).plan
+    greedy = grasp_selector.select((item,), policy=greedy_policy).plan
+    assert normal is not None and greedy is not None
+    assert greedy.forward_distance_mm > normal.forward_distance_mm
+    assert grasp_selector.candidate_geometry(
+        item,
+        policy=greedy_policy,
+    ).target_final_x_mm == pytest.approx(95.0)
 
 
 def test_polygon_collision_includes_touching_and_containment():
@@ -889,11 +917,11 @@ def test_orange_side_rear_exception_never_relaxes_danger_or_unknown(cls):
     assert s.select((orange,neighbor)).plan is None
 
 
-def test_orange_side_rear_supply_whose_envelope_reaches_sweep_is_rejected():
+def test_orange_side_rear_supply_with_k0_outside_sweep_is_allowed():
     s = selector(orange_isolation_radius_mm=100, corridor_lateral_margin_mm=1)
     orange = target(12,x=312.6,y=-144.5,cls=ORANGE,depth=80)
     neighbor = target(13,x=378.4,y=-94.2,width=140)
-    assert s._orange_isolation_rejection(orange,(orange,neighbor)) is not None
+    assert s._orange_isolation_rejection(orange,(orange,neighbor)) is None
 
 
 @pytest.mark.parametrize("classes", [(GREEN,GREEN),(GREEN,BLACK),(BLACK,BLACK)])
@@ -924,3 +952,52 @@ def test_outside_group_still_requires_a_near_field_entry_member():
     result = selector().select((target(1,x=500,y=0),target(2,x=500,y=45)))
     assert result.plan is None
     assert "outside_near_field" in result.rejections
+
+
+@pytest.mark.parametrize("cls,radius", [(GREEN, math.hypot(40, 40) / 2), (BLACK, 40 / math.sqrt(3))])
+def test_supply_grasp_travel_places_physical_base_behind_closed_tips(cls, radius):
+    grasp_selector = selector(target_final_x_mm=142.0)
+    plan = grasp_selector.select((target(cls=cls, x=300.0),)).plan
+    assert plan is not None
+    closed_front = grasp_selector.kinematics.left_tip_position(0).x
+    assert 300.0 - plan.forward_distance_mm + radius <= closed_front + 1e-9
+    assert plan.forward_distance_mm == pytest.approx(300.0 - (closed_front - radius))
+    diagnostic = grasp_selector.candidate_geometry(target(cls=cls, x=300.0))
+    assert diagnostic.target_final_x_mm == pytest.approx(closed_front - radius)
+    assert diagnostic.corridor_end_x_mm == pytest.approx(max(p.x for p in plan.regions[0]))
+
+
+def test_supply_endpoint_extension_checks_newly_swept_danger():
+    grasp_selector = selector(target_final_x_mm=142.0)
+    supply = target(x=300.0)
+    # The old centre-only travel ended at about 328 mm. The physical-base
+    # endpoint must also check the newly traversed space beyond that point.
+    danger = target(2, x=335.0, cls=BLUE)
+    selection = grasp_selector.select((supply, danger))
+    assert selection.plan is None
+    assert 'blocked_target:2:blue_danger' in selection.rejections
+
+
+@pytest.mark.parametrize("size", [40.0, 60.0])
+def test_supply_depth_uses_configured_base_size_and_preserves_distance_limit(size):
+    grasp_selector = selector(target_final_x_mm=142.0)
+    grasp_selector.target_geometry = physical_geometry_config(green_size_mm=size)
+    item = target(x=300.0, depth=150.0)
+    plan = grasp_selector.select((item,)).plan
+    assert plan is not None
+    expected = 300.0 + math.hypot(size, size) / 2 - 157.5
+    assert plan.forward_distance_mm == pytest.approx(expected)
+    grasp_selector.config = replace(grasp_selector.config, max_forward_distance_mm=expected - 1)
+    rejected = grasp_selector.select((item,))
+    assert rejected.plan is None
+    assert "forward_distance_exceeded" in rejected.rejections
+
+
+def test_supply_group_depth_checks_each_member_not_only_farthest_k0():
+    grasp_selector = selector(target_final_x_mm=142.0)
+    # The slightly nearer box extends farther than the tetrahedron.
+    plan = grasp_selector.select((target(1, x=300, y=-30),
+                                  target(2, x=302, y=30, cls=BLACK))).plan
+    assert plan is not None
+    assert plan.member_ids == (1, 2)
+    assert plan.forward_distance_mm == pytest.approx(300 + math.hypot(40, 40) / 2 - 157.5)

@@ -40,6 +40,34 @@ class BreakupTarget:
             raise ValueError(f'Invalid radii: {self.contact_radius_mm!r}, {self.safety_radius_mm!r}')
 
 
+@dataclass(frozen=True, slots=True)
+class BreakupSceneContext:
+    """Immutable control-side inputs for a stopped scene's recovery decision."""
+
+    config: MatchRuntimeConfig
+    origin: FieldPoint
+    heading_rad: float
+    static_map: StaticFieldMap
+    field_bounds: tuple[float, float, float, float]
+    front_mm: float
+    previous_plan: BreakupPlan | None = None
+    attempt: int = 1
+    objective_field: FieldPoint | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.origin, FieldPoint) or not isinstance(self.static_map, StaticFieldMap):
+            raise ValueError(f"Invalid recovery pose/map: {self.origin!r}, {self.static_map!r}")
+        if (not math.isfinite(self.heading_rad) or not math.isfinite(self.front_mm)
+                or self.front_mm <= 0 or not all(math.isfinite(v) for v in self.field_bounds)
+                or len(self.field_bounds) != 4 or self.field_bounds[0] >= self.field_bounds[1]
+                or self.field_bounds[2] >= self.field_bounds[3]):
+            raise ValueError(f"Invalid recovery geometry: {self!r}")
+        if isinstance(self.attempt, bool) or not isinstance(self.attempt, int) or self.attempt < 1:
+            raise ValueError(f"Invalid recovery attempt: {self.attempt!r}")
+        if self.objective_field is not None and not isinstance(self.objective_field, FieldPoint):
+            raise ValueError(f"Invalid objective_field={self.objective_field!r}")
+
+
 def physical_radii(geometry: TargetGeometry) -> tuple[float, float]:
     """Inscribed contact disk and circumscribed safety disk, independent of yaw."""
     if isinstance(geometry, BoxTargetGeometry):
@@ -251,13 +279,10 @@ def plan_breakup(
             near = min(x0 for _, x0, _ in contact)
             approach_mm = max(0.0, near-config.cluster_breakup_standoff_mm) if approach else 0.0
             gap = max(0.0, near-approach_mm-front_mm)
-            cap = config.breakup_penetration_mm if attempt == 1 else config.breakup_retry_penetration_mm
-            # Stop after opening a local pocket; never chase the far end of a long chain.
-            local = [(t, x0, x1) for t, x0, x1 in contact if x0 <= near+cap]
-            penetration = min(cap, max(x1 for _, _, x1 in local)-near)
-            max_penetration = min(config.breakup_forward_distance_m*1000-gap,
-                                  config.breakup_backward_distance_m*1000-config.breakup_retreat_clearance_mm-config.breakup_braking_margin_mm,
-                                  penetration)
+            # Distances describe the complete closed-jaw action, not search caps.
+            forward = config.breakup_forward_distance_m * 1000
+            backward = config.breakup_backward_distance_m * 1000
+            depth = forward - gap
             aim_field = field_point(aim.center, origin, heading_rad)
             repeated = previous_aim is not None and math.hypot(aim_field.x-previous_aim.x, aim_field.y-previous_aim.y) <= aim.contact_radius_mm
             direction = heading_rad + bearing
@@ -275,10 +300,9 @@ def plan_breakup(
                                 f":start=({start.x:.1f},{start.y:.1f})"
                                 f":end=({end.x:.1f},{end.y:.1f}):margin_mm={margin:.1f}")
                 return False
-            def clear(depth: float) -> bool:
-                forward = gap+depth
+            def clear() -> bool:
                 end = endpoint(origin, approach_mm+forward+config.breakup_braking_margin_mm)
-                retreat_end = endpoint(origin, approach_mm+gap-config.breakup_retreat_clearance_mm-config.breakup_braking_margin_mm)
+                retreat_end = endpoint(origin, approach_mm+forward-backward-config.breakup_braking_margin_mm)
                 margin = robot_clearance_mm(config, front_mm)
                 if not path_clear(origin, end, margin, "robot_forward") or not path_clear(end, retreat_end, margin, "robot_retreat"):
                     return False
@@ -293,28 +317,7 @@ def plan_breakup(
                                t.safety_radius_mm+config.breakup_push_margin_mm,
                                f"target_{t.track_id}_{t.target_class.value}")
                            for t, p in affected)
-            if max_penetration <= 0 or not clear(0):
-                skip("local_push_not_clear_or_no_penetration", aim.track_id,
-                     near_mm=f"{near:.1f}", gap_mm=f"{gap:.1f}",
-                     penetration_mm=f"{penetration:.1f}",
-                     max_penetration_mm=f"{max_penetration:.1f}", blocked_path=blocked_path,
-                     physical_field_bounds=field_bounds)
-                continue
-            depth = max_penetration
-            if not clear(max_penetration):
-                low, high = 0.0, max_penetration
-                for _ in range(16):
-                    mid = (low+high)/2
-                    if clear(mid):
-                        low = mid
-                    else:
-                        high = mid
-                depth = low
-            # 局部接触集自身的纵向跨度就是推穿它所需的全部行程：比固定门槛浅的
-            # 团只要能整段推穿就成立，不该被门槛永久淘汰。40 mm 正四面体黑核的
-            # 内切接触盘只有 2r≈23 mm，取固定门槛（10+20=30 mm）时它永远选不出
-            # 瞄准点；刹车余量已经由行程上限和扫掠外延各扣一次，不该再当成
-            # 物料深度要求。门槛取两者较小值后，浅团必须整段推穿才算成立。
+            penetration = max(x1 for _, _, x1 in contact) - near
             minimum_depth = min(config.breakup_min_penetration_mm
                                 + config.breakup_braking_margin_mm, penetration)
             if depth < minimum_depth or (repeated and depth <= previous_penetration_mm+1e-6):
@@ -322,7 +325,13 @@ def plan_breakup(
                      depth_mm=f"{depth:.1f}", minimum_mm=f"{minimum_depth:.1f}",
                      repeated=repeated, blocked_path=blocked_path)
                 continue
-            forward = gap+depth
+            if backward < config.breakup_retreat_clearance_mm + config.breakup_braking_margin_mm:
+                skip("retreat_below_clearance", aim.track_id, backward_mm=backward)
+                continue
+            if not clear():
+                skip("fixed_push_path_blocked", aim.track_id, blocked_path=blocked_path,
+                     forward_mm=forward, backward_mm=backward)
+                continue
             hit_ids = tuple(t.track_id for t, x0, _ in contact if x0 <= near+depth)
             if aim.track_id not in hit_ids:
                 # An aim member that would remain beyond the selected local
@@ -333,7 +342,7 @@ def plan_breakup(
                 continue
             density = sum(math.hypot(t.center.x-aim.center.x, t.center.y-aim.center.y) <= config.cluster_group_ground_mm for t in group)
             plan = BreakupPlan(ids, hit_ids, aim.track_id, aim.center, direction, approach_mm,
-                               forward, depth+config.breakup_retreat_clearance_mm+config.breakup_braking_margin_mm, depth,
+                               forward, backward, depth,
                                min(t.capture_timestamp_ns for t in group), attempt, points, aim_field,
                                config.robot_footprint_radius_mm, rejection_reasons)
             blocked_priority = not bool(priority_ids.intersection(ids))

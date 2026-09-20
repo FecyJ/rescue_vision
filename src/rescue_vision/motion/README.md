@@ -12,6 +12,12 @@
 同一静止区间跨应用会话保留；真实轮计数变化、旋转、无效传感器、重复/倒退设备样本
 或遥测间断会使它失效。状态机不能用当前轮询时刻冒充停车时刻；对象不打开设备或线程。
 
+`relative_action.RelativeActionController` 为 `match_nb` 提供相对定角度/定距离闭环。
+它使用编码器行程、IMU 航向/角速度和连续静止证据，按实际遥测年龄、轮速命令刷新周期
+和可标定的执行响应提前计算制动区，再输出高速、减速或低速修正目标；最终完成必须同时
+满足几何误差、轮速/角速度门限和新遥测停稳确认。它不直接访问 UART，最终轮速仍由
+`MotionController` 的线/角加减速度限制下发。
+
 树莓派与 STM32 接口以
 [`docs/树莓派与单片机通信协议v3.md`](../../../docs/树莓派与单片机通信协议v3.md)
 为唯一权威。树莓派端已经使用 COBS、CRC16 和固定长度二进制消息统一运动、
@@ -26,13 +32,14 @@
 
 | 入口 | 输入 | 输出或语义 |
 | --- | --- | --- |
-| `MotionLimits` | 轮距、车体/车轮速度上下限与单轮加速度上限、左右轮速度权重、远程有效期上限 | 创建时严格校验 |
+| `MotionLimits` | 轮距、车体/车轮速度上限、独立线/角加减速度上限、左右轮速度权重、远程有效期上限 | 创建时严格校验 |
 | `MotionController` | UART 帧通道、`MotionLimits` | STM32 运动控制器 |
+| `RelativeActionController` | 相对距离/角度目标、编码器/IMU反馈、遥测年龄和停稳证据 | 生成高速—制动—低速收尾的车体 twist；不直接访问硬件 |
 | `MotionController.drive()` | 前进速度 m/s、逆时针角速度 rad/s | 差速换算后设置左右轮目标 |
 | `drive_wheel_limited()` | 分别合法的车体线速度和角速度，可选单次 `min_wheel_velocity_m_s` | 必要时同比缩放并返回实际 twist，使单轮不超限；单次下限缺省使用 `MotionLimits` 全局值 |
 | `set_wheel_speeds()` | 左右轮速度 m/s，可选单次 `min_wheel_velocity_m_s` | 绕过车体 twist 换算；非零目标会提升到单次下限或全局 `min_wheel_velocity_m_s`，仍执行轮速限幅校验 |
-| `set_wheel_acceleration_limit_m_s2()` | 临时单轮最大加速度 m/s² 或 `None` | 限制后续速度斜坡；`None` 恢复 `motion.max_wheel_acceleration_m_s2`，临时值可超过全局基准 |
-| `update()` | 可选本机单调时间 ns | 按单轮最大加速度推进，并至少 20 Hz 刷新轮速；返回是否发送 |
+| `set_acceleration_limits()` | 四项可选车体线/角加减速度上限 | 每个 `None` 恢复 `motion` 中对应全局值；只影响后续速度斜坡 |
+| `update()` | 可选本机单调时间 ns | 按车体线/角加减速度推进，再换算轮速并至少 20 Hz 刷新；返回是否发送 |
 | `MotionControlTimingError` | 活动控制更新间隔超过 200 ms | 先发送柔和停车，再终止当前控制链路 |
 | `MotionStallError` | 有效编码器在持续轮速命令下不变化 | 先发送柔和停车，再终止当前控制链路 |
 | `forward()` / `backward()` | 非负速度 m/s | 直行前进/后退 |
@@ -100,12 +107,17 @@ right = (linear + angular × wheel_track / 2) × right_wheel_speed_weight
 时，会同比缩放两个分量以保持曲率，并在执行结果和运动日志中记录实际 twist。
 每个非零轮速目标都会先按单次指定的 `min_wheel_velocity_m_s` 抬升；未指定时使用
 `MotionLimits.min_wheel_velocity_m_s`，精确的零目标仍保持为零。单次参数允许显式传入
-`0` 以取消该次非零轮速抬升；上层精细闭环可以通过单次参数使用独立下限，但普通运动仍使用全局值。起停过渡和最终轮速仍由
-`max_wheel_acceleration_m_s2` 限制。这个最低值是减速
-电机可持续工作的目标速度，不应用于柔和停车的零目标。`drive_wheel_limited()`
+`0` 以取消该次非零轮速抬升；上层精细闭环可以通过单次参数使用独立下限，但普通运动仍使用全局值。这个最低值是减速
+电机可持续工作的目标速度，不应用于柔和停车的零目标；起停过渡由下述四项车体
+加减速度限制。`drive_wheel_limited()`
 返回的 twist 仍表示车体侧请求（以及必要的最高轮速缩放），单轮最低值可能使
 实际左右轮相对该 twist 产生最小速度量化偏差。
-速度变化率限制同时作用于直线加速和转向跳变。`target_heading` 在定位或 IMU 尚未提供其显式
+
+速度斜坡由 `max_linear_acceleration_m_s2`、`max_linear_deceleration_m_s2`、
+`max_angular_acceleration_rad_s2` 和 `max_angular_deceleration_rad_s2` 分别限制。
+同向增大使用加速度，同向减小或回零使用减速度；换向时先按减速度到零，剩余周期
+才按加速度进入反向。线速度和角速度同时变化时按两者允许的较小进度同步推进，保持
+过渡曲率，并在随后统一换算左右轮。`target_heading` 在定位或 IMU 尚未提供其显式
 参考系前也会被拒绝并停车。
 
 ## 1. 从运行配置装配
@@ -180,7 +192,7 @@ controller.update()
 `SOFT_BRAKE`，清零本地目标并抛出 `MotionControlTimingError`，上层随后退出
 会话。静止时的长间隔只会刷新零轮速，不误报活动控制故障。
 远程手柄在死手仍开启时回中，执行器会调用 `drive(0, 0)` 设置零目标，再由
-同一 `update()` 循环按 `max_wheel_acceleration_m_s2` 逐级降低左右轮命令；
+同一 `update()` 循环按线/角减速度上限逐级降低车体 twist 和左右轮命令；
 不会直接发送柔和停车命令。死手关闭、命令过期、非法输入及退出
 仍使用独立的柔和停车安全路径。
 
@@ -225,8 +237,8 @@ controller.update()
 ```
 
 该方法不使用 `wheel_track_m` 做换算，但仍检查
-`max_wheel_velocity_m_s`，并和 `drive()` 共用
-`max_wheel_acceleration_m_s2` 与 `update()`。上层一般应优先使用
+`max_wheel_velocity_m_s`；控制器先按轮距和权重反解车体 twist，再与 `drive()` 共用
+四项车体加减速度上限和 `update()`。上层一般应优先使用
 `drive()`，避免多个模块各自实现差速公式。
 
 ## 4. 前进、后退和原地转向
@@ -500,10 +512,10 @@ finally:
 - 远程夹爪不受运动死手控制，但任一按下状态必须持续刷新；客户端松开时发送
   两个状态均为 `false` 的命令。到期、断线或调用 `stop()` 会停止后续角度推进并
   保留最近目标，不自动开爪或闭爪。
-- 远程 twist 的 payload 和电脑端协议不变；最大加速度以及夹爪机械端点/
+- 远程 twist 的 payload 和电脑端协议不变；四项车体加减速度以及夹爪机械端点/
   全行程时间来自车端运行配置
   运行配置，不由客户端逐条指定，避免绕过统一安全上限。
-- 死手保持开启且 twist 回到零时，零目标和其他有效目标一样经过单轮加速度
+- 死手保持开启且 twist 回到零时，零目标和其他有效目标一样经过车体减速度
   限制；普通回中不发送 `SOFT_BRAKE`，只由周期轮速命令逐步降到零。
 - 死手关闭、命令过期、非法 payload、未知控制模式和循环正常退出均进入柔和
   停车；`run_remote_motion()` 的 `SOFT_BRAKE` 应答超时会保持零速并重试，底层
@@ -517,3 +529,12 @@ finally:
 
 真机还需核对实际左右轮正方向、实测轮距、轮速上限、急停锁存/恢复、断 UART
 和杀进程行为。上述项目目前均为“未验证”。
+
+### 抓取任务的连续静止证据
+
+`StationaryMotionEvidence` 跨搜索、近场及恢复阶段保存编码器/IMU连续证据。
+`diagnostic(now_ns)` 的 `stationary_reason` 区分 `encoder_motion`、`rotation`、
+`sensor_invalid`、`sample_overrun_or_gyro_saturated`、`duplicate_or_reversed_device_sample`、
+`host_sample_gap`、`device_sample_gap` 和 `telemetry_age_invalid`。
+`continuous_stationary` 才表示当前连续静止；`first_sample` 仍不足以证明静止。
+采集/遥测时刻统一为主机单调ns，设备us只用于采样连续性。零速命令不更新证据。

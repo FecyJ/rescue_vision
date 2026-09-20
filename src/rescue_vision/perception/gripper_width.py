@@ -13,11 +13,7 @@ import numpy as np
 from rescue_vision.geometry.ground_projector import GroundProjector
 from rescue_vision.geometry.types import GroundPoint, UndistortedPixel
 from rescue_vision.perception.detector import MODEL_GROUND_FORWARD_BIAS_MM
-from rescue_vision.perception.types import (
-    ColorSegmentationStatus,
-    TargetClass,
-    TargetObservation,
-)
+from rescue_vision.perception.types import TargetClass, TargetObservation
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,6 +265,24 @@ def _mask_pixels_in_full_image(
     )
 
 
+def _envelope_pixels(
+    observation: TargetObservation,
+    *,
+    min_mask_pixels: int,
+) -> tuple[UndistortedPixel, ...]:
+    """Use HSV geometry when present, otherwise the model bbox bottom edge."""
+
+    if cv2.countNonZero(observation.color_segmentation.mask) >= min_mask_pixels:
+        pixels = _mask_pixels_in_full_image(observation)
+        if pixels:
+            return pixels
+    box = observation.box
+    return (
+        UndistortedPixel(box.x_min, box.y_max),
+        UndistortedPixel(box.x_max, box.y_max),
+    )
+
+
 def estimate_gripper_width(
     observation: TargetObservation,
     ground_projector: GroundProjector,
@@ -277,9 +291,8 @@ def estimate_gripper_width(
     """估计一个横向居中目标的地面宽度。
 
     只有目标 K0 已成功投影、其中心满足严格开区间
-    ``-center_y_half_range_mm < y < center_y_half_range_mm``，并且颜色分割
-    已被接受时才返回结果。掩码前景像素全部通过现有 ``GroundProjector``
-    投影到机器人地面系，再在 ``y`` 方向取极值。
+    ``-center_y_half_range_mm < y < center_y_half_range_mm`` 时返回结果。
+    HSV 掩码只提供优先几何；掩码不足或歧义时改用模型 bbox 底边。
     """
 
     if not isinstance(observation, TargetObservation):
@@ -309,17 +322,10 @@ def estimate_gripper_width(
         < estimator_config.center_y_half_range_mm
     ):
         return None
-    if (
-        observation.color_segmentation.status
-        is not ColorSegmentationStatus.ACCEPTED
-    ):
-        return None
-
-    if cv2.countNonZero(observation.color_segmentation.mask) < estimator_config.min_mask_pixels:
-        return None
-    pixels = _mask_pixels_in_full_image(observation)
-    if not pixels:
-        return None
+    pixels = _envelope_pixels(
+        observation,
+        min_mask_pixels=estimator_config.min_mask_pixels,
+    )
     ground_points = ground_projector.pixels_to_ground(pixels)
     if len(ground_points) != len(pixels):
         raise RuntimeError(
@@ -398,13 +404,9 @@ def measure_target_envelope(
     """与居中门限无关的单目标测量；无有效 K0/颜色掩码时返回缺失。"""
     if isinstance(min_mask_pixels, bool) or not isinstance(min_mask_pixels, int) or min_mask_pixels <= 0:
         raise ValueError(f"min_mask_pixels must be a positive integer, got {min_mask_pixels!r}.")
-    if observation.ground_point is None or observation.color_segmentation.candidate_class is not observation.target_class:
+    if observation.ground_point is None:
         return None
-    if cv2.countNonZero(observation.color_segmentation.mask) < min_mask_pixels:
-        return None
-    pixels = _mask_pixels_in_full_image(observation)
-    if not pixels:
-        return None
+    pixels = _envelope_pixels(observation, min_mask_pixels=min_mask_pixels)
     points = ground_projector.pixels_to_ground(pixels)
     xs = [point.x + MODEL_GROUND_FORWARD_BIAS_MM for point in points]
     ys = [point.y for point in points]

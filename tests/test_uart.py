@@ -259,6 +259,26 @@ def test_reader_error_is_reported_and_port_still_closes() -> None:
         error = wait_for_failure(channel, UartError)
 
     assert isinstance(error.__cause__, OSError)
+    assert "USB disconnected" in str(error)
+    assert "/dev/test-uart" in str(error)
+    assert fake.closed
+
+
+def test_write_error_reports_partial_progress_and_underlying_cause() -> None:
+    class FailingWriteSerial(FakeSerial):
+        def write(self, data: bytes) -> int:
+            if self.written:
+                raise OSError("injected write timeout")
+            return super().write(data)
+
+    fake = FailingWriteSerial(maximum_write_size=2)
+    channel = make_channel(fake)
+    with channel, pytest.raises(UartError) as raised:
+        channel.send(b"12345")
+    assert "2/5" in str(raised.value)
+    assert "injected write timeout" in str(raised.value)
+    assert "/dev/test-uart" in str(raised.value)
+    assert isinstance(raised.value.__cause__, OSError)
     assert fake.closed
 
 

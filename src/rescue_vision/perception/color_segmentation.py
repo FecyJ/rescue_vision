@@ -62,12 +62,17 @@ def _class_mask(
     roi_hsv: np.ndarray,
     target_class: TargetClass,
     config: HsvColorClassifierConfig,
+    *,
+    shadow_min_value: int | None = None,
 ) -> np.ndarray:
     mask = np.zeros(roi_hsv.shape[:2], dtype=np.uint8)
     for hsv_range in config.ranges_for(target_class):
+        lower = hsv_range.lower
+        if shadow_min_value is not None:
+            lower = (lower[0], lower[1], min(lower[2], shadow_min_value))
         current = cv2.inRange(
             roi_hsv,
-            np.asarray(hsv_range.lower, dtype=np.uint8),
+            np.asarray(lower, dtype=np.uint8),
             np.asarray(hsv_range.upper, dtype=np.uint8),
         )
         mask = cv2.bitwise_or(mask, current)

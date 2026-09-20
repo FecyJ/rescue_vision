@@ -200,7 +200,7 @@ def test_unrelated_group_cannot_replace_confirming_core_or_extend_deadline():
     assert seq._breakup_phase_started_ns == deadline_start
 
 
-def test_forward_stops_before_open_and_retreat_uses_actual_travel():
+def test_forward_stops_before_reversing_and_retreat_keeps_configured_distance():
     seq=sequence(); frozen_plan(seq,forward=200)
     seq.state=MatchState.BREAKUP_FORWARD
     moving=tick(seq,1,10,distance=.05,speed=.1,observations=())
@@ -210,18 +210,15 @@ def test_forward_stops_before_open_and_retreat_uses_actual_travel():
     assert braking.gripper_posture is GripperPosture.CLOSED
     assert braking.soft_brake
     tick(seq,4,40,distance=.200,observations=())
-    opened=tick(seq,5,60,distance=.200,observations=())
-    assert opened.state is MatchState.OPEN_GRIPPER_SETTLE
-    assert opened.gripper_posture is GripperPosture.OPEN
-    # 后退距离 = 实际前进行程(200 mm) + 退出净空 + 刹车余量，跟着配置算。
-    assert seq._breakup_retreat_mm == pytest.approx(
-        200.0 - (seq._breakup_plan.forward_distance_mm - seq._breakup_plan.penetration_mm)
-        + seq.config.breakup_retreat_clearance_mm
-        + seq.config.breakup_braking_margin_mm
-    )
+    retreat=tick(seq,5,60,distance=.200,observations=())
+    assert retreat.state is MatchState.BREAKUP_BACKWARD
+    assert retreat.gripper_posture is GripperPosture.CLOSED
+    assert seq._breakup_retreat_mm == seq._breakup_plan.backward_distance_mm
     assert len(seq._breakup_attempts)==1
-    assert tick(seq,6,70,distance=.200,observations=()).state is MatchState.OPEN_GRIPPER_SETTLE
-    assert tick(seq,7,1100,distance=.200,observations=()).state is MatchState.BREAKUP_BACKWARD
+    reverse = tick(seq,6,70,distance=.200,observations=())
+    assert reverse.state is MatchState.BREAKUP_BACKWARD
+    assert reverse.linear_velocity_m_s < 0
+    assert reverse.gripper_posture is GripperPosture.CLOSED
 
 
 def test_retry_budget_is_only_consumed_by_completed_pushes():

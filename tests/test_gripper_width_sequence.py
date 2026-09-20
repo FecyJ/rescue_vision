@@ -82,7 +82,7 @@ def test_opening_uses_submitted_plan_without_later_visual_recheck():
     assert opening.state is State.OPENING
     waiting=seq.step(100_000_001,None,cumulative_distance_m=0)
     assert waiting.state is State.FORWARD
-    assert waiting.reason=='forward_open_loop'
+    assert waiting.reason=='forward_encoder_heading_hold'
     assert waiting.linear_velocity_m_s>0
 
 
@@ -171,35 +171,17 @@ def test_alignment_verify_loss_returns_to_aligning_without_resetting_timeout() -
     assert opening.state is State.OPENING
 
 
-def test_delayed_opposite_angle_with_motion_does_not_reverse_unfinished_turn() -> None:
-    """换向不再依赖静止遥测：有底盘运动证据时也立即反向。"""
-
+def test_motion_before_planning_cannot_start_fine_alignment() -> None:
     seq = sequence()
-    positive = selector().select((target(y=100),)).plan
-    negative = selector().select(
-        (target(y=-100, timestamp=100_000_000, frame=1),)
-    ).plan
-    assert positive is not None and negative is not None
-
-    # 注入「仍在运动」的遥测样本：旧实现会为此刹车并等待新的静止区间。
     seq.observe_motion(motion_sample(0, count=0))
     seq.observe_motion(motion_sample(10_000_000, count=1))
-    first = seq.step(
-        0,
-        replace(prep(positive, ready=False), checked_member_ids=None),
-        cumulative_distance_m=0,
-    )
-    assert first.state is State.ALIGNING
-    assert first.angular_velocity_rad_s > 0.0
-
-    crossed = seq.step(
-        100_000_000,
-        prep(negative, 100_000_000, ready=False),
-        cumulative_distance_m=0,
-    )
-    assert crossed.state is State.ALIGNING
-    assert crossed.angular_velocity_rad_s > 0.0
-    assert not crossed.soft_brake
+    for now in range(10_000_000, 100_000_001, 10_000_000):
+        seq.observe_motion(motion_sample(now, count=now // 10_000_000))
+        plan = selector().select((target(y=100, timestamp=now, frame=now),)).plan
+        decision = seq.step(now, prep(plan, now, ready=False), cumulative_distance_m=0)
+        assert decision.angular_velocity_rad_s == 0
+        assert decision.gripper_angles_deg is None
+        assert decision.reason == "waiting_stationary_scene"
 
 
 def test_confirmation_window_is_the_only_preopening_frame_gate() -> None:
@@ -380,17 +362,17 @@ def test_stale_or_degraded_observation_does_not_gate_open_loop_forward():
     start(seq,plan)
     missing=prep(plan,100_000_001)
     coast=seq.step(100_000_001,missing,cumulative_distance_m=.01)
-    assert coast.state is State.FORWARD and coast.reason=='forward_open_loop'
+    assert coast.state is State.FORWARD and coast.reason=='forward_encoder_heading_hold'
     assert coast.linear_velocity_m_s==pytest.approx(.1)
     stale=seq.step(2_000_000_001,None,cumulative_distance_m=.02)
-    assert stale.state is State.FORWARD and stale.reason=='forward_open_loop'
+    assert stale.state is State.FORWARD and stale.reason=='forward_encoder_heading_hold'
 
 
 def test_new_obstacle_after_plan_does_not_exit_open_loop_action():
     seq=sequence(); plan=selector().select((target(),)).plan
     start(seq,plan)
     decision=seq.step(100_000_001,prep(plan,100_000_001),cumulative_distance_m=0)
-    assert decision.state is State.FORWARD and decision.reason=='forward_open_loop'
+    assert decision.state is State.FORWARD and decision.reason=='forward_encoder_heading_hold'
     assert not decision.soft_brake
 
 
@@ -439,8 +421,9 @@ def test_confirmation_does_not_count_the_same_frame_twice():
         locked_ids=ids,
     )
 
-    assert first_confirmed.confirmation_progress == (1, 3)
-    assert duplicate.confirmation_progress == (1, 3)
+    assert first.confirmation_progress == (1, 3)
+    assert first_confirmed.confirmation_progress == (2, 3)
+    assert duplicate.confirmation_progress == (2, 3)
 
 
 def test_plan_and_preparation_ages_use_their_real_timestamps():
@@ -466,7 +449,8 @@ def test_confirmation_window_requires_distinct_valid_frames():
     first=worker.update(snapshot(0,(target(),)),locked_ids=None)
     ids=first.selection.plan.member_ids
     result = worker.update(snapshot(1,()),locked_ids=ids)
-    assert result.confirmation_count == 0
+    assert result.confirmation_count == 1
+    assert not result.ready
     for i in (2, 3, 4):
         result=worker.update(snapshot(i,(target(),)),locked_ids=ids)
     assert result.ready
@@ -494,7 +478,7 @@ def test_preparation_session_uses_handoff_prior_for_first_tentative_frame():
         ),
     )
     assert result.targets[0].handoff_matched
-    assert not result.targets[0].confirmed
+    assert result.targets[0].confirmed
     assert result.selection.plan is not None
 
 
@@ -557,7 +541,7 @@ def test_required_handoff_reports_disappearance_instead_of_switching_plan():
     )
 
     assert missing.selection.plan is None
-    assert missing.selection.rejections == ("handoff_target_missing",)
+    assert missing.selection.rejections == ("locked_member_class_changed",)
 
 
 def test_preparation_session_uses_current_servo_reach_without_alignment_plan():
@@ -606,7 +590,7 @@ def test_preparation_session_aligns_target_outside_current_servo_reach():
     assert 0.0 < result.selection.plan.alignment_angle_rad < math.atan2(100.0, 300.0)
 
 
-def test_first_green_preparation_waits_for_handoff_instead_of_selecting_neighbor():
+def test_first_green_preparation_freezes_distinct_first_frame_target():
     s = selector()
     worker = GraspPreparationSession(
         GraspTargetTracker(
@@ -627,7 +611,8 @@ def test_first_green_preparation_waits_for_handoff_instead_of_selecting_neighbor
         ),
     )
 
-    assert result.selection.plan is None
+    assert result.selection.plan is not None
+    assert result.targets[0].confirmed
 
 
 def test_confirmation_latch_survives_a_short_target_leak():
@@ -643,7 +628,7 @@ def test_confirmation_latch_survives_a_short_target_leak():
     assert leaked.confirmation_progress == (3, 3)
 
 
-def test_general_handoff_waits_for_local_companion_then_confirms_both():
+def test_general_handoff_freezes_distinct_local_companion_on_first_frame():
     planner = selector()
     worker = GraspPreparationSession(
         GraspTargetTracker(
@@ -657,7 +642,8 @@ def test_general_handoff_waits_for_local_companion_then_confirms_both():
         ground_point=GroundPoint(334, 5), source_track_id=6,
     )
     first = worker.update(snapshot(0, targets), locked_ids=None, handoff_prior=prior)
-    assert first.selection.plan is None
+    assert first.selection.plan is not None
+    assert len(first.selection.plan.member_ids) == 2
     second = worker.update(snapshot(1, targets), locked_ids=None, handoff_prior=prior)
     assert second.selection.plan is not None
     ids = second.selection.plan.member_ids
@@ -668,13 +654,35 @@ def test_general_handoff_waits_for_local_companion_then_confirms_both():
     assert confirmed.selection.plan.member_ids == ids
 
 
+def test_stopped_scene_does_not_freeze_high_overlap_duplicate_detection():
+    planner = selector()
+    worker = GraspPreparationSession(
+        GraspTargetTracker(
+            TrackingConfig(2, 80, .1, 500, 1, .1).build_tracker(),
+            projector(), planner.config,
+        ), planner,
+    )
+    original = target(x=300, y=0)
+    duplicate = target(2, x=302, y=1, cls=BLACK)
+
+    result = worker.update(snapshot(0, (original, duplicate)), locked_ids=None)
+
+    assert result.targets[0].confirmed
+    assert not result.targets[1].confirmed
+    assert result.targets[0].observation.box.iou(
+        result.targets[1].observation.box
+    ) > planner.config.stopped_scene_new_target_max_bbox_iou
+    assert result.selection.plan is None
+    assert "blocked_target:2:black_core" in result.selection.rejections
+
+
 def test_rejected_orange_alternative_does_not_starve_locked_green_confirmation():
     worker = session()
     seq = sequence()
     targets = (
         target(),
         target(2, x=400, y=180, cls=TargetClass.ORANGE_INJURED),
-        target(3, x=400, y=220, cls=BLUE),
+        target(3, x=400, y=185, cls=BLUE),
     )
     first = worker.update(snapshot(0, targets), locked_ids=None)
     assert first.selection.plan is not None
@@ -683,7 +691,7 @@ def test_rejected_orange_alternative_does_not_starve_locked_green_confirmation()
     assert seq.step(0, first, cumulative_distance_m=0).state is State.VERIFYING
     for frame in (1, 2, 3):
         result = worker.update(snapshot(frame, targets), locked_ids=ids)
-        assert result.confirmation_progress == (frame, 3)
+        assert result.confirmation_progress == (min(frame + 1, 3), 3)
         assert result.selection.rejections == ()
         decision = seq.step(frame * 10_000_000, result, cumulative_distance_m=0)
     assert decision.state is State.OPENING
@@ -1012,7 +1020,7 @@ def test_candidate_replan_starts_a_fresh_candidate_timeout():
     replanning = seq.step(40_000, invalid, cumulative_distance_m=0)
     assert replanning.reason.startswith('candidate_replan:')
 
-    replacement = selector().select((target(2, y=-100),)).plan
+    replacement = selector().select((target(2, y=-100, timestamp=50_000, frame=1),)).plan
     assert replacement is not None
     seq.step(
         50_000,
@@ -1131,7 +1139,7 @@ def test_even_fresh_plan_cannot_commit_after_observed_motion():
     plan = selector().select((target(timestamp=20_000_000, frame=1),)).plan
     decision = seq.step(40_000_000, replace(prep(plan, 20_000_000), checked_member_ids=None),
                         cumulative_distance_m=0)
-    assert decision.reason == 'confirmation_waiting_for_stationary_capture'
+    assert decision.reason == 'waiting_stationary_scene'
     assert decision.gripper_angles_deg is None
 
 

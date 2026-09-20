@@ -339,7 +339,10 @@ class UartFrameChannel:
             except BaseException as exc:
                 if isinstance(exc, UartError):
                     raise
-                raise UartError(f"UART write failed for {self.device!r}.") from exc
+                raise UartError(
+                    f"UART write failed for {self.device!r} at byte "
+                    f"{offset}/{len(payload)}: {type(exc).__name__}: {exc}"
+                ) from exc
 
     def send_frame(self, payload: bytes) -> None:
         """COBS 编码一个非空解码态帧并附加 ``0x00``。"""
@@ -484,7 +487,8 @@ class UartFrameChannel:
         if isinstance(self._reader_error, UartError):
             raise self._reader_error
         raise UartError(
-            f"UART reader failed for {self.device!r}."
+            f"UART reader failed for {self.device!r}: "
+            f"{type(self._reader_error).__name__}: {self._reader_error}"
         ) from self._reader_error
 
     def _require_healthy(self) -> _SerialPort:

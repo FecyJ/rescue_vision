@@ -19,7 +19,10 @@ from test_match_breakup_latency import scene
 @pytest.mark.parametrize('confirmation_frames', [1, 3])
 def test_delayed_rotating_search_aligns_small_far_core_then_pushes(delay_ms, period_ms, poll_ms, confirmation_frames):
     seq = sequence()
-    seq.config = replace(seq.config, breakup_confirmation_frames=confirmation_frames)
+    # Exercise delayed far-ray alignment with an explicitly longer test action;
+    # the production 0.5 m action must reject a core beyond its contact reach.
+    seq.config = replace(seq.config, breakup_confirmation_frames=confirmation_frames,
+                         breakup_forward_distance_m=0.8)
     specs = ((700., 130., TargetClass.BLACK_CORE, 10.),
              (750., 160., TargetClass.GREEN_SUPPLY, 40.))
     heading = -0.15
@@ -51,7 +54,7 @@ def test_delayed_rotating_search_aligns_small_far_core_then_pushes(delay_ms, per
             # Compensation keeps the physical field aim fixed through the turn.
             assert any(math.hypot(frozen.aim_field.x-x,frozen.aim_field.y-y)<1.
                        for x,y,_,_ in specs)
-        if decision.state is MatchState.OPEN_GRIPPER_SETTLE:
+        if decision.state is MatchState.BREAKUP_BACKWARD:
             assert frozen is not None
             assert (distance-start_push)*1000 >= frozen.forward_distance_mm-1.
             break

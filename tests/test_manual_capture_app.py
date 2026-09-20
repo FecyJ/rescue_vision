@@ -574,7 +574,7 @@ def test_manual_session_routes_capture_and_motion_then_stops_on_disconnect(
     executor = RemoteMotionExecutor(
         MotionController(
             car,
-            MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 500),
+            MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 0.5, 5.0, 5.0, 500),
         )
     )
     gripper_executor = RemoteGripperExecutor(
@@ -893,7 +893,7 @@ def test_manual_session_switches_between_raw_and_perception_video(tmp_path) -> N
     executor = RemoteMotionExecutor(
         MotionController(
             car,
-            MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 500),
+            MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 0.5, 5.0, 5.0, 500),
         )
     )
     renderer = FakePerceptionRenderer()
@@ -1119,7 +1119,7 @@ def test_manual_session_publishes_bev_with_robot_ground_mapping(tmp_path) -> Non
     executor = RemoteMotionExecutor(
         MotionController(
             FakeCarChannel(),
-            MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 500),
+            MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 0.5, 5.0, 5.0, 500),
         )
     )
     renderer = FakeBevRenderer()
@@ -1195,7 +1195,7 @@ def test_recording_queue_overflow_faults_capture_and_requires_stop(
     executor = RemoteMotionExecutor(
         MotionController(
             car,
-            MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 500),
+            MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 0.5, 5.0, 5.0, 500),
         )
     )
     gripper_executor = RemoteGripperExecutor(
@@ -1317,7 +1317,7 @@ def test_manual_cycle_services_motion_between_slow_image_operations(
     car = FakeCarChannel()
     controller = MotionController(
         car,
-        MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 500),
+        MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 0.5, 5.0, 5.0, 500),
         monotonic_ns=clock,
     )
     controller.forward(0.2)
@@ -1556,7 +1556,7 @@ def test_camera_failure_faults_capture_and_stops_motion(tmp_path) -> None:
     executor = RemoteMotionExecutor(
         MotionController(
             car,
-            MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 500),
+            MotionLimits(0.2, 0.25, 1.0, 0.3, 0.5, 0.5, 5.0, 5.0, 500),
         )
     )
     gripper_executor = RemoteGripperExecutor(

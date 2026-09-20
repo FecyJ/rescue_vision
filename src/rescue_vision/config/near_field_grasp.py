@@ -11,12 +11,18 @@ __all__ = ["NearFieldGraspConfig"]
 class NearFieldGraspConfig:
     max_targets: int = 3
     max_candidates: int = 12
+    # 同一停车视野中新出现的目标，与已有目标的 bbox IoU 不超过此值时
+    # 视为独立物体并在当前会话首帧冻结，不等待 tracker 二次确认。
+    stopped_scene_new_target_max_bbox_iou: float = 0.20
     max_range_mm: float = 450.0
     # 已锁定目标允许超出进入半径的距离滞回，避免边界观测抖动立即换组。
     range_hysteresis_mm: float = 50.0
     max_forward_distance_mm: float = 450.0
-    # 绿/黑组前进结束时，最远目标 K0 希望保留在机器人前方的距离。
+    # 绿/黑组最远 K0 的期望终点上限；实体底面超过闭爪末端时按机械几何进一步揽入。
     target_final_x_mm: float = 110.0
+    # 贪心补夹绿/黑组的独立终点，单位 mm；未显式配置时与普通近场终点保持一致。
+    # 该值只由贪心会话的 NearFieldGraspPolicy 使用，降低它会增加前进行程。
+    greedy_target_final_x_mm: float = 110.0
     # 单个橙色目标前进结束时，最前 K0 底面中心希望保留在机器人前方的距离。
     # 颜色上表面投影的纵向拉长不作为前进深度。
     orange_target_final_x_mm: float = 142.0
@@ -52,7 +58,7 @@ class NearFieldGraspConfig:
     # 最终精对准区内的单轮最小速度，允许为 0，单位 m/s。
     fine_alignment_min_wheel_velocity_m_s: float = 0.0
     # 橙色伤员周围拒绝其它目标的地面半径，单位 mm。
-    orange_isolation_radius_mm: float = 50.0
+    orange_isolation_radius_mm: float = 10.0
     min_mask_pixels: int = 1
     # 可抓目标轨迹出现一次未知/普通质量异常后，需要连续多少个干净观测才恢复可选。
     # 已出现明确危险模型证据的轨迹不使用此恢复路径。
@@ -83,6 +89,7 @@ class NearFieldGraspConfig:
             "side_neighbor_longitudinal_margin_mm",
             "side_neighbor_lateral_margin_mm",
             "fine_alignment_min_wheel_velocity_m_s",
+            "stopped_scene_new_target_max_bbox_iou",
         }
         for field in fields(self):
             value = getattr(self, field.name)
@@ -98,11 +105,22 @@ class NearFieldGraspConfig:
             raise ValueError(f"near_field_grasp.max_targets must be <= 3, got {self.max_targets}.")
         if self.max_candidates < self.max_targets or self.max_candidates > 20:
             raise ValueError(f"near_field_grasp.max_candidates must be in [max_targets,20], got {self.max_candidates}.")
+        if self.stopped_scene_new_target_max_bbox_iou > 1.0:
+            raise ValueError(
+                "near_field_grasp.stopped_scene_new_target_max_bbox_iou must "
+                "be in [0,1]."
+            )
         if self.corridor_start_x_mm > self.target_final_x_mm:
             raise ValueError(
                 "near_field_grasp.corridor_start_x_mm must be <= "
                 f"target_final_x_mm, got {self.corridor_start_x_mm} > "
                 f"{self.target_final_x_mm}."
+            )
+        if self.corridor_start_x_mm > self.greedy_target_final_x_mm:
+            raise ValueError(
+                "near_field_grasp.corridor_start_x_mm must be <= "
+                f"greedy_target_final_x_mm, got {self.corridor_start_x_mm} > "
+                f"{self.greedy_target_final_x_mm}."
             )
         try:
             total = math.fsum(self.weights)

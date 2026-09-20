@@ -43,7 +43,10 @@ def limits() -> MotionLimits:
         max_linear_velocity_m_s=0.80,
         max_angular_velocity_rad_s=1.0,
         max_wheel_velocity_m_s=0.80,
-        max_wheel_acceleration_m_s2=1.0,
+        max_linear_acceleration_m_s2=1.0,
+        max_linear_deceleration_m_s2=1.0,
+        max_angular_acceleration_rad_s2=10,
+        max_angular_deceleration_rad_s2=10,
         min_wheel_velocity_m_s=0.001,
         max_remote_command_valid_for_ms=500,
     )
@@ -107,7 +110,10 @@ def test_motion_sequence_protocol_check_ignores_configured_speed_and_acceleratio
         max_linear_velocity_m_s=0.10,
         max_angular_velocity_rad_s=0.10,
         max_wheel_velocity_m_s=0.80,
-        max_wheel_acceleration_m_s2=0.10,
+        max_linear_acceleration_m_s2=0.10,
+        max_linear_deceleration_m_s2=0.10,
+        max_angular_acceleration_rad_s2=1,
+        max_angular_deceleration_rad_s2=1,
         min_wheel_velocity_m_s=0.02,
         max_remote_command_valid_for_ms=500,
     )
@@ -120,7 +126,10 @@ def test_sequence_controller_does_not_copy_configured_speed_or_acceleration() ->
     controller = _build_sequence_controller(config, FakeCarChannel())
 
     assert controller.limits.max_wheel_velocity_m_s == pytest.approx(32.767)
-    assert controller.limits.max_wheel_acceleration_m_s2 == pytest.approx(
+    assert controller.limits.max_linear_acceleration_m_s2 == pytest.approx(
+        1_000_000.0
+    )
+    assert controller.limits.max_linear_deceleration_m_s2 == pytest.approx(
         1_000_000.0
     )
     assert controller.limits.min_wheel_velocity_m_s == pytest.approx(1e-9)
@@ -153,7 +162,12 @@ def test_motion_sequence_runner_executes_all_phases_and_stops() -> None:
     )
     assert result.elapsed_s >= 4.743
     assert controller.target_wheel_speeds_m_s == (0.0, 0.0)
-    assert controller.wheel_acceleration_limit_m_s2 == pytest.approx(1.0)
+    assert controller.acceleration_limits.linear_acceleration_m_s2 == pytest.approx(
+        1.0
+    )
+    assert controller.acceleration_limits.linear_deceleration_m_s2 == pytest.approx(
+        1.0
+    )
     assert channel.sent
 
 

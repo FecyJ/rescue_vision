@@ -533,7 +533,7 @@ class RemoteMotionExecutor:
             )
             if zero_twist:
                 # 死手仍开启时，手柄回中是普通目标变化，必须与其他 twist
-                # 共用树莓派单轮加速度限制。真机固件的 b0,0 会让实测轮速
+                # 共用树莓派车体线/角减速度限制。真机固件的 b0,0 会让实测轮速
                 # 直接归零，只保留给死手关闭、超时和异常等安全停车路径。
                 self.controller.drive(0.0, 0.0)
                 applied_linear = 0.0

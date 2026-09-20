@@ -167,7 +167,7 @@ def test_only_final_push_keeps_gripper_open_after_normal_transport_close() -> No
     assert started.state is MatchState.TRANSPORT_FORWARD
     assert started.gripper_posture is GripperPosture.OPEN
     assert flow._safe_zone_phase == "forward_final_open"
-    assert flow.safe_zone_motion_acceleration_limit_m_s2 is not None
+    assert flow.safe_zone_motion_acceleration_limits is not None
 
     flow._action_settle_until_ns = 0
     flow._transport_forward_base_distance_m = 0.0

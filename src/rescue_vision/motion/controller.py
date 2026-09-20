@@ -26,7 +26,11 @@ from rescue_vision.motion.protocol import (
 )
 
 
-_WHEEL_COMMAND_REFRESH_NS = 40_000_000
+# The application may poll faster, but wheel commands are refreshed at this
+# bounded period.  Relative actions use the same value when estimating the
+# distance travelled before a new command can take effect.
+WHEEL_COMMAND_REFRESH_S = 0.04
+_WHEEL_COMMAND_REFRESH_NS = round(WHEEL_COMMAND_REFRESH_S * 1_000_000_000)
 _MAX_ACTIVE_UPDATE_GAP_NS = 200_000_000
 _WHEEL_REPLY_TIMEOUT_NS = 100_000_000
 _MAX_PENDING_WHEEL_COMMANDS = 4
@@ -65,6 +69,50 @@ def _finite(value: object, location: str) -> float:
 
 
 @dataclass(frozen=True, slots=True)
+class MotionAccelerationLimits:
+    """车体线/角速度分量的独立加减速度上限。"""
+
+    linear_acceleration_m_s2: float
+    linear_deceleration_m_s2: float
+    angular_acceleration_rad_s2: float
+    angular_deceleration_rad_s2: float
+
+    def __post_init__(self) -> None:
+        for name in (
+            "linear_acceleration_m_s2",
+            "linear_deceleration_m_s2",
+            "angular_acceleration_rad_s2",
+            "angular_deceleration_rad_s2",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _positive_finite(getattr(self, name), name),
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class MotionAccelerationOverrides:
+    """动作阶段对四项加减速度上限的可选覆盖。"""
+
+    linear_acceleration_m_s2: float | None = None
+    linear_deceleration_m_s2: float | None = None
+    angular_acceleration_rad_s2: float | None = None
+    angular_deceleration_rad_s2: float | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "linear_acceleration_m_s2",
+            "linear_deceleration_m_s2",
+            "angular_acceleration_rad_s2",
+            "angular_deceleration_rad_s2",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _positive_finite(value, name))
+
+
+@dataclass(frozen=True, slots=True)
 class MotionLimits:
     """小车运动学参数和赛外调试限速。"""
 
@@ -72,7 +120,10 @@ class MotionLimits:
     max_linear_velocity_m_s: float
     max_angular_velocity_rad_s: float
     max_wheel_velocity_m_s: float
-    max_wheel_acceleration_m_s2: float
+    max_linear_acceleration_m_s2: float
+    max_linear_deceleration_m_s2: float
+    max_angular_acceleration_rad_s2: float
+    max_angular_deceleration_rad_s2: float
     max_remote_command_valid_for_ms: int
     min_wheel_velocity_m_s: float = 0.02
     left_wheel_speed_weight: float = 1.0
@@ -88,7 +139,10 @@ class MotionLimits:
             "max_linear_velocity_m_s",
             "max_angular_velocity_rad_s",
             "max_wheel_velocity_m_s",
-            "max_wheel_acceleration_m_s2",
+            "max_linear_acceleration_m_s2",
+            "max_linear_deceleration_m_s2",
+            "max_angular_acceleration_rad_s2",
+            "max_angular_deceleration_rad_s2",
             "min_wheel_velocity_m_s",
             "left_wheel_speed_weight",
             "right_wheel_speed_weight",
@@ -175,8 +229,19 @@ class MotionController:
         self._monotonic_ns = monotonic_ns
         self._target_wheel_speeds_m_s = (0.0, 0.0)
         self._commanded_wheel_speeds_m_s = (0.0, 0.0)
-        self._wheel_acceleration_limit_m_s2 = (
-            limits.max_wheel_acceleration_m_s2
+        self._target_twist = (0.0, 0.0)
+        self._commanded_twist = (0.0, 0.0)
+        self._linear_acceleration_limit_m_s2 = (
+            limits.max_linear_acceleration_m_s2
+        )
+        self._linear_deceleration_limit_m_s2 = (
+            limits.max_linear_deceleration_m_s2
+        )
+        self._angular_acceleration_limit_rad_s2 = (
+            limits.max_angular_acceleration_rad_s2
+        )
+        self._angular_deceleration_limit_rad_s2 = (
+            limits.max_angular_deceleration_rad_s2
         )
         self._last_sent_wheel_speeds_mm_s = (0, 0)
         self._last_acceleration_update_ns = self._now()
@@ -209,31 +274,60 @@ class MotionController:
         return self._commanded_wheel_speeds_m_s
 
     @property
-    def wheel_acceleration_limit_m_s2(self) -> float:
-        """返回当前生效的单轮最大加速度，单位 m/s²。"""
+    def acceleration_limits(self) -> MotionAccelerationLimits:
+        """返回当前线加速、线减速、角加速和角减速上限。"""
 
-        return self._wheel_acceleration_limit_m_s2
+        return MotionAccelerationLimits(
+            linear_acceleration_m_s2=self._linear_acceleration_limit_m_s2,
+            linear_deceleration_m_s2=self._linear_deceleration_limit_m_s2,
+            angular_acceleration_rad_s2=self._angular_acceleration_limit_rad_s2,
+            angular_deceleration_rad_s2=self._angular_deceleration_limit_rad_s2,
+        )
 
-    def set_wheel_acceleration_limit_m_s2(
+    def set_acceleration_limits(
         self,
-        acceleration_m_s2: float | None,
+        *,
+        linear_acceleration_m_s2: float | None = None,
+        linear_deceleration_m_s2: float | None = None,
+        angular_acceleration_rad_s2: float | None = None,
+        angular_deceleration_rad_s2: float | None = None,
     ) -> None:
-        """设置临时单轮加速度上限；传入 ``None`` 恢复全局配置值。
+        """分别设置临时车体加减速度上限；``None`` 恢复对应全局值。
 
-        临时值可以独立于 ``MotionLimits`` 的全局基准。该方法只改变后续
-        ``update()`` 的速度斜坡，不会立即发送轮速或改变当前目标速度。
+        临时值可以独立于 ``MotionLimits`` 的全局基准。该方法只影响后续
+        :meth:`update` 的车体 twist 斜坡，不立即发送轮速或改变目标速度。
         """
 
-        if acceleration_m_s2 is None:
-            self._wheel_acceleration_limit_m_s2 = (
-                self.limits.max_wheel_acceleration_m_s2
-            )
-            return
-        acceleration = _positive_finite(
-            acceleration_m_s2,
-            "acceleration_m_s2",
+        self._linear_acceleration_limit_m_s2 = self._resolve_acceleration_limit(
+            linear_acceleration_m_s2,
+            self.limits.max_linear_acceleration_m_s2,
+            "linear_acceleration_m_s2",
         )
-        self._wheel_acceleration_limit_m_s2 = acceleration
+        self._linear_deceleration_limit_m_s2 = self._resolve_acceleration_limit(
+            linear_deceleration_m_s2,
+            self.limits.max_linear_deceleration_m_s2,
+            "linear_deceleration_m_s2",
+        )
+        self._angular_acceleration_limit_rad_s2 = self._resolve_acceleration_limit(
+            angular_acceleration_rad_s2,
+            self.limits.max_angular_acceleration_rad_s2,
+            "angular_acceleration_rad_s2",
+        )
+        self._angular_deceleration_limit_rad_s2 = self._resolve_acceleration_limit(
+            angular_deceleration_rad_s2,
+            self.limits.max_angular_deceleration_rad_s2,
+            "angular_deceleration_rad_s2",
+        )
+
+    @staticmethod
+    def _resolve_acceleration_limit(
+        value: float | None,
+        configured: float,
+        location: str,
+    ) -> float:
+        if value is None:
+            return configured
+        return _positive_finite(value, location)
 
     @property
     def gripper_target_angles_deg(self) -> tuple[float, float] | None:
@@ -374,9 +468,10 @@ class MotionController:
         # 错算成新目标可用的加速时间。
         self.update()
         self._target_wheel_speeds_m_s = (left, right)
+        self._target_twist = self._wheel_speeds_to_twist(left, right)
 
     def update(self, *, now_ns: int | None = None) -> bool:
-        """按单轮最大加速度推进目标并下发；有新命令时返回 ``True``。"""
+        """按车体线/角加减速度上限推进目标并下发。"""
 
         current_ns = self._now(now_ns)
         if current_ns < self._last_acceleration_update_ns:
@@ -415,11 +510,38 @@ class MotionController:
                 "Active motion update gap exceeded 200 ms; "
                 f"soft brake was sent after {gap_ms:.3f} ms."
             )
-        maximum_delta = self._wheel_acceleration_limit_m_s2 * elapsed_s
-        previous_left, previous_right = self._commanded_wheel_speeds_m_s
-        target_left, target_right = self._target_wheel_speeds_m_s
-        next_left = _move_toward(previous_left, target_left, maximum_delta)
-        next_right = _move_toward(previous_right, target_right, maximum_delta)
+        previous_linear, previous_angular = self._commanded_twist
+        target_linear, target_angular = self._target_twist
+        candidate_linear = _move_axis_with_acceleration_limits(
+            previous_linear,
+            target_linear,
+            acceleration=self._linear_acceleration_limit_m_s2,
+            deceleration=self._linear_deceleration_limit_m_s2,
+            elapsed_s=elapsed_s,
+        )
+        candidate_angular = _move_axis_with_acceleration_limits(
+            previous_angular,
+            target_angular,
+            acceleration=self._angular_acceleration_limit_rad_s2,
+            deceleration=self._angular_deceleration_limit_rad_s2,
+            elapsed_s=elapsed_s,
+        )
+        linear_fraction = _movement_fraction(
+            previous_linear, target_linear, candidate_linear
+        )
+        angular_fraction = _movement_fraction(
+            previous_angular, target_angular, candidate_angular
+        )
+        fraction = min(linear_fraction, angular_fraction)
+        next_linear = previous_linear + fraction * (
+            target_linear - previous_linear
+        )
+        next_angular = previous_angular + fraction * (
+            target_angular - previous_angular
+        )
+        next_left, next_right = self._twist_to_wheel_speeds(
+            next_linear, next_angular
+        )
         self._last_acceleration_update_ns = current_ns
         next_wire_speeds_mm_s = (
             round(next_left * 1000.0),
@@ -429,6 +551,7 @@ class MotionController:
             current_ns - self._last_wheel_command_ns
             >= _WHEEL_COMMAND_REFRESH_NS
         )
+        self._commanded_twist = (next_linear, next_angular)
         self._commanded_wheel_speeds_m_s = (next_left, next_right)
         # The application safety loop may run every 5 ms, but the STM32
         # command/reply path is intentionally refreshed at 25 Hz.  Sending
@@ -540,6 +663,19 @@ class MotionController:
             linear + angular * half_track
         ) * self.limits.right_wheel_speed_weight
         return left, right
+
+    def _wheel_speeds_to_twist(
+        self,
+        left: float,
+        right: float,
+    ) -> tuple[float, float]:
+        unweighted_left = left / self.limits.left_wheel_speed_weight
+        unweighted_right = right / self.limits.right_wheel_speed_weight
+        linear = (unweighted_left + unweighted_right) / 2.0
+        angular = (
+            unweighted_right - unweighted_left
+        ) / self.limits.wheel_track_m
+        return linear, angular
 
     def _resolve_minimum_wheel_velocity(
         self,
@@ -691,6 +827,8 @@ class MotionController:
     def _reset_acceleration_state_at(self, current_ns: int) -> None:
         self._target_wheel_speeds_m_s = (0.0, 0.0)
         self._commanded_wheel_speeds_m_s = (0.0, 0.0)
+        self._target_twist = (0.0, 0.0)
+        self._commanded_twist = (0.0, 0.0)
         self._last_sent_wheel_speeds_mm_s = (0, 0)
         self._last_acceleration_update_ns = current_ns
         self._last_wheel_command_ns = current_ns
@@ -861,6 +999,39 @@ def _non_negative(value: object, location: str) -> float:
     return converted
 
 
+def _move_axis_with_acceleration_limits(
+    current: float,
+    target: float,
+    *,
+    acceleration: float,
+    deceleration: float,
+    elapsed_s: float,
+) -> float:
+    if current == target or elapsed_s <= 0.0:
+        return current
+    same_direction = current * target > 0.0
+    if current == 0.0 or (same_direction and abs(target) > abs(current)):
+        return _move_toward(current, target, acceleration * elapsed_s)
+    if target == 0.0 or same_direction:
+        return _move_toward(current, target, deceleration * elapsed_s)
+
+    time_to_zero_s = abs(current) / deceleration
+    if elapsed_s <= time_to_zero_s:
+        return _move_toward(current, 0.0, deceleration * elapsed_s)
+    return _move_toward(
+        0.0,
+        target,
+        acceleration * (elapsed_s - time_to_zero_s),
+    )
+
+
+def _movement_fraction(current: float, target: float, candidate: float) -> float:
+    distance = abs(target - current)
+    if distance == 0.0:
+        return 1.0
+    return min(1.0, abs(candidate - current) / distance)
+
+
 def _move_toward(current: float, target: float, maximum_delta: float) -> float:
     delta = target - current
     distance = abs(delta)
@@ -871,6 +1042,4 @@ def _move_toward(current: float, target: float, maximum_delta: float) -> float:
         abs_tol=1e-15,
     ):
         return target
-    if delta > 0.0:
-        return current + maximum_delta
-    return current - maximum_delta
+    return current + math.copysign(maximum_delta, delta)

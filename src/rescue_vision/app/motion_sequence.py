@@ -216,7 +216,10 @@ def _build_sequence_controller(
                 / (half_track * maximum_weight)
             ),
             max_wheel_velocity_m_s=_PROTOCOL_MAX_WHEEL_SPEED_M_S,
-            max_wheel_acceleration_m_s2=_UNBOUNDED_ACCELERATION_M_S2,
+            max_linear_acceleration_m_s2=_UNBOUNDED_ACCELERATION_M_S2,
+            max_linear_deceleration_m_s2=_UNBOUNDED_ACCELERATION_M_S2,
+            max_angular_acceleration_rad_s2=_UNBOUNDED_ACCELERATION_M_S2,
+            max_angular_deceleration_rad_s2=_UNBOUNDED_ACCELERATION_M_S2,
             min_wheel_velocity_m_s=_EFFECTIVELY_ZERO_MIN_WHEEL_SPEED_M_S,
             left_wheel_speed_weight=motion_config.left_wheel_speed_weight,
             right_wheel_speed_weight=motion_config.right_wheel_speed_weight,
@@ -401,15 +404,14 @@ class MotionSequenceRunner:
                 elapsed_s = (now_ns - start_ns) / 1_000_000_000.0
                 if elapsed_s < self.plan.acceleration_duration_s:
                     phase = MotionSequencePhase.ACCELERATING
-                    acceleration_limit = self.plan.a1_m_s2
                 else:
                     if phase is MotionSequencePhase.ACCELERATING:
                         phase = MotionSequencePhase.DECELERATING
                         phase_start_ns = now_ns
-                    acceleration_limit = self.plan.a2_m_s2
                 target_velocity = self.plan.target_linear_velocity_m_s(elapsed_s)
-                self.controller.set_wheel_acceleration_limit_m_s2(
-                    acceleration_limit
+                self.controller.set_acceleration_limits(
+                    linear_acceleration_m_s2=self.plan.a1_m_s2,
+                    linear_deceleration_m_s2=self.plan.a2_m_s2,
                 )
                 self.controller.forward(target_velocity)
                 # forward() internally settles the previous target using the
@@ -462,7 +464,7 @@ class MotionSequenceRunner:
             try:
                 self.controller.soft_brake()
             finally:
-                self.controller.set_wheel_acceleration_limit_m_s2(None)
+                self.controller.set_acceleration_limits()
 
         return MotionSequenceResult(
             completed=completed,

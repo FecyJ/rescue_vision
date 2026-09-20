@@ -408,7 +408,7 @@ def test_estimator_rejects_stale_and_incomplete_geometry() -> None:
         )
 
 
-def test_estimator_degrades_unknown_and_bad_masks_without_guessing() -> None:
+def test_estimator_uses_nonempty_mask_regardless_of_color_status() -> None:
     ground_projector = projector()
     source = observation(TargetClass.GREEN_SUPPLY, ground_projector)
     estimator = TargetGroundGeometryEstimator(
@@ -437,8 +437,8 @@ def test_estimator_degrades_unknown_and_bad_masks_without_guessing() -> None:
         [unknown],
         result_timestamp_ns=1_050_000_000,
     )[0]
-    assert unknown_result.center_ground is None
-    assert GroundGeometryQuality.COLOR_MASK_UNAVAILABLE in unknown_result.quality
+    assert unknown_result.center_ground is not None
+    assert GroundGeometryQuality.COLOR_MASK_UNAVAILABLE not in unknown_result.quality
 
     bad_mask = np.zeros_like(source.color_segmentation.mask)
     bad_mask[2:5, 2:5] = 255

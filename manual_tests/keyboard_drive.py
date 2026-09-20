@@ -17,7 +17,7 @@ OpenCV 叠加画面。方向键和 WASD 等价：
 
 先按 W/S 锁存纵向运动，再按住 A/D 即可组合成弧线（例如 W 后按住 D 为右前弧）；
 松开 A/D 后转向自动归中，空格清除全部运动。所有轮速仍受
-``motion`` 配置的线速度、角速度和单轮加速度上限约束，超限请求会被拒绝。
+``motion`` 配置的线速度、角速度和独立线/角加减速度上限约束，超限请求会被拒绝。
 脚本把每次变化后的实际底盘目标实时打印，并把目标及 100 Hz 编码器/IMU 遥测
 写入 JSONL；``--replay`` 使用轮累计行程和相对航向闭环回放。日志不包含夹爪
 动作；编码器闭环不能观测整车横向打滑，因此仍不是场地绝对轨迹控制。
@@ -77,7 +77,7 @@ _HOLD_TIMEOUT_NS = 200_000_000
 _ESC_LOOKAHEAD_S = 0.03
 
 _LOG_FORMAT = "rescue_vision.keyboard_drive"
-_LOG_VERSION = 2
+_LOG_VERSION = 3
 _REQUIRED_ENCODER_FLAGS = (
     SensorFlags.LEFT_ENCODER_VALID | SensorFlags.RIGHT_ENCODER_VALID
 )
@@ -432,7 +432,10 @@ def _motion_fingerprint(controller: object) -> dict[str, float]:
         "max_angular_velocity_rad_s": limits.max_angular_velocity_rad_s,
         "max_wheel_velocity_m_s": limits.max_wheel_velocity_m_s,
         "min_wheel_velocity_m_s": limits.min_wheel_velocity_m_s,
-        "max_wheel_acceleration_m_s2": limits.max_wheel_acceleration_m_s2,
+        "max_linear_acceleration_m_s2": limits.max_linear_acceleration_m_s2,
+        "max_linear_deceleration_m_s2": limits.max_linear_deceleration_m_s2,
+        "max_angular_acceleration_rad_s2": limits.max_angular_acceleration_rad_s2,
+        "max_angular_deceleration_rad_s2": limits.max_angular_deceleration_rad_s2,
         "left_wheel_speed_weight": limits.left_wheel_speed_weight,
         "right_wheel_speed_weight": limits.right_wheel_speed_weight,
     }
@@ -1763,7 +1766,7 @@ def main() -> None:
         "--replay",
         type=Path,
         help=(
-            "Replay a v2 keyboard_drive JSONL with encoder/IMU feedback "
+            "Replay a v3 keyboard_drive JSONL with encoder/IMU feedback "
             "instead of opening camera/Hailo."
         ),
     )

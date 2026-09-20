@@ -9,6 +9,10 @@ cp configs/runtime.example.yaml configs/runtime.yaml
 
 正式流程使用 `configs/runtime.match.yaml` 的 `match` 配置节：
 
+该配置及 `configs/runtime.match_nb.yaml` 的树莓派端车体线速度上限
+`motion.max_linear_velocity_m_s` 与单轮速度上限
+`motion.max_wheel_velocity_m_s` 均为 `1.5 m/s`；各阶段实际目标速度仍由对应动作参数决定。
+
 ```python
 from rescue_vision.config import load_runtime_config
 
@@ -42,26 +46,14 @@ grab_transport = config.build_grab_transport_sequence()
 `safety_margin_mm` 是解团/绿色接近路径的联合安全膨胀量；它们属于正式流程，不再从
 已删除的模拟流程读取。
 
-目标团选择由 `cluster_*`、机会抓取由 `opportunistic_single_green_*` 控制。机会抓取先按
-`motion.gripper.transport_*` 固定姿态检查前向走廊；首轮只接受单个绿色，一般阶段允许
-绿/黑物资组或单个橙色伤员；没有安全方案才继续目标团解团。正式动态解团在真实停稳后
-从当前帧选择接触核心，完成一次完整危险/边界检查，再按
-`match.breakup_confirmation_frames` 个不同有效帧确认并冻结，直接前推、张爪、后退；
-它不依赖近场准备器，也不执行单独接近或接触后第二轮复核。固定走廊外的合法目标
-仍先进入近场停车路由窗口。进入近场后锁定同一物理成员（tracker ID 变化由 K0 连续性关联），
-开爪提交时冻结执行计划，再按正式流程接近，进入 `near_field_grasp.max_range_mm` 后由近场状态机接管。首轮策略（单个
-绿色）与后续策略（绿/黑 1～3 个或单橙色）由 `MatchSequence` 按运输次数选择；近场配置同时
-用于独立收拢入口。单帧颜色证据不足或质量异常不累计疑似/恢复计数：锁定身份不因该单帧
-清零，下一帧当前清洁几何可继续，明确危险证据保持到轨迹消失。
-`action_settle_time_s` 在转向/直线切换前保持零速。
-普通运动的非零单轮最低速度由 `motion.min_wheel_velocity_m_s` 控制；远场绿色目标对准仍使用
-`match.green_alignment_min_wheel_velocity_m_s` 的单次覆盖值。近场选择器先在当前机器人方向下
-用原始横向包络分别反解左右舵机角度；两侧都可达且扫掠合法时直接提交，仅不可达才选最小必要
-转角，任一侧仍不可达即淘汰候选。
-已锁定目标使用 `max_range_mm + range_hysteresis_mm` 的退出半径，避免边界观测抖动换组；
-正式配置 `confirmation_frames=1`，表示真实停稳后的一个当前帧复核；
-`alignment_timeout_ms` 仅作为停稳和当前准备结果的总提交预算；
-单橙色计划还受配置项 `orange_isolation_radius_mm` 的硬门禁：只有当前帧有地面位置且落入半径的其它目标才拒绝，缺少 K0 的无关合法目标不作距离推定；当前扫掠内缺少 K0 的蓝色危险目标不能证明安全，拒绝提交。
+`match.grasp_task_timeout_ms`（默认20000 ms，有限正数）是选择物理目标后跨接近、
+停稳、规划、恢复与再抓取的总预算；状态和 tracker ID 变化不重置。
+`near_field_grasp.no_plan_wait_ms` 是无计划的短观察，`alignment_timeout_ms` 是稳定场景
+与异步准备的提交窗口，均受任务剩余预算约束。`confirmation_frames=1` 在第一张可靠
+静止帧中完成确认，无消费者锁组握手；`breakup_confirmation_frames` 单独约束恢复核心。
+正式恢复由同一准备器在抓取确实受阻时规划；带载补夹、单绿联调和CC保持各自限制。
+完整规则、机械可达性及时间语义见[正式流程设计](../../../docs/正式流程设计.md)。
+其余已有配置字段和CLI保持不变；模板可省略新字段并使用默认值。
 
 `cluster_search_empty_angular_velocity_rad_s` 是没有可搜索的绿/黑/橙目标时的同向快速扫描
 速度；如果当前帧所有有效非蓝目标的 bbox 中心都落在任一安全区 bbox 内，也使用该速度。它必须
@@ -69,25 +61,37 @@ grab_transport = config.build_grab_transport_sequence()
 （`TRANSPORT_GREEDY_SCAN`）：补夹候选为全场绿/黑，不受 `near_field_grasp.max_range_mm` 截断，
 按机器人地面距离优先。当前帧没有可补夹的绿/黑信息时快速转动，出现可补夹信息后回到
 `close_gripper_spin_angular_velocity_rad_s`，两条速度共用 `spin_angle_rad` 作为本次扫描的
-旋转预算；目标一旦确认不因新目标出现而换组，目标失观时才接管下一个候选。目标方向走廊的横向阻挡门限按两块实体的内切半径之和加
+旋转预算；目标一旦确认不因新目标出现而换组，目标失观时才接管下一个候选。目标方向走廊的横向阻挡门限按目标 K0 加
 `near_field_grasp.clearance_mm / 2 + corridor_lateral_margin_mm` 逐目标计算，
-`green_path_half_width_mm` 只是缺少目标物理尺寸配置时的回退值；近场蓝块净空同样使用内切半径，
-外接半径不再把只是近旁的蓝块当成阻挡。安全区运输参数分为夹取→d1、
-d1→d2、d2→末段三段；若夹取位置沿己方 y 方向已越过 d1，则跳过回到 d1 的直线段。
-纠偏搜索使用 `safe_zone_key_search_angular_velocity_rad_s`；有 bbox 时由
-`safe_zone_bbox_turn_kp_rad_s`、`safe_zone_bbox_turn_max_angular_velocity_rad_s` 和中心滞回参数
-按归一化水平误差比例追踪，换向先等待轮速停稳并只消费停车后的新帧。关键点暂缺时进入
-`safe_zone_keypoint_reobserve_timeout_s` 静止重观测；bbox 居中仍缺点时最多同向低速扫视一次，
-扫描后重新停车取新帧。
-`safe_zone_bbox_edge_margin_px` 仍要求完整 bbox 离开图像边缘后才采集 K0/K1/K2；角点和静态
+不再用目标实体半径扩大近场扫掠范围。安全区运输参数分为夹取→d1、
+d1→d2、d2→末段三段；d1→d2 严格使用 `safe_zone_d1_to_d2_speed_m_s`，不叠加
+`pickup_cruise_speed_scale`。D1 视觉校准距安全区终点的可用区间由
+`safe_zone_calibration_min_offset_mm` 和 `safe_zone_calibration_start_offset_mm`
+分别定义最小、最大偏移；夹取位置在区间内时原地校准，距安全区过近时先回到最小偏移线。
+正式配置 `configs/runtime.match.yaml` 的抓取对准增益 `green_alignment_kp_rad_s=2.0`
+（远场和近场共用）、解团对准增益 `cluster_align_kp_rad_s=1.0` 均为原值两倍；
+角速度继续随角度误差递减，并分别受原有 `0.6`、`0.4 rad/s` 上限约束。
+近场前进的航向纠偏也复用抓取对准增益；此次调参的真机响应与过冲未验证。
+抓取接近的最后 50 mm 使用 `pickup_terminal_speed_gain_s_inv`（单位 `s^-1`）按
+`目标速度 = 增益 × 剩余距离` 收速；默认 `1.0` 保持原曲线，最低目标速度仍为
+`0.005 m/s`。该增益同时用于远场接近终点和近场编码器定距收拢，不影响安全区运输。
+安全区两点策略和时间语义以[正式流程设计](../../../docs/正式流程设计.md#安全区视觉纠偏)为准。
+`safe_zone_bbox_turn_max_angular_velocity_rad_s` 是单侧裁剪时持续扫描到完整 bbox 入镜的固定角速度；`safe_zone_keypoint_reobserve_timeout_s`
+是静止观察窗口。删除旧追框比例增益和中心滞回三字段，外部配置必须同步移除。
+`safe_zone_bbox_edge_margin_px` 同时约束完整 bbox 四边和按画面位置选出的对侧两点；
+第三点允许缺失，完整框不可缺失。
+正式入口的 `localization.safe_zone_corners.max_observation_age_ms` 与 processing 对齐为 800 ms。
+两点和静态
 地标拟合 `FieldPose2D` 后覆盖当前航位。`safe_zone_d2_braking_overrun_*`
 和 `safe_zone_d2_to_final_braking_overrun_mm` 只补偿预计刹车过冲。绿/黑物资末段使用
 `safe_zone_d2_to_final_speed_m_s` 与 `safe_zone_d2_to_final_braking_overrun_mm`；单个橙色
 伤员使用独立的 `safe_zone_orange_d2_to_final_speed_m_s` 与
 `safe_zone_orange_d2_to_final_braking_overrun_mm`。解团阶段可用
-`breakup_max_wheel_acceleration_m_s2` 覆盖 `motion.max_wheel_acceleration_m_s2`，设为
-`null` 时继承全局值。释放并直线倒车退出后会再次执行同一视觉纠偏，再用新帧直接开始
-搜索，不做固定退出转向。视觉纠偏只消费停稳阶段的当前观测；正式 match 的目标对准会使用
+`motion.max_linear_acceleration_m_s2`、`max_linear_deceleration_m_s2`、
+`max_angular_acceleration_rad_s2`、`max_angular_deceleration_rad_s2` 分别限制车体
+直线加速、直线减速、角加速和角减速。解团和 D2→末段可用同名
+`breakup_max_*`、`safe_zone_d2_to_final_max_*` 字段逐项覆盖；某项为 `null` 时仅该项
+继承全局值。释放并直线倒车退出后直接转向搜索，不再执行退区安全区纠偏或停车等图。视觉纠偏只消费停稳阶段的当前观测；正式 match 的目标对准会使用
 有限采集时刻编码器/IMU 位姿历史，不接入跨帧目标记忆。
 绿/黑物资路线终点由 `safe_zone_fallback_target_field_mm` 配置，单个橙色
 伤员由 `safe_zone_injured_target_field_mm` 配置；两者都是 `FieldPoint`，单位 mm。
@@ -101,11 +105,11 @@ d1→d2、d2→末段三段；若夹取位置沿己方 y 方向已越过 d1，�
 重新搜索的最长等待。正式 match 的 `breakup_confirmation_frames` 控制停稳后接触核心
 确认所需的连续有效帧数；停稳后仍选不出任何合法接触计划时，`breakup_no_plan_reobserve_ms`
 只给一个有界的重观测窗口就退出本次区域，不占满按确认帧数计的确认预算。
-`breakup_forward_distance_m` 和
-`breakup_backward_distance_m` 是动态计划的行程上限；`breakup_penetration_mm` /
-`breakup_retry_penetration_mm` 分别限制首次和第二次及以后的局部穿入，
+`breakup_forward_distance_m` 和 `breakup_backward_distance_m` 是完整动作行程，
+正式配置及默认值分别为 0.5 m、0.3 m，全程闭爪；整段路径不安全时拒绝该方案，不缩短动作。
+旧 `breakup_penetration_mm` / `breakup_retry_penetration_mm` 已删除，外部 YAML 必须同步删除旧键。
 `breakup_max_attempts` 是同一物理接触团允许的推进尝试次数，取值范围 `[1, 4]`；
-第 2 次及以后都使用 `breakup_retry_penetration_mm`，且只有比上一次更深才会被采纳。
+同一接触射线重试需要几何改变并能产生更深接触，不能只靠重编号或重启会话。
 CC 入口仍把同名前进/后退值作为固定动作距离。
 `isolated_line_clearance_mm` 定义绿/黑物块的原点—K0 线段净空，
 橙色净空则逐帧使用颜色掩码的地面投影宽度。`block_alignment_tolerance_mm` 控制单块
@@ -134,6 +138,8 @@ python -m pytest tests/test_config.py
 
 `AppConfig.near_field_grasp` 为 `NearFieldGraspConfig`，配置缺省值与两个运行模板一致。
 `max_targets` 在 1～3 内；`max_candidates` 在 `max_targets`～20 内；
+`stopped_scene_new_target_max_bbox_iou` 在 0～1 内，控制停车视野中新目标首帧冻结的
+bbox IoU 上限；
 `confirmation_frames` 必须为正。`grasp_commit_max_observation_age_ms` 限制准备结果发布年龄、
 静止遥测的间断/年龄，以及没有静止证据时的短龄几何；实际静止期间采集的当前计划使用
 `processing.max_observation_age_ms` 作为观测失联上限。`stationary_max_gyro_rad_s` 为有限正数，
@@ -142,7 +148,8 @@ python -m pytest tests/test_config.py
 `orange_priority_weight` 必须大于数量、净空、距离和对准权重之和，以保证单橙严格优先于同分的绿黑组合；
 尺寸、范围和确认数量严格校验，未知字段拒绝加载。`max_range_mm` 是 K0 的机器人相对
 径向距离，`max_forward_distance_mm` 是底盘行程，不能互换。`target_final_x_mm` 是最远
-目标 K0 的期望结束位置，`corridor_start_x_mm` 和 `corridor_lateral_margin_mm` 定义危险
+目标 K0 的期望结束位置；贪心补夹绿/黑组使用独立的 `greedy_target_final_x_mm`，只在贪心
+近场策略生效，降低它会增加补夹前进行程。`corridor_start_x_mm` 和 `corridor_lateral_margin_mm` 定义危险
 目标 K0 的前进扫掠走廊；`side_neighbor_longitudinal_margin_mm` 与
 `side_neighbor_lateral_margin_mm` 定义预测抓取方向下非橙计划的蓝色侧邻、以及单橙计划的
 蓝/橙侧邻 K0 中心差门限，明显前后错开的目标不触发该门禁。
@@ -161,5 +168,28 @@ python -m pytest tests/test_config.py
 不在本页重复维护。
 
 正式一般阶段接近种子采用“近场优先、类别配置分值优先、距离优先”，最终组合仍按
-近场选择器评分。`orange_isolation_radius_mm` 保留原值，只有完整包络证明扫掠外的
-侧后方普通物资可通过精细复核；条件见 [app README](../app/README.md)。无需迁移配置。
+近场选择器评分。`orange_isolation_radius_mm` 当前为 `10 mm`；橙色邻近例外只依据邻近
+目标 K0 是否位于实际扫掠走廊内，目标完整外轮廓不扩大扫掠阻挡范围；条件见
+[app README](../app/README.md)。已有配置需要同步为 `10 mm`。
+
+## 夹爪内颜色门禁配置
+
+`configs/runtime.match.yaml` 的 `perception.gripper_color`（其余入口模板同步）默认启用。
+`polygon_normalized` 为全尺寸去畸变图的归一化 `(u,v)` 凸多边形，默认只包住夹臂内侧，
+当前实拍收紧为 `[(0.47,0.85),(0.53,0.85),(0.57,0.97),(0.43,0.97)]`，排除夹爪尖端前方
+及两侧夹臂外的色块；相机/安装改变后须在预览中重新核对。`min_component_fraction=0.03`
+为最大连通色块占ROI比例；
+`black_min_thickness_fraction=0.12` 为黑色去细线核直径与ROI包围框短边的比例；ROI收紧后
+同步增大该比例，以保持去细线核在实拍图上的像素尺度，仍随分辨率缩放。
+`shadow_min_value=30` 是夹爪内彩色暗面的OpenCV HSV亮度下限（整数1～255）；H/S继续来自
+`perception.color_classifier`。此放宽仅属于误夹色块检查，不改变模型类别或目标几何分割。
+`orange_bbox_min_color_fraction=0.15` 要求每个双橙误夹候选的模型框内，橙色 HSV 掩码至少占
+整个 bbox 的 15%；未达到时只保留模型观测，不作为误夹数量证据。通过该门限后，
+`orange_distinct_max_bbox_iou=0.20` 与 `orange_distinct_min_k0_distance_px=20.0` 共同定义两个明显
+不同目标：两者必须同时满足，缺 K0 或只有一项分离不触发张爪，避免将大框误检或同一橙块的
+重复检测当作两块。
+未知键、无效多边形和非有限/越界阈值拒绝加载；缺省使用上述值，无旧配置必删字段。
+
+调节时以 `gripper_color` 日志的 `black_raw_fraction`、`black_chromatic_fraction` 和
+最终 `components` 区分暗面混色、细线和实体黑块；不可只提高面积阈值掩盖误报。
+合成测试不代表现场黑块/危险类指标，参数与ROI须用固定相机的实物验证。

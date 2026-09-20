@@ -63,8 +63,11 @@ motion:
   max_linear_velocity_m_s: 0.25
   max_angular_velocity_rad_s: 1.0
   max_wheel_velocity_m_s: 0.30
-  # 单轮目标速度变化率；0.5 m/s² 时从静止到 0.30 m/s 约需 0.6 秒。
-  max_wheel_acceleration_m_s2: 0.50
+  # 车体直线和角速度分量分别限制加速与减速，单位为 m/s²、rad/s²。
+  max_linear_acceleration_m_s2: 0.50
+  max_linear_deceleration_m_s2: 0.80
+  max_angular_acceleration_rad_s2: 4.0
+  max_angular_deceleration_rad_s2: 6.0
   # 减速电机的非零单轮最低目标速度；低于该值的轮速会提升到该值。
   min_wheel_velocity_m_s: 0.02
   # 单轮速度权重，补偿重心偏移导致的直线偏转。默认 1.0 等于标准差速；
@@ -197,9 +200,7 @@ match:
   opportunistic_single_green_enabled: false
   # 旧纯逻辑夹具的邻域诊断参数；正式单绿机会使用固定 TRANSPORT 走廊判定。
   opportunistic_single_green_clearance_mm: 120.0
-  # match: 进退距离为上限；CC: 仍为固定距离。以下局部参数仅用于 match。
-  breakup_penetration_mm: 160.0
-  breakup_retry_penetration_mm: 240.0
+  # match: 闭爪定距前进 0.5 m、后退 0.3 m，整段路径不可行时拒绝该计划。
   breakup_min_penetration_mm: 10.0
   breakup_retreat_clearance_mm: 40.0
   breakup_push_margin_mm: 60.0
@@ -208,12 +209,19 @@ match:
   breakup_max_attempts: 2
   breakup_confirmation_frames: 1
   breakup_no_plan_reobserve_ms: 1000.0
-  breakup_forward_distance_m: 1.4
+  # 误夹释放后锁定原团短解团；速度/制动继承 breakup，航向只允许微调。
+  misgrasp_breakup_forward_distance_m: 0.30
+  misgrasp_breakup_backward_distance_m: 0.08
+  misgrasp_breakup_max_heading_change_rad: 0.17453292519943295
+  breakup_forward_distance_m: 0.5
   breakup_forward_speed_m_s: 0.40
-  breakup_backward_distance_m: 0.2
+  breakup_backward_distance_m: 0.3
   breakup_backward_speed_m_s: 0.08
-  # 解团阶段临时单轮最大加速度，单位 m/s²；null 继承 motion 全局值，按实车单独调节。
-  breakup_max_wheel_acceleration_m_s2: null
+  # 解团阶段临时车体加减速度；null 分别继承 motion 对应全局值。
+  breakup_max_linear_acceleration_m_s2: null
+  breakup_max_linear_deceleration_m_s2: null
+  breakup_max_angular_acceleration_rad_s2: null
+  breakup_max_angular_deceleration_rad_s2: null
   # 合爪后的补夹扫描：有可补夹信息时按 close_gripper_spin_angular_velocity_rad_s
   # 转动，当前帧没有可补夹的绿/黑信息时按 cluster_search_empty_angular_velocity_rad_s
   # 快速转动，两条速度共用 spin_angle_rad 作为旋转预算；具体夹爪角度统一由
@@ -232,19 +240,18 @@ match:
   green_alignment_hysteresis_mm: 20.0
   green_alignment_timeout_ms: 8000.0
   green_alignment_stable_frames: 1
+  # 抓取精细接近最后 50 mm 的比例速度增益，单位 s^-1；速度约为增益乘剩余距离。
+  pickup_terminal_speed_gain_s_inv: 1.0
   green_approach_speed_m_s: 0.08
   transport_rotate_angular_velocity_rad_s: 0.30
   # d1 纠偏先把安全区 bbox 转到画面中心；角速度单位 rad/s，边距单位 px。
   safe_zone_key_search_angular_velocity_rad_s: 0.45
-  safe_zone_bbox_turn_kp_rad_s: 0.8
   safe_zone_bbox_turn_max_angular_velocity_rad_s: 0.25
-  safe_zone_bbox_turn_deadband_ratio: 0.02
-  safe_zone_bbox_turn_resume_ratio: 0.03
   safe_zone_bbox_edge_margin_px: 2.0
   safe_zone_keypoint_reobserve_timeout_s: 0.8
-  # bbox 居中但关键点仍未出现时，小速度倒车寻找关键点；单位分别为 m/s、m。
+  # 两侧或上下裁剪且缺所选两点时，一次倒车调整；单位分别为 m/s、m。
   safe_zone_keypoint_reverse_speed_m_s: 0.08
-  safe_zone_keypoint_reverse_max_distance_m: 0.20
+  safe_zone_keypoint_reverse_max_distance_m: 0.10
   transport_align_tolerance_mm: 30.0
   # 安全区三段直行速度：夹取后→d1、d1→d2、d2→末段，单位 m/s。
   safe_zone_grab_to_d1_speed_m_s: 0.08
@@ -252,8 +259,11 @@ match:
   safe_zone_d2_to_final_speed_m_s: 0.08
   # 单橙色伤员 d2→安全区末端的独立速度，单位 m/s；当前先与通用末段一致，按实测单独调节。
   safe_zone_orange_d2_to_final_speed_m_s: 0.08
-  # d2→安全区末端的临时单轮最大加速度，单位 m/s²；null 继承 motion 全局值。
-  safe_zone_d2_to_final_max_wheel_acceleration_m_s2: null
+  # d2→安全区末端的临时车体加减速度；null 分别继承 motion 对应全局值。
+  safe_zone_d2_to_final_max_linear_acceleration_m_s2: null
+  safe_zone_d2_to_final_max_linear_deceleration_m_s2: null
+  safe_zone_d2_to_final_max_angular_acceleration_rad_s2: null
+  safe_zone_d2_to_final_max_angular_deceleration_rad_s2: null
   breakup_settle_time_s: 0.3
   # 每个转向/直行动作切换前的零速保持时间。
   action_settle_time_s: 0.3
@@ -266,9 +276,11 @@ match:
   safe_zone_fallback_heading_tolerance_rad: 0.20
   safe_zone_fallback_heading_kp_rad_s: 1.0
   safe_zone_fallback_max_angular_velocity_rad_s: 0.30
+  # D1 校准距安全区终点的最小/最大偏移；过近时先返回最小偏移线。
   # 从当前位置沿应用 x/y 刹车过冲补偿后的直线到推进终点方向的 d1，
   # 闭爪取样校准；随后沿校准位姿到 d2 定义坐标的直线行驶，d2 先张爪、转向己方安全区、闭爪后再冲刺，
   # 推进停稳并再次张爪后退出安全区。
+  safe_zone_calibration_min_offset_mm: 300.0
   safe_zone_calibration_start_offset_mm: 500.0
   safe_zone_open_offset_mm: 137.0
   # 夹取后→d1、d1→d2 软刹车后的 FieldPoint 坐标过冲分量，单位 mm；有符号，
@@ -418,10 +430,22 @@ mission:
   target_priority: [orange_injured, black_core, green_supply]
 
 perception:
-  # 模型负责检测框和 K0；最终任务类别由框内 HSV 颜色证据决定。
+  # 夹爪内侧颜色仅用于误夹恢复；归一化去畸变图 (u,v)，排除夹臂和车体。
+  gripper_color:
+    enabled: true
+    polygon_normalized: [[0.47, 0.85], [0.53, 0.85], [0.57, 0.97], [0.43, 0.97]]
+    min_component_fraction: 0.03
+    # 黑色先去除细于 ROI 短边此比例的线条，再检查实体色块面积。
+    black_min_thickness_fraction: 0.12
+    # 暗面仍按配置 H/S 识别彩色，防止暗绿被 V<70 的黑色范围覆盖。
+    shadow_min_value: 30
+    # 双橙误夹候选框内，橙色 HSV 掩码至少占整个 bbox 的比例。
+    orange_bbox_min_color_fraction: 0.15
+    orange_distinct_max_bbox_iou: 0.20
+    orange_distinct_min_k0_distance_px: 20.0
+  # 模型负责四类任务类别、检测框和 K0；HSV 只提供优先横向几何。
   detection_threshold: 0.25
   k0_threshold: 0.50
-  # 模型检测置信度严格高于该值时，即使 ROI 颜色证据不足/歧义也采用模型类别。
   center_cross_refinement:
     enabled: true
     canny_low: 50
@@ -656,12 +680,16 @@ near_field_grasp:
   max_targets: 3
   # 参与组合枚举的最近候选数量；其余检测仍用于障碍/顺带纳入检查，范围 3..20。
   max_candidates: 12
+  # 同一停车视野中新检测与已有目标 bbox 的 IoU 不超过此值时，首帧冻结为独立目标。
+  stopped_scene_new_target_max_bbox_iou: 0.20
   # 目标 K0 到车体原点的最大近场径向距离，单位 mm。
   max_range_mm: 450.0
   # 单次收拢允许的底盘最大前进行程，单位 mm。
   max_forward_distance_mm: 450.0
   # 绿/黑组前进结束时，最远目标 K0 希望保留在机器人前方的距离，单位 mm。
   target_final_x_mm: 115.5
+  # 贪心补夹绿/黑组的独立终点；降低此值会让补夹前进更深，单位 mm。
+  greedy_target_final_x_mm: 115.5
   # 单个橙色目标按最近端加完整纵向跨度计算，终点参考距离，单位 mm。
   orange_target_final_x_mm: 142.0
   # 夹爪前端参考线；危险目标 K0 从此处到扫掠终点才参与走廊门禁，单位 mm。
@@ -694,10 +722,9 @@ near_field_grasp:
   fine_alignment_zone_rad: 0.08
   fine_alignment_min_wheel_velocity_m_s: 0.0
   # 橙色伤员中心周围的独立性禁入半径，单位 mm。
-  orange_isolation_radius_mm: 60.0
-  # 颜色掩码至少需要的前景像素数；不足时视为无有效地面包络。
+  orange_isolation_radius_mm: 10.0
+  # 优先采用颜色掩码的最少前景像素数；不足时使用 bbox 底边几何。
   min_mask_pixels: 1
-  # 单帧未知/质量异常后，连续稳定为绿/黑多少帧才重新允许入组。
   # 净空评分归一化的参考长度，单位 mm；100 mm 对应评分 1.0。
   clearance_scale_mm: 100.0
   # 初赛规则分值；候选先按总分排序。

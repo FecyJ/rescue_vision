@@ -99,6 +99,58 @@ def test_formal_policy_is_single_green_then_supplies_or_single_injured() -> None
     assert later.max_targets == 3
 
 
+def test_greedy_policy_carries_only_the_greedy_endpoint_override() -> None:
+    sequence = _sequence(transports=1)
+    sequence._near_field_grasp_config = replace(
+        sequence._near_field_grasp_config,
+        target_final_x_mm=142.0,
+        greedy_target_final_x_mm=95.0,
+    )
+    sequence._transport_target_classes = (TargetClass.GREEN_SUPPLY,)
+    sequence._greedy_active = True
+    greedy = sequence.near_field_policy
+    assert greedy.target_final_x_mm == pytest.approx(95.0)
+    assert sequence.near_field_target_final_x_mm == pytest.approx(95.0)
+    assert sequence._greedy_new_target_min_x_mm() == pytest.approx(145.0)
+
+    sequence._greedy_active = False
+    normal = sequence.near_field_policy
+    assert normal.target_final_x_mm is None
+    assert sequence.near_field_target_final_x_mm == pytest.approx(142.0)
+
+
+def test_newer_scene_uses_k0_for_ordinary_obstacle_and_inscribed_radius_for_blue() -> None:
+    planner = selector()
+    member = target(x=300.0, y=0.0, timestamp=0, frame=0)
+    plan = planner.select((member,)).plan
+    assert plan is not None
+    sequence = _sequence(transports=1)
+
+    current_member = target(x=300.0, y=0.0, timestamp=10, frame=1).observation
+    side_supply = target(
+        i=2,
+        x=200.0,
+        y=40.0,
+        cls=TargetClass.BLACK_CORE,
+        timestamp=10,
+        frame=1,
+    ).observation
+    sequence._latest_perception = PerceptionSnapshot(
+        1, 10, 10, (current_member, side_supply), None
+    )
+    assert sequence._latest_scene_preserves_grasp(plan, 10)
+
+    side_blue = replace(
+        side_supply,
+        model_target_class=TargetClass.BLUE_DANGER,
+        target_class=TargetClass.BLUE_DANGER,
+    )
+    sequence._latest_perception = PerceptionSnapshot(
+        1, 10, 10, (current_member, side_blue), None
+    )
+    assert not sequence._latest_scene_preserves_grasp(plan, 10)
+
+
 def test_general_stage_accepts_only_isolated_orange_in_transport_corridor() -> None:
     sequence = _sequence(
         transports=1,
@@ -135,7 +187,7 @@ def test_general_stage_accepts_only_isolated_orange_in_transport_corridor() -> N
     assert sequence._transport_group_size(orange_track, 20) is None
 
 
-def test_general_stage_orange_rejects_any_target_inside_fifty_mm_radius() -> None:
+def test_general_stage_orange_rejects_any_target_inside_ten_mm_radius() -> None:
     sequence = _sequence(
         transports=1,
         config=runtime_config(opportunistic_single_green_enabled=True),
@@ -150,7 +202,7 @@ def test_general_stage_orange_rejects_any_target_inside_fifty_mm_radius() -> Non
     ).observation
     neighbor = target(
         i=2,
-        x=350.0,
+        x=310.0,
         y=0.0,
         cls=TargetClass.GREEN_SUPPLY,
         timestamp=20,
@@ -296,6 +348,10 @@ def test_near_field_confirmation_budget_starts_when_observation_window_opens() -
 
     sequence._action_settle_phase = None
     sequence._action_settle_until_ns = None
+    assert not sequence.near_field_observation_window_open(1_000_000_000)
+    from test_gripper_width_sequence import motion_sample
+    for stamp in range(900_000_000, 1_000_000_001, 10_000_000):
+        sequence.observe_grasp_motion(motion_sample(stamp))
     assert sequence.near_field_observation_window_open(1_000_000_000)
     assert sequence._near_field_confirmation_started_ns == 1_000_000_000
     # 选不出方案时只等 no_plan_wait_ms（远短于停稳提交预算），到期即带原因重选。

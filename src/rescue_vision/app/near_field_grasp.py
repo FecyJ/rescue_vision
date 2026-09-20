@@ -95,12 +95,18 @@ class NearFieldHandoffPrior:
 
 @dataclass(frozen=True, slots=True)
 class NearFieldGraspPolicy:
-    """一次近场动作允许选择的类别和成员容量。"""
+    """一次近场动作允许选择的类别、成员容量和可选终点覆盖。"""
 
     allowed_classes: frozenset[TargetClass]
     max_targets: int
+    # 仅用于本次绿/黑动作的前进终点；None 表示使用选择器普通配置。
+    target_final_x_mm: float | None = None
+    # 首趟单绿按配置物理尺寸复核邻块实体，不依赖顶部颜色投影。
+    obstacle_extent_required: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.obstacle_extent_required, bool):
+            raise ValueError(f"obstacle_extent_required must be bool, got {self.obstacle_extent_required!r}.")
         if not isinstance(self.allowed_classes, frozenset) or not self.allowed_classes:
             raise ValueError("allowed_classes must be a non-empty frozenset.")
         if not self.allowed_classes <= GRASPABLE_CLASSES:
@@ -113,6 +119,15 @@ class NearFieldGraspPolicy:
             or not 1 <= self.max_targets <= 3
         ):
             raise ValueError("max_targets must be an integer in [1, 3].")
+        if self.target_final_x_mm is not None and (
+            isinstance(self.target_final_x_mm, bool)
+            or not isinstance(self.target_final_x_mm, (int, float))
+            or not math.isfinite(float(self.target_final_x_mm))
+            or float(self.target_final_x_mm) <= 0.0
+        ):
+            raise ValueError(
+                "target_final_x_mm must be finite and positive or None."
+            )
 
 
 DEFAULT_NEAR_FIELD_POLICY = NearFieldGraspPolicy(GRASPABLE_CLASSES, 3)
@@ -352,7 +367,8 @@ class CandidateGeometry:
 
     ``x0_mm``/``x1_mm``/``depth_mm`` 只用于观察颜色掩码投影的纵向范围，
     不再作为目标自身的容纳硬约束。前进行程一律由最远 K0 的 ``x`` 决定：
-    绿/黑组减去 ``target_final_x_mm``，单个橙色目标减去
+    绿/黑组减去普通配置的 ``target_final_x_mm``；贪心补夹由本次策略的
+    ``target_final_x_mm`` 覆盖为 ``greedy_target_final_x_mm``。单个橙色目标减去
     ``orange_target_final_x_mm``。``corridor_end_x_mm`` 与实际扫掠走廊
     使用同一公式，包含夹爪末端前伸距离。
     """
@@ -594,6 +610,22 @@ class NearFieldGraspSelector:
     def default_policy(self) -> NearFieldGraspPolicy:
         return NearFieldGraspPolicy(GRASPABLE_CLASSES, self.config.max_targets)
 
+    @staticmethod
+    def _target_final_x_for_policy(
+        policy: NearFieldGraspPolicy | None,
+    ) -> float | None:
+        """Return a per-action supply endpoint override, if one is present."""
+
+        if policy is None:
+            return None
+        if not isinstance(policy, NearFieldGraspPolicy):
+            raise TypeError("policy must be a NearFieldGraspPolicy or None.")
+        return (
+            None
+            if policy.target_final_x_mm is None
+            else float(policy.target_final_x_mm)
+        )
+
     def servo_angles(self, width: float) -> tuple[float, float]:
         return self.kinematics.servo_angles_for_opening(width,
             open_left_angle_deg=self.open_angles[0], open_right_angle_deg=self.open_angles[1],
@@ -647,7 +679,6 @@ class NearFieldGraspSelector:
             and target.envelope is not None
             and observation.target_class in policy.allowed_classes
             and observation.model_target_class is not TargetClass.BLUE_DANGER
-            and not observation.quality
         )
 
     def _orange_isolation_rejection(
@@ -668,7 +699,7 @@ class NearFieldGraspSelector:
         for other in targets:
             if other.track_id == target.track_id:
                 continue
-            # 只有当前帧可定位的其它目标才能证明其落入 50 mm 禁区。
+            # 只有当前帧可定位的其它目标才能证明其落入 10 mm 禁区。
             # 失观轨迹或缺 K0 检测不能被无条件推定在橙色目标旁边。
             if not other.observed or other.observation.ground_point is None:
                 continue
@@ -697,13 +728,14 @@ class NearFieldGraspSelector:
         *,
         align: bool,
     ) -> bool:
-        """圆形近邻区内仅放行有完整当前包络证明位于扫掠外的侧后方物资。
+        """圆形近邻区内仅放行 K0 位于扫掠外的合法绿/黑物资。
 
-        危险/未知、缺包络、前方或贴邻目标仍执行原隔离门禁；不减小隔离半径。
+        危险/未知或 K0 进入扫掠的目标仍执行原隔离门禁；不减小隔离半径。
         """
         if (other.observation.target_class not in SUPPLIES
                 or not self._eligible(other, self.default_policy)
-                or other.envelope is None or orange.envelope is None):
+                or other.observation.ground_point is None
+                or orange.envelope is None):
             return False
         try:
             geometries = [self._group_geometry(
@@ -722,18 +754,22 @@ class NearFieldGraspSelector:
                 ))
         except ValueError:
             return False
-        if polygon_distance(orange.envelope.corners, other.envelope.corners) <= self.config.clearance_mm:
-            return False
-        margin = self.config.corridor_lateral_margin_mm + self.config.clearance_mm
         for geometry in geometries:
             if geometry.reasons:
                 return False
-            points = tuple(_rotate(point, -geometry.angle_rad) for point in other.envelope.corners)
-            x0, _, y0, y1 = _bounds(points)
-            orange_center = _rotate(orange.envelope.center, -geometry.angle_rad)
-            outside_sweep = (y0 > geometry.left_tip_y_mm + margin
-                             or y1 < geometry.right_tip_y_mm - margin)
-            if x0 <= orange_center.x or not outside_sweep:
+            # 扫掠门禁只判断邻近目标的 K0；目标外轮廓不再扩大扫掠阻挡范围。
+            other_point = other.observation.ground_point
+            assert other_point is not None
+            regions = self._regions(
+                geometry.angle_rad,
+                geometry.forward_distance_mm,
+                geometry.left_tip_y_mm,
+                geometry.right_tip_y_mm,
+            )
+            if min(
+                polygon_distance((other_point,), region)
+                for region in regions
+            ) <= 1e-6:
                 return False
         return True
 
@@ -789,21 +825,21 @@ class NearFieldGraspSelector:
         # 与观测侧的唯一部署前向偏差成对抵消，不复制投影矩阵。
         return tuple(self.projector.ground_to_pixels(tuple(GroundPoint(p.x - MODEL_GROUND_FORWARD_BIAS_MM, p.y) for p in region)))
 
-    def _obstacle_distance(self, target: GraspTarget, regions: tuple[tuple[GroundPoint, ...], ...]) -> float:
+    def _obstacle_distance(self, target: GraspTarget, regions: tuple[tuple[GroundPoint, ...], ...],
+                           *, obstacle_extent_required: bool = False) -> float:
         # 停车后的近场走廊只使用当前帧可靠 K0。历史失观轨迹的膨胀包络
         # 会把侧方静态目标扩张成横跨走廊的幽灵障碍；当前帧缺少地面点时
         # 同样不能用旧包络或旧像素框代替当前空间证据。
         if target.observed and target.observation.ground_point is not None:
             point = (target.observation.ground_point,)
             gap = min(polygon_distance(point, region) for region in regions)
-            if target.observation.target_class is TargetClass.BLUE_DANGER:
-                # 蓝块有实体：中心在路径外也可能被夹到，所以按实体半径收缩
-                # 净空。取内切半径——一定被实体占据的圆盘——与解团接触判定
-                # 同一条原则“内切半径才成立”；外接半径会把只是近旁、并不在
-                # 夹取路径上的蓝块当成阻挡，制造不必要的换组和解团。蓝块实体
-                # 始终参与扫掠检查，危险证据不因此删除。
-                radius, _ = physical_radii(self.target_geometry.geometry_for(TargetClass.BLUE_DANGER))
-                gap = max(0.0, gap - radius)
+            if obstacle_extent_required:
+                # K0 是底面中心；未知朝向采用配置实体外接半径，不能用顶部 HSV
+                # 包络替代底面位置。与解团共用尺寸权威，不增设开场距离阈值。
+                _, radius = physical_radii(
+                    self.target_geometry.geometry_for(target.observation.target_class)
+                )
+                return gap - radius
             return gap
         return math.inf
 
@@ -1030,6 +1066,7 @@ class NearFieldGraspSelector:
         align: bool = True,
         alignment_tolerance_mm: float | None = None,
         range_limit_mm: float | None = None,
+        target_final_x_mm: float | None = None,
     ) -> _GroupGeometry:
         """计算候选组几何；门禁理由也由此处统一生成。"""
 
@@ -1052,6 +1089,17 @@ class NearFieldGraspSelector:
         )
         if not math.isfinite(range_limit) or range_limit <= 0.0:
             raise ValueError("range_limit_mm must be finite and positive.")
+        if target_final_x_mm is not None:
+            if (
+                isinstance(target_final_x_mm, bool)
+                or not isinstance(target_final_x_mm, (int, float))
+                or not math.isfinite(float(target_final_x_mm))
+                or float(target_final_x_mm) <= 0.0
+            ):
+                raise ValueError(
+                    "target_final_x_mm must be finite and positive."
+                )
+            target_final_x_mm = float(target_final_x_mm)
         # 近场半径是进入一次收拢的条件，不是逐成员裁剪线。绿黑组合只需
         # 有一个成员已进入近场；其它成员仍由完整开度和最大前进行程约束。
         supply_group = len(members) > 1 and all(
@@ -1103,8 +1151,28 @@ class NearFieldGraspSelector:
         if is_single_orange:
             target_final_x = self.config.orange_target_final_x_mm
         else:
-            target_final_x = self.config.target_final_x_mm
+            target_final_x = (
+                self.config.target_final_x_mm
+                if target_final_x_mm is None
+                else target_final_x_mm
+            )
         forward_distance = max(0.0, x_front - target_final_x)
+        if not is_single_orange:
+            # K0 是底面中心，不是物块前缘。只有中心到达配置终点时，
+            # 物块前半部仍可能留在闭爪末端之外。复用真实底面尺寸的
+            # 外接半径（当前没有可靠底面 yaw），逐成员检查收拢深度。
+            closed_front = min(
+                self.kinematics.left_tip_position(0.0).x,
+                self.kinematics.right_tip_position(0.0).x,
+            )
+            forward_distance = max(
+                forward_distance,
+                *(point.x + physical_radii(self.target_geometry.geometry_for(
+                    member.observation.target_class))[1] - closed_front
+                  for member, point in zip(members, rotated_centers)),
+            )
+            # 诊断输出实际生效的组终点；下面的扫掠和行程上限使用同一距离。
+            target_final_x = min(target_final_x, x_front - forward_distance)
         # 与 `_regions()` 的实际扫掠走廊共用同一前端公式。
         corridor_end = self._sweep_end_x_mm(opening_servo_angles, forward_distance)
         corridor_half_width = max(
@@ -1146,6 +1214,7 @@ class NearFieldGraspSelector:
 
         if not isinstance(target, GraspTarget):
             raise TypeError("target must be a GraspTarget.")
+        target_final_x_mm = self._target_final_x_for_policy(policy)
         reasons: list[str] = []
         if not self._eligible(target, policy):
             reasons.append("ineligible_target")
@@ -1161,7 +1230,11 @@ class NearFieldGraspSelector:
                 x1_mm=None,
                 depth_mm=None,
                 opening_width_mm=None,
-                target_final_x_mm=self.config.target_final_x_mm,
+                target_final_x_mm=(
+                    self.config.target_final_x_mm
+                    if target_final_x_mm is None
+                    else target_final_x_mm
+                ),
                 corridor_start_x_mm=self.config.corridor_start_x_mm,
                 corridor_end_x_mm=None,
                 corridor_half_width_mm=None,
@@ -1172,7 +1245,10 @@ class NearFieldGraspSelector:
                 handoff_matched=target.handoff_matched,
             )
         try:
-            geometry = self._group_geometry((target,))
+            geometry = self._group_geometry(
+                (target,),
+                target_final_x_mm=target_final_x_mm,
+            )
         except ValueError as exc:
             reasons.append(str(exc))
             return CandidateGeometry(
@@ -1185,7 +1261,11 @@ class NearFieldGraspSelector:
                 x1_mm=None,
                 depth_mm=None,
                 opening_width_mm=None,
-                target_final_x_mm=self.config.target_final_x_mm,
+                target_final_x_mm=(
+                    self.config.target_final_x_mm
+                    if target_final_x_mm is None
+                    else target_final_x_mm
+                ),
                 corridor_start_x_mm=self.config.corridor_start_x_mm,
                 corridor_end_x_mm=None,
                 corridor_half_width_mm=None,
@@ -1260,6 +1340,7 @@ class NearFieldGraspSelector:
             policy = self.default_policy
         if not isinstance(policy, NearFieldGraspPolicy):
             raise TypeError("policy must be a NearFieldGraspPolicy or None.")
+        target_final_x_mm = self._target_final_x_for_policy(policy)
         cfg, k = self.config, self.kinematics
         if not 1 <= len(members) <= policy.max_targets or any(
             not self._eligible(t, policy) for t in members
@@ -1277,6 +1358,7 @@ class NearFieldGraspSelector:
             align=align,
             alignment_tolerance_mm=alignment_tolerance_mm,
             range_limit_mm=range_limit_mm,
+            target_final_x_mm=target_final_x_mm,
         )
         if geometry.reasons:
             raise ValueError(geometry.reasons[0])
@@ -1489,25 +1571,14 @@ class NearFieldGraspSelector:
                     for target in targets:
                         if target.track_id in plan.member_ids:
                             continue
-                        if (
-                            target.observed
-                            and (
-                                target.observation.target_class
-                                in {TargetClass.BLUE_DANGER}
-                                or target.observation.model_target_class
-                                in {TargetClass.BLUE_DANGER}
-                            )
-                            and target.observation.ground_point is None
-                        ):
-                            raise ValueError(
-                                "unknown_target_geometry_missing:"
-                                f"{target.track_id}:"
-                                f"{target.observation.target_class.value}"
-                            )
-                        gap = self._obstacle_distance(target, plan.regions)
+                        gap = self._obstacle_distance(
+                            target, plan.regions,
+                            obstacle_extent_required=policy.obstacle_extent_required,
+                        )
                         if gap <= 1e-6:
                             if (
-                                self._eligible(target, policy)
+                                not policy.obstacle_extent_required
+                                and self._eligible(target, policy)
                                 and target.observation.target_class in SUPPLIES
                                 and all(
                                     member.observation.target_class in SUPPLIES
@@ -1535,34 +1606,6 @@ class NearFieldGraspSelector:
         # 权重及数量、净空、距离、对准代价形成稳定次序。
         ranked_plans = tuple(sorted(plans, key=self._plan_rank))
         best = ranked_plans[0] if ranked_plans else None
-        if (
-            locked_ids is None
-            and best is not None
-            and len(best.members) < policy.max_targets
-            and all(member.observation.target_class in SUPPLIES for member in best.members)
-        ):
-            # A handoff can confirm its seed before adjacent local tracks have
-            # enough hits. Do not freeze a singleton during that startup race.
-            for other in targets:
-                if (
-                    other.track_id in best.member_ids
-                    or other.confirmed
-                    or not self._eligible(replace(other, confirmed=True), policy)
-                    or other.observation.target_class not in SUPPLIES
-                ):
-                    continue
-                # A fixed centre-distance box can split a reachable row. Use
-                # the same opening, travel and range constraints as selection.
-                try:
-                    self._build(
-                        (*best.members, replace(other, confirmed=True)),
-                        align=False,
-                        alignment_tolerance_mm=alignment_tolerance_mm,
-                        policy=policy,
-                    )
-                except ValueError:
-                    continue
-                return GraspSelection(None, ("waiting_adjacent_supply_confirmation",), best)
         preview = best or (
             min(preview_plans, key=self._plan_rank) if preview_plans else None
         )
@@ -1620,6 +1663,7 @@ class NearFieldGraspSelector:
             for member in plan.members
         )
         return (
+            abs(plan.alignment_angle_rad) > 1e-9,
             -len(plan.members),
             -black_count,
             -plan.score.rule_points,
@@ -1696,6 +1740,8 @@ class NearFieldGraspSelector:
                     ):
                         return f"member_outside_opening:{current.track_id}"
         for target in targets:
-            if target.track_id not in plan.member_ids and self._obstacle_distance(target, regions) <= 1e-6:
+            if target.track_id not in plan.member_ids and self._obstacle_distance(
+                target, regions, obstacle_extent_required=policy.obstacle_extent_required,
+            ) <= 1e-6:
                 return f"new_sweep_obstacle:{target.track_id}:{target.observation.target_class.value}"
         return None

@@ -38,10 +38,6 @@ POSE_MODEL_CLASSES = tuple(PoseModelClass)
 class ObservationQuality(str, Enum):
     """不会被静默丢弃的观测质量信息。"""
 
-    COLOR_EVIDENCE_INSUFFICIENT = "color_evidence_insufficient"
-    COLOR_EVIDENCE_AMBIGUOUS = "color_evidence_ambiguous"
-    HIGH_CONFIDENCE_COLOR_OVERRIDE = "high_confidence_color_override"
-    POSE_COLOR_CONFLICT = "pose_color_conflict"
     K0_UNAVAILABLE = "k0_unavailable"
 
 

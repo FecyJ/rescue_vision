@@ -28,15 +28,16 @@
 
 `estimate_gripper_width()` 只消费已有的 `TargetObservation` 和同一
 `GroundProjector`。目标地面中心满足严格开区间
-`-center_y_half_range_mm < ground_point.y < center_y_half_range_mm`，且 ROI
-颜色分割为 `accepted` 时，颜色掩码前景像素会按像素中心投影到机器人地面系。
+`-center_y_half_range_mm < ground_point.y < center_y_half_range_mm` 时返回结果。
+有效颜色掩码前景像素会按像素中心投影到机器人地面系；颜色掩码不足或歧义时
+使用模型 bbox 底边作为横向几何。
 机器人左侧边界取 `y` 最大值，右侧边界取 `y` 最小值，结果同时提供
 `width_mm`、`front_x_mm`、`center_to_front_mm` 和
 `opening_width_mm = width_mm + clearance_mm`。纯估计函数不负责舵机或
 UART。该单目标函数仍供独立测量使用；近场多目标入口改用
 `measure_target_envelope(observation, projector, min_mask_pixels=...)`，不应用居中门限，
-返回带采集时间 ns、类别、K0 中心和四角的 `TargetGroundEnvelope`。它包含颜色掩码
-与 K0 的机器人地面包络；几何缺失返回 `None`，由应用层保留为未知几何障碍。
+返回带采集时间 ns、类别、地面锚点和四角的 `TargetGroundEnvelope`。它优先包含颜色掩码
+与模型 K0；缺失时使用 bbox 底边及其中点，因此四类目标不会因 HSV 状态或 K0 缺失而失去几何。
 组宽、最大开口、目标 ID 采样和净空规则属于 `app/near_field_grasp.py`。
 物块顶部与地面不共面造成的误差仍需现场标定验证。
 
@@ -105,16 +106,15 @@ finally:
 
 ## 三关键点与降级
 
-- 四类目标：只消费 K0；K1/K2 必须无效。K0 低于阈值时 `ground_point=None`，
-  不使用 bbox 中心或底边兜底。
+- 四类目标：优先消费 K0；K1/K2 必须无效。K0 缺失或低于阈值时使用 bbox
+  底边中点作为地面锚点，并保留原始 K0 置信度用于诊断。
 - 模型类别是任务类别的唯一权威：`target_class` 始终等于 `model_target_class`，
   类别分布是该类的四类 one-hot，检测置信度独立保存。ROI HSV 只按模型类别提取几何掩码，
-  不覆盖类别，也不产生 `unknown` 任务类别。颜色证据不足时
-  `color_segmentation.candidate_class=None` 并带 `COLOR_EVIDENCE_INSUFFICIENT` 质量位，
-  供下游诊断和几何可用性判断使用。
+  不覆盖类别，也不产生 `unknown` 任务类别。颜色不足或歧义只保留在分割诊断中，
+  不产生质量门禁；HSV 掩码不可用时，夹爪横向包络使用 bbox 底边兜底。
 - 中心十字：K0 投影到机器人地面系；模型 bbox 内可用 Canny/Hough/直线拟合
   精修两条轴。精修失败保留单点和显式质量，不伪造航向。当前目标与场地
-  关键点的机器人地面前向坐标统一应用实测 `+225 mm` 修正，像素坐标不变。
+  关键点的机器人地面前向坐标统一应用实测 `+210 mm` 修正，像素坐标不变。
 - 安全区：标注语义仍定义为图像左 K1/右 K2；推理时若模型把两个同时有效的
   角点交换，后处理会按去畸变图 `u` 自动交换整组点和置信度。只有一点有效时
   不强行重排；身份颜色证据关闭、不足或遮挡时为 `unknown`，由定位层枚举红蓝
@@ -146,3 +146,16 @@ finally:
 后处理映射必须声明 `num_classes: 6`、`kpt_shape: [3, 3]`。示例 HSV、中心十字
 精修阈值和安全区颜色范围都不是现场验收值；正式模型、危险类指标、树莓派 +
 Hailo P50/P95 观测年龄及远场精度目前均未验证。
+
+## 夹爪内颜色观测
+
+`gripper_color.py` 的 `observe_gripper_colors()` 只读取配置内侧ROI，返回
+`GripperColorObservation`；帧号、采集/发布时间继承所属 `PoseDetectionResult`、
+`RealtimeDetectionResult` 和 `PerceptionSnapshot`。禁用或过期结果不提供颜色证据。
+检测后处理计时包括此步骤，结果仍先于渲染发布，不在控制循环转换图像。
+夹爪颜色证据只供任务层门禁和日志诊断消费，不绘制到本地或远程预览；这样误夹处理
+不会让观察旁路持有或重复显示某一张历史帧。
+`bounding_box_overlaps_gripper_polygon()` 默认要求正面积重叠；任务层对蓝色模型框传入
+`include_boundary=True`，将框与凸 ROI 的边缘或角点接触也计入误夹证据。
+纯函数不持有设备资源，生产装配由 `AppConfig.build_target_detector()` 与现有上下文关闭后端。
+模型类别不由门禁改写；误夹恢复归任务层。阈值和现场调节以 [config README](../config/README.md#夹爪内颜色门禁配置) 为准。

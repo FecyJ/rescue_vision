@@ -20,7 +20,6 @@ from rescue_vision.perception import (
     HsvColorClassifierConfig,
     HsvRange,
     ModelDetection,
-    ObservationQuality,
     PoseKeypoint,
     PerceptionFrameRenderer,
     RoiColorSegmentation,
@@ -166,8 +165,8 @@ def test_detector_uses_hsv_class_and_projects_k0() -> None:
     assert observation.class_probabilities.green_supply == pytest.approx(1.0)
     assert set(observation.class_probabilities.as_dict()) == {item.value for item in TargetClass}
     assert observation.detection_confidence == pytest.approx(0.8)
-    # 临时修改：目标地面点 x 统一补偿 +225（见 detector.py 临时注释）。
-    assert observation.ground_point == GroundPoint(235.0, 18.0)
+    # 当前相机/模型组合的目标地面点 x 统一补偿 +210（见 detector.py）。
+    assert observation.ground_point == GroundPoint(220.0, 18.0)
     assert observation.quality == frozenset()
     segmentation = observation.color_segmentation
     assert segmentation.status is ColorSegmentationStatus.ACCEPTED
@@ -215,7 +214,6 @@ def test_model_class_is_authoritative_over_roi_background() -> None:
     )[0]
     assert blue.model_target_class is TargetClass.GREEN_SUPPLY
     assert blue.target_class is TargetClass.GREEN_SUPPLY
-    assert ObservationQuality.POSE_COLOR_CONFLICT not in blue.quality
 
     green_image = image_with_regions((box, (60, 255, 200)))
     green = detector([[detection(class_id=3)]]).detect(
@@ -225,13 +223,16 @@ def test_model_class_is_authoritative_over_roi_background() -> None:
     )[0]
     assert green.model_target_class is TargetClass.BLUE_DANGER
     assert green.target_class is TargetClass.BLUE_DANGER
-    assert ObservationQuality.POSE_COLOR_CONFLICT not in green.quality
 
 
-def test_insufficient_color_and_k0_degrade_conservatively() -> None:
+def test_missing_k0_uses_bbox_bottom_midpoint_without_color_quality_gate() -> None:
     image = image_with_regions()
+    projector = GroundProjector(
+        np.array([[2.0, 0, 0], [0, 3.0, 0], [0, 0, 1]])
+    )
     observation = detector(
-        [[detection(k0_confidence=0.2)]]
+        [[detection(k0_confidence=0.2)]],
+        projector=projector,
     ).detect(
         frame(image),
         image,
@@ -242,14 +243,9 @@ def test_insufficient_color_and_k0_degrade_conservatively() -> None:
     assert set(observation.class_probabilities.as_dict()) == {item.value for item in TargetClass}
     assert observation.color_segmentation.candidate_class is None
     assert observation.color_segmentation.status is ColorSegmentationStatus.INSUFFICIENT
-    assert observation.k0 is None
-    assert observation.ground_point is None
-    assert observation.quality == frozenset(
-        {
-            ObservationQuality.COLOR_EVIDENCE_INSUFFICIENT,
-            ObservationQuality.K0_UNAVAILABLE,
-        }
-    )
+    assert observation.k0 == UndistortedPixel(5.0, 9.0)
+    assert observation.ground_point == GroundPoint(220.0, 27.0)
+    assert observation.quality == frozenset()
 
 
 def test_high_confidence_model_class_overrides_rejected_color() -> None:
@@ -265,11 +261,7 @@ def test_high_confidence_model_class_overrides_rejected_color() -> None:
     assert observation.class_probabilities.green_supply == pytest.approx(1.0)
     assert set(observation.class_probabilities.as_dict()) == {item.value for item in TargetClass}
     assert observation.color_segmentation.status is ColorSegmentationStatus.INSUFFICIENT
-    assert observation.quality == frozenset(
-        {
-            ObservationQuality.COLOR_EVIDENCE_INSUFFICIENT,
-        }
-    )
+    assert observation.quality == frozenset()
 
 
 def test_high_confidence_model_class_overrides_ambiguous_color() -> None:
@@ -289,10 +281,10 @@ def test_high_confidence_model_class_overrides_ambiguous_color() -> None:
     assert observation.target_class is TargetClass.GREEN_SUPPLY
     assert set(observation.class_probabilities.as_dict()) == {item.value for item in TargetClass}
     assert observation.color_segmentation.status is ColorSegmentationStatus.AMBIGUOUS
-    assert ObservationQuality.COLOR_EVIDENCE_AMBIGUOUS in observation.quality
+    assert observation.quality == frozenset()
 
 
-def test_high_confidence_override_threshold_is_strict() -> None:
+def test_model_class_does_not_create_color_override_quality() -> None:
     image = image_with_regions()
     observation = detector([[detection(confidence=0.8)]]).detect(
         frame(image),
@@ -301,7 +293,7 @@ def test_high_confidence_override_threshold_is_strict() -> None:
     )[0]
 
     assert observation.target_class is observation.model_target_class
-    assert ObservationQuality.HIGH_CONFIDENCE_COLOR_OVERRIDE not in observation.quality
+    assert observation.quality == frozenset()
 
 
 def test_low_coverage_keeps_candidate_roi_mask_for_diagnostics() -> None:
@@ -349,7 +341,7 @@ def test_ambiguous_two_color_roi_keeps_model_class() -> None:
     assert set(observation.class_probabilities.as_dict()) == {item.value for item in TargetClass}
     assert observation.color_segmentation.status is ColorSegmentationStatus.AMBIGUOUS
     assert observation.color_segmentation.dominance == pytest.approx(0.5)
-    assert ObservationQuality.COLOR_EVIDENCE_AMBIGUOUS in observation.quality
+    assert observation.quality == frozenset()
 
 
 def test_morphology_removes_isolated_color_noise() -> None:
@@ -400,7 +392,7 @@ def test_detector_rejects_stale_and_dispatches_field_classes() -> None:
     assert field_result.observations == ()
     assert field_result.field_features.center_cross is not None
     assert field_result.field_features.center_cross.intersection_ground == GroundPoint(
-        230.0,
+        215.0,
         6.0,
     )
 
@@ -421,9 +413,9 @@ def test_safe_zone_three_keypoints_share_frame_and_project_to_ground() -> None:
     assert output.observations == ()
     assert output.field_features.frame_sequence == 7
     zone = output.field_features.safe_zones[0]
-    assert zone.ground_anchor.ground == GroundPoint(230.0, 6.0)
-    assert zone.image_left_landmark.ground == GroundPoint(228.0, 7.0)
-    assert zone.image_right_landmark.ground == GroundPoint(232.0, 7.0)
+    assert zone.ground_anchor.ground == GroundPoint(215.0, 6.0)
+    assert zone.image_left_landmark.ground == GroundPoint(213.0, 7.0)
+    assert zone.image_right_landmark.ground == GroundPoint(217.0, 7.0)
     assert zone.image_left_landmark.undistorted.u < zone.image_right_landmark.undistorted.u
     assert zone.physical_color.value == "unknown"
 
@@ -561,6 +553,17 @@ def test_perception_frame_renderer_keeps_latest_result_off_realtime_thread() -> 
         assert snapshot is not None
         assert snapshot.frame_sequence == source_frame.sequence
         assert len(snapshot.observations) == 1
+
+        next_frame = CameraFrame(8, time.monotonic_ns() - 1_000_000, image)
+        renderer.submit(next_frame)
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            rendered = renderer.latest()
+            if rendered is not None and rendered.sequence == next_frame.sequence:
+                break
+            time.sleep(0.001)
+        assert rendered is not None
+        assert rendered.sequence == next_frame.sequence
     finally:
         renderer.stop()
 

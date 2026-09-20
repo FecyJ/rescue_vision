@@ -36,6 +36,32 @@ def test_last_50mm_pickup_profile_is_unchanged(remaining):
     assert approach_speed_m_s(remaining, .15, 1.5, .5, precision_approach=True) == pytest.approx(max(.005, remaining))
 
 
+@pytest.mark.parametrize('gain', [0.5, 1.0, 2.0])
+@pytest.mark.parametrize('remaining', [0.01, 0.03, 0.05])
+def test_last_50mm_pickup_profile_uses_configured_gain(gain, remaining):
+    assert approach_speed_m_s(
+        remaining,
+        .15,
+        1.5,
+        .5,
+        precision_approach=True,
+        terminal_speed_gain_s_inv=gain,
+    ) == pytest.approx(max(.005, gain * remaining))
+
+
+@pytest.mark.parametrize('gain', [0.0, -1.0, math.inf, math.nan])
+def test_terminal_speed_gain_must_be_finite_and_positive(gain):
+    with pytest.raises(ValueError, match='terminal_speed_gain_s_inv'):
+        approach_speed_m_s(
+            .05,
+            .15,
+            1.5,
+            .5,
+            precision_approach=True,
+            terminal_speed_gain_s_inv=gain,
+        )
+
+
 def test_transport_cruises_faster_but_preserves_calibrated_stop_speed():
     assert approach_speed_m_s(1., .35, 1.5, .5, precision_approach=False) == pytest.approx(.525)
     assert approach_speed_m_s(.1, .35, 1.5, .5, precision_approach=False) == pytest.approx(.35)

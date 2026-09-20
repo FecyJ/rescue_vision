@@ -19,7 +19,6 @@ from rescue_vision.geometry.types import (
 )
 from rescue_vision.perception.types import (
     COLOR_TARGET_CLASSES,
-    ColorSegmentationStatus,
     TargetClass,
     TargetObservation,
 )
@@ -894,11 +893,7 @@ class TargetGroundGeometryEstimator:
     ) -> TargetGroundGeometry:
         quality: set[GroundGeometryQuality] = set()
         segmentation = observation.color_segmentation
-        if (
-            segmentation.status is not ColorSegmentationStatus.ACCEPTED
-            or segmentation.candidate_class is not observation.target_class
-            or not np.any(segmentation.mask)
-        ):
+        if not np.any(segmentation.mask):
             quality.add(GroundGeometryQuality.COLOR_MASK_UNAVAILABLE)
             return self._unavailable(
                 observation,

@@ -520,10 +520,10 @@ def test_effective_relocation_reopens_the_same_physical_aim():
     assert seq._choose_breakup_plan(capture_ns) is None
 
     # Keep the target at the same field location while the robot translates
-    # 300 mm; a mere heading/session change is not used as the unlock.
-    seq._fallback_field_position = FieldPoint(300.0, 0.0)
+    # 200 mm keeps the same core ahead of the closed jaw; rotation alone cannot unlock it.
+    seq._fallback_field_position = FieldPoint(200.0, 0.0)
     moved_specs = tuple(
-        (x - 300.0, y, target_class, box_x)
+        (x - 200.0, y, target_class, box_x)
         for x, y, target_class, box_x in GROUP_SPECS
     )
     feed(seq, 2, 320, moved_specs)
@@ -579,7 +579,9 @@ def test_failed_attempts_do_not_bleed_into_a_neighbouring_group():
 
     seq = sequence()
     seq._latest_heading_rad = 0.0
-    _, capture_ns, _ = confirm_scene(seq, GROUP_SPECS + NEIGHBOUR_SPECS)
+    # Both groups must fit the fixed stroke and have disjoint push paths.
+    neighbour = tuple((x-400, y+350, cls, box) for x, y, cls, box in NEIGHBOUR_SPECS)
+    _, capture_ns, _ = confirm_scene(seq, GROUP_SPECS + neighbour)
     seq._breakup_attempts = [
         breakup_plan(450.0)
         for _ in range(int(seq.config.breakup_max_attempts))
@@ -588,7 +590,7 @@ def test_failed_attempts_do_not_bleed_into_a_neighbouring_group():
     plan = seq._choose_breakup_plan(capture_ns)
 
     assert plan is not None
-    assert plan.aim_field.x > 600.0
+    assert plan.aim_field.y >= 350.0
     assert any(
         "reason=group_attempts_exhausted" in line
         for line in seq._breakup_plan_rejections
@@ -604,7 +606,8 @@ def test_failed_attempt_records_the_aim_not_the_whole_group():
 
     seq = sequence()
     seq._latest_heading_rad = 0.0
-    _, capture_ns, _ = confirm_scene(seq, GROUP_SPECS + NEIGHBOUR_SPECS)
+    neighbour = tuple((x-400, y+350, cls, box) for x, y, cls, box in NEIGHBOUR_SPECS)
+    _, capture_ns, _ = confirm_scene(seq, GROUP_SPECS + neighbour)
     plan = seq._choose_breakup_plan(capture_ns)
     assert plan is not None
 
@@ -613,10 +616,10 @@ def test_failed_attempt_records_the_aim_not_the_whole_group():
 
     # 记忆里只应有被瞄准的那一个物理点，不是整组成员足迹。
     assert seq._breakup_failed_aims == [plan.aim_field]
-    # 该瞄准点被封锁，相距 400 mm 的另一团仍可选。
+    # 该瞄准点被封锁，侧方相距 350 mm 的另一团仍可选。
     alternative = seq._choose_breakup_plan(capture_ns)
     assert alternative is not None
-    assert alternative.aim_field.x > 600.0
+    assert alternative.aim_field.y >= 350.0
     assert any(
         "reason=group_in_failed_region" in line
         for line in seq._breakup_plan_rejections
@@ -877,16 +880,21 @@ def test_relocation_rechecks_new_danger_before_next_forward_command():
 
 
 @pytest.mark.parametrize('cls', list(TargetClass))
-def test_safe_zone_bbox_objects_are_removed_from_planning_input(cls):
+def test_safe_zone_bbox_objects_remain_obstacles_but_not_candidates(cls):
     seq = near_field_sequence(transports=1)
     inside = observation(1,0,GroundPoint(300,0),target_class=cls,box_x=10)
     outside = observation(1,0,GroundPoint(700,100),box_x=60)
     raw = with_safe_zone(1,0,UndistortedBoundingBox(0,0,40,40),(inside,outside))
-    filtered = seq.planning_perception(raw)
-    assert filtered.observations == (outside,)
+    filtered = raw
+    assert filtered is raw
+    assert filtered.observations == (inside,outside)
+    # 排除集只标记"已交付/已携带物资"；蓝色危险证据永远不进入该集合，
+    # 否则旧实现会把危险物从规划输入整体删除，安全区旁的危险物不再
+    # 阻挡夹爪扫掠（见 test_grasp_exclusions_mark_delivered_supplies_but_not_danger）。
+    excluded = frozenset() if cls is TargetClass.BLUE_DANGER else frozenset({0})
+    assert seq.grasp_excluded_observation_indices(filtered) == excluded
     assert raw.observations == (inside,outside)
     assert filtered.field_features is raw.field_features
-    assert seq.planning_perception(filtered) is filtered
 
 
 @pytest.mark.parametrize('delay_ms,period_ms', [(300,250),(600,400)])
@@ -912,3 +920,244 @@ def test_breakup_search_still_approaches_far_collectible(delay_ms,period_ms):
             assert decision.state is MatchState.TRANSPORT_APPROACH_GREEN
             break
     assert progressed, decision.reason
+
+
+def recovery_preparation(plan, *, session_id: int, capture_ns: int, prepared_ns: int):
+    """构造"近场判定抓不了、必须推开"的准备结果。
+
+    ``GraspPreparation.action`` 只有在 ``selection.plan`` 为空且
+    ``recovery_plan`` 存在时才是 ``RECOVERY``，所以这里必须显式留空计划。
+    """
+
+    from test_near_field_grasp import target
+
+    return GraspPreparation(
+        capture_ns,
+        GraspSelection(None, ("blocked_target:2:blue_danger",)),
+        (target(plan.aim_id, x=plan.aim.x, y=plan.aim.y, timestamp=capture_ns),),
+        True,
+        checked_member_ids=None,
+        session_id=session_id,
+        confirmation_count=1,
+        confirmation_required=1,
+        prepared_timestamp_ns=prepared_ns,
+        result_timestamp_ns=prepared_ns,
+        recovery_plan=plan,
+        recovery_checked=True,
+    )
+
+
+@pytest.mark.parametrize("poll_ms", (5, 10))
+def test_recovery_plan_survives_alignment_turn_instead_of_bouncing_back(poll_ms):
+    """接触朝向需要对准时，解团计划不能被当成"转向改变了相机几何"弃掉。
+
+    现场 20260913_1651：0～120 s 内近场一共给出 6 份 RECOVERY 接触计划，
+    其中 5 份因为朝向超出 ``cluster_align_tolerance_rad`` 而只转了一下就回到
+    ``transport_near_field_grasp``，只有朝向恰好已对准的那 1 份真的推了出去
+    （t=117.7 s）。每次弃团还会丢掉交接 prior，车随即转离已对准的朝向，于是
+    同一片密集团被反复重新判定为"必须解团"，首次推挤前空转了 5.9 圈。
+    """
+
+    seq = near_field_sequence()
+    seq._started = True
+    seq.config = replace(seq.config, safe_zone_calibration_stop_confirm_time_s=0.01)
+    plan = replace(breakup_plan(450.0), heading_rad=0.30)
+    capture_ns, prepared_ns = 20_000_000, 30_000_000
+    seq._record_pose_history(capture_ns, 0.0, 0.0)
+    # 近场 RECOVERY 只会出现在已经接管的抓取任务里；没有任务时
+    # ``_collect_dynamic_breakup`` 走的是另一条重新规划分支。
+    seq._adopt_grasp_task(
+        0, track_id=plan.aim_id, target_class=TargetClass.GREEN_SUPPLY,
+        point=GroundPoint(450.0, 0.0), field=FieldPoint(450.0, 0.0),
+    )
+    assert seq._grasp_task is not None
+    for stamp_ms in range(0, 41, poll_ms):
+        seq.observe_grasp_motion(motion_sample(stamp_ms * 1_000_000))
+    assert seq.near_field_observation_window_open(40_000_000)
+
+    def step(now_ns, heading_rad):
+        return seq.step(
+            now_ns,
+            perception=None,
+            heading_rad=heading_rad,
+            cumulative_distance_m=0.0,
+            left_speed_feedback_m_s=0.0,
+            right_speed_feedback_m_s=0.0,
+            near_field_preparation=recovery_preparation(
+                plan,
+                session_id=seq.near_field_session_id,
+                capture_ns=capture_ns,
+                prepared_ns=prepared_ns,
+            ),
+            near_field_path_clear=True,
+        )
+
+    # A newer frame may contain a different peripheral target count. Recovery
+    # execution no longer requires an exact full-scene replay of its source frame.
+    seq._latest_perception = snapshot(
+        2,
+        35_000_000,
+        observation(2, 35_000_000, GroundPoint(700.0, 300.0)),
+    )
+    entering = step(40_000_000, 0.0)
+    assert entering.reason == "grasp_recovery_turn_frozen", entering.reason
+    assert seq.state is MatchState.BREAKUP_SETTLE
+    assert seq._breakup_frozen_plan is not None
+
+    # 朝向还没到：只允许继续对准转向，不得回到近场重扫。
+    aligning = step(50_000_000, 0.10)
+    assert aligning.reason == "breakup_align_contact_imu", aligning.reason
+    assert seq.state is MatchState.BREAKUP_SETTLE
+    assert seq._breakup_frozen_plan is not None
+    assert seq._grasp_task is not None
+
+    frozen = step(60_000_000, 0.30)
+    assert seq.state is MatchState.BREAKUP_FORWARD, (frozen.reason, seq.state)
+    assert frozen.reason == "breakup_plan_frozen", frozen.reason
+
+
+def observe_preparation(*, session_id: int, capture_ns: int, prepared_ns: int):
+    """当前帧还没拿到任何可执行方案的准备结果。"""
+
+    return GraspPreparation(
+        capture_ns,
+        GraspSelection(None, ()),
+        (),
+        False,
+        checked_member_ids=None,
+        session_id=session_id,
+        confirmation_count=0,
+        confirmation_required=1,
+        prepared_timestamp_ns=prepared_ns,
+        result_timestamp_ns=prepared_ns,
+    )
+
+
+def locked_near_field_sequence():
+    """已定路由、已接管任务的近场会话；只缺当前帧的准备结果。"""
+
+    seq = near_field_sequence()
+    seq._started = True
+    seq.config = replace(seq.config, safe_zone_calibration_stop_confirm_time_s=0.01)
+    seq._near_field_route = GraspRoute.DIRECT_NEAR
+    seq._adopt_grasp_task(
+        0, track_id=1, target_class=TargetClass.GREEN_SUPPLY,
+        point=GroundPoint(300.0, 0.0), field=FieldPoint(300.0, 0.0),
+    )
+    seq._near_field_confirmation_started_ns = 0
+    return seq
+
+
+def blink_scene(seq, now_ns):
+    return seq._step_near_field_grasp(
+        now_ns,
+        cumulative_distance_m=0.0,
+        preparation=observe_preparation(
+            session_id=seq.near_field_session_id,
+            capture_ns=now_ns,
+            prepared_ns=now_ns,
+        ),
+        path_clear=None,
+    )
+
+
+@pytest.mark.parametrize("poll_ms", (5, 10))
+def test_locked_session_survives_short_scene_gap_up_to_commit_window(poll_ms):
+    """已定下方案的会话丢帧时，不能被 800 ms 的"没有方案"窗口掐断。
+
+    现场 20260913_1651：t=553.8 s 与 t=562.8 s 两次近场会话都已经
+    ``route=direct_near`` 并锁定成员（``locked_ids=(2,)/(1,)``），却在
+    800 ms 处按"完全没有方案"退出；16 次 ``scene_evidence_unavailable``
+    退出的前一 tick 有 9 次 ``stationary_reason=continuous_stationary``，
+    说明车早已停稳，缺的只是准备结果跨越提交窗口的那一点时间。
+    """
+
+    seq = locked_near_field_sequence()
+    early = blink_scene(seq, 900_000_000)
+    assert early.state is MatchState.TRANSPORT_NEAR_FIELD_GRASP, early.reason
+    assert early.reason == "grasp_scene_evidence_pending", early.reason
+
+    # 提交窗口耗尽后仍然只能有界等待：不允许无期限停在原地。
+    late = blink_scene(seq, 1_900_000_000)
+    assert late.state is not MatchState.SEARCH_CLUSTER or late.reason.startswith(
+        "near_field_route:reselect:"
+    ), late.reason
+
+
+@pytest.mark.parametrize("poll_ms", (5, 10))
+def test_scene_evidence_timeout_reobserves_once_before_recording_failure(poll_ms):
+    """没有发出过运动指令的退出必须先原地重观测一次，并保持有界。
+
+    现场 20260913_1651：t=531.6→563.8 s 之间同一片区域反复出现
+    "近场 1 s 失败 → search_cluster 空转 7～15 s → relocate_forward 300 mm"，
+    原因是纯场景证据超时被当成物理失败记忆，必须靠换位才能解锁同一目标；
+    而重观测只需要一帧。
+    """
+
+    seq = locked_near_field_sequence()
+    handoffs = 0
+    search_at = None
+    for ms in range(900, 8_000, 50):
+        decision = blink_scene(seq, ms * 1_000_000)
+        if decision.reason.startswith("near_field_reobserve_without_motion"):
+            handoffs += 1
+        if decision.state is MatchState.SEARCH_CLUSTER:
+            search_at = ms
+            break
+
+    assert search_at is not None, "同一片区域连续无动作退出必须有界收束"
+    # 会话由测试直接建立，不产生首次交接；这里只应出现一次原地重观测。
+    assert handoffs == 1, f"只允许一次原地重观测，实际 {handoffs}"
+    assert len(seq._near_field_failures) == 1, "只有放弃这片区域时才记录失败"
+    assert seq.grasp_task is None
+
+
+def test_approach_seed_diagnostic_names_the_first_failing_gate():
+    """远场入口淘汰必须可解释，才能区分"没看见"和"看见了但被否决"。
+
+    现场 20260913_1651 的第 2 个问题（首轮不选近处孤立单绿）无法定论，正是
+    因为远场入口此前没有等价于近场 ``grasp_candidate`` 的淘汰日志。
+    """
+
+    seq = near_field_sequence(transports=1)
+    seq._latest_heading_rad = 0.0
+    ahead = observation(1, 10, GroundPoint(400.0, 0.0))
+    behind = observation(2, 10, GroundPoint(-400.0, 0.0))
+    orange = observation(
+        3, 10, GroundPoint(410.0, 20.0), target_class=TargetClass.ORANGE_INJURED,
+    )
+    seq._tracker.update(10, [ahead, behind, orange])
+
+    reported = {}
+    for entry in seq.approach_seed_diagnostic(10).split(";"):
+        track_id, target_class, rejection = entry.split(",")
+        reported[(track_id, target_class)] = rejection
+    assert reported[("track=1", "green_supply")] == "accepted"
+    assert reported[("track=2", "green_supply")] == "behind_robot"
+    assert reported[("track=3", "orange_injured")] == "orange_not_isolated"
+    # 诊断必须与真正的筛选一致：同一个候选在这里被否决，就不能成为种子。
+    seed = seq._find_approach_seed(10)
+    assert seed is not None and seed.track_id == 1
+
+    # 失败记忆封锁也要能被指名，否则现场无法区分"没看见"与"被记忆挡住"。
+    from rescue_vision.app.match import _AttemptFailureRecord
+
+    blocked = near_field_sequence(transports=1)
+    blocked._latest_heading_rad = 0.0
+    blocked._tracker.update(10, [observation(1, 10, GroundPoint(400.0, 0.0))])
+    blocked._near_field_failures.append(
+        _AttemptFailureRecord(
+            TargetClass.GREEN_SUPPLY,
+            GroundPoint(400.0, 0.0),
+            FieldPoint(400.0, 0.0),
+            FieldPoint(0.0, 0.0),
+            0.0,
+            1,
+            "scene_evidence_unavailable",
+            10,
+        )
+    )
+    assert blocked.approach_seed_diagnostic(10) == (
+        "track=1,green_supply,attempt_blocked"
+    )
+    assert blocked._find_approach_seed(10) is None

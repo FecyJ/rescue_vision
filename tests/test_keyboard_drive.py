@@ -196,7 +196,10 @@ def _fake_controller(*, wheel_track_m: float = 0.30):
             max_angular_velocity_rad_s=1.2,
             max_wheel_velocity_m_s=0.5,
             min_wheel_velocity_m_s=0.02,
-            max_wheel_acceleration_m_s2=1.0,
+            max_linear_acceleration_m_s2=1.0,
+            max_linear_deceleration_m_s2=1.0,
+            max_angular_acceleration_rad_s2=10,
+            max_angular_deceleration_rad_s2=10,
             left_wheel_speed_weight=1.0,
             right_wheel_speed_weight=1.0,
         )
@@ -272,7 +275,13 @@ def test_keyboard_drive_log_round_trip(tmp_path) -> None:
 
     recording = load_keyboard_drive_log(path, controller, calibration)
     commands = recording.commands
+    header = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
 
+    assert header["version"] == 3
+    assert header["motion"]["max_linear_acceleration_m_s2"] == 1.0
+    assert header["motion"]["max_linear_deceleration_m_s2"] == 1.0
+    assert header["motion"]["max_angular_acceleration_rad_s2"] == 10
+    assert header["motion"]["max_angular_deceleration_rad_s2"] == 10
     assert [command.elapsed_ns for command in commands] == [0, 10_000, 20_000]
     assert commands[1].linear_velocity_m_s == pytest.approx(0.1)
     assert commands[1].angular_velocity_rad_s == pytest.approx(-0.6)

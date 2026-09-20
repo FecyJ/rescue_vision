@@ -55,7 +55,7 @@ def test_failed_greedy_candidate_resumes_original_scan_and_selects_far_alternati
     for stamp in (first_ns, now):
         sequence._record_pose_history(stamp, 0.0, 0.0)
     first, other = sequence._tracker.update(first_ns, (
-        target(x=700, timestamp=first_ns).observation,
+        target(x=350 if local_handoff else 700, timestamp=first_ns).observation,
         target(2, x=700, y=400, timestamp=first_ns).observation,
     ))
     sequence._last_timestamp_ns = now
@@ -77,13 +77,13 @@ def test_failed_greedy_candidate_resumes_original_scan_and_selects_far_alternati
     assert expired.reason == 'greedy_return:scan_timeout'
 
 
-def test_reachable_parallel_supply_waits_beyond_fixed_neighbor_margin():
+def test_reachable_parallel_supply_does_not_wait_for_tracker_confirmation():
     planner = selector(side_neighbor_lateral_margin_mm=60)
     first = replace(target(x=300, y=-35), handoff_matched=True)
     companion = replace(target(2, x=300, y=35, cls=BLACK), confirmed=False)
     waiting = planner.select((first, companion))
-    assert waiting.rejections == ('waiting_adjacent_supply_confirmation',)
-    assert waiting.plan is None
+    assert waiting.rejections == ()
+    assert waiting.plan is not None and waiting.plan.member_ids == (1,)
     confirmed = planner.select((first, replace(companion, confirmed=True)))
     assert confirmed.plan is not None
     assert confirmed.plan.member_ids == (1, 2)

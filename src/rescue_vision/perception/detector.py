@@ -14,6 +14,7 @@ from rescue_vision.camera.frame import CameraFrame
 from rescue_vision.geometry.ground_projector import GroundProjector
 from rescue_vision.geometry.types import GroundPoint, UndistortedPixel
 from rescue_vision.perception.backend import InferenceBackend
+from rescue_vision.perception.gripper_color import GripperColorConfig, GripperColorObservation, observe_gripper_colors
 from rescue_vision.perception.color_segmentation import segment_bgr_roi_colors
 from rescue_vision.perception.field_feature_types import (
     CenterCrossConfirmation,
@@ -28,7 +29,6 @@ from rescue_vision.perception.field_feature_types import (
 from rescue_vision.perception.types import (
     COLOR_TARGET_CLASSES,
     ClassProbabilities,
-    ColorSegmentationStatus,
     HsvColorClassifierConfig,
     ModelDetection,
     ObservationQuality,
@@ -42,7 +42,7 @@ from rescue_vision.perception.timing import PerceptionTiming
 
 
 # 当前相机/模型地面投影实测的统一前向偏差；目标和场地关键点共用同一修正。
-MODEL_GROUND_FORWARD_BIAS_MM = 225.0
+MODEL_GROUND_FORWARD_BIAS_MM = 210.0
 
 
 def _correct_model_ground_point(point: GroundPoint) -> GroundPoint:
@@ -80,6 +80,7 @@ class RealtimeDetectionResult:
     field_features: FieldFeatureDetectionResult | None
     timing: PerceptionTiming
     dropped_stale_age_ms: float | None = None
+    gripper_color: GripperColorObservation | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -120,6 +121,7 @@ class PoseDetectionResult:
     observations: tuple[TargetObservation, ...]
     field_features: FieldFeatureDetectionResult
     timing: PerceptionTiming
+    gripper_color: GripperColorObservation | None = None
 
     def __iter__(self):
         return iter(self.observations)
@@ -194,6 +196,7 @@ class TargetPoseDetector:
         ground_projector: GroundProjector | None = None,
         center_cross_refinement: CenterCrossRefinementConfig | None = None,
         safe_zone_color: SafeZoneColorConfig | None = None,
+        gripper_color: GripperColorConfig | None = None,
         clock_ns: Callable[[], int] = monotonic_ns,
     ) -> None:
         self._backend = backend
@@ -224,6 +227,7 @@ class TargetPoseDetector:
                 center_cross_refinement or CenterCrossRefinementConfig()
             )
             self._safe_zone_color = safe_zone_color or SafeZoneColorConfig()
+            self._gripper_color = gripper_color or GripperColorConfig()
             if not callable(clock_ns):
                 raise TypeError("clock_ns must be callable.")
             self._clock_ns = clock_ns
@@ -300,10 +304,6 @@ class TargetPoseDetector:
                 self._color_classifier,
                 target_class=model_target_class,
             )
-            if color_segmentation.status is ColorSegmentationStatus.INSUFFICIENT:
-                quality.add(ObservationQuality.COLOR_EVIDENCE_INSUFFICIENT)
-            elif color_segmentation.status is ColorSegmentationStatus.AMBIGUOUS:
-                quality.add(ObservationQuality.COLOR_EVIDENCE_AMBIGUOUS)
             # Model labels are authoritative. HSV supplies jaw geometry only.
             target_class = model_target_class
             probabilities = ClassProbabilities.from_top_class(target_class, detection.confidence)
@@ -311,22 +311,29 @@ class TargetPoseDetector:
             k0_keypoint = detection.keypoints[0]
             k0 = k0_keypoint.point
             if k0 is None or k0_keypoint.confidence < self._k0_threshold:
-                k0 = None
-                ground_point = None
-                quality.add(ObservationQuality.K0_UNAVAILABLE)
-            else:
-                width, height = image_size
-                if not (0.0 <= k0.u < width and 0.0 <= k0.v < height):
-                    raise ValueError(
-                        f"Model k0 {k0!r} is outside image_size {image_size!r}."
-                    )
-                ground_point = (
-                    self._ground_projector.pixel_to_ground(k0)
-                    if self._ground_projector is not None
-                    else None
+                # Four task classes always expose a usable ground anchor.  A
+                # missing/weak model K0 falls back to the bbox bottom midpoint,
+                # which is the closest available bottom-contact observation.
+                _, height = image_size
+                k0 = UndistortedPixel(
+                    (detection.box.x_min + detection.box.x_max) / 2.0,
+                    min(
+                        detection.box.y_max,
+                        math.nextafter(float(height), -math.inf),
+                    ),
                 )
-                if ground_point is not None:
-                    ground_point = _correct_model_ground_point(ground_point)
+            width, height = image_size
+            if not (0.0 <= k0.u < width and 0.0 <= k0.v < height):
+                raise ValueError(
+                    f"Model/fallback k0 {k0!r} is outside image_size {image_size!r}."
+                )
+            ground_point = (
+                self._ground_projector.pixel_to_ground(k0)
+                if self._ground_projector is not None
+                else None
+            )
+            if ground_point is not None:
+                ground_point = _correct_model_ground_point(ground_point)
 
             processed.append(
                 _ProcessedDetection(
@@ -350,6 +357,9 @@ class TargetPoseDetector:
             undistorted_image_bgr,
             candidate_detections,
             provisional_timestamp_ns,
+        )
+        gripper_color = observe_gripper_colors(
+            undistorted_image_bgr, self._gripper_color, self._color_classifier,
         )
         completed_timestamp_ns = (
             self._clock_ns() if result_timestamp_ns is None else result_timestamp_ns
@@ -405,7 +415,7 @@ class TargetPoseDetector:
             )
             for item in processed
         )
-        return PoseDetectionResult(observations, field_features, timing)
+        return PoseDetectionResult(observations, field_features, timing, gripper_color)
 
     def _timing(
         self,
@@ -627,6 +637,7 @@ class TargetPoseDetector:
             observations=detection_result.observations,
             field_features=detection_result.field_features,
             timing=detection_result.timing,
+            gripper_color=detection_result.gripper_color,
         )
 
     def close(self) -> None:

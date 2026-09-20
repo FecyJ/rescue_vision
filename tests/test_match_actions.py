@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 import sys
 
@@ -301,6 +302,8 @@ def test_startup_straight_pid_outputs_right_correction_for_right_wheel_excess() 
 
 def test_breakup_moves_forward_one_meter_then_backward_twenty_centimeters() -> None:
     sequence = make_sequence()
+    sequence.config = replace(sequence.config, breakup_forward_distance_m=1.0,
+                              breakup_backward_distance_m=0.2)
     # This fixture exercises the legacy fixed-action helper directly; formal
     # match execution supplies a BreakupPlan before entering the state.
     sequence._dynamic_breakup_enabled = False
@@ -418,7 +421,10 @@ def test_no_isolated_green_keeps_attempt_budget_and_loops_to_search() -> None:
 
 
 
-def test_hardware_entry_reaches_control_without_building_fusion(monkeypatch) -> None:
+@pytest.mark.parametrize("failure_phase", [None, "uart_open", "uart_synchronize"])
+def test_hardware_entry_reaches_control_without_building_fusion(
+    monkeypatch, tmp_path, failure_phase,
+) -> None:
     from pathlib import Path
     from types import SimpleNamespace
     from unittest.mock import MagicMock
@@ -426,6 +432,8 @@ def test_hardware_entry_reaches_control_without_building_fusion(monkeypatch) -> 
     from rescue_vision.config import AppConfig
     from rescue_vision.motion import CarSystemStatus, OdometryImu, SensorFlags
     from rescue_vision import perception as perception_module
+    from rescue_vision.communication import UartError
+    import sys
 
     config = load_runtime_config("configs/runtime.match.yaml")
     channel = MagicMock()
@@ -466,6 +474,12 @@ def test_hardware_entry_reaches_control_without_building_fusion(monkeypatch) -> 
     renderer.latest_fresh_snapshot.return_value = snapshot(1, 10)
     renderer.latest.return_value = None
     monkeypatch.setattr(perception_module, "PerceptionFrameRenderer", lambda factory, **kwargs: renderer)
+    def release_start_gate(**kwargs):
+        kwargs["service"]()
+        return match_runtime.time.monotonic_ns()
+
+    start_gate = MagicMock(side_effect=release_start_gate)
+    monkeypatch.setattr(match_runtime, "_wait_for_enter_start", start_gate)
     received = []
 
     def finish(self, timestamp_ns, **kwargs):
@@ -474,13 +488,94 @@ def test_hardware_entry_reaches_control_without_building_fusion(monkeypatch) -> 
         return self._decision(timestamp_ns, 0.0, 0.0, "test_complete")
 
     monkeypatch.setattr(MatchSequence, "step", finish)
+    if failure_phase is not None:
+        original_stdout, original_stderr = sys.stdout, sys.stderr
+        original_error = UartError("injected startup UART failure")
+        original_error.__cause__ = OSError("injected device failure")
+        if failure_phase == "uart_open":
+            channel.start.side_effect = original_error
+        else:
+            controller.synchronize.side_effect = original_error
+            controller.soft_brake.side_effect = OSError("injected brake failure")
+            channel.stop.side_effect = OSError("injected close failure")
+        with pytest.raises(UartError) as raised:
+            match_runtime._run_hardware(
+                Path("configs/runtime.match.yaml"),
+                supervised_stop_ready=True, log_dir=tmp_path,
+            )
+        assert raised.value is original_error
+        text = next(tmp_path.glob("match_*.log")).read_text()
+        assert "Traceback" in text
+        assert "injected startup UART failure" in text
+        assert "injected device failure" in text
+        assert f"runtime_phase={failure_phase}" in text
+        # Exception notes are displayed by traceback on Python 3.11+.
+        assert f"match runtime_phase={failure_phase}" in original_error.__notes__
+        assert sys.stdout is original_stdout
+        assert sys.stderr is original_stderr
+        assert received == []
+        if failure_phase == "uart_synchronize":
+            notes = "\n".join(original_error.__notes__)
+            assert "injected brake failure" in notes
+            assert "injected close failure" in notes
+            camera.stop.assert_called_once()
+            channel.stop.assert_called_once()
+        else:
+            camera.start_in_background.assert_not_called()
+        return
     match_runtime._run_hardware(
         Path("configs/runtime.match.yaml"),
         supervised_stop_ready=True, log_dir=None,
     )
     fusion_factory.assert_not_called()
+    start_gate.assert_called_once()
     assert len(received) == 1
     assert received[0]["heading_rad"] == pytest.approx(-math.pi / 2 - 0.01)
     assert received[0]["cumulative_distance_m"] > 0
     camera.stop.assert_called_once()
     channel.stop.assert_called_once()
+
+
+def test_start_gate_services_hardware_until_blank_line(monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    from rescue_vision.app import match_runtime
+
+    enter_checks = iter((False, False, True))
+    monkeypatch.setattr(
+        match_runtime,
+        "_stdin_enter_pressed",
+        lambda timeout_s: next(enter_checks),
+    )
+    monkeypatch.setattr(match_runtime.time, "monotonic_ns", lambda: 123_456_789)
+    service = Mock()
+
+    released_ns = match_runtime._wait_for_enter_start(
+        service=service,
+        should_stop=lambda: False,
+    )
+
+    assert released_ns == 123_456_789
+    assert service.call_count == 2
+
+
+def test_start_gate_ignores_nonblank_terminal_line(monkeypatch, capsys) -> None:
+    from io import StringIO
+
+    from rescue_vision.app import match_runtime
+
+    terminal_input = StringIO("start\n\n")
+    monkeypatch.setattr(match_runtime.sys, "stdin", terminal_input)
+    monkeypatch.setattr(
+        match_runtime.select,
+        "select",
+        lambda readable, writable, exceptional, timeout: (
+            readable,
+            writable,
+            exceptional,
+        ),
+    )
+
+    assert not match_runtime._stdin_enter_pressed(0.0)
+    assert "请直接按 Enter" in capsys.readouterr().out
+    assert match_runtime._stdin_enter_pressed(0.0)

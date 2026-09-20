@@ -12,6 +12,7 @@ import numpy as np
 
 from rescue_vision.camera.frame import CameraFrame
 from rescue_vision.perception.detector import TargetPoseDetector
+from rescue_vision.perception.gripper_color import GripperColorObservation
 from rescue_vision.perception.field_feature_types import FieldFeatureDetectionResult, SafeZoneColor
 from rescue_vision.perception.types import (
     TargetClass,
@@ -82,6 +83,7 @@ class PerceptionSnapshot:
     field_features: FieldFeatureDetectionResult | None
     dropped_stale_age_ms: float | None = None
     timing: PerceptionTiming | None = None
+    gripper_color: GripperColorObservation | None = None
 
     def __post_init__(self) -> None:
         if self.timing is None:
@@ -559,6 +561,7 @@ class PerceptionFrameRenderer:
                         field_features=result.field_features,
                         dropped_stale_age_ms=result.dropped_stale_age_ms,
                         timing=timing,
+                        gripper_color=result.gripper_color,
                     )
                     with self._lock:
                         self._latest_snapshot = snapshot

@@ -122,7 +122,7 @@
   `grasp_excluded_observation_indices()` 在送入近场 worker 前标记排除项，完整 `targets` 仍保留，
   蓝色危险证据始终不删除。`GraspPreparationSession` 在同帧去重、锁定 ID 映射后重新绑定索引，
   `MatchSequence._near_field_plan_has_delivered_member()` 在消费层按当前位姿再次复核。
-- 补夹扫描按 `target_final_x_mm + range_hysteresis_mm` 排除爪内物资，不把排除项计入新增容量；
+- 补夹扫描按 `greedy_target_final_x_mm + range_hysteresis_mm` 排除爪内物资，不把排除项计入新增容量；
   若该物资或蓝块实体仍落入真实扫掠，计划以 `blocked_target` 等明确原因拒绝，而不是删除障碍。
 - 已知非静态边界的抓取受阻直接进入 `BREAKUP_SETTLE`，不先发搜索转速。
 - 解团观察增加朝接触计划航向的 IMU 有界对准，再用真实停稳后的当前帧复核，不绕一周。

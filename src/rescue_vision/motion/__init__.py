@@ -1,11 +1,22 @@
 """Rescue Car 底盘/夹爪控制、协议适配与远程调试执行。"""
 
 from rescue_vision.motion.controller import (
+    MotionAccelerationLimits,
+    MotionAccelerationOverrides,
     MotionController,
     MotionControlTimingError,
     MotionStallError,
     MotionSynchronizationError,
     MotionLimits,
+    WHEEL_COMMAND_REFRESH_S,
+)
+from rescue_vision.motion.relative_action import (
+    RelativeActionCommand,
+    RelativeActionController,
+    RelativeActionFeedback,
+    RelativeActionKind,
+    RelativeActionPhase,
+    RelativeActionProfile,
 )
 from rescue_vision.motion.protocol import (
     CarCommandReply,
@@ -62,10 +73,19 @@ __all__ = [
     "ExecutedRemoteMotion",
     "GripperCalibration",
     "MotionController",
+    "MotionAccelerationLimits",
+    "MotionAccelerationOverrides",
     "MotionControlTimingError",
     "MotionStallError",
     "MotionSynchronizationError",
     "MotionLimits",
+    "RelativeActionCommand",
+    "RelativeActionController",
+    "RelativeActionFeedback",
+    "RelativeActionKind",
+    "RelativeActionPhase",
+    "RelativeActionProfile",
+    "WHEEL_COMMAND_REFRESH_S",
     "MANUAL_MOTION_LOG_FILENAME",
     "MANUAL_MOTION_STREAM_NAME",
     "ManualMotionLogWriter",

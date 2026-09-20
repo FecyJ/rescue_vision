@@ -92,7 +92,10 @@ motion:
   max_linear_velocity_m_s: 0.25
   max_angular_velocity_rad_s: 1.0
   max_wheel_velocity_m_s: 0.30
-  max_wheel_acceleration_m_s2: 0.50
+  max_linear_acceleration_m_s2: 0.50
+  max_linear_deceleration_m_s2: 0.75
+  max_angular_acceleration_rad_s2: 4.0
+  max_angular_deceleration_rad_s2: 6.0
   min_wheel_velocity_m_s: 0.02
   max_remote_command_valid_for_ms: 500
   synchronization_timeout_s: 1.0
@@ -923,7 +926,10 @@ def test_motion_config_builds_controller_without_opening_uart(tmp_path) -> None:
     assert not channel.started
     assert controller is not None
     assert controller.limits.wheel_track_m == pytest.approx(0.2)
-    assert controller.limits.max_wheel_acceleration_m_s2 == pytest.approx(0.5)
+    assert controller.limits.max_linear_acceleration_m_s2 == pytest.approx(0.5)
+    assert controller.limits.max_linear_deceleration_m_s2 == pytest.approx(0.75)
+    assert controller.limits.max_angular_acceleration_rad_s2 == pytest.approx(4.0)
+    assert controller.limits.max_angular_deceleration_rad_s2 == pytest.approx(6.0)
     assert controller.limits.min_wheel_velocity_m_s == pytest.approx(0.02)
     assert controller.limits.left_wheel_speed_weight == pytest.approx(1.0)
     assert controller.limits.right_wheel_speed_weight == pytest.approx(1.0)
@@ -986,12 +992,44 @@ def test_motion_synchronization_timeout_must_be_positive(tmp_path) -> None:
         load_runtime_config(path)
 
 
-def test_motion_acceleration_limit_must_be_positive(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "name",
+    [
+        "max_linear_acceleration_m_s2",
+        "max_linear_deceleration_m_s2",
+        "max_angular_acceleration_rad_s2",
+        "max_angular_deceleration_rad_s2",
+    ],
+)
+def test_motion_acceleration_limits_must_be_positive(
+    tmp_path,
+    name: str,
+) -> None:
+    configured_values = {
+        "max_linear_acceleration_m_s2": "0.50",
+        "max_linear_deceleration_m_s2": "0.75",
+        "max_angular_acceleration_rad_s2": "4.0",
+        "max_angular_deceleration_rad_s2": "6.0",
+    }
     path = tmp_path / "runtime.yaml"
     path.write_text(
         config_text().replace(
+            f"  {name}: {configured_values[name]}",
+            f"  {name}: 0.0",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=name):
+        load_runtime_config(path)
+
+
+def test_motion_config_rejects_removed_wheel_acceleration_key(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text().replace(
+            "  max_linear_acceleration_m_s2: 0.50",
             "  max_wheel_acceleration_m_s2: 0.50",
-            "  max_wheel_acceleration_m_s2: 0.0",
         ),
         encoding="utf-8",
     )
@@ -1019,8 +1057,8 @@ def test_motion_wheel_speed_weights_are_parsed(tmp_path) -> None:
     path.write_text(
         config_text()
         .replace(
-            "  max_wheel_acceleration_m_s2: 0.50",
-            "  max_wheel_acceleration_m_s2: 0.50\n"
+            "  max_linear_acceleration_m_s2: 0.50",
+            "  max_linear_acceleration_m_s2: 0.50\n"
             "  left_wheel_speed_weight: 1.05\n"
             "  right_wheel_speed_weight: 0.95",
         ),
@@ -1037,8 +1075,8 @@ def test_motion_wheel_speed_weight_must_be_positive(tmp_path) -> None:
     path = tmp_path / "runtime.yaml"
     path.write_text(
         config_text().replace(
-            "  max_wheel_acceleration_m_s2: 0.50",
-            "  max_wheel_acceleration_m_s2: 0.50\n"
+            "  max_linear_acceleration_m_s2: 0.50",
+            "  max_linear_acceleration_m_s2: 0.50\n"
             "  left_wheel_speed_weight: 0.0",
         ),
         encoding="utf-8",
@@ -1241,14 +1279,43 @@ def test_p1_config_rejects_invalid_values(
 
 def test_near_field_grasp_config_weights_and_strict_keys(tmp_path) -> None:
     path = tmp_path / "runtime.yaml"
-    path.write_text(config_text(extra="near_field_grasp:\n  orange_priority_weight: 0.7\n  target_final_x_mm: 105\n"), encoding="utf-8")
+    path.write_text(config_text(extra="near_field_grasp:\n  orange_priority_weight: 0.7\n  target_final_x_mm: 105\n  greedy_target_final_x_mm: 95\n"), encoding="utf-8")
     config = load_runtime_config(path)
     assert config.near_field_grasp.orange_priority_weight == 0.7
     assert config.near_field_grasp.target_final_x_mm == 105
+    assert config.near_field_grasp.greedy_target_final_x_mm == 95
     assert config.near_field_grasp.orange_target_final_x_mm == 142
     assert config.near_field_grasp.max_targets == 3
+    assert config.near_field_grasp.stopped_scene_new_target_max_bbox_iou == 0.2
+    path.write_text(
+        config_text(
+            extra=(
+                "near_field_grasp:\n"
+                "  stopped_scene_new_target_max_bbox_iou: 1.01\n"
+            )
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="stopped_scene_new_target_max_bbox_iou"):
+        load_runtime_config(path)
     path.write_text(config_text(extra="near_field_grasp:\n  typo_weight: 1\n"), encoding="utf-8")
     with pytest.raises(ValueError, match="Unknown keys"):
+        load_runtime_config(path)
+
+
+def test_pickup_terminal_speed_gain_is_configurable_and_positive(tmp_path) -> None:
+    path = tmp_path / "runtime.yaml"
+    path.write_text(
+        config_text(extra="match:\n  pickup_terminal_speed_gain_s_inv: 0.5\n"),
+        encoding="utf-8",
+    )
+    assert load_runtime_config(path).match.pickup_terminal_speed_gain_s_inv == 0.5
+
+    path.write_text(
+        config_text(extra="match:\n  pickup_terminal_speed_gain_s_inv: 0\n"),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="pickup_terminal_speed_gain_s_inv"):
         load_runtime_config(path)
 
 
