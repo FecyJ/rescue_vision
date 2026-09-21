@@ -1284,7 +1284,7 @@ def test_near_field_grasp_config_weights_and_strict_keys(tmp_path) -> None:
     assert config.near_field_grasp.orange_priority_weight == 0.7
     assert config.near_field_grasp.target_final_x_mm == 105
     assert config.near_field_grasp.greedy_target_final_x_mm == 95
-    assert config.near_field_grasp.orange_target_final_x_mm == 142
+    assert config.near_field_grasp.orange_target_final_x_mm == 112
     assert config.near_field_grasp.max_targets == 3
     assert config.near_field_grasp.stopped_scene_new_target_max_bbox_iou == 0.2
     path.write_text(

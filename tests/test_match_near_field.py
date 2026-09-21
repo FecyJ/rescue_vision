@@ -972,6 +972,33 @@ def test_near_field_alignment_keeps_transport_posture_without_full_open() -> Non
     assert decision.min_wheel_velocity_m_s == 0.01
 
 
+@pytest.mark.parametrize("reason", [
+    "critical_odometry_unavailable",
+    "encoder_direction_mismatch",
+    "encoder_no_forward_progress",
+])
+def test_near_field_motion_failure_reselects_instead_of_latching_stop(
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+) -> None:
+    sequence = _sequence()
+    plan = selector().select((target(),), policy=sequence.near_field_policy).plan
+    assert plan is not None
+    monkeypatch.setattr(
+        sequence._near_field_pickup,
+        "step",
+        lambda *args, **kwargs: GripperWidthPickupDecision(
+            1, GripperWidthPickupState.ABORTED, 0.0, 0.0, None, True, reason
+        ),
+    )
+
+    decision = sequence._step_near_field_grasp(1, 0.0, _preparation(plan), True)
+
+    assert decision.state is MatchState.SEARCH_CLUSTER
+    assert decision.state is not MatchState.TERMINAL_STOP
+    assert f"near_field_motion_failure:{reason}" in decision.reason
+
+
 def test_near_field_planning_corridor_is_drawn_on_matching_frame() -> None:
     grasp_selector = selector()
     plan = grasp_selector.select((target(),)).plan

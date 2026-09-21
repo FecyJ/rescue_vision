@@ -138,6 +138,19 @@ world:
         usable: true
 
 match:
+  # 实验性门前清障：关闭后恢复普通运输；区域沿用 world.static_map。
+  gate_clearance:
+    enabled: true
+    front_depth_mm: 200.0
+    side_x_mm: 350.0
+    sweep_y_mm: 1115.0
+    center_release_y_mm: 650.0
+    release_reverse_m: 0.12
+    sweep_speed_m_s: 1.0
+    transit_speed_m_s: 0.5
+    reacquire_radius_mm: 180.0
+    observation_timeout_ms: 1400.0
+    attempt_timeout_s: 30.0
   robot_footprint_radius_mm: 160.0
   safety_margin_mm: 10.0
   enabled: true
@@ -277,8 +290,6 @@ match:
   # 夹取后→d1、d1→d2 直线段软刹车后的场地坐标过冲分量，单位 mm；有符号。
   # 正值表示刹车后仍向 FieldPoint 的 +x/+y 方向移动，策略会将对应停车目标
   # 向负方向提前。
-  safe_zone_d2_braking_overrun_x_mm: 0.0
-  safe_zone_d2_braking_overrun_y_mm: 0.0
   # d1 处和 90° 校准后均要求左右轮速低于阈值并连续确认后再继续。
   safe_zone_calibration_stop_speed_threshold_m_s: 0.02
   safe_zone_calibration_stop_confirm_time_s: 0.3
@@ -352,8 +363,9 @@ near_field_grasp:
   target_final_x_mm: 142.0
   # 贪心补夹绿/黑组的独立终点；降低此值会让补夹前进更深，单位 mm。
   greedy_target_final_x_mm: 142.0
-  # 单个橙色目标按最近端加半个纵向跨度计算，终点参考距离，单位 mm。
-  orange_target_final_x_mm: 142.0
+  # 单个橙色目标的底面 K0 终点，降低该值会增加前进行程，单位 mm。
+  orange_target_final_x_mm: 112.0
+  black_closed_servo_offset_deg: 5.0
   # 夹爪前端参考线；危险目标 K0 从此处到扫掠终点才参与走廊门禁，单位 mm。
   corridor_start_x_mm: 60.0
   # 夹爪开口两侧的走廊安全余量，单位 mm。

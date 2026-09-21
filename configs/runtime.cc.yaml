@@ -137,6 +137,19 @@ world:
         usable: true
 
 match:
+  # 实验性门前清障：关闭后恢复普通运输；区域沿用 world.static_map。
+  gate_clearance:
+    enabled: true
+    front_depth_mm: 200.0
+    side_x_mm: 350.0
+    sweep_y_mm: 1115.0
+    center_release_y_mm: 650.0
+    release_reverse_m: 0.12
+    sweep_speed_m_s: 1.0
+    transit_speed_m_s: 0.5
+    reacquire_radius_mm: 180.0
+    observation_timeout_ms: 1400.0
+    attempt_timeout_s: 30.0
   # CC 与正式 match 共享的启动、夹爪近场入口和安全区运输参数。
   enabled: true
   robot_footprint_radius_mm: 160.0
@@ -212,8 +225,6 @@ match:
   safe_zone_calibration_min_offset_mm: 500.0
   safe_zone_calibration_start_offset_mm: 700.0
   safe_zone_open_offset_mm: 300.0
-  safe_zone_d2_braking_overrun_x_mm: 20.0
-  safe_zone_d2_braking_overrun_y_mm: 0.0
   safe_zone_d2_to_final_braking_overrun_mm: 110.0
   safe_zone_orange_d2_to_final_braking_overrun_mm: 110.0
   safe_zone_calibration_stop_speed_threshold_m_s: 0.02

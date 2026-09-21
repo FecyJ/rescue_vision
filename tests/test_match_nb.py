@@ -147,36 +147,25 @@ def reasons(records: list[dict[str, object]]) -> list[str]:
 def test_nb_config_contains_relative_actions() -> None:
     config = load_runtime_config("configs/runtime.match_nb.yaml").match
     assert config.nb_opening_actions == (
-        NBOpeningTurn(-1.0, 2.0),
-        NBOpeningStraight(1.3, 1.5),
-        NBOpeningTurn(0.89, 2.0),
-        NBOpeningStraight(0.9, 1.5),
-        NBOpeningStraight(-0.9, 1.5),
+        NBOpeningStraight(1.6, 1.5, 0.0),
+        NBOpeningTurn(math.pi / 3.0, 2.0, "left", 0.03),
+        NBOpeningStraight(1.0, 1.5, 0.1),
+        NBOpeningStraight(-1.0, 1.5),
     )
-    assert config.nb_opening_gripper_after_action == 2
-    assert config.nb_opening_turn_tolerance_rad == pytest.approx(0.08)
-    assert config.nb_opening_distance_tolerance_m == pytest.approx(0.03)
-    assert config.nb_opening_effective_linear_deceleration_m_s2 == pytest.approx(2.0)
+    assert config.nb_opening_gripper_after_action == 1
+    assert config.nb_opening_turn_tolerance_rad == pytest.approx(0.06)
+    assert config.nb_opening_distance_tolerance_m == pytest.approx(0.02)
+    assert load_runtime_config("configs/runtime.match_nb.yaml").motion.action_profile.linear_deceleration_m_s2 == pytest.approx(2.0)
 
 
 def test_nb_defaults_match_shipped_relative_opening() -> None:
-    defaults = MatchRuntimeConfig(enabled=True)
-    shipped = load_runtime_config("configs/runtime.match_nb.yaml").match
-    for name in (
-        "nb_opening_execution_response_s",
-        "nb_opening_max_telemetry_age_ms",
-        "nb_opening_fine_linear_speed_m_s",
-        "nb_opening_fine_angular_velocity_rad_s",
-        "nb_opening_stop_wheel_speed_m_s",
-        "nb_opening_stop_angular_velocity_rad_s",
-        "nb_opening_heading_tolerance_rad",
-        "nb_opening_heading_kp_rad_s",
-        "nb_opening_heading_max_angular_velocity_rad_s",
-        "nb_opening_correction_max_distance_m",
-        "nb_opening_correction_max_angle_rad",
-        "nb_opening_correction_timeout_s",
-    ):
-        assert getattr(defaults, name) == getattr(shipped, name), name
+    from dataclasses import fields
+    from rescue_vision.motion import RelativeActionProfile
+    defaults = RelativeActionProfile()
+    shipped = load_runtime_config("configs/runtime.match_nb.yaml").motion.action_profile
+    for item in fields(defaults):
+        if item.name != "linear_deceleration_m_s2":
+            assert getattr(defaults, item.name) == getattr(shipped, item.name), item.name
 
 
 def test_nb_uses_conservative_linear_deceleration_without_vehicle_calibration() -> None:
@@ -186,7 +175,7 @@ def test_nb_uses_conservative_linear_deceleration_without_vehicle_calibration() 
     limits = sequence.motion_acceleration_limits
 
     assert limits is not None
-    assert limits.linear_deceleration_m_s2 == pytest.approx(2.0)
+    assert limits.linear_deceleration_m_s2 == pytest.approx(1.0)
 
 
 def test_nb_opening_runs_configured_actions_in_order() -> None:

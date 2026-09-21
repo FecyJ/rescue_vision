@@ -172,6 +172,18 @@ bbox IoU 上限；
 目标 K0 是否位于实际扫掠走廊内，目标完整外轮廓不扩大扫掠阻挡范围；条件见
 [app README](../app/README.md)。已有配置需要同步为 `10 mm`。
 
+`near_field_grasp.orange_target_final_x_mm` 是橙色 K0 的合爪终点；减小该值会增加前进行程。
+本次按现场“约三分之一留在爪外”的反馈增加 30 mm 行程：正式 `runtime.match.yaml` 从
+138 mm 调为 108 mm，其余运行模板及缺省值从 142 mm 调为 112 mm。该值仍需真车校准。
+`black_closed_servo_offset_deg=5` 只在计划包含黑色物块时，把合爪及随后带载保持的左右绝对
+舵机命令各增加 5°；张爪几何仍使用原机械标定。
+
+`match.gate_clearance` 是独立的实验模块配置。`front_depth_mm` 定义两个己方安全区门前触发深度；
+`side_x_mm` / `sweep_y_mm` 定义 S1/S2，`release_reverse_m` 同时定义暂存点向外偏移和放置后
+退出距离，`center_release_y_mm` 定义中场释放线。`sweep_speed_m_s` 仅用于横扫，普通航点用
+`transit_speed_m_s`；`observation_timeout_ms` 是暂存物回取观察窗口，`attempt_timeout_s` 是从
+首次触发起连续计算的整次清障截止时间。数值必须有限且为正，未知键拒绝加载。
+
 ## 夹爪内颜色门禁配置
 
 `configs/runtime.match.yaml` 的 `perception.gripper_color`（其余入口模板同步）默认启用。

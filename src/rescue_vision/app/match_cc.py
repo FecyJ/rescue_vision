@@ -454,6 +454,7 @@ class MatchCCSequence(MatchSequence):
 
     def _step_actions(self, timestamp_ns: int, **kwargs) -> MatchDecision:
         shared_states = {
+            MatchState.GATE_CLEARANCE,
             MatchState.STARTUP_TURN_RIGHT,
             MatchState.STARTUP_TURN_SETTLE,
             MatchState.STARTUP_FORWARD,
@@ -653,6 +654,7 @@ class MatchCCSequence(MatchSequence):
             return self._decision(timestamp_ns, 0.0, 0.0, "cc_green_waiting_for_odometry", posture=GripperPosture.TRANSPORT)
         if abs(cumulative_distance_m - self._cc_motion_base_m) >= self._cc_motion_distance_m:
             self._cc_command_ns = timestamp_ns
+            self._transport_target_classes = (self._cc_selected_class or TargetClass.GREEN_SUPPLY,)
             self.state = MatchState.CC_GREEN_CLOSE_GAP
             return self._decision(timestamp_ns, 0.0, 0.0, "cc_green_forward_complete_close", posture=GripperPosture.CLOSED)
         return self._decision(timestamp_ns, self.cc_config.target_approach_speed_m_s, 0.0, "cc_green_fixed_forward", posture=GripperPosture.TRANSPORT)

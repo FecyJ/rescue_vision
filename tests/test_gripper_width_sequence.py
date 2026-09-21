@@ -66,12 +66,12 @@ def test_pickup_completes_without_turn_or_automatic_rearm():
     forward=seq.step(100_000_001,prep(plan,100_000_001),cumulative_distance_m=0)
     assert forward.state is State.FORWARD and forward.linear_velocity_m_s>0
     closing=seq.step(200_000_001,prep(plan,200_000_001),cumulative_distance_m=plan.forward_distance_mm/1000)
-    assert closing.state is State.CLOSING and closing.gripper_angles_deg==(90,90)
+    assert closing.state is State.CLOSING and closing.gripper_angles_deg==(95,95)
     complete=seq.step(300_000_001,prep(plan,300_000_001),cumulative_distance_m=plan.forward_distance_mm/1000)
     assert complete.state is State.COMPLETE and complete.angular_velocity_rad_s==0
     assert seq.result.member_ids==(1,2) and not seq.result.capture_confirmed
     assert seq.result.completed_timestamp_ns==300_000_001
-    assert seq.result.final_servo_angles_deg==(90,90)
+    assert seq.result.final_servo_angles_deg==(95,95)
     again=seq.step(10_000_000_000,None,cumulative_distance_m=None)
     assert again.state is State.COMPLETE and again.gripper_angles_deg is None and again.soft_brake
 

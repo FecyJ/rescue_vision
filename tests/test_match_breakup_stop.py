@@ -92,7 +92,7 @@ def test_endpoint_stays_latched_after_rollback_then_advances_when_stopped(forwar
 
 
 @pytest.mark.parametrize('failure', ['continued_motion', 'telemetry_gap', 'sensor_invalid'])
-def test_braking_without_control_confirmation_has_bounded_latched_failure(failure):
+def test_braking_without_control_confirmation_recovers_when_stopped(failure):
     flow = sequence()
     frozen_plan(flow, forward=500, backward=300)
     flow.state = MatchState.BREAKUP_FORWARD
@@ -112,13 +112,20 @@ def test_braking_without_control_confirmation_has_bounded_latched_failure(failur
         if deadline is None:
             deadline = flow._breakup_segment_stop_deadline_ns
         assert flow._breakup_segment_stop_deadline_ns == deadline
-        if flow.state is MatchState.TERMINAL_STOP:
+        if deadline is not None and now >= deadline + 100_000_000:
             break
-    assert now <= deadline+5_000_000
-    assert flow.state is MatchState.TERMINAL_STOP
+    assert flow.state is MatchState.BREAKUP_FORWARD
     assert decision.reason.startswith('breakup_stop_unconfirmed:')
     assert 'deadline_ns=' in decision.reason
-    again = flow.step(now+5_000_000, perception=None, heading_rad=0,
-                      cumulative_distance_m=.1)
-    assert again.state is MatchState.TERMINAL_STOP
-    assert again.linear_velocity_m_s == 0
+    recovered = None
+    for offset_ms in range(5, 501, 5):
+        recovered_at = now + offset_ms * 1_000_000
+        flow.observe_grasp_motion(motion_sample(recovered_at, count=9000))
+        recovered = flow.step(recovered_at, perception=None, heading_rad=0,
+            cumulative_distance_m=.51, left_speed_feedback_m_s=0,
+            right_speed_feedback_m_s=0)
+        if flow.state is MatchState.BREAKUP_BACKWARD:
+            break
+    assert recovered is not None
+    assert flow.state is MatchState.BREAKUP_BACKWARD
+    assert recovered.reason == 'breakup_forward_complete_closed_retreat'

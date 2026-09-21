@@ -60,6 +60,19 @@ remote:
   access_mode: observe_only
 
 motion:
+  action_profile:
+    execution_response_s: 0.04
+    linear_deceleration_m_s2: 2.0
+    max_telemetry_age_s: 0.16
+    fine_linear_speed_m_s: 0.05
+    fine_angular_velocity_rad_s: 0.12
+    stop_wheel_speed_m_s: 0.015
+    stop_angular_velocity_rad_s: 0.06
+    heading_kp_rad_s: 2.0
+    heading_max_angular_velocity_rad_s: 0.25
+    correction_max_distance_m: 0.08
+    correction_max_angle_rad: 0.12
+    correction_timeout_s: 0.50
   enabled: true
   wheel_track_m: 0.235
   max_linear_velocity_m_s: 1.5
@@ -138,30 +151,44 @@ world:
         usable: true
 
 match:
+  # 实验性门前清障：关闭后恢复普通运输；区域沿用 world.static_map。
+  gate_clearance:
+    enabled: true
+    front_depth_mm: 200.0
+    side_x_mm: 350.0
+    sweep_y_mm: 1115.0
+    center_release_y_mm: 650.0
+    release_reverse_m: 0.12
+    sweep_speed_m_s: 1.0
+    transit_speed_m_s: 0.5
+    reacquire_radius_mm: 180.0
+    observation_timeout_ms: 1400.0
+    attempt_timeout_s: 30.0
   robot_footprint_radius_mm: 160.0
   safety_margin_mm: 10.0
   enabled: true
-  # 从起点开始：转角 -> 直行 -> 转角 -> 直行 -> 倒车直行。
+  # 从 -135° 出发：直行1.6m -> 左轮固定左转60° -> 直行1m -> 停稳0.1s -> 倒车1m。
   # angle_rad：左转为正、右转为负；angular_velocity_rad_s 为正的速度幅值。
   # distance_m：前进为正、倒车为负；speed_m_s 为正的速度幅值。
   nb_opening_actions:
+    - type: straight
+      distance_m: 1.6
+      speed_m_s: 1.5
+      settle_time_s: 0.0
     - type: turn
-      angle_rad: -1.0
+      angle_rad: 1.0471975511965976
       angular_velocity_rad_s: 2
+      pivot_wheel: left
+      exit_speed_m_s: 0.03
     - type: straight
-      distance_m: 1.33
+      distance_m: 1.0
       speed_m_s: 1.5
-    - type: turn
-      angle_rad: 0.97
-      angular_velocity_rad_s: 2
+      settle_time_s: 0.1
     - type: straight
-      distance_m: 1.55
+      distance_m: -1.0
       speed_m_s: 1.5
-    - type: straight
-      distance_m: -0.9
-      speed_m_s: 1.5
-  # 完成第 2 个动作并停稳后张开夹爪；序号从 1 开始。
-  nb_opening_gripper_after_action: 2
+  # 保留第一段直行后张爪的行为；序号从 1 开始。
+  nb_opening_gripper_after_action: 1
   nb_opening_gripper_left_deg: 50.0
   nb_opening_gripper_right_deg: 160.0
   # 转向/直行的完成误差与每个动作间的零速停稳时间。
@@ -172,22 +199,9 @@ match:
   # 单次动作最长持续时间，超时进入 terminal_stop。
   nb_opening_turn_timeout_s: 8.0
   # 相对动作闭环：响应/低速/停稳参数需用真车标定，不能保证零误差。
-  nb_opening_execution_response_s: 0.04
   # 当前日志显示 motion 的 6 m/s² 限幅高估了真车制动；先用保守值 2 m/s²
   # 提前制动。完成前进/倒车标定后，按实测有效减速度替换，不能视为零误差保证。
-  nb_opening_effective_linear_deceleration_m_s2: 2.0
-  nb_opening_effective_angular_deceleration_rad_s2: null
-  nb_opening_max_telemetry_age_ms: 160.0
-  nb_opening_fine_linear_speed_m_s: 0.05
-  nb_opening_fine_angular_velocity_rad_s: 0.12
-  nb_opening_stop_wheel_speed_m_s: 0.015
-  nb_opening_stop_angular_velocity_rad_s: 0.06
   nb_opening_heading_tolerance_rad: 0.03
-  nb_opening_heading_kp_rad_s: 2.0
-  nb_opening_heading_max_angular_velocity_rad_s: 0.25
-  nb_opening_correction_max_distance_m: 0.08
-  nb_opening_correction_max_angle_rad: 0.12
-  nb_opening_correction_timeout_s: 0.50
   # 目标团搜索原地转速和单方向扫描跨度，单位 rad/s、rad。
   cluster_search_angular_velocity_rad_s: -0.3
   # 当前帧只有蓝色或没有任务目标时使用的同向快速扫描角速度。
@@ -336,8 +350,6 @@ match:
   # 夹取后→d1、d1→d2 直线段软刹车后的场地坐标过冲分量，单位 mm；有符号。
   # 正值表示刹车后仍向 FieldPoint 的 +x/+y 方向移动，策略会将对应停车目标
   # 向负方向提前。
-  safe_zone_d2_braking_overrun_x_mm: 20.0
-  safe_zone_d2_braking_overrun_y_mm: 0.0
   # d1 处和 90° 校准后均要求左右轮速低于阈值并连续确认后再继续。
   safe_zone_calibration_stop_speed_threshold_m_s: 0.02
   safe_zone_calibration_stop_confirm_time_s: 0.3
@@ -365,7 +377,7 @@ localization:
     initial_pose:
       x_mm: 1350.0
       y_mm: 1350.0
-      heading_deg: -90.0
+      heading_deg: -135.0
       position_uncertainty_mm: 50.0
       heading_uncertainty_deg: 5.0
       confidence: 0.8
@@ -405,8 +417,9 @@ near_field_grasp:
   target_final_x_mm: 142.0
   # 贪心补夹绿/黑组的独立终点；降低此值会让补夹前进更深，单位 mm。
   greedy_target_final_x_mm: 142.0
-  # 单个橙色目标按最近端加半个纵向跨度计算，终点参考距离，单位 mm。
-  orange_target_final_x_mm: 142.0
+  # 单个橙色目标的底面 K0 终点，降低该值会增加前进行程，单位 mm。
+  orange_target_final_x_mm: 112.0
+  black_closed_servo_offset_deg: 5.0
   # 夹爪前端参考线；危险目标 K0 从此处到扫掠终点才参与走廊门禁，单位 mm。
   corridor_start_x_mm: 60.0
   # 夹爪开口两侧的走廊安全余量，单位 mm。

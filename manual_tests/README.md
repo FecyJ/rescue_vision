@@ -490,8 +490,9 @@ rescue-vision-manual-capture \
 针对 `match_20260914_1650.log` 的修复复测：抓取 UART 运动命令/应答和双轮编码器，
 确认终点制动只发一次 `SOFT_BRAKE`，应答后零轮速继续按 25 Hz 刷新，不能用软件缓存零轮速
 代替实测。测量 0.5 m 前进和 0.3 m 后退的制动距离；终点后轻微回滚不应重启该段。
-持续运动、遥测断档或传感器无效应在 `segment_stop_deadline_ns` 到期时进入
-`terminal_stop / breakup_stop_unconfirmed`，不能自动倒车。正常停稳须继续后退并接回标记物块。
+持续运动、遥测断档或传感器无效应在 `segment_stop_deadline_ns` 到期后持续输出
+`breakup_stop_unconfirmed` 并保持软制动，不能自动倒车，也不能进入永久停车态。恢复有效遥测并
+连续确认真实停稳后，流程须自动继续后退并接回标记物块，无需重启。
 
 运行 `rescue-vision-match --config configs/runtime.match.yaml --supervised-physical-stop-ready
 --local-preview --log-dir logs`，确认解团严格按以下顺序运行：
@@ -739,6 +740,17 @@ configs/runtime.match.yaml --supervised-physical-stop-ready --local-preview --on
 
 自动回归仅验证逻辑；上述目标硬件时延、真实制动、接触效果与危险类指标均**未验证**。
 若后台Python计算仍造成控制长尾，依据剖析结果决定独立进程或释放GIL的实现，不能直接把线程等同实时隔离。
+
+## 实验性门前清障验收（未验证）
+
+使用 `configs/runtime.match.yaml` 和监督急停，先以低速或架空方式确认 S1/S2、暂存点和场地坐标方向，
+再逐步恢复配置速度。分别在己方物资区门前 200 mm 放橙色、伤员区门前放绿/黑、两区门前放蓝色；
+合法同区物块不得触发。红蓝方、左右较近 S 点、单块与多块原载荷都要覆盖。
+
+记录触发帧采集/发布时间、到暂存点误差、张爪后实际退出距离、S1—中点—S2 横扫轨迹、扫掠峰值速度、
+制动距离、中场释放位置和原载荷回取类别/数量。外围 ID 闪烁不得清零进度；新增危险侵入、旧帧、遥测失效、
+暂存物失观及 30 s 总截止必须有明确退出。暂存和清障释放不得增加交付计数，同一趟不得再次触发清障。
+这些项目目前均未在真机验证，尤其不能用无硬件 pytest 代替蓝色危险物的实际推移测量。
 
 ## 20260913 1651 现场回归（未验证）
 

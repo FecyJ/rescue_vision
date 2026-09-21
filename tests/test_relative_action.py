@@ -204,6 +204,70 @@ def test_turn_inside_angle_tolerance_still_trims_heading_error() -> None:
     assert not command.complete
 
 
+def test_turn_heading_trim_does_not_wait_for_stop_or_expire_locally() -> None:
+    controller = RelativeActionController(
+        RelativeActionProfile(
+            correction_timeout_s=0.10,
+            fine_angular_velocity_rad_s=0.12,
+        )
+    )
+    controller.set_tolerances(position_tolerance=0.08, heading_tolerance=0.03)
+    controller.begin(
+        RelativeActionKind.TURN,
+        0.80,
+        start_heading_rad=0.0,
+        target_heading_rad=0.80,
+        timestamp_ns=0,
+        cruise_speed=2.0,
+    )
+
+    command = controller.update(
+        feedback(
+            200_000_000,
+            progress=0.75,
+            heading_rad=0.74,
+            left=-0.04,
+            right=0.04,
+            angular=0.08,
+        )
+    )
+
+    assert command.phase is RelativeActionPhase.FINE
+    assert command.reason.startswith("angle_ok_heading_trim")
+    assert command.angular_velocity_rad_s > 0.0
+    assert not command.timed_out
+
+
+def test_straight_heading_trim_does_not_wait_for_stop_or_expire_locally() -> None:
+    controller = RelativeActionController(
+        RelativeActionProfile(correction_timeout_s=0.10)
+    )
+    controller.set_tolerances(position_tolerance=0.02, heading_tolerance=0.03)
+    controller.begin(
+        RelativeActionKind.STRAIGHT,
+        1.0,
+        start_heading_rad=0.0,
+        target_heading_rad=0.0,
+        timestamp_ns=0,
+        cruise_speed=1.0,
+    )
+
+    command = controller.update(
+        feedback(
+            200_000_000,
+            progress=0.99,
+            heading_rad=0.08,
+            left=0.04,
+            right=0.04,
+        )
+    )
+
+    assert command.phase is RelativeActionPhase.FINE
+    assert command.reason.startswith("distance_ok_heading_trim")
+    assert command.angular_velocity_rad_s < 0.0
+    assert not command.timed_out
+
+
 def test_negative_turn_overshoot_correction_reverses_direction() -> None:
     controller = RelativeActionController(
         RelativeActionProfile(fine_angular_velocity_rad_s=0.12)
@@ -264,7 +328,7 @@ def test_negative_straight_overshoot_correction_reverses_direction() -> None:
     assert command.linear_velocity_m_s == pytest.approx(0.05)
 
 
-def test_overshoot_waits_for_stop_before_correction_or_limit_failure() -> None:
+def test_overshoot_corrects_while_moving_without_intermediate_stop() -> None:
     controller = RelativeActionController(
         RelativeActionProfile(correction_max_distance_m=0.12)
     )
@@ -286,9 +350,9 @@ def test_overshoot_waits_for_stop_before_correction_or_limit_failure() -> None:
             right=0.04,
         )
     )
-    assert moving.phase is RelativeActionPhase.SETTLE
-    assert moving.reason.startswith("overshoot_waiting_for_stop")
-    assert moving.linear_velocity_m_s == 0.0
+    assert moving.phase is RelativeActionPhase.FINE
+    assert moving.reason.startswith("overshoot_correction")
+    assert moving.linear_velocity_m_s == pytest.approx(-0.05)
 
     stopped = controller.update(
         feedback(
@@ -304,7 +368,7 @@ def test_overshoot_waits_for_stop_before_correction_or_limit_failure() -> None:
     assert stopped.linear_velocity_m_s == pytest.approx(-0.05)
 
 
-def test_large_overshoot_is_rejected_after_vehicle_stops() -> None:
+def test_large_overshoot_remains_a_live_fine_correction() -> None:
     controller = RelativeActionController()
     controller.set_tolerances(position_tolerance=0.02, heading_tolerance=0.03)
     controller.begin(
@@ -326,12 +390,13 @@ def test_large_overshoot_is_rejected_after_vehicle_stops() -> None:
         )
     )
 
-    assert command.phase is RelativeActionPhase.TIMEOUT
-    assert command.reason.startswith("overshoot_correction_limit")
-    assert command.timed_out
+    assert command.phase is RelativeActionPhase.FINE
+    assert command.reason.startswith("overshoot_correction")
+    assert command.linear_velocity_m_s < 0.0
+    assert not command.timed_out
 
 
-def test_overshoot_stop_wait_has_a_bounded_deadline() -> None:
+def test_moving_overshoot_correction_does_not_expire_its_local_window() -> None:
     controller = RelativeActionController(
         RelativeActionProfile(correction_max_distance_m=0.12)
     )
@@ -353,7 +418,8 @@ def test_overshoot_stop_wait_has_a_bounded_deadline() -> None:
             right=0.04,
         )
     )
-    assert waiting.phase is RelativeActionPhase.SETTLE
+    assert waiting.phase is RelativeActionPhase.FINE
+    assert waiting.linear_velocity_m_s < 0.0
 
     command = controller.update(
         feedback(
@@ -364,9 +430,10 @@ def test_overshoot_stop_wait_has_a_bounded_deadline() -> None:
         )
     )
 
-    assert command.phase is RelativeActionPhase.TIMEOUT
-    assert command.reason.startswith("overshoot_settle_timeout")
-    assert command.timed_out
+    assert command.phase is RelativeActionPhase.FINE
+    assert command.reason.startswith("overshoot_correction")
+    assert command.linear_velocity_m_s < 0.0
+    assert not command.timed_out
 
 
 def test_straight_action_holds_route_heading_and_allows_fine_speed_without_wheel_lift() -> None:

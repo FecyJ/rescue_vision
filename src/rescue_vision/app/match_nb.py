@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import math
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -42,57 +43,7 @@ if TYPE_CHECKING:
 class MatchNBSequence(MatchSequence):
     """只替换开场动作，其余行为始终委托给当前正式流程。"""
 
-    # The motion limit is a command slew limit, not a measured vehicle
-    # stopping capability.  Until a true-car measurement is supplied, use a
-    # conservative NB profile so the route starts braking before the target.
-    _DEFAULT_LINEAR_DECELERATION_M_S2 = 2.0
-    _DEFAULT_ANGULAR_DECELERATION_RAD_S2 = 2.0
-
-    @classmethod
-    def _profile_from_match_config(
-        cls,
-        config: AppConfig,
-        *,
-        linear_deceleration_m_s2: float,
-        angular_deceleration_rad_s2: float,
-    ) -> RelativeActionProfile:
-        runtime = config.match
-        effective_linear_deceleration = min(
-            linear_deceleration_m_s2,
-            runtime.nb_opening_effective_linear_deceleration_m_s2
-            if runtime.nb_opening_effective_linear_deceleration_m_s2 is not None
-            else cls._DEFAULT_LINEAR_DECELERATION_M_S2,
-        )
-        effective_angular_deceleration = min(
-            angular_deceleration_rad_s2,
-            runtime.nb_opening_effective_angular_deceleration_rad_s2
-            if runtime.nb_opening_effective_angular_deceleration_rad_s2 is not None
-            else angular_deceleration_rad_s2,
-        )
-        return RelativeActionProfile(
-            linear_deceleration_m_s2=effective_linear_deceleration,
-            angular_deceleration_rad_s2=effective_angular_deceleration,
-            command_wait_s=WHEEL_COMMAND_REFRESH_S,
-            execution_response_s=runtime.nb_opening_execution_response_s,
-            max_telemetry_age_s=runtime.nb_opening_max_telemetry_age_ms / 1000.0,
-            fine_linear_speed_m_s=runtime.nb_opening_fine_linear_speed_m_s,
-            fine_angular_velocity_rad_s=(
-                runtime.nb_opening_fine_angular_velocity_rad_s
-            ),
-            stop_wheel_speed_m_s=runtime.nb_opening_stop_wheel_speed_m_s,
-            stop_angular_velocity_rad_s=(
-                runtime.nb_opening_stop_angular_velocity_rad_s
-            ),
-            heading_kp_rad_s=runtime.nb_opening_heading_kp_rad_s,
-            heading_max_angular_velocity_rad_s=(
-                runtime.nb_opening_heading_max_angular_velocity_rad_s
-            ),
-            correction_max_distance_m=runtime.nb_opening_correction_max_distance_m,
-            correction_max_angle_rad=runtime.nb_opening_correction_max_angle_rad,
-            correction_timeout_s=runtime.nb_opening_correction_timeout_s,
-            action_timeout_s=runtime.nb_opening_turn_timeout_s,
-            stationary_confirm_time_s=runtime.nb_opening_settle_time_s,
-        )
+    INITIAL_HEADING_RAD = -3.0 * math.pi / 4.0
 
     @classmethod
     def from_app_config(
@@ -104,11 +55,13 @@ class MatchNBSequence(MatchSequence):
         sequence = super().from_app_config(config, start_area=start_area)
         if not isinstance(sequence, cls):
             raise TypeError("MatchNBSequence factory returned an unexpected type.")
-        sequence._nb_motion_profile = cls._profile_from_match_config(
-            config,
-            linear_deceleration_m_s2=config.motion.max_linear_deceleration_m_s2,
-            angular_deceleration_rad_s2=config.motion.max_angular_deceleration_rad_s2,
+        sequence._nb_motion_profile = replace(
+            sequence._motion_profile,
+            action_timeout_s=config.match.nb_opening_turn_timeout_s,
+            stationary_confirm_time_s=config.match.nb_opening_settle_time_s,
         )
+        sequence._nb_wheel_track_m = config.motion.wheel_track_m
+        sequence._nb_initial_heading_rad = config.localization.fusion.initial_pose.heading_rad
         return sequence
 
     @property
@@ -135,7 +88,7 @@ class MatchNBSequence(MatchSequence):
         self._nb_turn_last_heading_rad: float | None = None
         self._nb_turn_progress_rad = 0.0
         self._nb_action_start_distance_m: float | None = None
-        self._nb_route_heading_rad: float | None = None
+        self._nb_route_heading_rad: float | None = getattr(self, "_nb_initial_heading_rad", None)
         self._nb_action_controller: RelativeActionController | None = None
         self._nb_last_action_command: RelativeActionCommand | None = None
         self._nb_gripper_opened = False
@@ -145,34 +98,10 @@ class MatchNBSequence(MatchSequence):
     def _profile_from_runtime_config(self) -> RelativeActionProfile:
         """Build the testable default when no full AppConfig was provided."""
 
-        runtime = self.config
-        return RelativeActionProfile(
-            linear_deceleration_m_s2=(
-                runtime.nb_opening_effective_linear_deceleration_m_s2
-                or self._DEFAULT_LINEAR_DECELERATION_M_S2
-            ),
-            angular_deceleration_rad_s2=(
-                runtime.nb_opening_effective_angular_deceleration_rad_s2
-                or self._DEFAULT_ANGULAR_DECELERATION_RAD_S2
-            ),
-            command_wait_s=WHEEL_COMMAND_REFRESH_S,
-            execution_response_s=runtime.nb_opening_execution_response_s,
-            max_telemetry_age_s=runtime.nb_opening_max_telemetry_age_ms / 1000.0,
-            fine_linear_speed_m_s=runtime.nb_opening_fine_linear_speed_m_s,
-            fine_angular_velocity_rad_s=(
-                runtime.nb_opening_fine_angular_velocity_rad_s
-            ),
-            stop_wheel_speed_m_s=runtime.nb_opening_stop_wheel_speed_m_s,
-            stop_angular_velocity_rad_s=runtime.nb_opening_stop_angular_velocity_rad_s,
-            heading_kp_rad_s=runtime.nb_opening_heading_kp_rad_s,
-            heading_max_angular_velocity_rad_s=(
-                runtime.nb_opening_heading_max_angular_velocity_rad_s
-            ),
-            correction_max_distance_m=runtime.nb_opening_correction_max_distance_m,
-            correction_max_angle_rad=runtime.nb_opening_correction_max_angle_rad,
-            correction_timeout_s=runtime.nb_opening_correction_timeout_s,
-            action_timeout_s=runtime.nb_opening_turn_timeout_s,
-            stationary_confirm_time_s=runtime.nb_opening_settle_time_s,
+        return replace(
+            self._motion_profile,
+            action_timeout_s=self.config.nb_opening_turn_timeout_s,
+            stationary_confirm_time_s=self.config.nb_opening_settle_time_s,
         )
 
     def _dispatch_state(
@@ -388,6 +317,8 @@ class MatchNBSequence(MatchSequence):
                 timestamp_ns=timestamp_ns,
                 cruise_speed=action.angular_velocity_rad_s,
                 target_heading_rad=self._nb_route_heading_rad,
+                pivot_track_m=(self._nb_wheel_track_m if action.pivot_wheel else None),
+                exit_speed_m_s=action.exit_speed_m_s,
             )
         else:
             if cumulative_distance_m is None or heading_rad is None:
@@ -400,7 +331,9 @@ class MatchNBSequence(MatchSequence):
                 # as a new reference.
                 self._nb_route_heading_rad = heading_rad
             self._nb_action_controller = RelativeActionController(
-                self._nb_motion_profile
+                self._nb_motion_profile if action.settle_time_s is None else replace(
+                    self._nb_motion_profile, stationary_confirm_time_s=action.settle_time_s,
+                )
             )
             self._nb_action_controller.set_tolerances(
                 position_tolerance=self.config.nb_opening_distance_tolerance_m,
@@ -644,13 +577,29 @@ class MatchNBSequence(MatchSequence):
                 gripper_angles_deg=angles,
             )
         if command.complete:
-            return self._nb_finish_action(
+            advanced = self._nb_finish_action(
                 timestamp_ns,
                 reason=(
                     f"nb_opening_action_{action_number}_complete"
                     f":{command.reason}"
                 ),
             )
+            if isinstance(action, NBOpeningTurn) and action.exit_speed_m_s > 0.0:
+                # Freeze the straight origin at this feedback sample. Its
+                # first target lets the left catch the still-moving right;
+                # do not inject the usual zero-speed action-switch command.
+                if cumulative_distance_m is None or not self._nb_begin_action(
+                    timestamp_ns, heading_rad=heading_rad,
+                    cumulative_distance_m=cumulative_distance_m,
+                ):
+                    self.state = MatchState.TERMINAL_STOP
+                    return self._decision(timestamp_ns, 0.0, 0.0, "nb_pivot_handoff_missing_distance")
+                return replace(
+                    advanced, linear_velocity_m_s=command.linear_velocity_m_s,
+                    angular_velocity_rad_s=0.0, min_wheel_velocity_m_s=0.0,
+                    reason="nb_opening_pivot_moving_handoff",
+                )
+            return advanced
         return self._decision(
             timestamp_ns,
             command.linear_velocity_m_s,

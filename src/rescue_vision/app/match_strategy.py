@@ -2198,9 +2198,7 @@ class MatchSequence(_SharedMatchSequence):
 
         if self._strategy_formal_phase:
             return _SharedMatchSequence._safe_zone_d2_target(self)
-        return self._safe_zone_braking_compensated_target(
-            self._safe_zone_transport_endpoint()
-        )
+        return self._safe_zone_transport_endpoint()
 
     def _safe_zone_final_target_y_mm(self) -> float:
         """策略在 D2 完成释放，不再向安全区深处二次推进。"""

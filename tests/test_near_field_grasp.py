@@ -118,10 +118,10 @@ def test_orange_target_is_allowed_as_a_single_member_with_its_distance_formula()
     assert plan is not None
     assert plan.member_ids == (1,)
     # K0 bottom centre determines travel; top-mask depth cannot extend it.
-    assert plan.forward_distance_mm == pytest.approx(158.0)
+    assert plan.forward_distance_mm == pytest.approx(188.0)
     diagnostic = grasp_selector.candidate_geometry(orange)
-    assert diagnostic.target_final_x_mm == pytest.approx(142.0)
-    assert plan.forward_distance_mm == pytest.approx(300.0 - 142.0)
+    assert diagnostic.target_final_x_mm == pytest.approx(112.0)
+    assert plan.forward_distance_mm == pytest.approx(300.0 - 112.0)
 
 
 @pytest.mark.parametrize(
@@ -155,8 +155,8 @@ def test_orange_travel_follows_k0_not_the_top_projection_depth(depth):
     diagnostic = grasp_selector.candidate_geometry(orange)
 
     assert diagnostic.depth_mm == pytest.approx(depth)
-    assert plan.forward_distance_mm == pytest.approx(158.0)
-    assert diagnostic.forward_distance_mm == pytest.approx(158.0)
+    assert plan.forward_distance_mm == pytest.approx(188.0)
+    assert diagnostic.forward_distance_mm == pytest.approx(188.0)
     # 扫掠前端随开口几何变化，但不随投影深度增长。
     assert diagnostic.corridor_end_x_mm == pytest.approx(
         max(point.x for point in plan.regions[0])

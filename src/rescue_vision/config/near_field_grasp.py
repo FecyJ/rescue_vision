@@ -25,7 +25,9 @@ class NearFieldGraspConfig:
     greedy_target_final_x_mm: float = 110.0
     # 单个橙色目标前进结束时，最前 K0 底面中心希望保留在机器人前方的距离。
     # 颜色上表面投影的纵向拉长不作为前进深度。
-    orange_target_final_x_mm: float = 142.0
+    orange_target_final_x_mm: float = 112.0
+    # 含黑色物资时，合爪及带载保持的左右绝对舵机命令各增加此值。
+    black_closed_servo_offset_deg: float = 5.0
     # 夹爪前端参考线；危险目标 K0 只有落入从此处开始的扫掠矩形才阻挡动作。
     corridor_start_x_mm: float = 60.0
     corridor_lateral_margin_mm: float = 10.0
@@ -83,6 +85,7 @@ class NearFieldGraspConfig:
             "confirmation_frames",
         }
         nonnegative = {
+            "black_closed_servo_offset_deg",
             "corridor_lateral_margin_mm",
             "clearance_mm",
             "range_hysteresis_mm",

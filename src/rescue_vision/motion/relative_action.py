@@ -224,10 +224,10 @@ class RelativeActionController:
         self._start_heading_rad: float | None = None
         self._target_heading_rad: float | None = None
         self._started_ns: int | None = None
-        self._correction_started_ns: int | None = None
-        self._overshoot_stop_started_ns: int | None = None
         self._last_linear_command_m_s = 0.0
         self._last_angular_command_rad_s = 0.0
+        self._pivot_track_m: float | None = None
+        self._exit_speed_m_s = 0.0
 
     @property
     def active(self) -> bool:
@@ -250,6 +250,8 @@ class RelativeActionController:
         timestamp_ns: int,
         cruise_speed: float,
         target_heading_rad: float | None = None,
+        pivot_track_m: float | None = None,
+        exit_speed_m_s: float = 0.0,
     ) -> None:
         if not isinstance(kind, RelativeActionKind):
             raise TypeError("kind must be a RelativeActionKind.")
@@ -258,6 +260,15 @@ class RelativeActionController:
             raise ValueError("target_signed must be non-zero.")
         heading = _finite(start_heading_rad, "start_heading_rad")
         cruise = _positive(cruise_speed, "cruise_speed")
+        exit_speed = _nonnegative(exit_speed_m_s, "exit_speed_m_s")
+        if pivot_track_m is not None:
+            pivot_track_m = _positive(pivot_track_m, "pivot_track_m")
+            if kind is not RelativeActionKind.TURN or target <= 0.0:
+                raise ValueError("Left pivot requires a positive TURN target.")
+            if exit_speed > cruise * pivot_track_m:
+                raise ValueError("exit_speed_m_s exceeds pivot wheel cruise speed.")
+        elif exit_speed:
+            raise ValueError("exit_speed_m_s requires pivot_track_m.")
         if (
             isinstance(timestamp_ns, bool)
             or not isinstance(timestamp_ns, int)
@@ -271,27 +282,27 @@ class RelativeActionController:
                 _finite(target_heading_rad, "target_heading_rad")
             )
         self._kind = kind
+        self._pivot_track_m = pivot_track_m
+        self._exit_speed_m_s = exit_speed
         self._target_signed = target
         self._target_abs = abs(target)
         self._cruise_speed = cruise
         self._start_heading_rad = heading
         self._target_heading_rad = target_heading
         self._started_ns = timestamp_ns
-        self._correction_started_ns = None
-        self._overshoot_stop_started_ns = None
         self._last_linear_command_m_s = 0.0
         self._last_angular_command_rad_s = 0.0
 
     def reset(self) -> None:
         self._kind = None
+        self._pivot_track_m = None
+        self._exit_speed_m_s = 0.0
         self._target_signed = 0.0
         self._target_abs = 0.0
         self._cruise_speed = 0.0
         self._start_heading_rad = None
         self._target_heading_rad = None
         self._started_ns = None
-        self._correction_started_ns = None
-        self._overshoot_stop_started_ns = None
         self._last_linear_command_m_s = 0.0
         self._last_angular_command_rad_s = 0.0
 
@@ -324,76 +335,30 @@ class RelativeActionController:
                 timed_out=True,
             )
 
-        if position_error < -position_tolerance:
-            # Never reverse a still-moving vehicle merely because one delayed
-            # telemetry sample crossed the target.  First command zero and
-            # wait for measured stop; otherwise the fine correction fights the
-            # residual momentum and produces the sharp brake-then-creep seen
-            # in the vehicle log.
-            if not stopped:
-                if self._overshoot_stop_started_ns is None:
-                    self._overshoot_stop_started_ns = feedback.timestamp_ns
-                stop_wait_elapsed_s = (
-                    feedback.timestamp_ns - self._overshoot_stop_started_ns
-                ) / 1e9
-                if stop_wait_elapsed_s > self.profile.correction_timeout_s:
-                    return self._command(
-                        0.0,
-                        0.0,
-                        RelativeActionPhase.TIMEOUT,
-                        reason="overshoot_settle_timeout",
-                        position_error=position_error,
-                        heading_error=heading_error,
-                        braking_distance=braking_distance,
-                        telemetry_delay_s=telemetry_delay_s,
-                        timed_out=True,
-                    )
-                return self._command(
-                    0.0,
-                    0.0,
-                    RelativeActionPhase.SETTLE,
-                    reason="overshoot_waiting_for_stop",
-                    position_error=position_error,
-                    heading_error=heading_error,
-                    braking_distance=braking_distance,
-                    telemetry_delay_s=telemetry_delay_s,
-                )
-
-            self._overshoot_stop_started_ns = None
-            correction_limit = (
-                self.profile.correction_max_angle_rad
-                if self._kind is RelativeActionKind.TURN
-                else self.profile.correction_max_distance_m
+        if (feedback.telemetry_age_s is None
+                or feedback.telemetry_age_s > self.profile.max_telemetry_age_s
+                or feedback.heading_rad is None
+                or feedback.angular_velocity_rad_s is None
+                or feedback.left_wheel_velocity_m_s is None
+                or feedback.right_wheel_velocity_m_s is None):
+            return self._command(
+                0.0, 0.0, RelativeActionPhase.WAITING_FEEDBACK,
+                reason="critical_motion_feedback_unavailable",
+                position_error=position_error, heading_error=heading_error,
+                braking_distance=braking_distance, telemetry_delay_s=telemetry_delay_s,
             )
-            if abs(position_error) > correction_limit:
-                return self._command(
-                    0.0,
-                    0.0,
-                    RelativeActionPhase.TIMEOUT,
-                    reason="overshoot_correction_limit",
-                    position_error=position_error,
-                    heading_error=heading_error,
-                    braking_distance=braking_distance,
-                    telemetry_delay_s=telemetry_delay_s,
-                    timed_out=True,
-                )
-            if self._correction_started_ns is None:
-                self._correction_started_ns = feedback.timestamp_ns
-            correction_elapsed_s = (
-                feedback.timestamp_ns - self._correction_started_ns
-            ) / 1e9
-            if correction_elapsed_s > self.profile.correction_timeout_s:
-                return self._command(
-                    0.0,
-                    0.0,
-                    RelativeActionPhase.TIMEOUT,
-                    reason="overshoot_correction_timeout",
-                    position_error=position_error,
-                    heading_error=heading_error,
-                    braking_distance=braking_distance,
-                    telemetry_delay_s=telemetry_delay_s,
-                    timed_out=True,
-                )
+
+        if self._pivot_track_m is not None and self._exit_speed_m_s > 0.0:
+            return self._rolling_pivot_command(
+                feedback, position_error, heading_error, measured_speed,
+                braking_distance, telemetry_delay_s,
+            )
+
+        if position_error < -position_tolerance:
+            # Correct through zero without an intermediate stop gate. The
+            # lower motion controller still applies its deceleration and
+            # direction-change ramp, so this requests progress immediately
+            # without commanding an abrupt wheel reversal.
             return self._fine_command(
                 feedback,
                 position_error=position_error,
@@ -407,11 +372,7 @@ class RelativeActionController:
         heading_ok = (
             heading_error is not None and abs(heading_error) <= heading_tolerance
         )
-        self._overshoot_stop_started_ns = None
-        if not position_ok:
-            self._correction_started_ns = None
         if position_ok and heading_ok:
-            self._correction_started_ns = None
             if stopped and stationary:
                 return self._command(
                     0.0,
@@ -439,42 +400,16 @@ class RelativeActionController:
             # A turn has two independent completion gates: accumulated angle
             # and final heading.  The angle can be inside its wider tolerance
             # while the heading is still outside the route tolerance (this is
-            # exactly the small overshoot case).  Once the measured motion is
-            # stopped, trim that heading at fine speed instead of feeding a
-            # zero command forever.
-            if stopped and heading_error is not None:
-                if self._correction_started_ns is None:
-                    self._correction_started_ns = feedback.timestamp_ns
-                correction_elapsed_s = (
-                    feedback.timestamp_ns - self._correction_started_ns
-                ) / 1e9
-                if correction_elapsed_s > self.profile.correction_timeout_s:
-                    return self._command(
-                        0.0,
-                        0.0,
-                        RelativeActionPhase.TIMEOUT,
-                        reason="heading_trim_timeout",
-                        position_error=position_error,
-                        heading_error=heading_error,
-                        braking_distance=braking_distance,
-                        telemetry_delay_s=telemetry_delay_s,
-                        timed_out=True,
-                    )
-                return self._command(
-                    0.0,
-                    self._heading_trim_command(heading_error),
-                    RelativeActionPhase.FINE,
-                    reason="angle_ok_heading_trim",
-                    position_error=position_error,
-                    heading_error=heading_error,
-                    braking_distance=braking_distance,
-                    telemetry_delay_s=telemetry_delay_s,
-                )
+            # exactly the small overshoot case).  Request the bounded trim
+            # immediately; MotionController decelerates the existing motion
+            # and ramps through the direction change without a zero-command
+            # stop gate.
+            assert heading_error is not None
             return self._command(
                 0.0,
-                0.0,
-                RelativeActionPhase.SETTLE,
-                reason=self._settle_reason(feedback, stopped, stationary),
+                self._heading_trim_command(heading_error),
+                RelativeActionPhase.FINE,
+                reason="angle_ok_heading_trim",
                 position_error=position_error,
                 heading_error=heading_error,
                 braking_distance=braking_distance,
@@ -482,43 +417,15 @@ class RelativeActionController:
             )
 
         if position_ok and self._kind is RelativeActionKind.STRAIGHT:
-            # Do not rotate while the vehicle is still carrying translational
-            # momentum.  Once it is slow, use a bounded in-place heading trim.
-            if stopped and heading_error is not None:
-                if self._correction_started_ns is None:
-                    self._correction_started_ns = feedback.timestamp_ns
-                correction_elapsed_s = (
-                    feedback.timestamp_ns - self._correction_started_ns
-                ) / 1e9
-                if correction_elapsed_s > self.profile.correction_timeout_s:
-                    return self._command(
-                        0.0,
-                        0.0,
-                        RelativeActionPhase.TIMEOUT,
-                        reason="heading_trim_timeout",
-                        position_error=position_error,
-                        heading_error=heading_error,
-                        braking_distance=braking_distance,
-                        telemetry_delay_s=telemetry_delay_s,
-                        timed_out=True,
-                    )
-                angular = self._heading_trim_command(heading_error)
-                return self._command(
-                    0.0,
-                    angular,
-                    RelativeActionPhase.FINE,
-                    reason="distance_ok_heading_trim",
-                    position_error=position_error,
-                    heading_error=heading_error,
-                    braking_distance=braking_distance,
-                    telemetry_delay_s=telemetry_delay_s,
-                )
-            self._correction_started_ns = None
+            # Keep progressing toward the requested heading instead of
+            # waiting at zero for a separate stopped state.  The lower layer
+            # remains the sole authority for the physical acceleration ramp.
+            assert heading_error is not None
             return self._command(
                 0.0,
-                0.0,
-                RelativeActionPhase.SETTLE,
-                reason=self._settle_reason(feedback, stopped, stationary),
+                self._heading_trim_command(heading_error),
+                RelativeActionPhase.FINE,
+                reason="distance_ok_heading_trim",
                 position_error=position_error,
                 heading_error=heading_error,
                 braking_distance=braking_distance,
@@ -692,6 +599,70 @@ class RelativeActionController:
             return self.profile.fine_angular_velocity_rad_s
         return min(self._cruise_speed, safe_speed)
 
+    def _rolling_pivot_command(
+        self,
+        feedback: RelativeActionFeedback,
+        position_error: float,
+        heading_error: float | None,
+        speed: float,
+        braking_distance: float,
+        delay_s: float,
+    ) -> RelativeActionCommand:
+        """Keep the left wheel zero until a bounded moving handoff is possible.
+
+        The right wheel slows to exit speed. Completion predicts the residual
+        yaw while the left catches up; the next straight closes heading error.
+        This is a moving handoff, never a claim of stationary completion.
+        """
+        assert self._pivot_track_m is not None
+        assert heading_error is not None
+        assert feedback.angular_velocity_rad_s is not None
+        assert feedback.left_wheel_velocity_m_s is not None
+        assert feedback.right_wheel_velocity_m_s is not None
+        tolerance = min(self._position_tolerance(), self._heading_tolerance())
+        angular = feedback.angular_velocity_rad_s
+        residual = (max(0.0, angular) * delay_s
+                    + max(0.0, angular) ** 2 / (2.0 * self.profile.angular_deceleration_rad_s2))
+        exit_angular = self._exit_speed_m_s / self._pivot_track_m
+        wheel_tolerance = self.profile.stop_wheel_speed_m_s
+        complete = (
+            abs(position_error) <= self._position_tolerance()
+            and abs(heading_error) <= self._heading_tolerance()
+            and abs(position_error - residual) <= self._position_tolerance()
+            and abs(heading_error - residual) <= self._heading_tolerance()
+            and 0.0 <= angular <= exit_angular * 1.2
+            and abs(feedback.left_wheel_velocity_m_s) <= wheel_tolerance
+            and abs(feedback.right_wheel_velocity_m_s - self._exit_speed_m_s) <= wheel_tolerance
+        )
+        if complete:
+            return self._command(
+                self._exit_speed_m_s, 0.0, RelativeActionPhase.COMPLETE,
+                reason="pivot_moving_handoff", complete=True,
+                position_error=position_error, heading_error=heading_error,
+                braking_distance=braking_distance, telemetry_delay_s=delay_s,
+            )
+        if min(position_error, heading_error) < -tolerance:
+            return self._command(
+                0.0, 0.0, RelativeActionPhase.TIMEOUT,
+                reason="pivot_handoff_missed", timed_out=True,
+                position_error=position_error, heading_error=heading_error,
+                braking_distance=braking_distance, telemetry_delay_s=delay_s,
+            )
+        remaining = max(0.0, min(position_error, heading_error))
+        # Use the terminal wheel speed as a floor; do not stop and restart
+        # the right wheel between the pivot and the following straight.
+        safe = math.sqrt(2.0 * self.profile.angular_deceleration_rad_s2
+                         * max(0.0, remaining - speed * delay_s))
+        target_angular = min(self._cruise_speed, max(exit_angular, safe))
+        phase = (RelativeActionPhase.FINE if target_angular <= exit_angular
+                 else RelativeActionPhase.BRAKE if target_angular < self._cruise_speed
+                 else RelativeActionPhase.CRUISE)
+        return self._command(
+            0.0, target_angular, phase, reason="left_wheel_pivot",
+            position_error=position_error, heading_error=heading_error,
+            braking_distance=braking_distance, telemetry_delay_s=delay_s,
+        )
+
     def _heading_command(self, heading_error: float | None) -> float:
         if heading_error is None:
             return 0.0
@@ -731,7 +702,9 @@ class RelativeActionController:
         latest = feedback.stationary_latest_ns
         if since is None or latest is None or self._started_ns is None:
             return False
-        if since < self._started_ns or latest < self._started_ns:
+        # A continuously stationary vehicle remains stationary across actions.
+        # Require a fresh sample, but never move the physical stop origin.
+        if latest < self._started_ns or latest > feedback.timestamp_ns or since > latest:
             return False
         if feedback.telemetry_age_s is None or feedback.telemetry_age_s > self.profile.max_telemetry_age_s:
             return False
@@ -807,6 +780,8 @@ class RelativeActionController:
         complete: bool = False,
         timed_out: bool = False,
     ) -> RelativeActionCommand:
+        if self._pivot_track_m is not None and angular != 0.0:
+            linear = angular * self._pivot_track_m / 2.0
         self._last_linear_command_m_s = linear
         self._last_angular_command_rad_s = angular
         heading_text = (

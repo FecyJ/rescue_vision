@@ -1026,6 +1026,7 @@ class GripperWidthPickupDecision:
 class GripperWidthPickupSequence:
     def __init__(self, *, gripper_full_travel_time_s: float, forward_speed_m_s: float,
                  closed_servo_angles_deg: tuple[float, float], max_observation_age_ms: float,
+                 black_closed_servo_offset_deg: float = 5.0,
                  alignment_kp_rad_s: float = 1.0, alignment_max_angular_velocity_rad_s: float = 0.35,
                  alignment_min_wheel_velocity_m_s: float | None = None,
                  alignment_timeout_ms: float = 8_000.0,
@@ -1084,6 +1085,8 @@ class GripperWidthPickupSequence:
         if not isinstance(closed_servo_angles_deg, tuple) or len(closed_servo_angles_deg) != 2 or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)) or not 0 <= float(v) <= 180 for v in closed_servo_angles_deg):
             raise ValueError(f"Invalid closed servo angles {closed_servo_angles_deg!r}.")
         self.closed_angles = closed_servo_angles_deg
+        self.black_closed_servo_offset_deg = _nonnegative(black_closed_servo_offset_deg, "black_closed_servo_offset_deg")
+        self.closed_angles_for_classes((TargetClass.BLACK_CORE,))
         self.state = GripperWidthPickupState.SEARCH
         self.locked_ids: tuple[int, ...] | None = None
         self.active_plan: NearFieldGraspPlan | None = None
@@ -1108,6 +1111,17 @@ class GripperWidthPickupSequence:
         self.alignment_motion_allowance_ns = 0
         self._alignment_completed_ns = -1
         self._alignment_finished = False
+
+    def closed_angles_for_classes(self, classes: tuple[TargetClass, ...]) -> tuple[float, float]:
+        """黑色使用绝对命令偏置；几何张开角与全局机械零位仍保持原标定。"""
+        offset = self.black_closed_servo_offset_deg if TargetClass.BLACK_CORE in classes else 0.0
+        angles = (self.closed_angles[0] + offset, self.closed_angles[1] + offset)
+        if any(not 0.0 <= angle <= 180.0 for angle in angles):
+            raise ValueError(f"black closed servo commands outside [0,180]: {angles!r}.")
+        return angles
+
+    def _plan_closed_angles(self, plan: NearFieldGraspPlan) -> tuple[float, float]:
+        return self.closed_angles_for_classes(tuple(t.observation.target_class for t in plan.members))
 
     def observe_motion(self, message: OdometryImu) -> None:
         """消费真实编码器/IMU样本；接收时间与相机同为主机单调时钟。
@@ -1630,9 +1644,9 @@ class GripperWidthPickupSequence:
         # 被夹臂遮挡不应把已提交动作改称需要重新抓取。
         if self.state is GripperWidthPickupState.CLOSING:
             if now - self._phase_ns < self.travel_ns:
-                return self._decision(now, "closing_gripper", brake=True)
+                return self._decision(now, "closing_gripper", angles=self._plan_closed_angles(plan), brake=True)
             self.state = GripperWidthPickupState.COMPLETE
-            self.result = GripperWidthPickupResult(plan.member_ids, tuple(t.observation.target_class.value for t in plan.members), now, self.closed_angles)
+            self.result = GripperWidthPickupResult(plan.member_ids, tuple(t.observation.target_class.value for t in plan.members), now, self._plan_closed_angles(plan))
             return self._decision(now, "complete_capture_unconfirmed", brake=True)
         if self.state is GripperWidthPickupState.OPENING:
             elapsed_ns = now - self._phase_ns
@@ -1668,7 +1682,7 @@ class GripperWidthPickupSequence:
             if self.progress_mm(cumulative_distance_m) >= plan.forward_distance_mm:
                 self.state = GripperWidthPickupState.CLOSING
                 self._phase_ns = now
-                return self._decision(now, "distance_reached_close_gripper", angles=self.closed_angles, brake=True)
+                return self._decision(now, "distance_reached_close_gripper", angles=self._plan_closed_angles(plan), brake=True)
             # 速度仍受剩余定距限制，但不受视觉观测年龄/退化状态降速。
             remaining_m = (plan.forward_distance_mm - self.progress_mm(cumulative_distance_m)) / 1000
             speed = approach_speed_m_s(remaining_m, self.speed, self.cruise_speed_scale,
