@@ -20,6 +20,13 @@
 航向微调，都不中途插入停稳门禁，也不因局部修正幅度或时间单独终止比赛；轮速换向仍经过
 底层减速到零和反向加速。
 
+`wheel_action.WheelTurnAndAdvanceController` 是 `match_nb` 开头的轮级动作：在首段直行
+达到里程目标时不把右轮归零，右轮保持配置速度，左轮按固定加减速度切换到保持速度；
+IMU 航向累计达到目标角后左轮恢复到右轮速度，双轮再按里程推进固定距离并提前刹车。
+动作完成仍要求距离误差、轮速/角速度和 `StationaryMotionEvidence` 的连续停稳证据同时合格。
+它通过 `MotionController.set_wheel_speeds()` 下发，`WheelAccelerationOverrides` 只覆盖
+开头轮级切换的斜坡，刹车阶段恢复车体默认减速度。
+
 树莓派与 STM32 接口以
 [`docs/树莓派与单片机通信协议v3.md`](../../../docs/树莓派与单片机通信协议v3.md)
 为唯一权威。树莓派端已经使用 COBS、CRC16 和固定长度二进制消息统一运动、
@@ -37,10 +44,12 @@
 | `MotionLimits` | 轮距、车体/车轮速度上限、独立线/角加减速度上限、左右轮速度权重、远程有效期上限 | 创建时严格校验 |
 | `MotionController` | UART 帧通道、`MotionLimits` | STM32 运动控制器 |
 | `RelativeActionController` | 相对距离/角度目标、编码器/IMU反馈、遥测年龄和停稳证据 | 生成高速—制动—低速收尾的车体 twist；不直接访问硬件 |
+| `WheelTurnAndAdvanceController` | 左右轮速度、IMU 航向、编码器累计距离和停稳证据 | 右轮恒速、左轮斜坡、定角度后双轮定距刹停；不直接访问硬件 |
 | `MotionController.drive()` | 前进速度 m/s、逆时针角速度 rad/s | 差速换算后设置左右轮目标 |
 | `drive_wheel_limited()` | 分别合法的车体线速度和角速度，可选单次 `min_wheel_velocity_m_s` | 必要时同比缩放并返回实际 twist，使单轮不超限；单次下限缺省使用 `MotionLimits` 全局值 |
 | `set_wheel_speeds()` | 左右轮速度 m/s，可选单次 `min_wheel_velocity_m_s` | 绕过车体 twist 换算；非零目标会提升到单次下限或全局 `min_wheel_velocity_m_s`，仍执行轮速限幅校验 |
 | `set_acceleration_limits()` | 四项可选车体线/角加减速度上限 | 每个 `None` 恢复 `motion` 中对应全局值；只影响后续速度斜坡 |
+| `set_wheel_acceleration_limits()` | 四项可选左右轮加减速度上限 | 独立推进左右轮目标；`None` 恢复车体斜坡 |
 | `update()` | 可选本机单调时间 ns | 按车体线/角加减速度推进，再换算轮速并至少 20 Hz 刷新；返回是否发送 |
 | `MotionControlTimingError` | 活动控制更新间隔超过 200 ms | 先发送柔和停车，再终止当前控制链路 |
 | `MotionStallError` | 有效编码器在持续轮速命令下不变化 | 先发送柔和停车，再终止当前控制链路 |
@@ -242,6 +251,18 @@ controller.update()
 `max_wheel_velocity_m_s`；控制器先按轮距和权重反解车体 twist，再与 `drive()` 共用
 四项车体加减速度上限和 `update()`。上层一般应优先使用
 `drive()`，避免多个模块各自实现差速公式。
+
+轮级闭环需要独立斜坡时，可在同一个控制周期装配覆盖：
+
+```python
+controller.set_wheel_acceleration_limits(
+    WheelAccelerationOverrides(
+        left_acceleration_m_s2=0.5,
+        left_deceleration_m_s2=0.5,
+    )
+)
+```
+该覆盖只改变主机侧目标轮速斜坡，不替代真车制动标定，也不能仅凭配置保证最终零误差。
 
 ## 4. 前进、后退和原地转向
 

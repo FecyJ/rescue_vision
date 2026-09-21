@@ -23,6 +23,7 @@ from rescue_vision.motion import (
     CommandResult,
     GripperCalibration,
     MotionAccelerationLimits,
+    WheelAccelerationOverrides,
     MotionController,
     MotionControlTimingError,
     MotionStallError,
@@ -549,6 +550,29 @@ def test_wheel_targets_are_slew_limited_across_acceleration_and_reversal() -> No
         encode_wheel_speed_command(2, 0.0, 0.0),
         encode_wheel_speed_command(3, -0.05, 0.05),
     ]
+
+
+def test_wheel_acceleration_override_slows_only_left_wheel_transition() -> None:
+    channel = FakeCarChannel()
+    clock = FakeClock()
+    controller = MotionController(channel, limits(), monotonic_ns=clock)
+    controller.set_wheel_acceleration_limits(
+        WheelAccelerationOverrides(
+            left_acceleration_m_s2=0.5,
+            left_deceleration_m_s2=0.5,
+        )
+    )
+
+    controller.set_wheel_speeds(0.30, 0.30)
+    for _ in range(10):
+        clock.advance(0.1)
+        controller.update()
+    assert controller.commanded_wheel_speeds_m_s == pytest.approx((0.30, 0.30))
+
+    controller.set_wheel_speeds(0.10, 0.30)
+    clock.advance(0.1)
+    controller.update()
+    assert controller.commanded_wheel_speeds_m_s == pytest.approx((0.25, 0.30))
 
 
 def test_linear_acceleration_and_deceleration_are_independent() -> None:

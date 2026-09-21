@@ -1,5 +1,5 @@
 # 当前 match 的开场变体，其余配置与正式流程相同。开场从当前起点按相对
-# turn / straight 动作执行；转角为 rad（左正右负），距离为 m（前进正、倒车负）。
+# turn / wheel_turn / straight 动作执行；转角为 rad（左正右负），距离为 m（前进正、倒车负）。
 # 每个动作单独配置速度，动作之间只保留短暂停稳，不按场地点反复校准。
 # 本文件以启动区域 2（地图右上角、红方）为基准，不提供区域 3 中心对称。
 
@@ -76,7 +76,8 @@ motion:
   enabled: true
   wheel_track_m: 0.235
   max_linear_velocity_m_s: 1.5
-  max_angular_velocity_rad_s: 2
+  # 右轮1.5、左轮1.0时的理论差速角速度约2.13 rad/s；保留少量配置余量。
+  max_angular_velocity_rad_s: 2.2
   max_wheel_velocity_m_s: 1.5
   max_linear_acceleration_m_s2: 6
   max_linear_deceleration_m_s2: 6
@@ -167,28 +168,26 @@ match:
   robot_footprint_radius_mm: 160.0
   safety_margin_mm: 10.0
   enabled: true
-  # 从 -135° 出发：直行1.6m -> 左轮固定左转60° -> 直行1m -> 停稳0.1s -> 倒车1m。
-  # angle_rad：左转为正、右转为负；angular_velocity_rad_s 为正的速度幅值。
-  # distance_m：前进为正、倒车为负；speed_m_s 为正的速度幅值。
+  # 从 -135° 出发：直行1.6m；右轮保持1.5m/s、左轮以固定加速度降至1.0m/s，
+  # 用 IMU/里程计闭环累计左转60°；左轮以同一加速度升回1.5m/s，双轮闭环前进1m后刹车，最后倒车1m。
+  # wheel_turn 不再另接一段正向 straight，否则会重复走 post_turn_distance_m。
   nb_opening_actions:
     - type: straight
       distance_m: 1.6
       speed_m_s: 1.5
       settle_time_s: 0.0
-    - type: turn
+    - type: wheel_turn
       angle_rad: 1.0471975511965976
-      angular_velocity_rad_s: 2
-      pivot_wheel: left
-      exit_speed_m_s: 0.03
-    - type: straight
-      distance_m: 1.0
-      speed_m_s: 1.5
-      settle_time_s: 0.1
+      right_wheel_speed_m_s: 1.5
+      left_wheel_hold_speed_m_s: 1.0
+      left_wheel_final_speed_m_s: 1.5
+      left_transition_acceleration_m_s2: 0.5
+      post_turn_distance_m: 1.0
     - type: straight
       distance_m: -1.0
       speed_m_s: 1.5
-  # 保留第一段直行后张爪的行为；序号从 1 开始。
-  nb_opening_gripper_after_action: 1
+  # 轮级转向要求在1.6m处保持右轮运行，因此这里不插入张爪停顿。
+  nb_opening_gripper_after_action: null
   nb_opening_gripper_left_deg: 50.0
   nb_opening_gripper_right_deg: 160.0
   # 转向/直行的完成误差与每个动作间的零速停稳时间。

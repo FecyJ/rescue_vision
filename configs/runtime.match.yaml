@@ -60,6 +60,12 @@ remote:
   access_mode: observe_only
 
 motion:
+  # 安全区点跟随的保守动作曲线；未列出的字段继续使用 RelativeActionProfile 默认值。
+  action_profile:
+    heading_kp_rad_s: 1.5
+    angular_deceleration_rad_s2: 1.5
+    fine_linear_speed_m_s: 0.03
+    fine_angular_velocity_rad_s: 0.08
   enabled: true
   wheel_track_m: 0.235
   max_linear_velocity_m_s: 1.5
@@ -156,10 +162,10 @@ match:
   enabled: true
   # 启动右转角，单位 rad；角速度符号决定右转方向。
   startup_turn_angle_rad: 0.75
-  startup_turn_angular_velocity_rad_s: -2.0
+  startup_turn_angular_velocity_rad_s: -3.0
   startup_turn_settle_time_s: 0.2
   # 启动直行距离和速度，单位 m、m/s。
-  startup_forward_distance_m: 2.1
+  startup_forward_distance_m: 2.5
   startup_forward_speed_m_s: 1.5
   startup_forward_settle_time_s: 0.1
   # 启动直行的左右轮速 PID；现场先调 P，I/D 通常保持 0。
@@ -228,7 +234,7 @@ match:
   misgrasp_breakup_backward_distance_m: 0.08
   misgrasp_breakup_max_heading_change_rad: 0.17453292519943295
   breakup_forward_distance_m: 0.4
-  breakup_forward_speed_m_s: 1.0
+  breakup_forward_speed_m_s: 1.5
   breakup_backward_distance_m: 0.10
   breakup_backward_speed_m_s: 1.5
   # 解团阶段临时车体加减速度；null 分别继承 motion 对应全局值。
@@ -285,17 +291,18 @@ match:
   # 两侧或上下裁剪且缺所选两点时，一次倒车调整；单位分别为 m/s、m。
   safe_zone_keypoint_reverse_speed_m_s: 0.1
   safe_zone_keypoint_reverse_max_distance_m: 0.10
-  transport_align_tolerance_mm: 30.0
+  transport_align_tolerance_mm: 20.0
+  transport_d2_tolerance_mm: 15.0
   # 夹取后→d1 的推进速度，单位 m/s。
-  safe_zone_grab_to_d1_speed_m_s: 1.0
+  safe_zone_grab_to_d1_speed_m_s: 0.5
   # d1→d2 的推进速度，单位 m/s。
-  safe_zone_d1_to_d2_speed_m_s: 0.5
+  safe_zone_d1_to_d2_speed_m_s: 0.35
   # d2 张爪、转向、闭爪后到安全区末端的推进速度，单位 m/s。
-  safe_zone_d2_to_final_speed_m_s: 0.35
+  safe_zone_d2_to_final_speed_m_s: 0.25
   # 单橙色伤员 d2→安全区末端的独立速度，单位 m/s；当前先与通用末段一致，按实测单独调节。
-  safe_zone_orange_d2_to_final_speed_m_s: 0.35
+  safe_zone_orange_d2_to_final_speed_m_s: 0.25
   # d2 闭爪推进后末段的固定刹车过冲提前量，正值沿己方安全区方向在终点前停车，单位 mm。
-  safe_zone_d2_to_final_braking_overrun_mm: 30
+  safe_zone_d2_to_final_braking_overrun_mm: 40
   # 单橙色伤员 d2→安全区末端的独立刹车过冲提前量，单位 mm；当前先与通用末段一致。
   safe_zone_orange_d2_to_final_braking_overrun_mm: 50.0
   # d2→安全区末端的临时车体加减速度；允许独立高于 motion 全局基准。
@@ -311,7 +318,7 @@ match:
   # 安全区路线航向保持参数；角度单位 rad，角速度单位 rad/s。
   safe_zone_fallback_heading_tolerance_rad: 0.02
   safe_zone_fallback_heading_kp_rad_s: 1.0
-  safe_zone_fallback_max_angular_velocity_rad_s: 1.0
+  safe_zone_fallback_max_angular_velocity_rad_s: 0.7
   # D1 视觉校正距安全区终点的最小/最大偏移，单位 mm。
   # 落在区间内可原地校准；更靠近安全区时先返回最小偏移线。
   safe_zone_calibration_min_offset_mm: 400.0
@@ -443,20 +450,3 @@ near_field_grasp:
   distance_weight: 0.12
   # 选组评分中对准转角的权重；所需转角越小得分越高。
   alignment_weight: 0.08
-
-green_grab:
-  # 无地面标定时识别单个绿色物资、开夹爪像素居中接近并合爪的简化试验；
-  # 依赖 hailo.enabled 的 v3 模型，不是完整比赛入口。
-  enabled: true
-  # 原地搜索角速度，单位 rad/s；左转为正、右转为负，符号即方向。
-  search_angular_velocity_rad_s: 0.30
-  approach_speed_m_s: 0.08
-  # 目标水平中心相对半幅图像的比例误差门限，及居中控制增益与角速度上限。
-  align_tolerance_ratio: 0.06
-  align_kp_rad_s: 1.2
-  align_max_angular_velocity_rad_s: 0.35
-  # 目标框下边进入该图像高度比例即视为足够接近，停车合爪。
-  engage_bottom_fraction: 0.80
-  # 连续看到绿色才确认并打开夹爪的帧数。
-  confirm_frames: 3
-  target_loss_timeout_ms: 500.0

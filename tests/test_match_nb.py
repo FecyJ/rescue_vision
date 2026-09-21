@@ -17,6 +17,7 @@ from rescue_vision.config import (
     MatchRuntimeConfig,
     NBOpeningStraight,
     NBOpeningTurn,
+    NBOpeningWheelTurn,
     load_runtime_config,
 )
 from rescue_vision.geometry.types import FieldPoint
@@ -144,18 +145,56 @@ def reasons(records: list[dict[str, object]]) -> list[str]:
     return [str(record["reason"]) for record in records]
 
 
-def test_nb_config_contains_relative_actions() -> None:
+def test_nb_config_contains_wheel_closed_loop_actions() -> None:
     config = load_runtime_config("configs/runtime.match_nb.yaml").match
     assert config.nb_opening_actions == (
         NBOpeningStraight(1.6, 1.5, 0.0),
-        NBOpeningTurn(math.pi / 3.0, 2.0, "left", 0.03),
-        NBOpeningStraight(1.0, 1.5, 0.1),
+        NBOpeningWheelTurn(
+            math.pi / 3.0, 1.5, 1.0, 1.5, 0.5, 1.0,
+        ),
         NBOpeningStraight(-1.0, 1.5),
     )
-    assert config.nb_opening_gripper_after_action == 1
+    assert config.nb_opening_gripper_after_action is None
     assert config.nb_opening_turn_tolerance_rad == pytest.approx(0.06)
     assert config.nb_opening_distance_tolerance_m == pytest.approx(0.02)
     assert load_runtime_config("configs/runtime.match_nb.yaml").motion.action_profile.linear_deceleration_m_s2 == pytest.approx(2.0)
+
+
+def test_nb_straight_hands_off_to_wheel_turn_without_braking_right_wheel() -> None:
+    sequence = make_nb(
+        config=runtime_config(
+            nb_opening_actions=(
+                NBOpeningStraight(0.10, 0.50, 0.0),
+                NBOpeningWheelTurn(0.50, 0.50, 0.30, 0.50, 0.50, 0.10),
+                NBOpeningStraight(-0.10, 0.50),
+            ),
+            nb_opening_gripper_after_action=None,
+        )
+    )
+    start_nb(sequence)
+
+    sequence.observe_grasp_motion(motion_sample(1_000_000, count=0, gyro=0))
+    sequence.step(
+        1_000_000,
+        perception=None,
+        heading_rad=START_HEADING_RAD,
+        cumulative_distance_m=0.0,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    sequence.observe_grasp_motion(motion_sample(100_000_000, count=1_000, gyro=0))
+    decision = sequence.step(
+        100_000_000,
+        perception=None,
+        heading_rad=START_HEADING_RAD,
+        cumulative_distance_m=0.10,
+        left_speed_feedback_m_s=0.50,
+        right_speed_feedback_m_s=0.50,
+    )
+
+    assert decision.reason.startswith("nb_opening_wheel_turn_2_lower_left")
+    assert decision.wheel_speeds_m_s == pytest.approx((0.30, 0.50))
+    assert decision.wheel_speeds_m_s[1] == pytest.approx(0.50)
 
 
 def test_nb_defaults_match_shipped_relative_opening() -> None:

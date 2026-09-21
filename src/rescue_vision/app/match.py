@@ -62,7 +62,10 @@ from rescue_vision.perception import (
 from rescue_vision.tracking import MultiTargetTracker, TrackStatus, TrackedTarget
 from rescue_vision.mission import SafetySignals
 from rescue_vision.motion.approach_speed import approach_speed_m_s
-from rescue_vision.motion.controller import MotionAccelerationOverrides
+from rescue_vision.motion.controller import (
+    MotionAccelerationOverrides,
+    WheelAccelerationOverrides,
+)
 from rescue_vision.motion.gripper_kinematics import GripperKinematics
 from rescue_vision.motion.protocol import OdometryImu
 from rescue_vision.motion.stationary import StationaryMotionEvidence
@@ -220,7 +223,7 @@ class MatchPreflight:
 
 @dataclass(frozen=True, slots=True)
 class MatchDecision:
-    """单个控制周期的差速 twist 与夹爪姿态意图。"""
+    """单个控制周期的差速 twist、可选轮速意图与夹爪姿态。"""
 
     timestamp_ns: int
     state: MatchState
@@ -232,6 +235,7 @@ class MatchDecision:
     gripper_angles_deg: tuple[float, float] | None = None
     soft_brake: bool = False
     min_wheel_velocity_m_s: float | None = None
+    wheel_speeds_m_s: tuple[float, float] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -281,6 +285,17 @@ class MatchDecision:
             raise ValueError(
                 "min_wheel_velocity_m_s must be finite and non-negative or None."
             )
+        if self.wheel_speeds_m_s is not None and (
+            not isinstance(self.wheel_speeds_m_s, tuple)
+            or len(self.wheel_speeds_m_s) != 2
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for value in self.wheel_speeds_m_s
+            )
+        ):
+            raise ValueError("wheel_speeds_m_s must contain two finite speeds or None.")
 
 
 def _clamp(value: float, minimum: float, maximum: float) -> float:
@@ -3728,6 +3743,7 @@ class MatchSequence:
         gripper_angles_deg: tuple[float, float] | None = None,
         soft_brake: bool = False,
         min_wheel_velocity_m_s: float | None = None,
+        wheel_speeds_m_s: tuple[float, float] | None = None,
     ) -> MatchDecision:
         # 正式近场流程在远场只携带闭合夹爪接近目标；进入近场后，
         # ``gripper_angles_deg`` 才能覆盖这个闭合默认值。这样不会在
@@ -3762,6 +3778,7 @@ class MatchSequence:
             gripper_angles_deg=gripper_angles_deg,
             soft_brake=soft_brake,
             min_wheel_velocity_m_s=min_wheel_velocity_m_s,
+            wheel_speeds_m_s=wheel_speeds_m_s,
         )
 
     CLUSTER_REFERENCE_AVERAGE_FRAMES = 5
@@ -4343,6 +4360,12 @@ class MatchSequence:
         if breakup_limits is not None:
             return breakup_limits
         return self.safe_zone_motion_acceleration_limits
+
+    @property
+    def wheel_acceleration_limits(self) -> WheelAccelerationOverrides | None:
+        """当前动作的独立左右轮加减速度覆盖。"""
+
+        return None
 
     @property
     def safe_zone_calibration_pose(self) -> FieldPose2D | None:

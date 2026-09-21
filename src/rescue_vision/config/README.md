@@ -53,6 +53,10 @@ grab_transport = config.build_grab_transport_sequence()
 静止帧中完成确认，无消费者锁组握手；`breakup_confirmation_frames` 单独约束恢复核心。
 正式恢复由同一准备器在抓取确实受阻时规划；带载补夹、单绿联调和CC保持各自限制。
 完整规则、机械可达性及时间语义见[正式流程设计](../../../docs/正式流程设计.md)。
+
+`configs/runtime.match_nb.yaml` 的 `match.nb_opening_actions` 还支持 `wheel_turn`：
+它直接表达右轮恒速、左轮固定加速度切换、IMU 定角度和里程定距刹停，适用于需要连续
+轮速交接的开头动作。该参数只定义主机控制目标，最终制动距离和精度必须用真车标定。
 其余已有配置字段和CLI保持不变；模板可省略新字段并使用默认值。
 
 `cluster_search_empty_angular_velocity_rad_s` 是没有可搜索的绿/黑/橙目标时的同向快速扫描

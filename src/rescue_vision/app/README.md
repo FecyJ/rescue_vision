@@ -466,10 +466,10 @@ flow = config.build_match_sequence()
 
 `MatchNBSequence` 与 `config.build_match_nb_sequence()` 对应
 `rescue-vision-match-nb`。它直接继承当前 `MatchSequence`，只替换区域 2 开场：从当前起点
-按配置的 `turn` / `straight` 动作顺序执行，完成指定动作后张爪，随后进入正式目标团搜索。
+按配置的 `turn` / `wheel_turn` / `straight` 动作顺序执行，完成指定动作后可张爪，随后进入正式目标团搜索。
 该入口不提供区域 3 中心对称。
 
-转向使用 IMU 的相对航向进度和角速度，直行使用编码器累计路程并以动作开始时冻结的路线
+普通转向使用 IMU 的相对航向进度和角速度，普通直行使用编码器累计路程并以动作开始时冻结的路线
 航向做保持。两类动作都由 `motion.relative_action.RelativeActionController` 按
 “高速运行 → 提前减速 → 低速闭环收尾”输出目标；制动区包含实际遥测年龄、底层 40 ms
 轮速命令刷新周期和可标定执行响应。几何误差达标后仍需实测轮速/角速度足够小，以及
@@ -477,6 +477,12 @@ flow = config.build_match_sequence()
 输出受限的低速反向修正，由底层加减速度斜坡自然过零；不会插入“先停稳再修正”的门禁，
 位置达标后的航向微调同样直接保持闭环；两者都不会因局部修正幅度或时间单独结束比赛流程。动作序列放在
 `configs/runtime.match_nb.yaml` 的 `match` 节中：
+
+`wheel_turn` 是连续轮速开头动作：前一段正向 `straight` 到达目标时直接交接，不发送全车零速；
+右轮保持 `right_wheel_speed_m_s`，左轮按 `left_transition_acceleration_m_s2` 降到
+`left_wheel_hold_speed_m_s`。IMU 航向累计到 `angle_rad` 后，左轮以同一斜坡升到
+`left_wheel_final_speed_m_s`，双轮以轮速闭环前进 `post_turn_distance_m` 后刹车并确认停稳。
+该动作已经包含转后正向距离，后面不能再接正向 `straight`；倒车等后续动作可以继续配置。
 
 ```yaml
 nb_opening_actions:
@@ -500,6 +506,10 @@ nb_opening_gripper_after_action: 2
 | 字段 | 单位 | 说明 |
 | --- | --- | --- |
 | `nb_opening_actions[].type: turn` | — | 原地转向；`angle_rad` 左正右负，`angular_velocity_rad_s` 为正速度幅值 |
+| `nb_opening_actions[].type: wheel_turn` | — | 左轮斜坡/右轮恒速的 IMU 定角度、里程定距动作；包含转后正向距离 |
+| `wheel_turn` 的 `right_wheel_speed_m_s` / `left_wheel_hold_speed_m_s` / `left_wheel_final_speed_m_s` | m/s | 右轮保持速度、左轮转向阶段速度和恢复后的双轮速度 |
+| `wheel_turn.left_transition_acceleration_m_s2` | m/s² | 左轮降速和升速共用的固定主机斜坡 |
+| `wheel_turn.post_turn_distance_m` | m | 左轮恢复后双轮共同推进的距离；刹车点由实测速度、遥测年龄和有效减速度计算 |
 | `nb_opening_actions[].type: straight` | — | 直行；`distance_m` 前进正倒车负，`speed_m_s` 为正速度幅值 |
 | `nb_opening_gripper_after_action` | 1-based 序号 | 完成该动作并停稳后张爪；`null` 表示不自动张爪 |
 | `nb_opening_gripper_left_deg` / `nb_opening_gripper_right_deg` | deg | 张爪左右角度 |

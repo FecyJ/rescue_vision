@@ -113,6 +113,27 @@ class MotionAccelerationOverrides:
 
 
 @dataclass(frozen=True, slots=True)
+class WheelAccelerationOverrides:
+    """独立左右轮的加减速度覆盖；``None`` 继承车体默认限制。"""
+
+    left_acceleration_m_s2: float | None = None
+    left_deceleration_m_s2: float | None = None
+    right_acceleration_m_s2: float | None = None
+    right_deceleration_m_s2: float | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "left_acceleration_m_s2",
+            "left_deceleration_m_s2",
+            "right_acceleration_m_s2",
+            "right_deceleration_m_s2",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _positive_finite(value, name))
+
+
+@dataclass(frozen=True, slots=True)
 class MotionLimits:
     """小车运动学参数和赛外调试限速。"""
 
@@ -243,6 +264,7 @@ class MotionController:
         self._angular_deceleration_limit_rad_s2 = (
             limits.max_angular_deceleration_rad_s2
         )
+        self._wheel_acceleration_overrides: WheelAccelerationOverrides | None = None
         self._last_sent_wheel_speeds_mm_s = (0, 0)
         self._last_acceleration_update_ns = self._now()
         self._last_wheel_command_ns = self._last_acceleration_update_ns
@@ -318,6 +340,16 @@ class MotionController:
             self.limits.max_angular_deceleration_rad_s2,
             "angular_deceleration_rad_s2",
         )
+
+    def set_wheel_acceleration_limits(
+        self,
+        overrides: WheelAccelerationOverrides | None = None,
+    ) -> None:
+        """设置独立左右轮斜坡；传入 ``None`` 恢复车体斜坡。"""
+
+        if overrides is not None and not isinstance(overrides, WheelAccelerationOverrides):
+            raise TypeError("overrides must be WheelAccelerationOverrides or None.")
+        self._wheel_acceleration_overrides = overrides
 
     @staticmethod
     def _resolve_acceleration_limit(
@@ -471,7 +503,7 @@ class MotionController:
         self._target_twist = self._wheel_speeds_to_twist(left, right)
 
     def update(self, *, now_ns: int | None = None) -> bool:
-        """按车体线/角加减速度上限推进目标并下发。"""
+        """按当前车体或轮级加减速度上限推进目标并下发。"""
 
         current_ns = self._now(now_ns)
         if current_ns < self._last_acceleration_update_ns:
@@ -510,6 +542,36 @@ class MotionController:
                 "Active motion update gap exceeded 200 ms; "
                 f"soft brake was sent after {gap_ms:.3f} ms."
             )
+        wheel_overrides = self._wheel_acceleration_overrides
+        if wheel_overrides is not None:
+            previous_left, previous_right = self._commanded_wheel_speeds_m_s
+            target_left, target_right = self._target_wheel_speeds_m_s
+            next_left = _move_axis_with_acceleration_limits(
+                previous_left,
+                target_left,
+                acceleration=(wheel_overrides.left_acceleration_m_s2
+                              or self._linear_acceleration_limit_m_s2),
+                deceleration=(wheel_overrides.left_deceleration_m_s2
+                              or self._linear_deceleration_limit_m_s2),
+                elapsed_s=elapsed_s,
+            )
+            next_right = _move_axis_with_acceleration_limits(
+                previous_right,
+                target_right,
+                acceleration=(wheel_overrides.right_acceleration_m_s2
+                              or self._linear_acceleration_limit_m_s2),
+                deceleration=(wheel_overrides.right_deceleration_m_s2
+                              or self._linear_deceleration_limit_m_s2),
+                elapsed_s=elapsed_s,
+            )
+            next_linear, next_angular = self._wheel_speeds_to_twist(
+                next_left, next_right
+            )
+            self._commanded_twist = (next_linear, next_angular)
+            self._commanded_wheel_speeds_m_s = (next_left, next_right)
+            self._last_acceleration_update_ns = current_ns
+            return self._send_wheel_update(current_ns, next_left, next_right)
+
         previous_linear, previous_angular = self._commanded_twist
         target_linear, target_angular = self._target_twist
         candidate_linear = _move_axis_with_acceleration_limits(
@@ -568,6 +630,33 @@ class MotionController:
         sequence = self._next_command_sequence()
         self._channel.send_frame(
             encode_wheel_speed_command(sequence, next_left, next_right)
+        )
+        if self._synchronization_enforced:
+            self._pending_wheel_commands[sequence] = current_ns
+        self._last_sent_wheel_speeds_mm_s = next_wire_speeds_mm_s
+        self._last_wheel_command_ns = current_ns
+        return True
+
+    def _send_wheel_update(
+        self,
+        current_ns: int,
+        left: float,
+        right: float,
+    ) -> bool:
+        """按统一刷新/ACK规则发送已经斜坡限制后的轮速。"""
+
+        next_wire_speeds_mm_s = (round(left * 1000.0), round(right * 1000.0))
+        refresh_due = (
+            current_ns - self._last_wheel_command_ns
+            >= _WHEEL_COMMAND_REFRESH_NS
+        )
+        if not refresh_due:
+            return False
+        if self._synchronization_enforced and self._pending_wheel_commands:
+            return False
+        sequence = self._next_command_sequence()
+        self._channel.send_frame(
+            encode_wheel_speed_command(sequence, left, right)
         )
         if self._synchronization_enforced:
             self._pending_wheel_commands[sequence] = current_ns

@@ -86,11 +86,18 @@ def _apply_match_motion(
         if not braking:
             controller.soft_brake()
     else:
-        controller.drive_wheel_limited(
-            decision.linear_velocity_m_s,
-            decision.angular_velocity_rad_s,
-            min_wheel_velocity_m_s=decision.min_wheel_velocity_m_s,
-        )
+        if decision.wheel_speeds_m_s is None:
+            controller.drive_wheel_limited(
+                decision.linear_velocity_m_s,
+                decision.angular_velocity_rad_s,
+                min_wheel_velocity_m_s=decision.min_wheel_velocity_m_s,
+            )
+        else:
+            controller.set_wheel_speeds(
+                decision.wheel_speeds_m_s[0],
+                decision.wheel_speeds_m_s[1],
+                min_wheel_velocity_m_s=decision.min_wheel_velocity_m_s,
+            )
     return should_brake
 
 
@@ -848,6 +855,7 @@ def _run_hardware(
                     else overrides.angular_deceleration_rad_s2
                 ),
             )
+            controller.set_wheel_acceleration_limits(sequence.wheel_acceleration_limits)
 
         class _MotionChannelContext:
             def __enter__(self):

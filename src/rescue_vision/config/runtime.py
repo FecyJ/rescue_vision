@@ -820,6 +820,55 @@ class NBOpeningTurn:
 
 
 @dataclass(frozen=True, slots=True)
+class NBOpeningWheelTurn:
+    """左轮变速、右轮恒速的 IMU/里程计闭环开场动作。"""
+
+    angle_rad: float
+    right_wheel_speed_m_s: float
+    left_wheel_hold_speed_m_s: float
+    left_wheel_final_speed_m_s: float
+    left_transition_acceleration_m_s2: float
+    post_turn_distance_m: float
+
+    def __post_init__(self) -> None:
+        angle = _finite_float(self.angle_rad, "nb_opening_actions[].angle_rad", minimum=0.001)
+        right = _finite_float(
+            self.right_wheel_speed_m_s,
+            "nb_opening_actions[].right_wheel_speed_m_s",
+            minimum=0.001,
+        )
+        hold = _finite_float(
+            self.left_wheel_hold_speed_m_s,
+            "nb_opening_actions[].left_wheel_hold_speed_m_s",
+            minimum=0.001,
+        )
+        final = _finite_float(
+            self.left_wheel_final_speed_m_s,
+            "nb_opening_actions[].left_wheel_final_speed_m_s",
+            minimum=0.001,
+        )
+        acceleration = _finite_float(
+            self.left_transition_acceleration_m_s2,
+            "nb_opening_actions[].left_transition_acceleration_m_s2",
+            minimum=0.001,
+        )
+        distance = _finite_float(
+            self.post_turn_distance_m,
+            "nb_opening_actions[].post_turn_distance_m",
+            minimum=0.001,
+        )
+        if not hold < right <= final:
+            raise ValueError("Wheel turn requires left_hold < right_speed <= left_final.")
+        for name, value in (
+            ("angle_rad", angle), ("right_wheel_speed_m_s", right),
+            ("left_wheel_hold_speed_m_s", hold), ("left_wheel_final_speed_m_s", final),
+            ("left_transition_acceleration_m_s2", acceleration),
+            ("post_turn_distance_m", distance),
+        ):
+            object.__setattr__(self, name, value)
+
+
+@dataclass(frozen=True, slots=True)
 class NBOpeningStraight:
     """无解团开场的相对直行动作；负距离表示倒车。"""
 
@@ -850,7 +899,7 @@ class NBOpeningStraight:
             ))
 
 
-NBOpeningAction = NBOpeningTurn | NBOpeningStraight
+NBOpeningAction = NBOpeningTurn | NBOpeningWheelTurn | NBOpeningStraight
 
 
 _DEFAULT_NB_OPENING_ACTIONS: tuple[NBOpeningAction, ...] = (
@@ -1021,7 +1070,8 @@ class MatchRuntimeConfig:
     return_backup_speed_m_s: float = 0.08
     # 无解团（no-breakup）变体开场：从当前起点按相对动作序列执行。
     # 转向角为带符号 rad（左正右负），直行距离为带符号 m（前进正倒车负），
-    # 每个动作的速度均为正的幅值。正式 match 不读取这些字段。
+    # 每个动作的速度均为正的幅值；wheel_turn 用左右轮参数表达连续交接。
+    # 正式 match 不读取这些字段。
     nb_opening_actions: tuple[NBOpeningAction, ...] = _DEFAULT_NB_OPENING_ACTIONS
     # 1-based 动作序号；完成该动作并停稳后张开夹爪，None 表示不自动张爪。
     nb_opening_gripper_after_action: int | None = 2
@@ -1054,10 +1104,11 @@ class MatchRuntimeConfig:
         if not isinstance(self.nb_opening_actions, tuple) or not self.nb_opening_actions:
             raise ValueError("nb_opening_actions must be a non-empty tuple.")
         for index, action in enumerate(self.nb_opening_actions, start=1):
-            if not isinstance(action, (NBOpeningTurn, NBOpeningStraight)):
+            if not isinstance(action, (NBOpeningTurn, NBOpeningWheelTurn, NBOpeningStraight)):
                 raise ValueError(
-                    "nb_opening_actions must contain only NBOpeningTurn or "
-                    f"NBOpeningStraight, got item {index}: {action!r}."
+                    "nb_opening_actions must contain only NBOpeningTurn, "
+                    "NBOpeningWheelTurn or NBOpeningStraight, "
+                    f"got item {index}: {action!r}."
                 )
             if isinstance(action, NBOpeningTurn) and action.exit_speed_m_s > 0.0:
                 following = self.nb_opening_actions[index:index + 1]
@@ -1065,6 +1116,10 @@ class MatchRuntimeConfig:
                         or following[0].distance_m <= 0.0
                         or following[0].speed_m_s < action.exit_speed_m_s):
                     raise ValueError("Rolling pivot must precede a forward straight at least as fast as exit_speed_m_s.")
+            if isinstance(action, NBOpeningWheelTurn):
+                following = self.nb_opening_actions[index:index + 1]
+                if following and isinstance(following[0], NBOpeningStraight) and following[0].distance_m > 0.0:
+                    raise ValueError("Wheel turn already contains its post-turn distance; do not add a following straight for that distance.")
         if self.nb_opening_gripper_after_action is not None:
             if (
                 isinstance(self.nb_opening_gripper_after_action, bool)
@@ -2660,6 +2715,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         "safe_zone_keypoint_reverse_speed_m_s",
         "safe_zone_keypoint_reverse_max_distance_m",
         "transport_align_tolerance_mm",
+        "transport_d2_tolerance_mm",
         "safe_zone_grab_to_d1_speed_m_s",
         "safe_zone_d1_to_d2_speed_m_s",
         "safe_zone_d2_to_final_speed_m_s",
@@ -2811,6 +2867,24 @@ def load_runtime_config(path: str | Path) -> AppConfig:
                 actions.append(NBOpeningTurn(
                     angle, speed, action.get("pivot_wheel"), action.get("exit_speed_m_s", 0.0),
                 ))
+            elif action_type == "wheel_turn":
+                _reject_unknown(
+                    action,
+                    {
+                        "type", "angle_rad", "right_wheel_speed_m_s",
+                        "left_wheel_hold_speed_m_s", "left_wheel_final_speed_m_s",
+                        "left_transition_acceleration_m_s2", "post_turn_distance_m",
+                    },
+                    location,
+                )
+                actions.append(NBOpeningWheelTurn(
+                    _finite_float(_required(action, "angle_rad", location), f"{location}.angle_rad", minimum=0.001),
+                    _finite_float(_required(action, "right_wheel_speed_m_s", location), f"{location}.right_wheel_speed_m_s", minimum=0.001),
+                    _finite_float(_required(action, "left_wheel_hold_speed_m_s", location), f"{location}.left_wheel_hold_speed_m_s", minimum=0.001),
+                    _finite_float(_required(action, "left_wheel_final_speed_m_s", location), f"{location}.left_wheel_final_speed_m_s", minimum=0.001),
+                    _finite_float(_required(action, "left_transition_acceleration_m_s2", location), f"{location}.left_transition_acceleration_m_s2", minimum=0.001),
+                    _finite_float(_required(action, "post_turn_distance_m", location), f"{location}.post_turn_distance_m", minimum=0.001),
+                ))
             elif action_type == "straight":
                 _reject_unknown(
                     action,
@@ -2830,7 +2904,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
                 actions.append(NBOpeningStraight(distance, speed, action.get("settle_time_s")))
             else:
                 raise ValueError(
-                    f"{location}.type must be 'turn' or 'straight', "
+                    f"{location}.type must be 'turn', 'wheel_turn' or 'straight', "
                     f"got {action_type!r}."
                 )
         return tuple(actions)
@@ -3186,6 +3260,21 @@ def load_runtime_config(path: str | Path) -> AppConfig:
                         raise ValueError("Pivot exit_speed_m_s exceeds right-wheel cruise speed.")
                     if action.exit_speed_m_s > motion.max_linear_velocity_m_s:
                         raise ValueError("Pivot exit_speed_m_s exceeds motion.max_linear_velocity_m_s.")
+            elif isinstance(action, NBOpeningWheelTurn):
+                wheel_speed = max(
+                    action.right_wheel_speed_m_s,
+                    action.left_wheel_final_speed_m_s,
+                    action.left_wheel_hold_speed_m_s,
+                )
+                turn_rate = (
+                    action.right_wheel_speed_m_s
+                    - action.left_wheel_hold_speed_m_s
+                ) / motion.wheel_track_m
+                if turn_rate > motion.max_angular_velocity_rad_s:
+                    raise ValueError(
+                        f"match.nb_opening_actions[{index - 1}] wheel-turn angular "
+                        f"speed {turn_rate:g} rad/s exceeds motion.max_angular_velocity_rad_s."
+                    )
             else:
                 if action.speed_m_s > motion.max_linear_velocity_m_s:
                     raise ValueError(

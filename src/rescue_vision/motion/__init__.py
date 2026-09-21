@@ -3,6 +3,7 @@
 from rescue_vision.motion.controller import (
     MotionAccelerationLimits,
     MotionAccelerationOverrides,
+    WheelAccelerationOverrides,
     MotionController,
     MotionControlTimingError,
     MotionStallError,
@@ -17,6 +18,13 @@ from rescue_vision.motion.relative_action import (
     RelativeActionKind,
     RelativeActionPhase,
     RelativeActionProfile,
+)
+from rescue_vision.motion.wheel_action import (
+    WheelActionCommand,
+    WheelActionFeedback,
+    WheelActionPhase,
+    WheelActionProfile,
+    WheelTurnAndAdvanceController,
 )
 from rescue_vision.motion.protocol import (
     CarCommandReply,
@@ -75,6 +83,7 @@ __all__ = [
     "MotionController",
     "MotionAccelerationLimits",
     "MotionAccelerationOverrides",
+    "WheelAccelerationOverrides",
     "MotionControlTimingError",
     "MotionStallError",
     "MotionSynchronizationError",
@@ -85,6 +94,11 @@ __all__ = [
     "RelativeActionKind",
     "RelativeActionPhase",
     "RelativeActionProfile",
+    "WheelActionCommand",
+    "WheelActionFeedback",
+    "WheelActionPhase",
+    "WheelActionProfile",
+    "WheelTurnAndAdvanceController",
     "WHEEL_COMMAND_REFRESH_S",
     "MANUAL_MOTION_LOG_FILENAME",
     "MANUAL_MOTION_STREAM_NAME",
