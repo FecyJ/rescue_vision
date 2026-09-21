@@ -472,7 +472,8 @@ flow = config.build_match_sequence()
 `MatchNBSequence` 与 `config.build_match_nb_sequence()` 对应
 `rescue-vision-match-nb`。它直接继承当前 `MatchSequence`，只替换区域 2 开场：从当前起点
 按配置的 `turn` / `wheel_turn` / `straight` 动作顺序执行，完成指定动作后可张爪，随后进入正式目标团搜索。
-该入口不提供区域 3 中心对称。
+当前发布配置恢复为历史的 `turn → straight → turn → straight → reverse` 路线；`wheel_turn`
+仍可作为单独配置动作使用。该入口不提供区域 3 中心对称。
 
 普通转向使用 IMU 的相对航向进度和角速度，普通直行使用编码器累计路程并以动作开始时冻结的路线
 航向做保持。两类动作都由 `motion.relative_action.RelativeActionController` 按

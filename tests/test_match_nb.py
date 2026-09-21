@@ -145,23 +145,22 @@ def reasons(records: list[dict[str, object]]) -> list[str]:
     return [str(record["reason"]) for record in records]
 
 
-def test_nb_config_contains_wheel_closed_loop_actions() -> None:
+def test_nb_config_contains_historical_relative_actions() -> None:
     config = load_runtime_config("configs/runtime.match_nb.yaml").match
-    assert len(config.nb_opening_actions) == 3
-    first, wheel_turn, reverse = config.nb_opening_actions
-    assert isinstance(first, NBOpeningStraight)
-    assert first.distance_m == pytest.approx(1.6)
-    assert first.settle_time_s == pytest.approx(0.0)
-    assert isinstance(wheel_turn, NBOpeningWheelTurn)
-    assert wheel_turn.angle_rad > 0.0
-    assert wheel_turn.left_wheel_hold_speed_m_s < wheel_turn.right_wheel_speed_m_s
-    assert wheel_turn.left_wheel_final_speed_m_s == pytest.approx(
-        wheel_turn.right_wheel_speed_m_s,
-    )
-    assert wheel_turn.post_turn_distance_m == pytest.approx(1.0)
+    assert len(config.nb_opening_actions) == 5
+    first, straight_2, turn_3, straight_4, reverse = config.nb_opening_actions
+    assert isinstance(first, NBOpeningTurn)
+    assert first.angle_rad == pytest.approx(-1.0)
+    assert first.angular_velocity_rad_s == pytest.approx(2.0)
+    assert isinstance(straight_2, NBOpeningStraight)
+    assert straight_2.distance_m == pytest.approx(1.33)
+    assert isinstance(turn_3, NBOpeningTurn)
+    assert turn_3.angle_rad == pytest.approx(0.97)
+    assert isinstance(straight_4, NBOpeningStraight)
+    assert straight_4.distance_m == pytest.approx(1.55)
     assert isinstance(reverse, NBOpeningStraight)
-    assert reverse.distance_m == pytest.approx(-1.0)
-    assert config.nb_opening_gripper_after_action is None
+    assert reverse.distance_m == pytest.approx(-0.9)
+    assert config.nb_opening_gripper_after_action == 2
     assert config.nb_opening_turn_tolerance_rad == pytest.approx(0.06)
     assert config.nb_opening_distance_tolerance_m == pytest.approx(0.02)
     assert load_runtime_config("configs/runtime.match_nb.yaml").motion.action_profile.linear_deceleration_m_s2 == pytest.approx(2.0)

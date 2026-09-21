@@ -169,26 +169,27 @@ match:
   robot_footprint_radius_mm: 160.0
   safety_margin_mm: 10.0
   enabled: true
-  # 从 -135° 出发：直行1.6m；右轮保持1.5m/s、左轮以固定加速度降至1.0m/s，
-  # 用 IMU/里程计闭环累计左转60°；左轮以同一加速度升回1.5m/s，双轮闭环前进1m后刹车，最后倒车1m。
-  # wheel_turn 不再另接一段正向 straight，否则会重复走 post_turn_distance_m。
+  # 按历史开场路线执行：转弯 -> 直行 -> 转弯 -> 直行 -> 倒车直行。
+  # angle_rad：左转为正、右转为负；angular_velocity_rad_s 为正的速度幅值。
+  # distance_m：前进为正、倒车为负；speed_m_s 为正的速度幅值。
   nb_opening_actions:
+    - type: turn
+      angle_rad: -1.0
+      angular_velocity_rad_s: 2.0
     - type: straight
-      distance_m: 1.5
-      speed_m_s: 0.8
-      settle_time_s: 0.0
-    - type: wheel_turn
-      angle_rad: 0.4
-      right_wheel_speed_m_s: 0.8
-      left_wheel_hold_speed_m_s: 0.4
-      left_wheel_final_speed_m_s: 0.8
-      left_transition_acceleration_m_s2: 5
-      post_turn_distance_m: 0.8
-    - type: straight
-      distance_m: -0.6
+      distance_m: 1.33
       speed_m_s: 1.5
-  # 轮级转向要求在1.6m处保持右轮运行，因此这里不插入张爪停顿。
-  nb_opening_gripper_after_action: null
+    - type: turn
+      angle_rad: 0.97
+      angular_velocity_rad_s: 2.0
+    - type: straight
+      distance_m: 1.55
+      speed_m_s: 1.5
+    - type: straight
+      distance_m: -0.9
+      speed_m_s: 1.5
+  # 完成第 2 个动作并停稳后张开夹爪；序号从 1 开始。
+  nb_opening_gripper_after_action: 2
   nb_opening_gripper_left_deg: 50.0
   nb_opening_gripper_right_deg: 160.0
   # 转向/直行的完成误差与每个动作间的零速停稳时间。
@@ -196,7 +197,7 @@ match:
   nb_opening_distance_tolerance_m: 0.02
   # 该时间是连续新遥测停稳确认时长，不是固定 sleep。
   nb_opening_settle_time_s: 0.10
-  # 单次动作最长持续时间，超时进入 terminal_stop。
+  # 单次动作诊断截止时间；NB 开场超时保留当前开场状态，不切 terminal_stop。
   nb_opening_turn_timeout_s: 8.0
   # 相对动作闭环：响应/低速/停稳参数需用真车标定，不能保证零误差。
   # 当前日志显示 motion 的 6 m/s² 限幅高估了真车制动；先用保守值 2 m/s²

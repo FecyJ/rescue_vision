@@ -20,14 +20,16 @@
 航向微调，都不中途插入停稳门禁，也不因局部修正幅度或时间单独终止比赛；轮速换向仍经过
 底层减速到零和反向加速。
 
-`wheel_action.WheelTurnAndAdvanceController` 是 `match_nb` 开头的轮级动作：在首段直行
+`wheel_action.WheelTurnAndAdvanceController` 是 `match_nb` 可选的轮级动作：在首段直行
 达到里程目标时不把右轮归零，右轮保持配置速度，左轮按固定加减速度切换到保持速度；
 左右轮累计编码器里程差除以轮距达到目标角后左轮恢复到右轮速度，双轮再按里程推进固定
 距离并提前刹车；轮级角度进度不使用 IMU 航向。动作完成仍要求距离误差、轮速/角速度和
 `StationaryMotionEvidence` 的连续停稳证据同时合格。停稳后若角度或距离有残差，控制器
 按左右轮里程误差低速修正，再次停稳确认；不会因该局部误差直接报告动作失败。
 它通过 `MotionController.set_wheel_speeds()` 下发，`WheelAccelerationOverrides` 只覆盖
-开头轮级切换的斜坡，刹车阶段恢复车体默认减速度。
+开头轮级切换的斜坡，刹车阶段恢复车体默认减速度。当前
+`configs/runtime.match_nb.yaml` 使用普通 `turn` / `straight` 相对动作；轮级动作保留为
+实验性可配置路径，不是当前默认开场路线。
 
 树莓派与 STM32 接口以
 [`docs/树莓派与单片机通信协议v3.md`](../../../docs/树莓派与单片机通信协议v3.md)
