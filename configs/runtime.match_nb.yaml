@@ -174,14 +174,14 @@ match:
   nb_opening_actions:
     - type: straight
       distance_m: 1.6
-      speed_m_s: 1.5
+      speed_m_s: 1.0
       settle_time_s: 0.0
     - type: wheel_turn
-      angle_rad: 1.0471975511965976
-      right_wheel_speed_m_s: 1.5
-      left_wheel_hold_speed_m_s: 1.0
-      left_wheel_final_speed_m_s: 1.5
-      left_transition_acceleration_m_s2: 0.5
+      angle_rad: 0.8
+      right_wheel_speed_m_s: 1.0
+      left_wheel_hold_speed_m_s: 0.5
+      left_wheel_final_speed_m_s: 1.0
+      left_transition_acceleration_m_s2: 5
       post_turn_distance_m: 1.0
     - type: straight
       distance_m: -1.0

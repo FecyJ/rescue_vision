@@ -294,11 +294,11 @@ match:
   transport_align_tolerance_mm: 20.0
   transport_d2_tolerance_mm: 15.0
   # 夹取后→d1 的推进速度，单位 m/s。
-  safe_zone_grab_to_d1_speed_m_s: 0.5
+  safe_zone_grab_to_d1_speed_m_s: 1.0
   # d1→d2 的推进速度，单位 m/s。
-  safe_zone_d1_to_d2_speed_m_s: 0.35
+  safe_zone_d1_to_d2_speed_m_s: 0.5
   # d2 张爪、转向、闭爪后到安全区末端的推进速度，单位 m/s。
-  safe_zone_d2_to_final_speed_m_s: 0.25
+  safe_zone_d2_to_final_speed_m_s: 0.35
   # 单橙色伤员 d2→安全区末端的独立速度，单位 m/s；当前先与通用末段一致，按实测单独调节。
   safe_zone_orange_d2_to_final_speed_m_s: 0.25
   # d2 闭爪推进后末段的固定刹车过冲提前量，正值沿己方安全区方向在终点前停车，单位 mm。

@@ -37,6 +37,7 @@ from rescue_vision.motion import (
     RelativeActionFeedback,
     RelativeActionKind,
     RelativeActionProfile,
+    RelativeActionPhase,
     WheelActionCommand,
     WheelActionFeedback,
     WheelActionPhase,
@@ -765,16 +766,28 @@ class MatchNBSequence(MatchSequence):
             progress = direction * (
                 cumulative_distance_m - self._nb_action_start_distance_m
             )
+        wheel_turn_handoff_threshold_m: float | None = None
         if (
             isinstance(action, NBOpeningStraight)
+            and action.distance_m > 0.0
             and self._nb_action_index + 1 < len(self.config.nb_opening_actions)
             and isinstance(
                 self.config.nb_opening_actions[self._nb_action_index + 1],
                 NBOpeningWheelTurn,
             )
-            and progress >= abs(action.distance_m)
         ):
-            # 轮级动作明确要求 1.6 m 处右轮不回零：把当前直行的
+            # RelativeActionController begins braking before its position
+            # tolerance.  The following wheel action owns this final window,
+            # so do not let the old body controller brake both wheels first.
+            wheel_turn_handoff_threshold_m = max(
+                0.0,
+                abs(action.distance_m) - self.config.nb_opening_distance_tolerance_m,
+            )
+        if (
+            wheel_turn_handoff_threshold_m is not None
+            and progress + 1e-9 >= wheel_turn_handoff_threshold_m
+        ):
+            # 轮级动作明确要求终点附近右轮不回零：把当前直行的
             # 路程样本直接作为 wheel_turn 的起点，跳过旧动作的全车刹停。
             self._nb_action_index += 1
             self._nb_action_started_ns = None
@@ -818,6 +831,36 @@ class MatchNBSequence(MatchSequence):
                 )}",
                 posture=posture,
                 gripper_angles_deg=angles,
+            )
+        if (
+            wheel_turn_handoff_threshold_m is not None
+            and command.phase in {
+                RelativeActionPhase.BRAKE,
+                RelativeActionPhase.FINE,
+            }
+        ):
+            # Keep the straight-run wheel targets constant only after the
+            # normal closed-loop controller reaches its braking phase.  This
+            # prevents it from slowing the right wheel before the left-wheel
+            # turn controller takes over, while preserving heading feedback
+            # throughout the earlier cruise phase.
+            left_speed = action.speed_m_s * self._motion_wheel_weights[0]
+            right_speed = action.speed_m_s * self._motion_wheel_weights[1]
+            return self._decision(
+                timestamp_ns,
+                action.speed_m_s,
+                0.0,
+                f"nb_opening_straight_{action_number}_handoff_cruise:"
+                f"progress={progress:.4f},threshold={wheel_turn_handoff_threshold_m:.4f},"
+                f"phase={command.phase.value}:"
+                f"{self._nb_action_diagnostic_context(
+                    timestamp_ns,
+                    confirmation_progress='handoff_cruise',
+                )}",
+                posture=posture,
+                gripper_angles_deg=angles,
+                min_wheel_velocity_m_s=0.0,
+                wheel_speeds_m_s=(left_speed, right_speed),
             )
         if command.complete:
             advanced = self._nb_finish_action(

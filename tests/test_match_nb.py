@@ -147,13 +147,20 @@ def reasons(records: list[dict[str, object]]) -> list[str]:
 
 def test_nb_config_contains_wheel_closed_loop_actions() -> None:
     config = load_runtime_config("configs/runtime.match_nb.yaml").match
-    assert config.nb_opening_actions == (
-        NBOpeningStraight(1.6, 1.5, 0.0),
-        NBOpeningWheelTurn(
-            math.pi / 3.0, 1.5, 1.0, 1.5, 0.5, 1.0,
-        ),
-        NBOpeningStraight(-1.0, 1.5),
+    assert len(config.nb_opening_actions) == 3
+    first, wheel_turn, reverse = config.nb_opening_actions
+    assert isinstance(first, NBOpeningStraight)
+    assert first.distance_m == pytest.approx(1.6)
+    assert first.settle_time_s == pytest.approx(0.0)
+    assert isinstance(wheel_turn, NBOpeningWheelTurn)
+    assert wheel_turn.angle_rad > 0.0
+    assert wheel_turn.left_wheel_hold_speed_m_s < wheel_turn.right_wheel_speed_m_s
+    assert wheel_turn.left_wheel_final_speed_m_s == pytest.approx(
+        wheel_turn.right_wheel_speed_m_s,
     )
+    assert wheel_turn.post_turn_distance_m == pytest.approx(1.0)
+    assert isinstance(reverse, NBOpeningStraight)
+    assert reverse.distance_m == pytest.approx(-1.0)
     assert config.nb_opening_gripper_after_action is None
     assert config.nb_opening_turn_tolerance_rad == pytest.approx(0.06)
     assert config.nb_opening_distance_tolerance_m == pytest.approx(0.02)
@@ -182,12 +189,24 @@ def test_nb_straight_hands_off_to_wheel_turn_without_braking_right_wheel() -> No
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
     )
-    sequence.observe_grasp_motion(motion_sample(100_000_000, count=1_000, gyro=0))
+    sequence.observe_grasp_motion(motion_sample(80_000_000, count=750, gyro=0))
+    cruise_decision = sequence.step(
+        80_000_000,
+        perception=None,
+        heading_rad=START_HEADING_RAD,
+        cumulative_distance_m=0.075,
+        left_speed_feedback_m_s=0.50,
+        right_speed_feedback_m_s=0.50,
+    )
+    assert cruise_decision.reason.startswith("nb_opening_straight_1_handoff_cruise")
+    assert cruise_decision.wheel_speeds_m_s == pytest.approx((0.50, 0.50))
+
+    sequence.observe_grasp_motion(motion_sample(100_000_000, count=900, gyro=0))
     decision = sequence.step(
         100_000_000,
         perception=None,
         heading_rad=START_HEADING_RAD,
-        cumulative_distance_m=0.10,
+        cumulative_distance_m=0.09,
         left_speed_feedback_m_s=0.50,
         right_speed_feedback_m_s=0.50,
     )
