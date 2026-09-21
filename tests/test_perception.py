@@ -13,6 +13,7 @@ from rescue_vision.camera.frame import CameraFrame
 from rescue_vision.evaluation.report import evaluate_records
 from rescue_vision.geometry.ground_projector import GroundProjector
 from rescue_vision.geometry.types import GroundPoint, UndistortedPixel
+from rescue_vision.perception.gripper_color import GripperColorObservation
 from rescue_vision.perception import (
     ClassProbabilities,
     ColorSegmentationStatus,
@@ -529,6 +530,29 @@ def test_perception_visualization_isolated_and_marks_stale_results() -> None:
     assert not np.array_equal(stale_preview, image)
 
 
+def test_perception_visualization_always_draws_gripper_far_edge() -> None:
+    image = np.zeros((12, 16, 3), dtype=np.uint8)
+    gripper_color = GripperColorObservation(
+        polygon=(
+            UndistortedPixel(4.0, 5.0),
+            UndistortedPixel(11.0, 5.0),
+            UndistortedPixel(10.0, 8.0),
+            UndistortedPixel(5.0, 8.0),
+        ),
+        component_fractions=(),
+        present_classes=frozenset(),
+        horizontal_line_v=5.0,
+    )
+
+    preview = render_target_observations(
+        image,
+        (),
+        gripper_color=gripper_color,
+    )
+
+    assert np.any(np.all(preview[5, 4:11] == (255, 0, 255), axis=1))
+
+
 def test_perception_frame_renderer_keeps_latest_result_off_realtime_thread() -> None:
     image = image_with_regions()
     source_frame = CameraFrame(7, time.monotonic_ns() - 1_000_000, image)
@@ -549,6 +573,7 @@ def test_perception_frame_renderer_keeps_latest_result_off_realtime_thread() -> 
         assert rendered.sequence == source_frame.sequence
         assert rendered.timestamp_ns == source_frame.timestamp_ns
         assert not np.array_equal(rendered.image_bgr, source_frame.image_bgr)
+        assert np.any(np.all(rendered.image_bgr == (255, 0, 255), axis=2))
         snapshot = renderer.latest_snapshot()
         assert snapshot is not None
         assert snapshot.frame_sequence == source_frame.sequence

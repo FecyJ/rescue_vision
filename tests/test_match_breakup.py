@@ -221,6 +221,28 @@ def test_forward_stops_before_reversing_and_retreat_keeps_configured_distance():
     assert reverse.gripper_posture is GripperPosture.CLOSED
 
 
+def test_first_formal_breakup_uses_the_dedicated_twenty_centimeter_retreat():
+    seq = sequence()
+    for frame, ms in ((1, 10), (2, 20), (3, 30)):
+        tick(seq, frame, ms)
+
+    plan = seq._choose_breakup_plan(30_000_000)
+
+    assert plan is not None
+    assert plan.backward_distance_mm == pytest.approx(200.0)
+
+
+def test_first_near_field_recovery_passes_the_dedicated_retreat_to_worker():
+    seq = sequence()
+    tick(seq, 1, 10)
+
+    context = seq.grasp_recovery_context(seq._latest_perception)
+
+    assert context is not None
+    assert context.attempt == 1
+    assert context.config.breakup_backward_distance_m == pytest.approx(0.2)
+
+
 def test_retry_budget_is_only_consumed_by_completed_pushes():
     seq = sequence()
     for frame, ms in ((1, 10), (2, 20), (3, 30), (4, 40), (5, 50)):

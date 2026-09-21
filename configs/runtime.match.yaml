@@ -22,6 +22,7 @@ perception:
   gripper_color:
     enabled: true
     polygon_normalized: [[0.47, 0.85], [0.53, 0.85], [0.57, 0.97], [0.43, 0.97]]
+    line_forward_offset_mm: 100.0
     min_component_fraction: 0.03
     # 黑色先去除细于 ROI 短边此比例的线条，再检查实体色块面积。
     black_min_thickness_fraction: 0.12
@@ -209,7 +210,7 @@ match:
   # 保留为旧纯逻辑夹具的邻域诊断参数；正式单绿机会使用固定 TRANSPORT 走廊判定。
   opportunistic_single_green_clearance_mm: 120.0
   # 解团前推/后退的距离和速度，单位 m、m/s。
-  # match: 闭爪定距前进 0.5 m、后退 0.3 m，整段路径不可行时拒绝该计划。
+  # 首次 match 解团闭爪前进 0.4 m、后退 0.2 m；后续重试后退 0.1 m，整段路径不可行时拒绝该计划。
   # 最小推进门槛，单位 mm。门槛取 `breakup_min_penetration_mm +
   # breakup_braking_margin_mm` 与局部接触集自身纵向跨度的较小值：浅团只要能
   # 整段推穿就成立。40 mm 正四面体黑核的内切接触盘只有 2r≈23 mm，固定门槛
@@ -236,6 +237,8 @@ match:
   breakup_forward_distance_m: 0.4
   breakup_forward_speed_m_s: 1.5
   breakup_backward_distance_m: 0.10
+  # 首次正式解团完成前推并停稳后，额外按编码器倒车 0.2 m；后续重试使用上面的常规距离。
+  first_breakup_backward_distance_m: 0.20
   breakup_backward_speed_m_s: 1.5
   # 解团阶段临时车体加减速度；null 分别继承 motion 对应全局值。
   breakup_max_linear_acceleration_m_s2: 4.0

@@ -22,6 +22,7 @@ perception:
   gripper_color:
     enabled: true
     polygon_normalized: [[0.47, 0.85], [0.53, 0.85], [0.57, 0.97], [0.43, 0.97]]
+    line_forward_offset_mm: 100.0
     min_component_fraction: 0.03
     # 黑色先去除细于 ROI 短边此比例的线条，再检查实体色块面积。
     black_min_thickness_fraction: 0.12

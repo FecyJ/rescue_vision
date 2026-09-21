@@ -177,8 +177,10 @@ bbox 底边横向边界，并包含模型 K0 或 bbox 底边中点兜底。整�
 `MatchSequence` 持有跨搜索、接近、稳定规划、解团和再抓取的 `GraspTask`。
 解团是当前物理抓取任务的恢复动作，退离后接回该任务；执行次序、规则与时间预算统一见
 [正式流程设计](../../../docs/正式流程设计.md#抓取任务与动作顺序)。
-`breakup_forward_distance_m` / `breakup_backward_distance_m` 在正式流程中是完整动作距离，
-当前配置为闭爪前进 0.5 m、闭爪后退 0.3 m。`grasp_task.marked_targets` 持有团内得分物块
+`breakup_forward_distance_m` / `breakup_backward_distance_m` 在正式流程中是完整动作距离；
+`first_breakup_backward_distance_m` 可为首次正式解团覆盖后退距离，当前 `runtime.match.yaml`
+配置为首次闭爪前进 0.4 m、停稳后倒车 0.2 m，后续重试使用常规后退距离 0.1 m。
+`grasp_task.marked_targets` 持有团内得分物块
 的类别、最后实测 `FieldPoint`、采集时间（ns）与可选主 tracker ID；采集位姿补偿与唯一关联
 在解团期间持续更新，退离后以新观测交接同一物块。预览只高亮同帧关联框，日志保留标记及年龄。
 CC 继续使用独立固定动作，单绿运输联调与带载补夹不开放解团。
@@ -309,7 +311,9 @@ require_handoff=..., excluded_observation_indices=..., recovery_context=...)`；
 计划进入 `forward_encoder_heading_hold`。动作退出后必须用退出之后采集的新证据重新选组，不能直接
 重放旧计划。
 合爪指令提交后只等待计时并保持底盘静止，遮挡不会自行重新抓取；不把视觉消失当成成功
-证据。`rx_degraded` 只保留在日志诊断中。
+证据。夹爪 ROI 外接矩形最远边向机器人前方暂偏移 100 mm 的绿色/橙色连通域跨线是例外的
+重夹证据：符合当前趟次规则时张爪、编码器前进 30 mm、停稳合爪；不合法的线侧目标则张爪、
+编码器后退 10 mm、停稳合爪，之后均回到原运输状态；`rx_degraded` 只保留在日志诊断中。
 
 `GraspPreparation` 的 `confirmation_progress`、计划的 `capture_timestamp_ns` 和
 `prepared_timestamp_ns` 分别用于确认进度、计划年龄和准备结果年龄，
@@ -403,9 +407,10 @@ Enter 放行后立即执行启动转向/直行和目标搜索，输入其它文�
 `match*.log`。`runtime_phase` 标明打开 UART、序号同步、等待相机、首帧、预检或
 控制阶段；`uart_sync_attempt` 记录同步失败原因、次数和单调时间截止点（ns）。
 制动或关闭 UART 再次失败时作为原异常的附注保留，仍尝试关闭通道。
-排查偶发启动失败应查看该次日志末尾的底层异常，而不是仅凭 `UART reader failed`
-推断原因。打开失败、设备断开和队列溢出不做无条件重试；本次修复不代表真机启动
-成功率已验证。
+启动阶段若底层异常链明确包含 PySerial `SerialTimeoutException`，会最多重开 UART
+并重新执行零速同步 3 次；成功后继续启动，失败仍按原异常退出。普通打开失败、设备断开
+和队列溢出不做无条件重试。排查偶发启动失败仍应查看该次日志末尾的底层异常，而不是
+仅凭 `UART reader failed` 推断原因；该恢复路径的真机成功率尚未验证。
 
 如果只需联调绿色物块夹取、末端张爪推送和安全区运输，使用 `rescue-vision-grab-transport`；该入口复用
 同一配置，从 `(0,0,+90°)` 直接搜索固定 `TRANSPORT` 走廊内的单个绿色 K0，不执行目标团解团。
@@ -480,9 +485,11 @@ flow = config.build_match_sequence()
 
 `wheel_turn` 是连续轮速开头动作：前一段正向 `straight` 到达目标时直接交接，不发送全车零速；
 右轮保持 `right_wheel_speed_m_s`，左轮按 `left_transition_acceleration_m_s2` 降到
-`left_wheel_hold_speed_m_s`。IMU 航向累计到 `angle_rad` 后，左轮以同一斜坡升到
+`left_wheel_hold_speed_m_s`。左右轮里程差累计到 `angle_rad` 后，左轮以同一斜坡升到
 `left_wheel_final_speed_m_s`，双轮以轮速闭环前进 `post_turn_distance_m` 后刹车并确认停稳。
-该动作已经包含转后正向距离，后面不能再接正向 `straight`；倒车等后续动作可以继续配置。
+如果停稳时角度或距离仍有残差，进入低速轮级闭环修正，重新停稳确认后再完成；不会因为
+该局部误差直接把 NB 开场改成 `terminal_stop`。该动作已经包含转后正向距离，后面不能再接
+正向 `straight`；倒车等后续动作可以继续配置。
 
 ```yaml
 nb_opening_actions:
@@ -506,7 +513,7 @@ nb_opening_gripper_after_action: 2
 | 字段 | 单位 | 说明 |
 | --- | --- | --- |
 | `nb_opening_actions[].type: turn` | — | 原地转向；`angle_rad` 左正右负，`angular_velocity_rad_s` 为正速度幅值 |
-| `nb_opening_actions[].type: wheel_turn` | — | 左轮斜坡/右轮恒速的 IMU 定角度、里程定距动作；包含转后正向距离 |
+| `nb_opening_actions[].type: wheel_turn` | — | 左轮斜坡/右轮恒速的轮里程定角度、里程定距动作；包含转后正向距离和残差修正 |
 | `wheel_turn` 的 `right_wheel_speed_m_s` / `left_wheel_hold_speed_m_s` / `left_wheel_final_speed_m_s` | m/s | 右轮保持速度、左轮转向阶段速度和恢复后的双轮速度 |
 | `wheel_turn.left_transition_acceleration_m_s2` | m/s² | 左轮降速和升速共用的固定主机斜坡 |
 | `wheel_turn.post_turn_distance_m` | m | 左轮恢复后双轮共同推进的距离；刹车点由实测速度、遥测年龄和有效减速度计算 |
@@ -516,7 +523,7 @@ nb_opening_gripper_after_action: 2
 | `nb_opening_turn_tolerance_rad` | rad | 转向完成误差 |
 | `nb_opening_distance_tolerance_m` | m | 直行完成误差 |
 | `nb_opening_settle_time_s` | s | 连续新遥测的停稳确认时长，不是固定 sleep |
-| `nb_opening_turn_timeout_s` | s | 单次 NB 动作截止时间，超时后停车 |
+| `nb_opening_turn_timeout_s` | s | NB 动作诊断截止时间；动作超时只记录并保持开场状态，不把局部动作误差切成 `terminal_stop` |
 | `motion.action_profile` | 多单位 | match 与 match_nb 共用的制动能力、响应延迟、低速收尾、停稳门限及航向保持参数；需用真车标定 |
 
 车端诊断：`MatchNBSequence.nb_opening_route_phase` 返回当前动作，`nb_opening_diagnostic`

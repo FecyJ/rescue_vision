@@ -208,7 +208,7 @@ def test_spatial_identity_survives_id_reset_but_not_distant_group():
     assert not same_local_group(a, (FieldPoint(900, 0), FieldPoint(950, 0)), 100)
 
 
-@pytest.mark.parametrize('name,value', [('breakup_forward_distance_m', float('nan')), ('breakup_min_penetration_mm', True), ('breakup_max_attempts', 5), ('breakup_backward_distance_m', -1)])
+@pytest.mark.parametrize('name,value', [('breakup_forward_distance_m', float('nan')), ('breakup_min_penetration_mm', True), ('breakup_max_attempts', 5), ('breakup_backward_distance_m', -1), ('first_breakup_backward_distance_m', -1)])
 def test_invalid_configuration(name, value):
     with pytest.raises(ValueError):
         replace(load_runtime_config('configs/runtime.match.yaml').match, **{name: value})

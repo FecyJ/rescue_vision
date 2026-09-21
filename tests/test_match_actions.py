@@ -421,7 +421,10 @@ def test_no_isolated_green_keeps_attempt_budget_and_loops_to_search() -> None:
 
 
 
-@pytest.mark.parametrize("failure_phase", [None, "uart_open", "uart_synchronize"])
+@pytest.mark.parametrize(
+    "failure_phase",
+    [None, "uart_open", "uart_synchronize", "uart_write_timeout"],
+)
 def test_hardware_entry_reaches_control_without_building_fusion(
     monkeypatch, tmp_path, failure_phase,
 ) -> None:
@@ -444,10 +447,18 @@ def test_hardware_entry_reaches_control_without_building_fusion(
     status.watchdog_armed = True
     status.emergency_stop_latched = False
 
+    synchronize_count = 0
+
     def synchronize(**kwargs):
+        nonlocal synchronize_count
+        synchronize_count += 1
         consume = kwargs["on_message"]
         consume(status)
-        for sample_us, count in ((1_000_000, 0), (1_020_000, 8)):
+        base_timestamp_us = synchronize_count * 100_000
+        for sample_us, count in (
+            (base_timestamp_us, synchronize_count * 100),
+            (base_timestamp_us + 20_000, synchronize_count * 100 + 8),
+        ):
             consume(OdometryImu(
                 uart_sequence=count, telemetry_sequence=count,
                 received_timestamp_ns=1_000_000_000 + count,
@@ -494,10 +505,34 @@ def test_hardware_entry_reaches_control_without_building_fusion(
         original_error.__cause__ = OSError("injected device failure")
         if failure_phase == "uart_open":
             channel.start.side_effect = original_error
-        else:
+        elif failure_phase == "uart_synchronize":
             controller.synchronize.side_effect = original_error
             controller.soft_brake.side_effect = OSError("injected brake failure")
             channel.stop.side_effect = OSError("injected close failure")
+        else:
+            class SerialTimeoutException(Exception):
+                pass
+
+            timeout_error = UartError("UART write failed")
+            timeout_error.__cause__ = SerialTimeoutException("Write timeout")
+            update_calls = 0
+
+            def update(**kwargs):
+                nonlocal update_calls
+                del kwargs
+                update_calls += 1
+                if update_calls == 1:
+                    raise timeout_error
+
+            controller.update.side_effect = update
+            match_runtime._run_hardware(
+                Path("configs/runtime.match.yaml"),
+                supervised_stop_ready=True, log_dir=None,
+            )
+            assert channel.start.call_count == 2
+            assert channel.stop.call_count == 2
+            assert start_gate.call_count == 1
+            return
         with pytest.raises(UartError) as raised:
             match_runtime._run_hardware(
                 Path("configs/runtime.match.yaml"),

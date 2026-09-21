@@ -180,6 +180,7 @@ def test_nb_straight_hands_off_to_wheel_turn_without_braking_right_wheel() -> No
     )
     start_nb(sequence)
 
+    sequence.observe_wheel_odometry(left_distance_m=0.0, right_distance_m=0.0)
     sequence.observe_grasp_motion(motion_sample(1_000_000, count=0, gyro=0))
     sequence.step(
         1_000_000,
@@ -189,6 +190,7 @@ def test_nb_straight_hands_off_to_wheel_turn_without_braking_right_wheel() -> No
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
     )
+    sequence.observe_wheel_odometry(left_distance_m=0.075, right_distance_m=0.075)
     sequence.observe_grasp_motion(motion_sample(80_000_000, count=750, gyro=0))
     cruise_decision = sequence.step(
         80_000_000,
@@ -201,6 +203,7 @@ def test_nb_straight_hands_off_to_wheel_turn_without_braking_right_wheel() -> No
     assert cruise_decision.reason.startswith("nb_opening_straight_1_handoff_cruise")
     assert cruise_decision.wheel_speeds_m_s == pytest.approx((0.50, 0.50))
 
+    sequence.observe_wheel_odometry(left_distance_m=0.09, right_distance_m=0.09)
     sequence.observe_grasp_motion(motion_sample(100_000_000, count=900, gyro=0))
     decision = sequence.step(
         100_000_000,
@@ -323,7 +326,7 @@ def test_nb_relative_route_does_not_depend_on_field_position() -> None:
     assert records[-1]["state"] is MatchState.SEARCH_CLUSTER
 
 
-def test_nb_turn_timeout_stops_without_translation() -> None:
+def test_nb_turn_timeout_does_not_terminal_stop_the_opening_sequence() -> None:
     sequence = make_nb(
         config=runtime_config(
             nb_opening_actions=(NBOpeningTurn(0.5, 0.5),),
@@ -334,9 +337,11 @@ def test_nb_turn_timeout_stops_without_translation() -> None:
     start_nb(sequence)
     records = drive_opening(sequence, fixed_heading=START_HEADING_RAD)
 
-    assert records[-1]["state"] is MatchState.TERMINAL_STOP
-    assert str(records[-1]["reason"]).startswith("nb_opening_turn_1_timeout")
-    assert all(record["linear"] == 0.0 for record in records)
+    assert records[-1]["state"] is MatchState.NB_OPENING_SEQUENCE
+    assert str(records[-1]["reason"]).startswith(
+        "nb_opening_turn_1_timeout_continue"
+    )
+    assert all(record["state"] is not MatchState.TERMINAL_STOP for record in records)
 
 
 def test_nb_waits_for_heading_before_turn_command() -> None:
@@ -354,7 +359,7 @@ def test_nb_waits_for_heading_before_turn_command() -> None:
     assert waiting.angular_velocity_rad_s == 0.0
 
 
-def test_nb_missing_heading_timeout_stops_without_translation() -> None:
+def test_nb_missing_heading_timeout_keeps_waiting_without_terminal_stop() -> None:
     sequence = make_nb(
         config=runtime_config(
             nb_opening_actions=(NBOpeningTurn(0.5, 0.5),),
@@ -378,8 +383,8 @@ def test_nb_missing_heading_timeout_stops_without_translation() -> None:
     )
 
     assert waiting.reason.startswith("nb_opening_turn_waiting_heading:")
-    assert decision.state is MatchState.TERMINAL_STOP
-    assert decision.reason.startswith("nb_opening_turn_timeout_stop")
+    assert decision.state is MatchState.NB_OPENING_SEQUENCE
+    assert decision.reason.startswith("nb_opening_turn_waiting_heading")
     assert decision.linear_velocity_m_s == 0.0
     assert decision.angular_velocity_rad_s == 0.0
 

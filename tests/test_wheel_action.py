@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 
+import pytest
+
 from rescue_vision.motion import (
     WheelActionFeedback,
     WheelActionPhase,
@@ -17,6 +19,8 @@ def feedback(
     *,
     heading: float,
     distance: float,
+    left_distance: float = 0.0,
+    right_distance: float = 0.0,
     left: float,
     right: float,
     gyro: float = 0.0,
@@ -24,8 +28,9 @@ def feedback(
 ) -> WheelActionFeedback:
     return WheelActionFeedback(
         timestamp_ns=timestamp_ns,
-        heading_rad=heading,
         distance_m=distance,
+        left_wheel_distance_m=left_distance,
+        right_wheel_distance_m=right_distance,
         left_wheel_velocity_m_s=left,
         right_wheel_velocity_m_s=right,
         angular_velocity_rad_s=gyro,
@@ -46,7 +51,12 @@ def test_wheel_turn_ramps_left_holds_angle_then_drives_and_stops() -> None:
             stationary_confirm_time_s=0.1,
         )
     )
-    controller.begin(timestamp_ns=0, heading_rad=0.0, distance_m=0.0)
+    controller.begin(
+        timestamp_ns=0,
+        distance_m=0.0,
+        left_wheel_distance_m=0.0,
+        right_wheel_distance_m=0.0,
+    )
 
     lowering = controller.update(
         feedback(0, heading=0.0, distance=0.0, left=1.5, right=1.5)
@@ -61,19 +71,40 @@ def test_wheel_turn_ramps_left_holds_angle_then_drives_and_stops() -> None:
     assert holding.left_wheel_velocity_m_s == 1.0
 
     raising = controller.update(
-        feedback(2_000_000_000, heading=math.pi / 3.0, distance=0.0, left=1.0, right=1.5)
+        feedback(
+            2_000_000_000,
+            heading=0.0,
+            distance=0.0,
+            right_distance=math.pi / 3.0 * 0.235,
+            left=1.0,
+            right=1.5,
+        )
     )
     assert raising.phase is WheelActionPhase.RAISE_LEFT
     assert raising.left_wheel_velocity_m_s == 1.5
 
     cruising = controller.update(
-        feedback(3_000_000_000, heading=math.pi / 3.0, distance=0.0, left=1.5, right=1.5)
+        feedback(
+            3_000_000_000,
+            heading=999.0,
+            distance=0.0,
+            right_distance=math.pi / 3.0 * 0.235,
+            left=1.5,
+            right=1.5,
+        )
     )
     assert cruising.phase is WheelActionPhase.DRIVE_DISTANCE
     assert cruising.left_wheel_velocity_m_s == 1.5
 
     braking = controller.update(
-        feedback(4_000_000_000, heading=math.pi / 3.0, distance=0.30, left=1.5, right=1.5)
+        feedback(
+            4_000_000_000,
+            heading=999.0,
+            distance=0.30,
+            right_distance=math.pi / 3.0 * 0.235,
+            left=1.5,
+            right=1.5,
+        )
     )
     assert braking.phase is WheelActionPhase.STOPPING
     assert (braking.left_wheel_velocity_m_s, braking.right_wheel_velocity_m_s) == (0.0, 0.0)
@@ -81,8 +112,9 @@ def test_wheel_turn_ramps_left_holds_angle_then_drives_and_stops() -> None:
     complete = controller.update(
         feedback(
             5_000_000_000,
-            heading=math.pi / 3.0,
+            heading=-999.0,
             distance=1.0,
+            right_distance=math.pi / 3.0 * 0.235,
             left=0.0,
             right=0.0,
             stationary_since_ns=4_800_000_000,
@@ -101,10 +133,163 @@ def test_wheel_turn_does_not_finish_from_angle_before_stationary_distance_check(
             post_turn_distance_m=1.0,
         )
     )
-    controller.begin(timestamp_ns=0, heading_rad=0.0, distance_m=0.0)
+    controller.begin(
+        timestamp_ns=0,
+        distance_m=0.0,
+        left_wheel_distance_m=0.0,
+        right_wheel_distance_m=0.0,
+    )
     controller.update(feedback(0, heading=0.0, distance=0.0, left=1.0, right=1.5))
     command = controller.update(
-        feedback(1_000_000_000, heading=1.0, distance=0.0, left=1.0, right=1.5)
+        feedback(
+            1_000_000_000,
+            heading=0.0,
+            distance=0.0,
+            right_distance=1.0 * 0.235,
+            left=1.0,
+            right=1.5,
+        )
     )
     assert command.phase is WheelActionPhase.RAISE_LEFT
     assert not command.complete
+
+
+def test_wheel_turn_corrects_residual_odometry_error_after_stopping() -> None:
+    controller = WheelTurnAndAdvanceController(
+        WheelActionProfile(
+            wheel_track_m=0.235,
+            target_angle_rad=0.5,
+            post_turn_distance_m=1.0,
+            angle_tolerance_rad=0.03,
+            distance_tolerance_m=0.02,
+            stationary_confirm_time_s=0.1,
+        )
+    )
+    controller.begin(
+        timestamp_ns=0,
+        distance_m=0.0,
+        left_wheel_distance_m=0.0,
+        right_wheel_distance_m=0.0,
+    )
+    controller.update(feedback(0, heading=0.0, distance=0.0, left=1.5, right=1.5))
+    controller.update(feedback(1_000_000_000, heading=0.0, distance=0.0, left=1.0, right=1.5))
+    controller.update(
+        feedback(
+            2_000_000_000,
+            heading=0.0,
+            distance=0.0,
+            right_distance=0.5 * 0.235,
+            left=1.0,
+            right=1.5,
+        )
+    )
+    controller.update(
+        feedback(
+            3_000_000_000,
+            heading=0.0,
+            distance=0.0,
+            right_distance=0.5 * 0.235,
+            left=1.5,
+            right=1.5,
+        )
+    )
+    controller.update(
+        feedback(
+            4_000_000_000,
+            heading=0.0,
+            distance=0.30,
+            right_distance=0.5 * 0.235,
+            left=1.5,
+            right=1.5,
+        )
+    )
+
+    correction = controller.update(
+        feedback(
+            5_000_000_000,
+            heading=0.0,
+            distance=1.0,
+            right_distance=0.75 * 0.235,
+            left=0.0,
+            right=0.0,
+            stationary_since_ns=4_800_000_000,
+        )
+    )
+    assert correction.phase is WheelActionPhase.CORRECTING
+    assert not correction.timed_out
+    assert correction.left_wheel_velocity_m_s > 0.0
+    assert correction.right_wheel_velocity_m_s < 0.0
+
+    settling = controller.update(
+        feedback(
+            6_000_000_000,
+            heading=0.0,
+            distance=1.0,
+            left_distance=0.01,
+            right_distance=0.01 + 0.52 * 0.235,
+            left=0.0,
+            right=0.0,
+            stationary_since_ns=5_800_000_000,
+        )
+    )
+    assert settling.phase is WheelActionPhase.STOPPING
+    assert not settling.complete
+
+    complete = controller.update(
+        feedback(
+            7_000_000_000,
+            heading=0.0,
+            distance=1.0,
+            left_distance=0.01,
+            right_distance=0.01 + 0.52 * 0.235,
+            left=0.0,
+            right=0.0,
+            stationary_since_ns=5_800_000_000,
+        )
+    )
+    assert complete.phase is WheelActionPhase.COMPLETE
+    assert complete.complete
+    assert not complete.timed_out
+
+
+def test_wheel_turn_has_bounded_left_lowering_when_speed_feedback_is_stuck() -> None:
+    controller = WheelTurnAndAdvanceController(
+        WheelActionProfile(
+            wheel_track_m=0.235,
+            target_angle_rad=0.8,
+            left_wheel_hold_speed_m_s=1.0,
+            right_wheel_speed_m_s=1.5,
+            left_wheel_final_speed_m_s=1.5,
+            left_transition_acceleration_m_s2=5.0,
+            telemetry_delay_s=0.1,
+        )
+    )
+    controller.begin(
+        timestamp_ns=0,
+        distance_m=0.0,
+        left_wheel_distance_m=0.0,
+        right_wheel_distance_m=0.0,
+    )
+
+    lowering = controller.update(
+        feedback(0, heading=0.0, distance=0.0, left=1.5, right=1.5)
+    )
+    assert lowering.phase is WheelActionPhase.LOWER_LEFT
+
+    hold = controller.update(
+        feedback(200_000_000, heading=123.0, distance=0.0, left=1.5, right=1.5)
+    )
+    assert hold.phase is WheelActionPhase.HOLD_ANGLE
+    assert hold.angle_progress_rad == pytest.approx(0.0)
+
+    raising = controller.update(
+        feedback(
+            300_000_000,
+            heading=-123.0,
+            distance=0.0,
+            right_distance=0.8 * 0.235,
+            left=1.5,
+            right=1.5,
+        )
+    )
+    assert raising.phase is WheelActionPhase.DRIVE_DISTANCE

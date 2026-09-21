@@ -29,6 +29,21 @@ if TYPE_CHECKING:
     from rescue_vision.app.near_field_grasp import NearFieldGraspSelector
 _PREFLIGHT_RETRY_WINDOW_NS = 5_000_000_000
 _START_GATE_POLL_S = 0.005
+_STARTUP_UART_RECOVERY_ATTEMPTS = 3
+_STARTUP_UART_RECOVERY_DELAY_S = 0.1
+
+
+def _is_serial_write_timeout(error: BaseException) -> bool:
+    """判断异常链是否包含 PySerial 的写超时。"""
+
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if type(current).__name__ == "SerialTimeoutException":
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _stdin_enter_pressed(timeout_s: float) -> bool:
@@ -463,6 +478,7 @@ def _run_hardware(
             RemoteAccessMode,
             RemoteRole,
             TeamColor as RemoteTeamColor,
+            UartError,
         )
         from rescue_vision.motion import (
             CarCommandReply,
@@ -598,7 +614,10 @@ def _run_hardware(
             f"close_gripper_spin_angle_rad={config.match.spin_angle_rad:g} "
             f"breakup_confirmation_frames={config.match.breakup_confirmation_frames} "
             f"breakup_field_half_extent_mm={config.match.breakup_field_half_extent_mm:g} "
-            f"breakup_gripper_offset_mm={config.match.breakup_gripper_offset_mm:g}",
+            f"breakup_gripper_offset_mm={config.match.breakup_gripper_offset_mm:g} "
+            f"breakup_forward_distance_m={config.match.breakup_forward_distance_m:g} "
+            f"breakup_backward_distance_m={config.match.breakup_backward_distance_m:g} "
+            f"first_breakup_backward_distance_m={config.match.first_breakup_backward_distance_m}",
             flush=True,
         )
         print(
@@ -793,6 +812,14 @@ def _run_hardware(
                     )
                 sequence.observe_grasp_motion(message)
                 encoder_tracker.submit(message)
+                observe_wheel_odometry = getattr(
+                    sequence, "observe_wheel_odometry", None
+                )
+                if callable(observe_wheel_odometry):
+                    observe_wheel_odometry(
+                        left_distance_m=encoder_tracker.left_distance_m,
+                        right_distance_m=encoder_tracker.right_distance_m,
+                    )
                 previous = previous_odometry
                 if previous is not None:
                     elapsed_s = (
@@ -828,8 +855,48 @@ def _run_hardware(
             elif isinstance(message, CarSystemStatus):
                 latest_status = message
 
+        def recover_startup_uart(error: UartError) -> None:
+            """重开串口并重新同步一次启动期写超时。"""
+
+            if not _is_serial_write_timeout(error):
+                raise error
+            for attempt in range(1, _STARTUP_UART_RECOVERY_ATTEMPTS + 1):
+                print(
+                    "uart_startup_recovery="
+                    f"attempt_{attempt}/{_STARTUP_UART_RECOVERY_ATTEMPTS} "
+                    f"reason={type(error).__name__}: {error}",
+                    flush=True,
+                )
+                try:
+                    # 写超时后不复用当前 fd；关闭后台读线程并重开串口，
+                    # 再以 SOFT_BRAKE + ACK 重新建立运动同步。
+                    channel.stop()
+                    time.sleep(_STARTUP_UART_RECOVERY_DELAY_S)
+                    channel.start()
+                    controller.synchronize(
+                        timeout_s=config.motion.synchronization_timeout_s,
+                        on_message=consume,
+                    )
+                except Exception as recovery_error:
+                    add_exception_note(
+                        error,
+                        "startup UART recovery "
+                        f"attempt {attempt} failed: {type(recovery_error).__name__}: "
+                        f"{recovery_error}",
+                    )
+                    continue
+                print(
+                    f"uart_startup_recovery=success attempt={attempt}",
+                    flush=True,
+                )
+                return
+            raise error
+
         def service_uart_during_startup() -> None:
-            controller.update(now_ns=time.monotonic_ns())
+            try:
+                controller.update(now_ns=time.monotonic_ns())
+            except UartError as error:
+                recover_startup_uart(error)
             for message in controller.drain_messages():
                 consume(message)
             if latest_status is not None and latest_status.emergency_stop_latched:
@@ -920,6 +987,9 @@ def _run_hardware(
                             on_message=consume,
                         )
                         break
+                    except UartError as error:
+                        recover_startup_uart(error)
+                        break
                     except MotionSynchronizationError as exc:
                         print(
                             f"uart_sync_attempt={sync_attempt} error={exc} "
@@ -939,12 +1009,13 @@ def _run_hardware(
                     on_wait=service_uart_during_startup,
                 )
                 camera_started = True
-                controller.query_state()
+                try:
+                    controller.query_state()
+                except UartError as error:
+                    recover_startup_uart(error)
                 runtime_phase = "first_perception"
                 while latest_snapshot is None and not stop_requested:
-                    controller.update(now_ns=time.monotonic_ns())
-                    for message in controller.drain_messages():
-                        consume(message)
+                    service_uart_during_startup()
                     camera_pump.check_health()
                     latest_snapshot = renderer.latest_fresh_snapshot(
                         time.monotonic_ns(),
@@ -985,7 +1056,10 @@ def _run_hardware(
 
                     now_ns = time.monotonic_ns()
                     apply_motion_acceleration_limits()
-                    controller.update(now_ns=now_ns)
+                    try:
+                        controller.update(now_ns=now_ns)
+                    except UartError as error:
+                        recover_startup_uart(error)
                     for message in controller.drain_messages():
                         consume(message)
                     if (

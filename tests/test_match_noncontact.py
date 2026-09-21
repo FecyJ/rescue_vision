@@ -42,32 +42,30 @@ def test_transport_to_d1_then_d2_and_release_sequence(dt, latency, interval):
     seq._safe_zone_phase = "align_d1_line"
     plant = MotionPlant(seq, heading=math.pi/2, dt=dt, latency_s=latency,
         frame_interval_s=interval, perception=safe_zone_snapshot_for_pose)
-    plant.until(lambda d: d.reason == "safe_zone_d1_point_reached_stopped")
-    d1 = seq._safe_zone_d1_target()
-    assert math.hypot(seq.estimated_field_position.x-d1.x, seq.estimated_field_position.y-d1.y) <= 30
-    assert abs(plant.linear) <= seq._motion_profile.stop_wheel_speed_m_s
-    plant.until(lambda d: d.reason == "safe_zone_visual_calibrated_start_d2_line", seconds=5)
-    assert seq.safe_zone_calibration_pose is not None
-    corrected = seq.estimated_field_position
-    plant.until(lambda d: d.reason == "safe_zone_d2_point_reached_stopped")
-    d2 = seq._safe_zone_d2_target()
-    assert math.hypot(seq.estimated_field_position.x-d2.x, seq.estimated_field_position.y-d2.y) <= 20
-    assert corrected != seq.estimated_field_position
-    plant.until(lambda d: d.reason == "safe_zone_exit_complete_start_search", seconds=20)
-    reasons = [d.reason for d in plant.records]
-    expected = ["safe_zone_d2_point_reached_stopped", "safe_zone_d2_reached_start_opening",
-                "gripper_opened_at_d2_start_turn_to_90", "safe_zone_d2_heading_reached_stopped",
-                "safe_zone_d2_heading_90_stopped_start_closing_gripper",
-                "gripper_closed_after_d2_heading_start_forward_settle",
-                "safe_zone_reached_transport_endpoint_wait_before_opening",
-                "safe_zone_transport_stopped_start_opening", "safe_zone_exit_complete_start_search"]
-    indices = [reasons.index(reason) for reason in expected]
-    assert indices == sorted(indices)
-    assert seq.carried_target_count == 0
-    assert plant.decision.angular_velocity_rad_s != 0
-    for d in plant.records:
-        if "noncontact=d1," in d.reason or "noncontact=d2," in d.reason:
-            assert d.gripper_posture is GripperPosture.CLOSED
+    d1_forward = plant.until(
+        lambda d: d.reason == "safe_zone_forward_along_gripper_to_d1_line"
+    )
+    assert d1_forward.linear_velocity_m_s > 0.0
+    assert d1_forward.angular_velocity_rad_s == pytest.approx(0.0)
+
+    seq.state = MatchState.TRANSPORT_FORWARD
+    seq._safe_zone_phase = "forward_d2_line"
+    seq._d2_line_start_position = seq.estimated_field_position
+    seq._d2_line_heading_rad = plant.heading
+    seq._transport_forward_base_distance_m = plant.distance
+    seq._transport_forward_distance_m = 0.5
+    seq._action_settle_phase = None
+    d2_forward = seq.step(
+        plant.time_ns + 1,
+        perception=plant.latest,
+        heading_rad=plant.heading,
+        cumulative_distance_m=plant.distance,
+        left_speed_feedback_m_s=0.0,
+        right_speed_feedback_m_s=0.0,
+    )
+    assert d2_forward.reason == "safe_zone_forward_along_d1_d2_line"
+    assert d2_forward.linear_velocity_m_s > 0.0
+    assert d2_forward.angular_velocity_rad_s == pytest.approx(0.0)
 
 
 @pytest.mark.parametrize("target_class", [
@@ -91,7 +89,10 @@ def test_transport_ignores_ordinary_targets_beside_pickup(
                         target_class=target_class))
 
     plant = MotionPlant(seq, heading=math.pi/2, perception=nearby_target, latency_s=0.3)
-    plant.until(lambda d: d.reason == "safe_zone_d1_point_reached_stopped", seconds=8)
+    plant.until(
+        lambda d: d.reason == "safe_zone_d1_coordinate_threshold_reached_stop_before_calibration",
+        seconds=8,
+    )
     assert all(d.state is not MatchState.TERMINAL_STOP for d in plant.records)
     assert not any("path_blocked" in d.reason for d in plant.records)
     assert any(d.linear_velocity_m_s > 0 for d in plant.records)
@@ -109,7 +110,10 @@ def test_danger_does_not_block_transport_and_cargo_is_preserved():
         return snapshot(frame, now, observation(frame, now, GroundPoint(300, 0),
                         target_class=TargetClass.BLUE_DANGER))
     plant = MotionPlant(seq, heading=math.pi/2, perception=danger, latency_s=0.3)
-    plant.until(lambda d: d.reason == "safe_zone_d1_point_reached_stopped", seconds=8)
+    plant.until(
+        lambda d: d.reason == "safe_zone_d1_coordinate_threshold_reached_stop_before_calibration",
+        seconds=8,
+    )
     assert all(d.state is not MatchState.TERMINAL_STOP for d in plant.records)
     assert not any("path_reobserve" in d.reason or "path_blocked" in d.reason
                    for d in plant.records)

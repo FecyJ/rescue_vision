@@ -130,6 +130,8 @@ class MatchNBSequence(MatchSequence):
         self._nb_last_action_command: RelativeActionCommand | None = None
         self._nb_wheel_action_controller: WheelTurnAndAdvanceController | None = None
         self._nb_last_wheel_action_command: WheelActionCommand | None = None
+        self._nb_left_wheel_distance_m: float | None = None
+        self._nb_right_wheel_distance_m: float | None = None
         self._nb_gripper_opened = False
         self.state = MatchState.NB_OPENING_SEQUENCE
         return self._decision(timestamp_ns, 0.0, 0.0, "nb_opening_started")
@@ -142,6 +144,25 @@ class MatchNBSequence(MatchSequence):
             action_timeout_s=self.config.nb_opening_turn_timeout_s,
             stationary_confirm_time_s=self.config.nb_opening_settle_time_s,
         )
+
+    def observe_wheel_odometry(
+        self,
+        *,
+        left_distance_m: float,
+        right_distance_m: float,
+    ) -> None:
+        """更新轮级动作使用的左右轮累计里程（单位 m）。"""
+
+        for name, value in (
+            ("left_distance_m", left_distance_m),
+            ("right_distance_m", right_distance_m),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be a finite number, got {value!r}.")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be a finite number, got {value!r}.")
+        self._nb_left_wheel_distance_m = float(left_distance_m)
+        self._nb_right_wheel_distance_m = float(right_distance_m)
 
     def _dispatch_state(
         self,
@@ -160,6 +181,8 @@ class MatchNBSequence(MatchSequence):
                 timestamp_ns,
                 heading_rad=heading_rad,
                 cumulative_distance_m=cumulative_distance_m,
+                left_wheel_distance_m=self._nb_left_wheel_distance_m,
+                right_wheel_distance_m=self._nb_right_wheel_distance_m,
                 left_speed_feedback_m_s=left_speed_feedback_m_s,
                 right_speed_feedback_m_s=right_speed_feedback_m_s,
             )
@@ -328,10 +351,17 @@ class MatchNBSequence(MatchSequence):
         *,
         heading_rad: float | None,
         cumulative_distance_m: float | None,
+        wheel_odometry_available: bool | None = None,
     ) -> str:
+        wheel_odometry = (
+            ""
+            if wheel_odometry_available is None
+            else f" wheel_odometry={'available' if wheel_odometry_available else 'missing'}"
+        )
         return (
             f"{base_reason}:heading={'available' if heading_rad is not None else 'missing'} "
-            f"distance={'available' if cumulative_distance_m is not None else 'missing'} "
+            f"distance={'available' if cumulative_distance_m is not None else 'missing'}"
+            f"{wheel_odometry} "
             f"{self._nb_action_diagnostic_context(
                 timestamp_ns, confirmation_progress='not_started'
             )}"
@@ -362,9 +392,12 @@ class MatchNBSequence(MatchSequence):
         if self._nb_action_started_ns is None:
             self._nb_action_started_ns = timestamp_ns
         if isinstance(action, NBOpeningWheelTurn):
-            if heading_rad is None or cumulative_distance_m is None:
+            if (
+                cumulative_distance_m is None
+                or self._nb_left_wheel_distance_m is None
+                or self._nb_right_wheel_distance_m is None
+            ):
                 return False
-            self._nb_action_start_heading_rad = heading_rad
             self._nb_action_start_distance_m = cumulative_distance_m
             profile = WheelActionProfile(
                 wheel_track_m=self._nb_wheel_track_m,
@@ -392,8 +425,9 @@ class MatchNBSequence(MatchSequence):
             self._nb_wheel_action_controller = WheelTurnAndAdvanceController(profile)
             self._nb_wheel_action_controller.begin(
                 timestamp_ns=timestamp_ns,
-                heading_rad=heading_rad,
                 distance_m=cumulative_distance_m,
+                left_wheel_distance_m=self._nb_left_wheel_distance_m,
+                right_wheel_distance_m=self._nb_right_wheel_distance_m,
             )
             return True
         if isinstance(action, NBOpeningTurn):
@@ -495,8 +529,9 @@ class MatchNBSequence(MatchSequence):
         self,
         timestamp_ns: int,
         *,
-        heading_rad: float | None,
         cumulative_distance_m: float | None,
+        left_wheel_distance_m: float | None,
+        right_wheel_distance_m: float | None,
         left_speed_feedback_m_s: float | None,
         right_speed_feedback_m_s: float | None,
     ) -> WheelActionFeedback:
@@ -507,8 +542,9 @@ class MatchNBSequence(MatchSequence):
         feedback_missing = any(
             value is None
             for value in (
-                heading_rad,
                 cumulative_distance_m,
+                left_wheel_distance_m,
+                right_wheel_distance_m,
                 left_speed_feedback_m_s,
                 right_speed_feedback_m_s,
             )
@@ -523,13 +559,23 @@ class MatchNBSequence(MatchSequence):
             telemetry_age_s = self._nb_motion_profile.max_telemetry_age_s * 2.0
         else:
             telemetry_age_s = (timestamp_ns - stationary_latest_ns) / 1e9
-        start_heading = self._nb_action_start_heading_rad or 0.0
         start_distance = self._nb_action_start_distance_m or 0.0
+        left_distance = (
+            self._nb_left_wheel_distance_m
+            if left_wheel_distance_m is None
+            else left_wheel_distance_m
+        )
+        right_distance = (
+            self._nb_right_wheel_distance_m
+            if right_wheel_distance_m is None
+            else right_wheel_distance_m
+        )
         gyro = 0.0 if latest is None or not math.isfinite(latest.gyro_z_rad_s) else latest.gyro_z_rad_s
         return WheelActionFeedback(
             timestamp_ns=timestamp_ns,
-            heading_rad=start_heading if heading_rad is None else heading_rad,
             distance_m=(start_distance if cumulative_distance_m is None else cumulative_distance_m),
+            left_wheel_distance_m=0.0 if left_distance is None else left_distance,
+            right_wheel_distance_m=0.0 if right_distance is None else right_distance,
             left_wheel_velocity_m_s=(0.0 if left_speed_feedback_m_s is None else left_speed_feedback_m_s),
             right_wheel_velocity_m_s=(0.0 if right_speed_feedback_m_s is None else right_speed_feedback_m_s),
             angular_velocity_rad_s=gyro,
@@ -604,6 +650,8 @@ class MatchNBSequence(MatchSequence):
         *,
         heading_rad: float | None,
         cumulative_distance_m: float | None,
+        left_wheel_distance_m: float | None,
+        right_wheel_distance_m: float | None,
         left_speed_feedback_m_s: float | None,
         right_speed_feedback_m_s: float | None,
     ) -> MatchDecision:
@@ -632,22 +680,10 @@ class MatchNBSequence(MatchSequence):
                     else "turn" if isinstance(action, NBOpeningTurn)
                     else "straight"
                 )
-                if timestamp_ns - self._nb_action_started_ns >= self._seconds_to_ns(
-                    self.config.nb_opening_turn_timeout_s
-                ):
-                    self.state = MatchState.TERMINAL_STOP
-                    return self._decision(
-                        timestamp_ns,
-                        0.0,
-                        0.0,
-                        f"nb_opening_{kind}_timeout_stop_waiting_feedback",
-                        posture=posture,
-                        gripper_angles_deg=angles,
-                    )
                 waiting_reason = self._nb_waiting_reason(
                     (
                         (
-                            "nb_opening_wheel_turn_waiting_heading_or_distance"
+                            "nb_opening_wheel_turn_waiting_odometry_or_distance"
                             if isinstance(action, NBOpeningWheelTurn)
                             else "nb_opening_turn_waiting_heading"
                             if isinstance(action, NBOpeningTurn)
@@ -657,6 +693,12 @@ class MatchNBSequence(MatchSequence):
                     timestamp_ns,
                     heading_rad=heading_rad,
                     cumulative_distance_m=cumulative_distance_m,
+                    wheel_odometry_available=(
+                        self._nb_left_wheel_distance_m is not None
+                        and self._nb_right_wheel_distance_m is not None
+                        if isinstance(action, NBOpeningWheelTurn)
+                        else None
+                    ),
                 )
                 return self._decision(
                     timestamp_ns,
@@ -673,8 +715,9 @@ class MatchNBSequence(MatchSequence):
             command = controller.update(
                 self._nb_wheel_feedback(
                     timestamp_ns,
-                    heading_rad=heading_rad,
                     cumulative_distance_m=cumulative_distance_m,
+                    left_wheel_distance_m=left_wheel_distance_m,
+                    right_wheel_distance_m=right_wheel_distance_m,
                     left_speed_feedback_m_s=left_speed_feedback_m_s,
                     right_speed_feedback_m_s=right_speed_feedback_m_s,
                 )
@@ -682,14 +725,13 @@ class MatchNBSequence(MatchSequence):
             self._nb_last_wheel_action_command = command
             action_number = self._nb_action_index + 1
             if command.timed_out:
-                self.state = MatchState.TERMINAL_STOP
                 return self._decision(
                     timestamp_ns,
                     0.0,
                     0.0,
-                    f"nb_opening_wheel_turn_{action_number}_timeout:{command.reason}:"
+                    f"nb_opening_wheel_turn_{action_number}_timeout_continue:{command.reason}:"
                     f"{self._nb_action_diagnostic_context(
-                        timestamp_ns, confirmation_progress='timeout'
+                        timestamp_ns, confirmation_progress='timeout_observed'
                     )}",
                     posture=posture,
                     gripper_angles_deg=angles,
@@ -803,6 +845,8 @@ class MatchNBSequence(MatchSequence):
                 timestamp_ns,
                 heading_rad=heading_rad,
                 cumulative_distance_m=cumulative_distance_m,
+                left_wheel_distance_m=left_wheel_distance_m,
+                right_wheel_distance_m=right_wheel_distance_m,
                 left_speed_feedback_m_s=left_speed_feedback_m_s,
                 right_speed_feedback_m_s=right_speed_feedback_m_s,
             )
@@ -820,14 +864,13 @@ class MatchNBSequence(MatchSequence):
         action_number = self._nb_action_index + 1
         kind = "turn" if isinstance(action, NBOpeningTurn) else "straight"
         if command.timed_out:
-            self.state = MatchState.TERMINAL_STOP
             return self._decision(
                 timestamp_ns,
                 0.0,
                 0.0,
-                f"nb_opening_{kind}_{action_number}_timeout:{command.reason}:"
+                f"nb_opening_{kind}_{action_number}_timeout_continue:{command.reason}:"
                 f"{self._nb_action_diagnostic_context(
-                    timestamp_ns, confirmation_progress='timeout'
+                    timestamp_ns, confirmation_progress='timeout_observed'
                 )}",
                 posture=posture,
                 gripper_angles_deg=angles,
@@ -878,8 +921,12 @@ class MatchNBSequence(MatchSequence):
                     timestamp_ns, heading_rad=heading_rad,
                     cumulative_distance_m=cumulative_distance_m,
                 ):
-                    self.state = MatchState.TERMINAL_STOP
-                    return self._decision(timestamp_ns, 0.0, 0.0, "nb_pivot_handoff_missing_distance")
+                    return self._decision(
+                        timestamp_ns,
+                        0.0,
+                        0.0,
+                        "nb_pivot_handoff_waiting_distance",
+                    )
                 return replace(
                     advanced, linear_velocity_m_s=command.linear_velocity_m_s,
                     angular_velocity_rad_s=0.0, min_wheel_velocity_m_s=0.0,

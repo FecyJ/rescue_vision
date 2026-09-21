@@ -110,7 +110,8 @@ d1→d2、d2→末段三段；d1→d2 严格使用 `safe_zone_d1_to_d2_speed_m_s
 确认所需的连续有效帧数；停稳后仍选不出任何合法接触计划时，`breakup_no_plan_reobserve_ms`
 只给一个有界的重观测窗口就退出本次区域，不占满按确认帧数计的确认预算。
 `breakup_forward_distance_m` 和 `breakup_backward_distance_m` 是完整动作行程，
-正式配置及默认值分别为 0.5 m、0.3 m，全程闭爪；整段路径不安全时拒绝该方案，不缩短动作。
+`first_breakup_backward_distance_m` 可单独覆盖首次正式解团的后退行程；当前正式配置为首次
+前进 0.4 m、后退 0.2 m，后续重试后退 0.1 m，全程闭爪。整段路径不安全时拒绝该方案，不缩短动作。
 旧 `breakup_penetration_mm` / `breakup_retry_penetration_mm` 已删除，外部 YAML 必须同步删除旧键。
 `breakup_max_attempts` 是同一物理接触团允许的推进尝试次数，取值范围 `[1, 4]`；
 同一接触射线重试需要几何改变并能产生更深接触，不能只靠重编号或重启会话。
@@ -195,6 +196,8 @@ bbox IoU 上限；
 当前实拍收紧为 `[(0.47,0.85),(0.53,0.85),(0.57,0.97),(0.43,0.97)]`，排除夹爪尖端前方
 及两侧夹臂外的色块；相机/安装改变后须在预览中重新核对。`min_component_fraction=0.03`
 为最大连通色块占ROI比例；
+`line_forward_offset_mm=100.0` 暂把水平检测线从 ROI 外接矩形最远边向机器人前方偏移
+100 mm；该偏移通过 `GroundProjector` 换算，缺少地面映射的标定工具仍显示未偏移的临时线。
 `black_min_thickness_fraction=0.12` 为黑色去细线核直径与ROI包围框短边的比例；ROI收紧后
 同步增大该比例，以保持去细线核在实拍图上的像素尺度，仍随分辨率缩放。
 `shadow_min_value=30` 是夹爪内彩色暗面的OpenCV HSV亮度下限（整数1～255）；H/S继续来自

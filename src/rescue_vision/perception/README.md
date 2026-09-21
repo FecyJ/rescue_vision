@@ -149,13 +149,20 @@ Hailo P50/P95 观测年龄及远场精度目前均未验证。
 
 ## 夹爪内颜色观测
 
-`gripper_color.py` 的 `observe_gripper_colors()` 只读取配置内侧ROI，返回
+`gripper_color.py` 的 `observe_gripper_colors()` 读取配置内侧 ROI，并在其外接矩形最远边
+附近增加一条临时判定带，返回
 `GripperColorObservation`；帧号、采集/发布时间继承所属 `PoseDetectionResult`、
 `RealtimeDetectionResult` 和 `PerceptionSnapshot`。禁用或过期结果不提供颜色证据。
 检测后处理计时包括此步骤，结果仍先于渲染发布，不在控制循环转换图像。
-夹爪颜色证据只供任务层门禁和日志诊断消费，不绘制到本地或远程预览；这样误夹处理
-不会让观察旁路持有或重复显示某一张历史帧。
+夹爪颜色证据只供任务层门禁和日志诊断消费，颜色掩码本身不绘制到本地或远程预览；ROI
+外接矩形最远边向机器人前方暂偏移 100 mm 的临时水平线会持续绘制到预览，便于现场确定位置。这不会让观察旁路持有
+或重复显示某一张历史帧。
 `bounding_box_overlaps_gripper_polygon()` 默认要求正面积重叠；任务层对蓝色模型框传入
 `include_boundary=True`，将框与凸 ROI 的边缘或角点接触也计入误夹证据。
+ROI 外接矩形的上边向机器人前方暂偏移 100 mm 作为夹爪检测水平线；在该线两侧各取同深度
+图像带，绿色或橙色掩码必须属于同一个 8 邻域连通域并跨过水平线，才写入
+`line_crossing_classes`。该证据供 match 的张爪—前进 30 mm—合爪重夹恢复使用，
+不改变模型类别；若线侧类别不符合当前趟次规则，则供张爪—后退 10 mm—合爪的短恢复使用；
+该水平线会持续绘制到预览，颜色证据本身不绘制。
 纯函数不持有设备资源，生产装配由 `AppConfig.build_target_detector()` 与现有上下文关闭后端。
 模型类别不由门禁改写；误夹恢复归任务层。阈值和现场调节以 [config README](../config/README.md#夹爪内颜色门禁配置) 为准。

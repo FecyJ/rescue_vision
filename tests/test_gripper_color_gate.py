@@ -9,6 +9,7 @@ import pytest
 
 from rescue_vision.app.match import MatchState, GripperPosture
 from rescue_vision.config import load_runtime_config
+from rescue_vision.geometry.ground_projector import GroundProjector
 from rescue_vision.geometry.types import FieldPoint, GroundPoint, UndistortedPixel
 from rescue_vision.perception import (
     FakeInferenceBackend,
@@ -86,6 +87,47 @@ def test_independent_roi_detects_conflicting_patch_without_model_detection():
     assert result.observations == ()
     assert result.gripper_color.present_classes == {G, B}
     assert dict(result.gripper_color.component_fractions)[B] >= 0.03
+    assert G in result.gripper_color.line_crossing_classes
+    assert B not in result.gripper_color.line_crossing_classes
+
+
+@pytest.mark.parametrize(("hue", "target_class"), [(60, G), (10, O)])
+def test_far_roi_edge_line_requires_one_connected_color_component_on_both_sides(
+    hue, target_class,
+):
+    hsv = np.full((400, 600, 3), (0, 0, 220), np.uint8)
+    hsv[350:380, 285:315] = (hue, 230, 200)
+    image = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    inside_only = observe_gripper_colors(image, GripperColorConfig(), color_config())
+    assert inside_only is not None
+    assert inside_only.line_crossing_classes == frozenset()
+
+    hsv[320:350, 285:315] = (hue, 230, 200)
+    image = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    crossing = observe_gripper_colors(image, GripperColorConfig(), color_config())
+    assert crossing is not None
+    assert crossing.line_crossing_classes == frozenset({target_class})
+    assert crossing.horizontal_line_v == pytest.approx(339.0)
+
+
+def test_far_roi_edge_line_moves_forward_100mm_with_ground_mapping():
+    image = np.full((400, 600, 3), 220, np.uint8)
+    projector = GroundProjector(
+        np.asarray(
+            [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+    )
+
+    observation = observe_gripper_colors(
+        image,
+        GripperColorConfig(line_forward_offset_mm=100.0),
+        color_config(),
+        ground_projector=projector,
+    )
+
+    assert observation is not None
+    assert observation.horizontal_line_v == pytest.approx(439.0)
 
 
 @pytest.mark.parametrize('override', [
@@ -121,6 +163,149 @@ def test_gate_uses_current_trip_legality_without_reclassifying_targets(transport
     seq._latest_perception = color_snapshot(1, 100, 200, seen)
     assert bool(seq._gripper_color_conflict(200)) is conflict
     assert seq._transport_target_classes == cargo
+
+
+def test_line_crossing_starts_open_forward_close_regrasp():
+    seq = _sequence(transports=1)
+    seq._started = True
+    seq._transport_target_classes = (G,)
+    seq._cargo_capture_floor_ns = 100
+    seq.state = MatchState.TRANSPORT_GREEDY_SCAN
+    latest = color_snapshot(1, 100, 200, {G})
+    latest = replace(
+        latest,
+        gripper_color=replace(
+            latest.gripper_color,
+            line_crossing_classes=frozenset({G}),
+            horizontal_line_v=339.0,
+        ),
+    )
+
+    decision = seq.step(
+        200,
+        perception=latest,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+    )
+    assert decision.state is MatchState.REGRASP_OPEN
+    assert decision.gripper_posture is GripperPosture.OPEN
+    assert decision.reason == "regrasp_open:gripper_line_crossing:green_supply"
+
+    for timestamp_ns in (200_000_000, 250_000_000, 300_000_000):
+        seq.observe_grasp_motion(motion_sample(timestamp_ns))
+    decision = seq.step(
+        300_000_000,
+        perception=None,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+    )
+    assert decision.state is MatchState.REGRASP_FORWARD
+    assert decision.gripper_posture is GripperPosture.OPEN
+
+    decision = seq.step(
+        310_000_000,
+        perception=None,
+        heading_rad=0.0,
+        cumulative_distance_m=0.015,
+    )
+    assert decision.state is MatchState.REGRASP_FORWARD
+    assert decision.linear_velocity_m_s > 0.0
+
+    decision = seq.step(
+        320_000_000,
+        perception=None,
+        heading_rad=0.0,
+        cumulative_distance_m=0.030,
+    )
+    assert decision.state is MatchState.REGRASP_CLOSE
+    assert decision.gripper_posture is GripperPosture.OPEN
+
+    for timestamp_ns in (400_000_000, 450_000_000, 520_000_000, 620_000_000, 700_000_000):
+        seq.observe_grasp_motion(motion_sample(timestamp_ns))
+    assert seq.step(
+        520_000_000,
+        perception=None,
+        heading_rad=0.0,
+        cumulative_distance_m=0.030,
+    ).state is MatchState.REGRASP_CLOSE
+    decision = seq.step(
+        700_000_000,
+        perception=None,
+        heading_rad=0.0,
+        cumulative_distance_m=0.030,
+    )
+    assert decision.state is MatchState.REGRASP_CLOSE
+    seq.observe_grasp_motion(motion_sample(800_000_000))
+    decision = seq.step(
+        800_000_000,
+        perception=None,
+        heading_rad=0.0,
+        cumulative_distance_m=0.030,
+    )
+    assert decision.state is MatchState.TRANSPORT_GREEDY_SCAN
+    assert decision.gripper_posture is GripperPosture.CLOSED
+    assert seq._cargo_capture_floor_ns == 800_000_000
+
+
+@pytest.mark.parametrize(
+    ("transports", "cargo", "target_class"),
+    [(0, (G,), G), (1, (O,), O)],
+)
+def test_illegal_line_target_opens_moves_back_10mm_and_closes(
+    transports, cargo, target_class,
+):
+    seq = _sequence(transports=transports)
+    seq._started = True
+    seq._transport_target_classes = cargo
+    seq._cargo_capture_floor_ns = 100
+    seq.state = MatchState.TRANSPORT_GREEDY_SCAN
+    latest = color_snapshot(1, 100, 200, {target_class})
+    latest = replace(
+        latest,
+        gripper_color=replace(
+            latest.gripper_color,
+            line_crossing_classes=frozenset({target_class}),
+        ),
+    )
+
+    decision = seq.step(
+        200,
+        perception=latest,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+    )
+    assert decision.state is MatchState.REGRASP_OPEN
+    assert decision.gripper_posture is GripperPosture.OPEN
+    assert "requires_backup" in decision.reason
+
+    for timestamp_ns in (200_000_000, 250_000_000, 300_000_000):
+        seq.observe_grasp_motion(motion_sample(timestamp_ns))
+    decision = seq.step(
+        300_000_000,
+        perception=None,
+        heading_rad=0.0,
+        cumulative_distance_m=0.0,
+    )
+    assert decision.state is MatchState.REGRASP_BACKWARD
+    assert decision.gripper_posture is GripperPosture.OPEN
+
+    decision = seq.step(
+        310_000_000,
+        perception=None,
+        heading_rad=0.0,
+        cumulative_distance_m=-0.005,
+    )
+    assert decision.state is MatchState.REGRASP_BACKWARD
+    assert decision.linear_velocity_m_s < 0.0
+
+    decision = seq.step(
+        320_000_000,
+        perception=None,
+        heading_rad=0.0,
+        cumulative_distance_m=-0.010,
+    )
+    assert decision.state is MatchState.REGRASP_CLOSE
+    assert decision.gripper_posture is GripperPosture.OPEN
 
 
 def test_old_preclose_future_and_stale_colors_do_not_release_current_cargo():
@@ -466,6 +651,7 @@ def test_runtime_config_builds_enabled_gripper_color_observation():
     assert config.perception.gripper_color.polygon_normalized == (
         (0.47, 0.85), (0.53, 0.85), (0.57, 0.97), (0.43, 0.97),
     )
+    assert config.perception.gripper_color.line_forward_offset_mm == 100.0
     assert config.perception.gripper_color.min_component_fraction == 0.03
     assert config.perception.gripper_color.black_min_thickness_fraction == 0.12
     assert config.perception.gripper_color.orange_bbox_min_color_fraction == 0.15
@@ -567,7 +753,6 @@ def test_dark_colored_faces_are_not_misreported_as_black(hue, color):
 
 def test_first_green_with_dark_face_does_not_release_but_actual_black_beside_it_does():
     hsv = np.full((400, 600, 3), (0, 0, 220), np.uint8)
-    hsv[325:345, 280:318] = (60, 230, 190)
     hsv[345:378, 280:318] = (60, 230, 45)
     image = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
     seq = _sequence(transports=0)
