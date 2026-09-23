@@ -184,12 +184,17 @@ def _draw_gripper_far_edge(
     if not np.isfinite(line_v):
         return
 
-    contour = np.rint(
-        [(point.u, point.v) for point in gripper_color.polygon]
-    ).astype(np.int32)
-    x, _, width, _ = cv2.boundingRect(contour)
-    x_min = max(0, x)
-    x_max = min(image_bgr.shape[1] - 1, x + width - 1)
+    if gripper_color.horizontal_line_u_range is None:
+        contour = np.rint(
+            [(point.u, point.v) for point in gripper_color.polygon]
+        ).astype(np.int32)
+        x, _, width, _ = cv2.boundingRect(contour)
+        x_min = max(0, x)
+        x_max = min(image_bgr.shape[1] - 1, x + width - 1)
+    else:
+        line_u_min, line_u_max = gripper_color.horizontal_line_u_range
+        x_min = max(0, round(line_u_min))
+        x_max = min(image_bgr.shape[1] - 1, round(line_u_max))
     y = max(0, min(image_bgr.shape[0] - 1, round(line_v)))
     if x_max <= x_min:
         return

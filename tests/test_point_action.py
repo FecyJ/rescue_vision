@@ -116,3 +116,20 @@ def test_full_route_prediction_is_bounded_and_reaches_target():
     route = action.predicted_path(pose)
     assert 2 < len(route) <= 321
     assert math.hypot(route[-1].position.x-1200, route[-1].position.y-300) <= 20
+
+
+def test_wheel_limit_clamps_roundoff_at_body_angular_limit():
+    action = PointActionController(
+        RelativeActionProfile(action_timeout_s=15),
+        wheel_track_m=0.235,
+        max_wheel_speed_m_s=1.5,
+        max_angular_velocity_rad_s=3.0,
+    )
+
+    linear, angular = action._limit_wheels(
+        -0.03,
+        math.nextafter(3.0, math.inf),
+    )
+
+    assert linear == -0.03
+    assert angular == 3.0

@@ -79,6 +79,9 @@ if visual is not None and snapshot is not None and snapshot.field_features is no
   观测距离必须与 `world.static_map.safe_zone_landmarks` 中的实测距离相差不超过
   `localization.safe_zone_corners.max_k0_corner_distance_error_mm`，否则不提交
   安全区位置纠偏。两点通过时用两点刚体变换，三点通过时用三点残差复核。
+- 先验不只用于候选排序；最优解相对里程计先验跳变超过
+  `max_prior_position_innovation_mm` 或 `max_prior_heading_innovation_deg` 时以
+  `prior_innovation_too_large` 拒绝，不能因点对内部残差小就覆盖当前场地位姿。
 - 安全区颜色未知时枚举 red/blue；对每种身份再枚举 K1/K2 两种世界对应。
   无先验时对称解保持歧义，不提交纠偏。
 - 同帧同时得到十字和安全区全位姿时只提交一项，避免相关证据重复压缩方差。

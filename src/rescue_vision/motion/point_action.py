@@ -92,6 +92,14 @@ class PointActionController(RelativeActionController):
         return self._limit_wheels(-speed if self._point_reverse else speed, speed * curvature)
 
     def _limit_wheels(self, linear: float, angular: float) -> tuple[float, float]:
+        # ``speed = maximum / curvature`` followed by ``speed * curvature``
+        # can round one ULP above the configured body-rate limit.  Keep this
+        # controller's advertised bound exact so MotionController does not
+        # reject a mathematically on-limit command as an unsafe request.
+        angular = max(
+            -self.max_angular_velocity_rad_s,
+            min(self.max_angular_velocity_rad_s, angular),
+        )
         peak = max(abs((linear - angular * self.wheel_track_m / 2) * self.left_wheel_weight),
                    abs((linear + angular * self.wheel_track_m / 2) * self.right_wheel_weight))
         scale = min(1.0, self.max_wheel_speed_m_s / max(peak, 1e-9))

@@ -685,15 +685,21 @@ class MotionController:
         *,
         min_wheel_velocity_m_s: float | None = None,
     ) -> tuple[float, float]:
-        """按比例缩放合法 twist，使差速合成不超过单轮硬上限。
+        """钳制并按比例缩放 twist，使车体和单轮都不超过硬上限。
 
         返回实际采用的 ``(linear_velocity_m_s, angular_velocity_rad_s)``。
-        线速度或角速度自身超限时仍拒绝，不以缩放掩盖非法请求。
+        有限的车体速度超限时按原方向使用对应最高允许值；非有限值仍拒绝。
         """
 
-        linear, angular = self._validate_twist(
-            linear_velocity_m_s,
-            angular_velocity_rad_s,
+        linear = _finite(linear_velocity_m_s, "linear_velocity_m_s")
+        angular = _finite(angular_velocity_rad_s, "angular_velocity_rad_s")
+        linear = math.copysign(
+            min(abs(linear), self.limits.max_linear_velocity_m_s),
+            linear,
+        )
+        angular = math.copysign(
+            min(abs(angular), self.limits.max_angular_velocity_rad_s),
+            angular,
         )
         left, right = self._twist_to_wheel_speeds(linear, angular)
         peak_wheel_speed = max(abs(left), abs(right))

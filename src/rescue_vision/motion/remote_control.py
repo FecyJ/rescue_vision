@@ -539,8 +539,8 @@ class RemoteMotionExecutor:
                 applied_linear = 0.0
                 applied_angular = 0.0
             else:
-                # 手柄两个轴分别合法时，差速合成仍可能让外侧轮超限。
-                # 同比缩放保留曲率，底层单轮硬上限仍由 controller 校验。
+                # 有限的轴请求超限时由 controller 钳到同方向最高允许值；
+                # 差速合成仍超单轮上限时再同比缩放，不能因限速而停车退出。
                 applied_linear, applied_angular = (
                     self.controller.drive_wheel_limited(
                         command.linear_velocity_m_s,

@@ -9,8 +9,10 @@
 调用方逐条传入真实 `OdometryImu`；主机接收时刻与图像采集时刻同属单调时钟 ns，
 设备采样时刻只用于验证样本递增和连续性。`stationary_since(now_ns)` 查询仍新鲜的
 静止区间起点，`capture_valid(capture_ns, now_ns, max_age_ns=...)` 验证图像在该区间采集。
-同一静止区间跨应用会话保留；真实轮计数变化、旋转、无效传感器、重复/倒退设备样本
-或遥测间断会使它失效。状态机不能用当前轮询时刻冒充停车时刻；对象不打开设备或线程。
+同一静止区间跨应用会话保留；数据无效、重复/倒退设备样本或遥测间断会立即使它失效。
+角速度退出阈值和编码器变化采用迟滞与持续时间确认：单次量化抖动只暂时关闭采集门，
+持续运动才清除原始静止起点，避免一次微动把已经停稳的场景强制变成“再次停车”。
+状态机不能用当前轮询时刻冒充停车时刻；对象不打开设备或线程。
 
 `relative_action.RelativeActionController` 为 `match_nb` 提供相对定角度/定距离闭环。
 它使用编码器行程、IMU 航向/角速度和连续静止证据，按实际遥测年龄、轮速命令刷新周期
@@ -19,6 +21,8 @@
 `MotionController` 的线/角加减速度限制下发。越过目标后的低速反向修正，以及位置达标后的
 航向微调，都不中途插入停稳门禁，也不因局部修正幅度或时间单独终止比赛；轮速换向仍经过
 底层减速到零和反向加速。
+`exclude_pause(duration_ns)` 仅排除上层有界机械等待对动作超时的消耗，不改编码器/航向原点；
+因此等待期间的实测底盘位移仍计入原相对动作进度。只能在已 `begin()` 的动作上调用。
 
 `wheel_action.WheelTurnAndAdvanceController` 是 `match_nb` 可选的轮级动作：在首段直行
 达到里程目标时不把右轮归零，右轮保持配置速度，左轮按固定加减速度切换到保持速度；
@@ -50,7 +54,7 @@
 | `RelativeActionController` | 相对距离/角度目标、编码器/IMU反馈、遥测年龄和停稳证据 | 生成高速—制动—低速收尾的车体 twist；不直接访问硬件 |
 | `WheelTurnAndAdvanceController` | 左右轮速度、左右轮累计编码器里程、中心累计距离和停稳证据 | 右轮恒速、左轮斜坡、按编码器差定角度后双轮定距刹停；不直接访问硬件 |
 | `MotionController.drive()` | 前进速度 m/s、逆时针角速度 rad/s | 差速换算后设置左右轮目标 |
-| `drive_wheel_limited()` | 分别合法的车体线速度和角速度，可选单次 `min_wheel_velocity_m_s` | 必要时同比缩放并返回实际 twist，使单轮不超限；单次下限缺省使用 `MotionLimits` 全局值 |
+| `drive_wheel_limited()` | 有限的车体线速度和角速度，可选单次 `min_wheel_velocity_m_s` | 车体分量超限时钳到同方向最高允许值，再按需同比缩放并返回实际 twist，使单轮不超限；单次下限缺省使用 `MotionLimits` 全局值 |
 | `set_wheel_speeds()` | 左右轮速度 m/s，可选单次 `min_wheel_velocity_m_s` | 绕过车体 twist 换算；非零目标会提升到单次下限或全局 `min_wheel_velocity_m_s`，仍执行轮速限幅校验 |
 | `set_acceleration_limits()` | 四项可选车体线/角加减速度上限 | 每个 `None` 恢复 `motion` 中对应全局值；只影响后续速度斜坡 |
 | `set_wheel_acceleration_limits()` | 四项可选左右轮加减速度上限 | 独立推进左右轮目标；`None` 恢复车体斜坡 |
@@ -117,9 +121,10 @@ right = (linear + angular × wheel_track / 2) × right_wheel_speed_weight
 这两个权重在 `drive()` 与 `drive_wheel_limited()` 中统一生效，`drive_wheel_limited()`
 的单轮超限缩放也基于加权后的轮速计算。
 
-底层 `drive()` 的超限命令会被拒绝，不会静默截断。手动遥控执行器使用
-`drive_wheel_limited()`：当线速度和角速度分别合法、但二者合成使外侧轮超限
-时，会同比缩放两个分量以保持曲率，并在执行结果和运动日志中记录实际 twist。
+底层 `drive()` 的超限命令会被拒绝，不会静默截断。正式流程和手动遥控执行器使用
+`drive_wheel_limited()`：有限的线速度或角速度请求超限时，先按原方向钳到对应车体
+最高允许值而不中止控制链；若两个分量合成后仍使外侧轮超限，再同比缩放以保持
+曲率，并在执行结果和运动日志中记录实际 twist。`NaN` 和无穷值仍作为损坏输入拒绝。
 每个非零轮速目标都会先按单次指定的 `min_wheel_velocity_m_s` 抬升；未指定时使用
 `MotionLimits.min_wheel_velocity_m_s`，精确的零目标仍保持为零。单次参数允许显式传入
 `0` 以取消该次非零轮速抬升；上层精细闭环可以通过单次参数使用独立下限，但普通运动仍使用全局值。这个最低值是减速

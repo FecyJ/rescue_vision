@@ -542,6 +542,7 @@ def test_perception_visualization_always_draws_gripper_far_edge() -> None:
         component_fractions=(),
         present_classes=frozenset(),
         horizontal_line_v=5.0,
+        horizontal_line_u_range=(6.0, 9.0),
     )
 
     preview = render_target_observations(
@@ -550,7 +551,9 @@ def test_perception_visualization_always_draws_gripper_far_edge() -> None:
         gripper_color=gripper_color,
     )
 
-    assert np.any(np.all(preview[5, 4:11] == (255, 0, 255), axis=1))
+    assert np.all(np.all(preview[5, 6:10] == (255, 0, 255), axis=1))
+    assert not np.all(preview[5, 4] == (255, 0, 255))
+    assert not np.all(preview[5, 11] == (255, 0, 255))
 
 
 def test_perception_frame_renderer_keeps_latest_result_off_realtime_thread() -> None:

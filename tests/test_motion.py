@@ -1002,15 +1002,28 @@ def test_wheel_limited_drive_preserves_curvature_at_joystick_diagonal(
     assert channel.sent == []
 
 
-def test_wheel_limited_drive_still_rejects_body_velocity_limit() -> None:
+@pytest.mark.parametrize(
+    ("linear", "angular", "expected_linear", "expected_angular"),
+    [
+        (0.31, 0.0, 0.30, 0.0),
+        (-0.31, 0.0, -0.30, 0.0),
+        (0.0, 2.1, 0.0, 2.0),
+        (0.0, -2.1, 0.0, -2.0),
+    ],
+)
+def test_wheel_limited_drive_clamps_body_velocity_to_highest_allowed(
+    linear: float,
+    angular: float,
+    expected_linear: float,
+    expected_angular: float,
+) -> None:
     channel = FakeCarChannel()
     controller = MotionController(channel, limits())
 
-    with pytest.raises(ValueError, match="linear_velocity"):
-        controller.drive_wheel_limited(0.31, 0.0)
-    with pytest.raises(ValueError, match="angular_velocity"):
-        controller.drive_wheel_limited(0.0, 2.1)
+    applied = controller.drive_wheel_limited(linear, angular)
 
+    assert applied == pytest.approx((expected_linear, expected_angular))
+    assert max(map(abs, controller.target_wheel_speeds_m_s)) <= 0.30
     assert channel.sent == []
 
 
@@ -1365,7 +1378,7 @@ def test_remote_deadman_off_and_already_expired_commands_stop() -> None:
     ]
 
 
-def test_invalid_remote_commands_stop_before_reporting_error() -> None:
+def test_invalid_remote_commands_stop_but_speed_limit_is_clamped_and_applied() -> None:
     channel = FakeCarChannel()
     executor = RemoteMotionExecutor(MotionController(channel, limits()))
     target_heading = DebugMotionCommand(
@@ -1385,11 +1398,17 @@ def test_invalid_remote_commands_stop_before_reporting_error() -> None:
             remote_message(target_heading),
             now_ns=1_050_000_000,
         )
-    with pytest.raises(RemoteMotionError, match="Invalid"):
-        executor.execute(
-            remote_message(twist_command(linear_velocity_m_s=0.31)),
-            now_ns=1_050_000_000,
-        )
+    limited = executor.execute(
+        remote_message(twist_command(
+            linear_velocity_m_s=0.31,
+            angular_velocity_rad_s=0.0,
+        )),
+        now_ns=1_050_000_000,
+    )
+    assert limited.result is RemoteMotionResult.APPLIED
+    assert limited.linear_velocity_m_s == pytest.approx(0.30)
+    assert limited.angular_velocity_rad_s == 0.0
+    assert executor.active_deadline_ns == 1_200_000_000
     with pytest.raises(RemoteMotionError, match="topic"):
         executor.execute(
             remote_message(twist_command(), topic="control/debug/capture"),
@@ -1399,7 +1418,6 @@ def test_invalid_remote_commands_stop_before_reporting_error() -> None:
     assert channel.sent == [
         encode_soft_brake_command(0),
         encode_soft_brake_command(1),
-        encode_soft_brake_command(2),
     ]
 
 

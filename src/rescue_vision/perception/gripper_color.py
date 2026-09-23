@@ -27,6 +27,13 @@ class GripperColorConfig:
     )
     # 暂定把判定线放在 ROI 最远边前方 100 mm；真实位置需现场校准。
     line_forward_offset_mm: float = 100.0
+    # 水平判定线占 ROI 外接矩形宽度的比例；以图像中心对称收缩。
+    line_width_fraction: float = 0.5
+    # 同一组跨线类别按采集时间持续达到该时长后，任务层才允许触发重夹。
+    line_contact_hold_ms: float = 800.0
+    # 重夹结束后屏蔽同一跨线证据的时间，单位 ms；
+    # 机械动作和延迟帧不得连续启动重夹，因此最少为 1000 ms。
+    line_regrasp_cooldown_ms: float = 1000.0
     min_component_fraction: float = 0.03
     black_min_thickness_fraction: float = 0.12
     shadow_min_value: int = 30
@@ -50,6 +57,36 @@ class GripperColorConfig:
             raise ValueError(
                 "gripper_color.line_forward_offset_mm must be finite and non-negative, "
                 f"got {self.line_forward_offset_mm!r}"
+            )
+        if (
+            isinstance(self.line_contact_hold_ms, bool)
+            or not isinstance(self.line_contact_hold_ms, (int, float))
+            or not math.isfinite(self.line_contact_hold_ms)
+            or self.line_contact_hold_ms < 0.0
+        ):
+            raise ValueError(
+                "gripper_color.line_contact_hold_ms must be finite and "
+                f"non-negative, got {self.line_contact_hold_ms!r}"
+            )
+        if (
+            isinstance(self.line_width_fraction, bool)
+            or not isinstance(self.line_width_fraction, (int, float))
+            or not math.isfinite(self.line_width_fraction)
+            or not 0.0 < self.line_width_fraction <= 1.0
+        ):
+            raise ValueError(
+                "gripper_color.line_width_fraction must be finite in (0,1], "
+                f"got {self.line_width_fraction!r}"
+            )
+        if (
+            isinstance(self.line_regrasp_cooldown_ms, bool)
+            or not isinstance(self.line_regrasp_cooldown_ms, (int, float))
+            or not math.isfinite(self.line_regrasp_cooldown_ms)
+            or self.line_regrasp_cooldown_ms < 1000.0
+        ):
+            raise ValueError(
+                "gripper_color.line_regrasp_cooldown_ms must be finite and "
+                f"at least 1000 ms, got {self.line_regrasp_cooldown_ms!r}"
             )
         points = self.polygon_normalized
         if len(points) < 3 or any(
@@ -129,6 +166,7 @@ class GripperColorObservation:
     # A class is present here only when one connected color component has
     # pixels on both sides of that line.
     horizontal_line_v: float | None = None
+    horizontal_line_u_range: tuple[float, float] | None = None
     line_crossing_classes: frozenset[TargetClass] = frozenset()
 
 
@@ -285,7 +323,13 @@ def observe_gripper_colors(
     line_center = round(line_v)
     line_band_y_min = max(0, line_center - h)
     line_band_y_max = min(height, line_center + h + 1)
-    line_band = image_bgr[line_band_y_min:line_band_y_max, x:x + w]
+    line_width = max(1, min(w, round(w * config.line_width_fraction)))
+    line_x_min = x + (w - line_width) // 2
+    line_x_max = line_x_min + line_width
+    line_band = image_bgr[
+        line_band_y_min:line_band_y_max,
+        line_x_min:line_x_max,
+    ]
     line_hsv = cv2.cvtColor(line_band, cv2.COLOR_BGR2HSV)
     line_crossing_classes: set[TargetClass] = set()
     for target_class in (TargetClass.GREEN_SUPPLY, TargetClass.ORANGE_INJURED):
@@ -305,7 +349,7 @@ def observe_gripper_colors(
             component_bottom = component_top + int(stats[label, cv2.CC_STAT_HEIGHT]) - 1
             if (
                 component_area >= area * config.min_component_fraction
-                and component_top < y < component_bottom
+                and component_top < line_v < component_bottom
             ):
                 line_crossing_classes.add(target_class)
                 break
@@ -318,5 +362,6 @@ def observe_gripper_colors(
         black_chromatic_fraction=black_chromatic_fraction,
         components=tuple(components),
         horizontal_line_v=line_v,
+        horizontal_line_u_range=(float(line_x_min), float(line_x_max - 1)),
         line_crossing_classes=frozenset(line_crossing_classes),
     )
