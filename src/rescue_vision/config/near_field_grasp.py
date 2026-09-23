@@ -26,8 +26,9 @@ class NearFieldGraspConfig:
     # 单个橙色目标前进结束时，最前 K0 底面中心希望保留在机器人前方的距离。
     # 颜色上表面投影的纵向拉长不作为前进深度。
     orange_target_final_x_mm: float = 112.0
-    # 含黑色物资时，合爪及带载保持的左右绝对舵机命令各增加此值。
-    black_closed_servo_offset_deg: float = 5.0
+    # 含黑色物资时，按目标宽度张爪并前进夹取的左右绝对舵机命令各增加此值。
+    # 到达后的合爪和带载保持仍使用 motion.gripper 的闭爪标定。
+    black_grasp_servo_offset_deg: float = 5.0
     # 夹爪前端参考线；危险目标 K0 只有落入从此处开始的扫掠矩形才阻挡动作。
     corridor_start_x_mm: float = 60.0
     corridor_lateral_margin_mm: float = 10.0
@@ -52,14 +53,23 @@ class NearFieldGraspConfig:
     # 无静止证据的几何、准备发布和静止遥测的年龄上限，单位 ms。
     # 停车后采集且持续静止的当前计划使用 processing 的观测失联上限。
     grasp_commit_max_observation_age_ms: float = 150.0
+    # 进入静止使用较窄阈值，退出静止使用较宽阈值，避免编码器/IMU量化抖动清空证据。
     stationary_max_gyro_rad_s: float = 0.03
+    stationary_exit_gyro_rad_s: float = 0.06
+    # 超过退出阈值的运动必须连续达到该时长才使静止证据失效，单位 ms。
+    stationary_motion_confirm_ms: float = 80.0
+    # 编码器相对静止基线允许的量化抖动，单位 count。
+    stationary_encoder_tolerance_counts: int = 0
+    # 静止遥测最大间断，独立于抓取图像/准备结果年龄，单位 ms。
+    stationary_max_telemetry_gap_ms: float = 250.0
     # 停稳后当前帧复核数量；正式配置使用 1，不做额外多帧中心确认。
     confirmation_frames: int = 3
     # 进入最终精对准区的角度半径，单位 rad。
     fine_alignment_zone_rad: float = 0.08
     # 最终精对准区内的单轮最小速度，允许为 0，单位 m/s。
     fine_alignment_min_wheel_velocity_m_s: float = 0.0
-    # 橙色伤员周围拒绝其它目标的地面半径，单位 mm。
+    # 正式近场黑/绿/橙候选周围拒绝其它目标的统一 K0 半径，单位 mm。
+    # 保留字段名以维持当前配置 schema。
     orange_isolation_radius_mm: float = 10.0
     min_mask_pixels: int = 1
     # 可抓目标轨迹出现一次未知/普通质量异常后，需要连续多少个干净观测才恢复可选。
@@ -83,9 +93,11 @@ class NearFieldGraspConfig:
             "max_candidates",
             "min_mask_pixels",
             "confirmation_frames",
+            "stationary_encoder_tolerance_counts",
         }
+        nonnegative_integers = {"stationary_encoder_tolerance_counts"}
         nonnegative = {
-            "black_closed_servo_offset_deg",
+            "black_grasp_servo_offset_deg",
             "corridor_lateral_margin_mm",
             "clearance_mm",
             "range_hysteresis_mm",
@@ -97,8 +109,13 @@ class NearFieldGraspConfig:
         for field in fields(self):
             value = getattr(self, field.name)
             if field.name in integer_names:
-                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                    raise ValueError(f"near_field_grasp.{field.name} must be a positive integer, got {value!r}.")
+                minimum = 0 if field.name in nonnegative_integers else 1
+                if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                    qualifier = "non-negative" if minimum == 0 else "positive"
+                    raise ValueError(
+                        f"near_field_grasp.{field.name} must be a {qualifier} integer, "
+                        f"got {value!r}."
+                    )
             else:
                 if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value):
                     raise ValueError(f"near_field_grasp.{field.name} must be finite, got {value!r}.")
@@ -108,6 +125,11 @@ class NearFieldGraspConfig:
             raise ValueError(f"near_field_grasp.max_targets must be <= 3, got {self.max_targets}.")
         if self.max_candidates < self.max_targets or self.max_candidates > 20:
             raise ValueError(f"near_field_grasp.max_candidates must be in [max_targets,20], got {self.max_candidates}.")
+        if self.stationary_exit_gyro_rad_s < self.stationary_max_gyro_rad_s:
+            raise ValueError(
+                "near_field_grasp.stationary_exit_gyro_rad_s must be >= "
+                "stationary_max_gyro_rad_s."
+            )
         if self.stopped_scene_new_target_max_bbox_iou > 1.0:
             raise ValueError(
                 "near_field_grasp.stopped_scene_new_target_max_bbox_iou must "

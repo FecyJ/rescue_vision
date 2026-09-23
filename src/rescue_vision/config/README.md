@@ -54,10 +54,19 @@ grab_transport = config.build_grab_transport_sequence()
 正式恢复由同一准备器在抓取确实受阻时规划；带载补夹、单绿联调和CC保持各自限制。
 完整规则、机械可达性及时间语义见[正式流程设计](../../../docs/正式流程设计.md)。
 
+正式 `match` 的开场动作使用 `match.opening_actions`，每项为独立的 `turn` 或 `straight`：
+`turn.angle_rad` 左正右负，`straight.distance_m` 前正后负，速度均为正的幅值；可选
+`settle_time_s` 是该动作完成后额外的停稳切换时间，省略时使用 `match.action_settle_time_s`。
+该列表与 `match_nb` 的 `nb_opening_actions` 分开配置，正式流程不会读取 NB 动作列表。
+省略 `opening_actions` 时，旧的 `startup_*` 两段启动仍仅作为纯逻辑/策略回退。
+
 `configs/runtime.match_nb.yaml` 的 `match.nb_opening_actions` 还支持 `wheel_turn`：
 它直接表达右轮恒速、左轮固定加速度切换、IMU 定角度和里程定距刹停，适用于需要连续
 轮速交接的开头动作。该参数只定义主机控制目标，最终制动距离和精度必须用真车标定。
-其余已有配置字段和CLI保持不变；模板可省略新字段并使用默认值。
+开场的 `nb_opening_turn_tolerance_rad`、`nb_opening_heading_tolerance_rad` 和
+`nb_opening_distance_tolerance_m` 只作用于 NB 开场；进入正式 `match` 流程后分别使用
+`cluster_align_tolerance_rad`、`noncontact_heading_tolerance_rad` 等正式字段。其余已有配置
+字段和 CLI 保持不变；模板可省略新字段并使用默认值。
 
 `cluster_search_empty_angular_velocity_rad_s` 是没有可搜索的绿/黑/橙目标时的同向快速扫描
 速度；如果当前帧所有有效非蓝目标的 bbox 中心都落在任一安全区 bbox 内，也使用该速度。它必须
@@ -85,6 +94,8 @@ d1→d2、d2→末段三段；d1→d2 严格使用 `safe_zone_d1_to_d2_speed_m_s
 `safe_zone_bbox_edge_margin_px` 同时约束完整 bbox 四边和按画面位置选出的对侧两点；
 第三点允许缺失，完整框不可缺失。
 正式入口的 `localization.safe_zone_corners.max_observation_age_ms` 与 processing 对齐为 800 ms。
+`max_prior_position_innovation_mm=200.0` 和 `max_prior_heading_innovation_deg=25.0`
+是安全区绝对位姿相对里程计先验的硬门限；超限候选即使内部拟合残差很小也不提交。
 两点和静态
 地标拟合 `FieldPose2D` 后覆盖当前航位。`safe_zone_d2_braking_overrun_*`
 和 `safe_zone_d2_to_final_braking_overrun_mm` 只补偿预计刹车过冲。绿/黑物资末段使用
@@ -110,8 +121,7 @@ d1→d2、d2→末段三段；d1→d2 严格使用 `safe_zone_d1_to_d2_speed_m_s
 确认所需的连续有效帧数；停稳后仍选不出任何合法接触计划时，`breakup_no_plan_reobserve_ms`
 只给一个有界的重观测窗口就退出本次区域，不占满按确认帧数计的确认预算。
 `breakup_forward_distance_m` 和 `breakup_backward_distance_m` 是完整动作行程，
-`first_breakup_backward_distance_m` 可单独覆盖首次正式解团的后退行程；当前正式配置为首次
-前进 0.4 m、后退 0.2 m，后续重试后退 0.1 m，全程闭爪。整段路径不安全时拒绝该方案，不缩短动作。
+正式配置及默认值分别为 0.5 m、0.3 m，全程闭爪；整段路径不安全时拒绝该方案，不缩短动作。
 旧 `breakup_penetration_mm` / `breakup_retry_penetration_mm` 已删除，外部 YAML 必须同步删除旧键。
 `breakup_max_attempts` 是同一物理接触团允许的推进尝试次数，取值范围 `[1, 4]`；
 同一接触射线重试需要几何改变并能产生更深接触，不能只靠重编号或重启会话。
@@ -145,10 +155,13 @@ python -m pytest tests/test_config.py
 `max_targets` 在 1～3 内；`max_candidates` 在 `max_targets`～20 内；
 `stopped_scene_new_target_max_bbox_iou` 在 0～1 内，控制停车视野中新目标首帧冻结的
 bbox IoU 上限；
-`confirmation_frames` 必须为正。`grasp_commit_max_observation_age_ms` 限制准备结果发布年龄、
-静止遥测的间断/年龄，以及没有静止证据时的短龄几何；实际静止期间采集的当前计划使用
-`processing.max_observation_age_ms` 作为观测失联上限。`stationary_max_gyro_rad_s` 为有限正数，
-默认0.03 rad/s；完整证据条件见 [app README](../app/README.md)。准备器不改写 `capture_timestamp_ns`。
+`confirmation_frames` 必须为正。`grasp_commit_max_observation_age_ms` 限制准备结果发布年龄和
+没有静止证据时的短龄几何；实际静止期间采集的当前计划使用 `processing.max_observation_age_ms`
+作为观测失联上限。`stationary_max_telemetry_gap_ms` 独立限制静止遥测断档，默认 250 ms；
+`stationary_max_gyro_rad_s` 为进入/保持静止的阈值，`stationary_exit_gyro_rad_s` 为退出阈值，
+`stationary_motion_confirm_ms` 为持续运动确认时长，`stationary_encoder_tolerance_counts` 为
+编码器量化容差。准备器不改写 `capture_timestamp_ns`，完整证据条件见
+[app README](../app/README.md)。
 规则分值、权重与余量有限且非负，权重和必须有限且大于零；
 `orange_priority_weight` 必须大于数量、净空、距离和对准权重之和，以保证单橙严格优先于同分的绿黑组合；
 尺寸、范围和确认数量严格校验，未知字段拒绝加载。`max_range_mm` 是 K0 的机器人相对
@@ -173,21 +186,30 @@ bbox IoU 上限；
 不在本页重复维护。
 
 正式一般阶段接近种子采用“近场优先、类别配置分值优先、距离优先”，最终组合仍按
-近场选择器评分。`orange_isolation_radius_mm` 当前为 `10 mm`；橙色邻近例外只依据邻近
-目标 K0 是否位于实际扫掠走廊内，目标完整外轮廓不扩大扫掠阻挡范围；条件见
-[app README](../app/README.md)。已有配置需要同步为 `10 mm`。
+近场选择器评分。`orange_isolation_radius_mm` 保留为兼容字段，正式 match 将其统一解释为
+所有黑/绿/橙候选的 `10 mm` K0 邻物半径；路径安全仍由实际扫掠走廊、场界和安全区检查负责，
+条件见 [app README](../app/README.md)。
 
 `near_field_grasp.orange_target_final_x_mm` 是橙色 K0 的合爪终点；减小该值会增加前进行程。
 本次按现场“约三分之一留在爪外”的反馈增加 30 mm 行程：正式 `runtime.match.yaml` 从
 138 mm 调为 108 mm，其余运行模板及缺省值从 142 mm 调为 112 mm。该值仍需真车校准。
-`black_closed_servo_offset_deg=5` 只在计划包含黑色物块时，把合爪及随后带载保持的左右绝对
-舵机命令各增加 5°；张爪几何仍使用原机械标定。
+`black_grasp_servo_offset_deg=5` 只在计划包含黑色物块时，把目标宽度对应的抓取开度及前进期间
+保持的左右绝对舵机命令各增加 5°；到达目标后的合爪及带载保持仍使用原机械标定值。
 
-`match.gate_clearance` 是独立的实验模块配置。`front_depth_mm` 定义两个己方安全区门前触发深度；
-`side_x_mm` / `sweep_y_mm` 定义 S1/S2，`release_reverse_m` 同时定义暂存点向外偏移和放置后
-退出距离，`center_release_y_mm` 定义中场释放线。`sweep_speed_m_s` 仅用于横扫，普通航点用
-`transit_speed_m_s`；`observation_timeout_ms` 是暂存物回取观察窗口，`attempt_timeout_s` 是从
-首次触发起连续计算的整次清障截止时间。数值必须有限且为正，未知键拒绝加载。
+`match.gate_clearance` 是独立的实验模块配置，当前 `enabled=false`；显式开启后只在 D1 两帧
+视觉校准成功后至 D2 前生效。
+`front_edge_inset_mm` 将静态安全区前沿向场地中心移动，`front_depth_mm` 定义从该基准线继续
+向场地中心延伸的触发深度，`lateral_inset_mm` 同时内缩每个安全区的左右边界；三者共同定义
+门前触发条带，两个 inset 允许为 0，其余数值必须为正。
+`side_x_mm` / `sweep_y_mm` 定义 S1/S2；当前 `side_x_mm=500`，左右点分别比原位置向外
+移动 150 mm；当前 `sweep_y_mm=885`，相对原 `y=±1115 mm` 点位向场地中心内移 230 mm。
+`release_reverse_m` 同时定义暂存点向外偏移和放置后
+退出距离，`center_stop_radius_mm` 定义清障物释放时距场地原点的最大半径。`sweep_speed_m_s` 仅用于
+横扫，普通转场用 `transit_speed_m_s`；`attempt_timeout_s` 是从首次触发起连续计算的整次
+清障截止时间。`sweep_heading_tolerance_rad` 是横扫前及运行中的绝对航向门限，当前约为
+2°（0.035 rad），超限先
+刹车停稳再重对正；`sweep_cross_track_tolerance_mm` 限制轴心偏离 S1—S2 横线。所有数值
+必须有限，未知键拒绝加载。
 
 ## 夹爪内颜色门禁配置
 
@@ -198,6 +220,16 @@ bbox IoU 上限；
 为最大连通色块占ROI比例；
 `line_forward_offset_mm=100.0` 暂把水平检测线从 ROI 外接矩形最远边向机器人前方偏移
 100 mm；该偏移通过 `GroundProjector` 换算，缺少地面映射的标定工具仍显示未偏移的临时线。
+`line_width_fraction=0.5` 只在 ROI 外接矩形中央 50% 宽度内判断跨线，预览也绘制同一短线；
+两端各向中心收进 25%，避免夹臂、场地线及外围色块在边缘形成跨线连通域。
+`line_contact_hold_ms=800.0` 要求同一组绿色/橙色跨线类别按不同帧的真实采集时间连续触碰
+检测线至少 800 ms 才允许触发重夹；重复读取同一帧不累计，新帧不再跨线、类别变化或离开
+允许重夹的运输阶段会清空本次连续证据。设为 `0` 可关闭持续触碰门禁。
+`line_regrasp_cooldown_ms=1000.0` 是一次重夹完成后再次允许同一跨线证据触发重夹的冷却时间；
+配置不得小于 1000 ms，该时间内即使收到新鲜帧也不重复触发。跨线证据只有在确认合爪并进入
+D1 路线后、到达 D2 前才由任务层消费；D1 视觉校准的搜索、停稳和取样窗口不消费。
+单橙载荷会剔除自身橙色跨线证据，避免把已经夹住的伤员重复解释为第二个橙色目标；绿/黑
+异物证据仍按冲突载荷处理。
 `black_min_thickness_fraction=0.12` 为黑色去细线核直径与ROI包围框短边的比例；ROI收紧后
 同步增大该比例，以保持去细线核在实拍图上的像素尺度，仍随分辨率缩放。
 `shadow_min_value=30` 是夹爪内彩色暗面的OpenCV HSV亮度下限（整数1～255）；H/S继续来自

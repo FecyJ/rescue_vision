@@ -307,6 +307,9 @@ def _perception_defaults() -> dict[str, Any]:
             "enabled": True,
             "polygon_normalized": [[0.47, 0.85], [0.53, 0.85], [0.57, 0.97], [0.43, 0.97]],
             "line_forward_offset_mm": 100.0,
+            "line_width_fraction": 0.5,
+            "line_contact_hold_ms": 800.0,
+            "line_regrasp_cooldown_ms": 1000.0,
             "min_component_fraction": 0.03,
             "black_min_thickness_fraction": 0.12,
             "shadow_min_value": 30,
@@ -436,6 +439,8 @@ def _localization_defaults() -> dict[str, Any]:
             "max_fit_residual_mm": 80.0,
             "position_uncertainty_floor_mm": 30.0,
             "heading_uncertainty_floor_deg": 3.0,
+            "max_prior_position_innovation_mm": 200.0,
+            "max_prior_heading_innovation_deg": 25.0,
         },
         "fusion": {
             "enabled": False,
@@ -903,6 +908,83 @@ class NBOpeningStraight:
 NBOpeningAction = NBOpeningTurn | NBOpeningWheelTurn | NBOpeningStraight
 
 
+@dataclass(frozen=True, slots=True)
+class MatchOpeningTurn:
+    """正式 ``match`` 开场的独立相对转向动作。"""
+
+    angle_rad: float
+    angular_velocity_rad_s: float
+    settle_time_s: float | None = None
+
+    def __post_init__(self) -> None:
+        angle = _finite_float(
+            self.angle_rad,
+            "opening_actions[].angle_rad",
+            minimum=-float("inf"),
+        )
+        if abs(angle) < 0.001:
+            raise ValueError(
+                "opening_actions[].angle_rad must have absolute value >= 0.001."
+            )
+        speed = _finite_float(
+            self.angular_velocity_rad_s,
+            "opening_actions[].angular_velocity_rad_s",
+            minimum=0.001,
+        )
+        object.__setattr__(self, "angle_rad", angle)
+        object.__setattr__(self, "angular_velocity_rad_s", speed)
+        if self.settle_time_s is not None:
+            object.__setattr__(
+                self,
+                "settle_time_s",
+                _finite_float(
+                    self.settle_time_s,
+                    "opening_actions[].settle_time_s",
+                    minimum=0.0,
+                ),
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class MatchOpeningStraight:
+    """正式 ``match`` 开场的独立相对直行动作；负距离表示倒车。"""
+
+    distance_m: float
+    speed_m_s: float
+    settle_time_s: float | None = None
+
+    def __post_init__(self) -> None:
+        distance = _finite_float(
+            self.distance_m,
+            "opening_actions[].distance_m",
+            minimum=-float("inf"),
+        )
+        if abs(distance) < 0.001:
+            raise ValueError(
+                "opening_actions[].distance_m must have absolute value >= 0.001."
+            )
+        speed = _finite_float(
+            self.speed_m_s,
+            "opening_actions[].speed_m_s",
+            minimum=0.001,
+        )
+        object.__setattr__(self, "distance_m", distance)
+        object.__setattr__(self, "speed_m_s", speed)
+        if self.settle_time_s is not None:
+            object.__setattr__(
+                self,
+                "settle_time_s",
+                _finite_float(
+                    self.settle_time_s,
+                    "opening_actions[].settle_time_s",
+                    minimum=0.0,
+                ),
+            )
+
+
+MatchOpeningAction = MatchOpeningTurn | MatchOpeningStraight
+
+
 _DEFAULT_NB_OPENING_ACTIONS: tuple[NBOpeningAction, ...] = (
     # Starting from (1350, 1350) with heading -90 degrees, these values
     # reproduce the previous (100, 800) -> (100, -900) -> (100, 0) route.
@@ -934,6 +1016,9 @@ class MatchRuntimeConfig:
     startup_straight_pid_integral_limit: float = 0.10
     startup_straight_pid_deadband_m_s: float = 0.0
     startup_straight_pid_max_angular_velocity_rad_s: float = 0.12
+    # 正式 ``match`` 的独立开场动作；None 保留纯逻辑/策略调用方的旧两段启动。
+    # ``nb_opening_actions`` 只属于 match_nb，不能与此字段混用。
+    opening_actions: tuple[MatchOpeningAction, ...] | None = None
     cluster_search_angular_velocity_rad_s: float = -0.30
     cluster_search_empty_angular_velocity_rad_s: float = -0.45
     cluster_search_sweep_angle_rad: float = 2.0 * math.pi
@@ -950,9 +1035,8 @@ class MatchRuntimeConfig:
     # 正式流程 专用：搜索目标团时，可靠的单个绿色普通物资可以抢占解团流程。
     # 正式运行配置显式开启；纯逻辑调用方可按场景关闭。
     opportunistic_single_green_enabled: bool = False
-    # 目标周围该半径内不能有其它新鲜轨迹，单位 mm；需结合目标尺寸和
-    # GroundPoint 实测误差现场复核。
-    opportunistic_single_green_clearance_mm: float = 120.0
+    # 正式 match 的黑/绿/橙候选统一使用该 K0 邻物半径，单位 mm。
+    opportunistic_single_green_clearance_mm: float = 10.0
     # 旧纯逻辑夹具的构造兼容字段；正式运行由 near_field_grasp.max_range_mm
     # 统一控制近场接管，YAML 不再接受该字段。
     opportunistic_single_green_realign_standoff_mm: float = 350.0
@@ -978,9 +1062,6 @@ class MatchRuntimeConfig:
     breakup_forward_distance_m: float = 0.5
     breakup_forward_speed_m_s: float = 0.40
     breakup_backward_distance_m: float = 0.3
-    # Optional first-attempt override for the formal match breakup retreat.
-    # ``None`` keeps the regular retreat distance for non-match variants.
-    first_breakup_backward_distance_m: float | None = None
     breakup_backward_speed_m_s: float = 0.08
     # 正式流程解团阶段的临时车体加减速度；None 分别继承 motion 对应值。
     breakup_max_linear_acceleration_m_s2: float | None = None
@@ -1060,10 +1141,9 @@ class MatchRuntimeConfig:
     safe_zone_calibration_min_offset_mm: float = 300.0
     safe_zone_calibration_start_offset_mm: float = 500.0
     safe_zone_open_offset_mm: float = 137.0
-    # 正式流程 d2→末段的固定刹车过冲提前量，正值表示沿己方安全区方向
-    # （区域 2 为 +y、区域 3 为 -y）过冲，单位 mm。
+    # 保留用于现场诊断/迁移记录的旧固定刹车参数；严格闭环运输不再从实际终点扣除，单位 mm。
     safe_zone_d2_to_final_braking_overrun_mm: float = 0.0
-    # 正式流程 单橙色伤员 d2→末段的独立刹车过冲提前量，单位 mm。
+    # 单橙色伤员对应的旧诊断参数；严格闭环运输不再从实际终点扣除，单位 mm。
     safe_zone_orange_d2_to_final_braking_overrun_mm: float = 0.0
     safe_zone_calibration_stop_speed_threshold_m_s: float = 0.02
     safe_zone_calibration_stop_confirm_time_s: float = 0.30
@@ -1105,6 +1185,16 @@ class MatchRuntimeConfig:
             raise ValueError(
                 "safe_zone_injured_target_field must be a FieldPoint."
             )
+        if self.opening_actions is not None:
+            if not isinstance(self.opening_actions, tuple) or not self.opening_actions:
+                raise ValueError("opening_actions must be a non-empty tuple or None.")
+            for index, action in enumerate(self.opening_actions, start=1):
+                if not isinstance(action, (MatchOpeningTurn, MatchOpeningStraight)):
+                    raise ValueError(
+                        "opening_actions must contain only MatchOpeningTurn or "
+                        "MatchOpeningStraight, "
+                        f"got item {index}: {action!r}."
+                    )
         if not isinstance(self.nb_opening_actions, tuple) or not self.nb_opening_actions:
             raise ValueError("nb_opening_actions must be a non-empty tuple.")
         for index, action in enumerate(self.nb_opening_actions, start=1):
@@ -1260,18 +1350,6 @@ class MatchRuntimeConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive, got {value!r}.")
-        if self.first_breakup_backward_distance_m is not None:
-            value = self.first_breakup_backward_distance_m
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                or float(value) <= 0.0
-            ):
-                raise ValueError(
-                    "first_breakup_backward_distance_m must be finite and positive, or None, "
-                    f"got {value!r}."
-                )
         if self.misgrasp_breakup_max_heading_change_rad > math.radians(30.0):
             raise ValueError(
                 "misgrasp_breakup_max_heading_change_rad must be <= 30 degrees, "
@@ -2681,6 +2759,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         "startup_straight_pid_integral_limit",
         "startup_straight_pid_deadband_m_s",
         "startup_straight_pid_max_angular_velocity_rad_s",
+        "opening_actions",
         "cluster_search_angular_velocity_rad_s",
         "cluster_search_empty_angular_velocity_rad_s",
         "cluster_search_sweep_angle_rad",
@@ -2702,7 +2781,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         "breakup_forward_distance_m",
         "breakup_forward_speed_m_s",
         "breakup_backward_distance_m",
-        "first_breakup_backward_distance_m",
         "breakup_backward_speed_m_s",
         "breakup_max_linear_acceleration_m_s2",
         "breakup_max_linear_deceleration_m_s2",
@@ -2852,6 +2930,68 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         ),
     )
 
+    def parse_opening_actions() -> tuple[MatchOpeningAction, ...] | None:
+        if "opening_actions" not in match_raw:
+            return None
+        raw_actions = match_raw["opening_actions"]
+        if not isinstance(raw_actions, list) or not raw_actions:
+            raise ValueError(
+                "match.opening_actions must be a non-empty list."
+            )
+        actions: list[MatchOpeningAction] = []
+        for index, raw_action in enumerate(raw_actions, start=1):
+            location = f"match.opening_actions[{index - 1}]"
+            action = _mapping(raw_action, location)
+            action_type = _required(action, "type", location)
+            if action_type == "turn":
+                _reject_unknown(
+                    action,
+                    {"type", "angle_rad", "angular_velocity_rad_s", "settle_time_s"},
+                    location,
+                )
+                actions.append(
+                    MatchOpeningTurn(
+                        _finite_float(
+                            _required(action, "angle_rad", location),
+                            f"{location}.angle_rad",
+                            minimum=-float("inf"),
+                        ),
+                        _finite_float(
+                            _required(action, "angular_velocity_rad_s", location),
+                            f"{location}.angular_velocity_rad_s",
+                            minimum=0.001,
+                        ),
+                        action.get("settle_time_s"),
+                    )
+                )
+            elif action_type == "straight":
+                _reject_unknown(
+                    action,
+                    {"type", "distance_m", "speed_m_s", "settle_time_s"},
+                    location,
+                )
+                actions.append(
+                    MatchOpeningStraight(
+                        _finite_float(
+                            _required(action, "distance_m", location),
+                            f"{location}.distance_m",
+                            minimum=-float("inf"),
+                        ),
+                        _finite_float(
+                            _required(action, "speed_m_s", location),
+                            f"{location}.speed_m_s",
+                            minimum=0.001,
+                        ),
+                        action.get("settle_time_s"),
+                    )
+                )
+            else:
+                raise ValueError(
+                    f"{location}.type must be 'turn' or 'straight', "
+                    f"got {action_type!r}."
+                )
+        return tuple(actions)
+
     def parse_nb_opening_actions() -> tuple[NBOpeningAction, ...]:
         if "nb_opening_actions" not in match_raw:
             return _DEFAULT_NB_OPENING_ACTIONS
@@ -2926,6 +3066,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
                 )
         return tuple(actions)
 
+    opening_actions = parse_opening_actions()
     nb_opening_actions = parse_nb_opening_actions()
     gripper_after_action_raw = match_raw.get(
         "nb_opening_gripper_after_action", 2
@@ -2996,6 +3137,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         startup_straight_pid_max_angular_velocity_rad_s=match_float(
             "startup_straight_pid_max_angular_velocity_rad_s", 0.12
         ),
+        opening_actions=opening_actions,
         cluster_search_angular_velocity_rad_s=_signed_angular_velocity(
             match_raw.get("cluster_search_angular_velocity_rad_s", -0.30),
             "match.cluster_search_angular_velocity_rad_s",
@@ -3053,9 +3195,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         ),
         breakup_backward_distance_m=match_float(
             "breakup_backward_distance_m", 0.3
-        ),
-        first_breakup_backward_distance_m=match_optional_positive_float(
-            "first_breakup_backward_distance_m"
         ),
         breakup_backward_speed_m_s=match_float(
             "breakup_backward_speed_m_s", 0.08
@@ -3257,6 +3396,38 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             if abs(getattr(match_cc, name)) > motion.max_angular_velocity_rad_s:
                 raise ValueError(f"match_cc.{name} exceeds motion.max_angular_velocity_rad_s.")
     if match.enabled:
+        if match.opening_actions is not None:
+            for index, action in enumerate(match.opening_actions, start=1):
+                if isinstance(action, MatchOpeningTurn):
+                    if action.angular_velocity_rad_s > motion.max_angular_velocity_rad_s:
+                        raise ValueError(
+                            f"match.opening_actions[{index - 1}] angular speed "
+                            "exceeds motion.max_angular_velocity_rad_s."
+                        )
+                    wheel_speed = (
+                        action.angular_velocity_rad_s
+                        * motion.wheel_track_m
+                        / 2.0
+                        * max(
+                            motion.left_wheel_speed_weight,
+                            motion.right_wheel_speed_weight,
+                        )
+                    )
+                else:
+                    if action.speed_m_s > motion.max_linear_velocity_m_s:
+                        raise ValueError(
+                            f"match.opening_actions[{index - 1}] linear speed "
+                            "exceeds motion.max_linear_velocity_m_s."
+                        )
+                    wheel_speed = action.speed_m_s * max(
+                        motion.left_wheel_speed_weight,
+                        motion.right_wheel_speed_weight,
+                    )
+                if wheel_speed > motion.max_wheel_velocity_m_s:
+                    raise ValueError(
+                        f"match.opening_actions[{index - 1}] requires wheel speed "
+                        f"{wheel_speed:g} m/s, above motion.max_wheel_velocity_m_s."
+                    )
         for index, action in enumerate(match.nb_opening_actions, start=1):
             if isinstance(action, NBOpeningTurn):
                 if action.angular_velocity_rad_s > motion.max_angular_velocity_rad_s:
@@ -4210,7 +4381,10 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     )
     gripper_color_raw = _mapping(perception_raw["gripper_color"], "perception.gripper_color")
     _reject_unknown(gripper_color_raw, {
-        "enabled", "polygon_normalized", "line_forward_offset_mm", "min_component_fraction",
+        "enabled", "polygon_normalized", "line_forward_offset_mm",
+        "line_width_fraction",
+        "line_contact_hold_ms",
+        "line_regrasp_cooldown_ms", "min_component_fraction",
         "black_min_thickness_fraction", "shadow_min_value",
         "orange_bbox_min_color_fraction",
         "orange_distinct_max_bbox_iou", "orange_distinct_min_k0_distance_px",
@@ -4226,6 +4400,21 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             gripper_color_raw["line_forward_offset_mm"],
             "perception.gripper_color.line_forward_offset_mm",
             minimum=0.0,
+        ),
+        line_width_fraction=_finite_float(
+            gripper_color_raw["line_width_fraction"],
+            "perception.gripper_color.line_width_fraction",
+            minimum=0.000001,
+        ),
+        line_contact_hold_ms=_finite_float(
+            gripper_color_raw["line_contact_hold_ms"],
+            "perception.gripper_color.line_contact_hold_ms",
+            minimum=0.0,
+        ),
+        line_regrasp_cooldown_ms=_finite_float(
+            gripper_color_raw["line_regrasp_cooldown_ms"],
+            "perception.gripper_color.line_regrasp_cooldown_ms",
+            minimum=1000.0,
         ),
         min_component_fraction=_finite_float(gripper_color_raw["min_component_fraction"], "perception.gripper_color.min_component_fraction", minimum=0.000001),
         black_min_thickness_fraction=_finite_float(gripper_color_raw["black_min_thickness_fraction"], "perception.gripper_color.black_min_thickness_fraction", minimum=0.000001),
@@ -4434,6 +4623,8 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         "max_fit_residual_mm",
         "position_uncertainty_floor_mm",
         "heading_uncertainty_floor_deg",
+        "max_prior_position_innovation_mm",
+        "max_prior_heading_innovation_deg",
     }
     _reject_unknown(
         safe_zone_corners_raw,
@@ -4469,6 +4660,16 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         heading_uncertainty_floor_deg=_finite_float(
             safe_zone_corners_raw["heading_uncertainty_floor_deg"],
             "localization.safe_zone_corners.heading_uncertainty_floor_deg",
+            minimum=0.001,
+        ),
+        max_prior_position_innovation_mm=_finite_float(
+            safe_zone_corners_raw["max_prior_position_innovation_mm"],
+            "localization.safe_zone_corners.max_prior_position_innovation_mm",
+            minimum=0.001,
+        ),
+        max_prior_heading_innovation_deg=_finite_float(
+            safe_zone_corners_raw["max_prior_heading_innovation_deg"],
+            "localization.safe_zone_corners.max_prior_heading_innovation_deg",
             minimum=0.001,
         ),
     )

@@ -22,7 +22,10 @@ perception:
   gripper_color:
     enabled: true
     polygon_normalized: [[0.47, 0.85], [0.53, 0.85], [0.57, 0.97], [0.43, 0.97]]
-    line_forward_offset_mm: 100.0
+    line_forward_offset_mm: 45.0
+    line_width_fraction: 0.5
+    line_contact_hold_ms: 800.0
+    line_regrasp_cooldown_ms: 1000.0
     min_component_fraction: 0.03
     # 黑色先去除细于 ROI 短边此比例的线条，再检查实体色块面积。
     black_min_thickness_fraction: 0.12
@@ -147,22 +150,45 @@ world:
 match:
   # 实验性门前清障：关闭后恢复普通运输；区域沿用 world.static_map。
   gate_clearance:
-    enabled: true
+    enabled: false
+    # 从静态区域 y=±1200 向场地中心移动基准线
+    front_edge_inset_mm: 0.0
+    # 从基准线向场地中心延伸的纵深
     front_depth_mm: 200.0
-    side_x_mm: 350.0
-    sweep_y_mm: 1115.0
-    center_release_y_mm: 650.0
+    # 每个安全区左右边界同时内缩
+    lateral_inset_mm: 100
+    side_x_mm: 500.0
+    sweep_y_mm: 885.0
+    center_stop_radius_mm: 200.0
     release_reverse_m: 0.12
     sweep_speed_m_s: 1.0
     transit_speed_m_s: 0.5
-    reacquire_radius_mm: 180.0
-    observation_timeout_ms: 1400.0
+    sweep_heading_tolerance_rad: 0.035
+    sweep_cross_track_tolerance_mm: 20.0
     attempt_timeout_s: 30.0
   robot_footprint_radius_mm: 160.0
   safety_margin_mm: 10.0
   enabled: true
+  # 正式 match 自身的开场动作；与 match_nb 的 nb_opening_actions 分开维护。
+  # angle_rad：左转为正、右转为负；angular_velocity_rad_s 为正的速度幅值。
+  # distance_m：前进为正、倒车为负；speed_m_s 为正的速度幅值。
+  opening_actions:
+    - type: turn
+      angle_rad: -0.71
+      angular_velocity_rad_s: 3.0
+      settle_time_s: 0.2
+    - type: straight
+      distance_m: 2.5
+      speed_m_s: 1.5
+      settle_time_s: 0.1
+    - type: straight
+      distance_m: -0.2
+      speed_m_s: 1.5
+      settle_time_s: 0.1
+  # 以下 startup_* 字段供仍采用旧两段启动的策略纯逻辑入口使用；正式 match
+  # 入口以 opening_actions 为唯一开场动作来源。
   # 启动右转角，单位 rad；角速度符号决定右转方向。
-  startup_turn_angle_rad: 0.75
+  startup_turn_angle_rad: 0.73
   startup_turn_angular_velocity_rad_s: -3.0
   startup_turn_settle_time_s: 0.2
   # 启动直行距离和速度，单位 m、m/s。
@@ -170,11 +196,11 @@ match:
   startup_forward_speed_m_s: 1.5
   startup_forward_settle_time_s: 0.1
   # 启动直行的左右轮速 PID；现场先调 P，I/D 通常保持 0。
-  startup_straight_pid_kp_rad_s_per_m_s: 1
+  startup_straight_pid_kp_rad_s_per_m_s: 2.0
   startup_straight_pid_ki_rad_s_per_m: 0.0
   startup_straight_pid_kd_rad_s_per_m_s2: 0.0
   startup_straight_pid_integral_limit: 0.10
-  startup_straight_pid_deadband_m_s: 0.012
+  startup_straight_pid_deadband_m_s: 0.0
   startup_straight_pid_max_angular_velocity_rad_s: 0.08
   # 目标团搜索原地转速和单方向扫描跨度，单位 rad/s、rad。
   cluster_search_angular_velocity_rad_s: -1
@@ -207,10 +233,10 @@ match:
   cluster_align_max_angular_velocity_rad_s: 0.4
   # 搜索目标团时启用机会抓取；首轮单绿，一般阶段优先多物资组。
   opportunistic_single_green_enabled: true
-  # 保留为旧纯逻辑夹具的邻域诊断参数；正式单绿机会使用固定 TRANSPORT 走廊判定。
-  opportunistic_single_green_clearance_mm: 120.0
+  # 黑/绿/橙候选统一的 K0 邻物半径，单位 mm；路径仍独立检查安全区和场界。
+  opportunistic_single_green_clearance_mm: 10.0
   # 解团前推/后退的距离和速度，单位 m、m/s。
-  # 首次 match 解团闭爪前进 0.4 m、后退 0.2 m；后续重试后退 0.1 m，整段路径不可行时拒绝该计划。
+  # match: 闭爪定距前进 0.5 m、后退 0.3 m，整段路径不可行时拒绝该计划。
   # 最小推进门槛，单位 mm。门槛取 `breakup_min_penetration_mm +
   # breakup_braking_margin_mm` 与局部接触集自身纵向跨度的较小值：浅团只要能
   # 整段推穿就成立。40 mm 正四面体黑核的内切接触盘只有 2r≈23 mm，固定门槛
@@ -237,8 +263,6 @@ match:
   breakup_forward_distance_m: 0.4
   breakup_forward_speed_m_s: 1.5
   breakup_backward_distance_m: 0.10
-  # 首次正式解团完成前推并停稳后，额外按编码器倒车 0.2 m；后续重试使用上面的常规距离。
-  first_breakup_backward_distance_m: 0.20
   breakup_backward_speed_m_s: 1.5
   # 解团阶段临时车体加减速度；null 分别继承 motion 对应全局值。
   breakup_max_linear_acceleration_m_s2: 4.0
@@ -301,12 +325,12 @@ match:
   # d1→d2 的推进速度，单位 m/s。
   safe_zone_d1_to_d2_speed_m_s: 0.5
   # d2 张爪、转向、闭爪后到安全区末端的推进速度，单位 m/s。
-  safe_zone_d2_to_final_speed_m_s: 0.35
+  safe_zone_d2_to_final_speed_m_s: 0.40
   # 单橙色伤员 d2→安全区末端的独立速度，单位 m/s；当前先与通用末段一致，按实测单独调节。
-  safe_zone_orange_d2_to_final_speed_m_s: 0.25
-  # d2 闭爪推进后末段的固定刹车过冲提前量，正值沿己方安全区方向在终点前停车，单位 mm。
+  safe_zone_orange_d2_to_final_speed_m_s: 0.35
+  # 兼容现场诊断记录的旧固定刹车过冲参数；严格闭环运输不再从实际终点扣除，单位 mm。
   safe_zone_d2_to_final_braking_overrun_mm: 40
-  # 单橙色伤员 d2→安全区末端的独立刹车过冲提前量，单位 mm；当前先与通用末段一致。
+  # 单橙色伤员对应的旧诊断参数；严格闭环运输不再从实际终点扣除，单位 mm。
   safe_zone_orange_d2_to_final_braking_overrun_mm: 50.0
   # d2→安全区末端的临时车体加减速度；允许独立高于 motion 全局基准。
   # 现场按加速响应、刹车距离和转向响应分别实测调整。
@@ -320,8 +344,8 @@ match:
   safe_zone_injured_target_field_mm: [170.0, 1115.0]
   # 安全区路线航向保持参数；角度单位 rad，角速度单位 rad/s。
   safe_zone_fallback_heading_tolerance_rad: 0.02
-  safe_zone_fallback_heading_kp_rad_s: 1.0
-  safe_zone_fallback_max_angular_velocity_rad_s: 0.7
+  safe_zone_fallback_heading_kp_rad_s: 3.0
+  safe_zone_fallback_max_angular_velocity_rad_s: 3
   # D1 视觉校正距安全区终点的最小/最大偏移，单位 mm。
   # 落在区间内可原地校准；更靠近安全区时先返回最小偏移线。
   safe_zone_calibration_min_offset_mm: 400.0
@@ -352,6 +376,8 @@ localization:
   # 与感知快照年龄门一致，静止采集仍由编码器/IMU验证。
   safe_zone_corners:
     max_observation_age_ms: 800.0
+    max_prior_position_innovation_mm: 200.0
+    max_prior_heading_innovation_deg: 25.0
   enabled: false
   fusion:
     enabled: false
@@ -400,7 +426,7 @@ near_field_grasp:
   greedy_target_final_x_mm: 108.0
   # 单个橙色目标的底面 K0 终点，降低该值会增加前进行程，单位 mm。
   orange_target_final_x_mm: 108.0
-  black_closed_servo_offset_deg: 5.0
+  black_grasp_servo_offset_deg: 5.0
   # 夹爪前端参考线；危险目标 K0 从此处到扫掠终点才参与走廊门禁，单位 mm。
   corridor_start_x_mm: 60.0
   # 夹爪开口两侧的走廊安全余量，单位 mm。
@@ -428,6 +454,12 @@ near_field_grasp:
   grasp_commit_max_observation_age_ms: 150.0
   # 实测轮编码器不变且IMU角速度低于此值，才积累静止证据。
   stationary_max_gyro_rad_s: 0.03
+  # 单次微动进入候选后，只有持续达到该时长才清除静止证据，单位 ms。
+  stationary_exit_gyro_rad_s: 0.06
+  stationary_motion_confirm_ms: 80.0
+  stationary_encoder_tolerance_counts: 0
+  # 独立于图像提交年龄的静止遥测最大间断，单位 ms。
+  stationary_max_telemetry_gap_ms: 250.0
   # 停稳后的一个当前有效帧即可提交，不再做额外中心确认。
   confirmation_frames: 1
   # 进入该角度范围后取消单轮最小速度抬升，单位 rad。

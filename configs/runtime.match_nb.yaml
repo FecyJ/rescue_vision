@@ -24,6 +24,9 @@ perception:
     enabled: true
     polygon_normalized: [[0.47, 0.85], [0.53, 0.85], [0.57, 0.97], [0.43, 0.97]]
     line_forward_offset_mm: 100.0
+    line_width_fraction: 0.5
+    line_contact_hold_ms: 800.0
+    line_regrasp_cooldown_ms: 1000.0
     min_component_fraction: 0.03
     # 黑色先去除细于 ROI 短边此比例的线条，再检查实体色块面积。
     black_min_thickness_fraction: 0.12
@@ -155,16 +158,18 @@ world:
 match:
   # 实验性门前清障：关闭后恢复普通运输；区域沿用 world.static_map。
   gate_clearance:
-    enabled: true
+    enabled: false
+    front_edge_inset_mm: 0.0
     front_depth_mm: 200.0
-    side_x_mm: 350.0
-    sweep_y_mm: 1115.0
-    center_release_y_mm: 650.0
+    lateral_inset_mm: 0.0
+    side_x_mm: 500.0
+    sweep_y_mm: 885.0
+    center_stop_radius_mm: 200.0
     release_reverse_m: 0.12
     sweep_speed_m_s: 1.0
     transit_speed_m_s: 0.5
-    reacquire_radius_mm: 180.0
-    observation_timeout_ms: 1400.0
+    sweep_heading_tolerance_rad: 0.035
+    sweep_cross_track_tolerance_mm: 20.0
     attempt_timeout_s: 30.0
   robot_footprint_radius_mm: 160.0
   safety_margin_mm: 10.0
@@ -183,7 +188,7 @@ match:
       angle_rad: 0.97
       angular_velocity_rad_s: 2.0
     - type: straight
-      distance_m: 1.55
+      distance_m: 1.60
       speed_m_s: 1.5
     - type: straight
       distance_m: -0.9
@@ -192,7 +197,9 @@ match:
   nb_opening_gripper_after_action: 2
   nb_opening_gripper_left_deg: 50.0
   nb_opening_gripper_right_deg: 160.0
-  # 转向/直行的完成误差与每个动作间的零速停稳时间。
+  # 仅 NB 开场动作的转向/直行完成误差与每个动作间的零速停稳时间。
+  # 正式后续流程使用下方 cluster_align_tolerance_rad、
+  # noncontact_heading_tolerance_rad 等字段，不继承这些 NB 开场容差。
   nb_opening_turn_tolerance_rad: 0.06
   nb_opening_distance_tolerance_m: 0.02
   # 该时间是连续新遥测停稳确认时长，不是固定 sleep。
@@ -234,7 +241,7 @@ match:
   # 搜索目标团时启用机会抓取；首轮单绿，一般阶段优先多物资组。
   opportunistic_single_green_enabled: true
   # 保留为旧纯逻辑夹具的邻域诊断参数；正式单绿机会使用固定 TRANSPORT 走廊判定。
-  opportunistic_single_green_clearance_mm: 120.0
+  opportunistic_single_green_clearance_mm: 10.0
   # 解团前推/后退的距离和速度，单位 m、m/s。
   # match: 闭爪定距前进 0.5 m、后退 0.3 m，整段路径不可行时拒绝该计划。
   # 最小推进门槛，单位 mm。门槛取 `breakup_min_penetration_mm +
@@ -372,6 +379,8 @@ localization:
   # 与感知快照年龄门一致，静止采集仍由编码器/IMU验证。
   safe_zone_corners:
     max_observation_age_ms: 800.0
+    max_prior_position_innovation_mm: 200.0
+    max_prior_heading_innovation_deg: 25.0
   enabled: false
   fusion:
     enabled: false
@@ -420,7 +429,7 @@ near_field_grasp:
   greedy_target_final_x_mm: 142.0
   # 单个橙色目标的底面 K0 终点，降低该值会增加前进行程，单位 mm。
   orange_target_final_x_mm: 112.0
-  black_closed_servo_offset_deg: 5.0
+  black_grasp_servo_offset_deg: 5.0
   # 夹爪前端参考线；危险目标 K0 从此处到扫掠终点才参与走廊门禁，单位 mm。
   corridor_start_x_mm: 60.0
   # 夹爪开口两侧的走廊安全余量，单位 mm。
@@ -448,6 +457,12 @@ near_field_grasp:
   grasp_commit_max_observation_age_ms: 150.0
   # 实测轮编码器不变且IMU角速度低于此值，才积累静止证据。
   stationary_max_gyro_rad_s: 0.03
+  # 单次微动进入候选后，只有持续达到该时长才清除静止证据，单位 ms。
+  stationary_exit_gyro_rad_s: 0.06
+  stationary_motion_confirm_ms: 80.0
+  stationary_encoder_tolerance_counts: 0
+  # 独立于图像提交年龄的静止遥测最大间断，单位 ms。
+  stationary_max_telemetry_gap_ms: 250.0
   # 停稳后的一个当前有效帧即可提交，不再做额外中心确认。
   confirmation_frames: 1
   # 进入该角度范围后取消单轮最小速度抬升，单位 rad。

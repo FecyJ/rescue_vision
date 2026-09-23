@@ -23,6 +23,9 @@ perception:
     enabled: true
     polygon_normalized: [[0.47, 0.85], [0.53, 0.85], [0.57, 0.97], [0.43, 0.97]]
     line_forward_offset_mm: 100.0
+    line_width_fraction: 0.5
+    line_contact_hold_ms: 800.0
+    line_regrasp_cooldown_ms: 1000.0
     min_component_fraction: 0.03
     # 黑色先去除细于 ROI 短边此比例的线条，再检查实体色块面积。
     black_min_thickness_fraction: 0.12
@@ -140,16 +143,18 @@ world:
 match:
   # 实验性门前清障：关闭后恢复普通运输；区域沿用 world.static_map。
   gate_clearance:
-    enabled: true
+    enabled: false
+    front_edge_inset_mm: 0.0
     front_depth_mm: 200.0
-    side_x_mm: 350.0
-    sweep_y_mm: 1115.0
-    center_release_y_mm: 650.0
+    lateral_inset_mm: 0.0
+    side_x_mm: 500.0
+    sweep_y_mm: 885.0
+    center_stop_radius_mm: 200.0
     release_reverse_m: 0.12
     sweep_speed_m_s: 1.0
     transit_speed_m_s: 0.5
-    reacquire_radius_mm: 180.0
-    observation_timeout_ms: 1400.0
+    sweep_heading_tolerance_rad: 0.035
+    sweep_cross_track_tolerance_mm: 20.0
     attempt_timeout_s: 30.0
   # CC 与正式 match 共享的启动、夹爪近场入口和安全区运输参数。
   enabled: true
@@ -254,6 +259,8 @@ localization:
   # 与感知快照年龄门一致，静止采集仍由编码器/IMU验证。
   safe_zone_corners:
     max_observation_age_ms: 800.0
+    max_prior_position_innovation_mm: 200.0
+    max_prior_heading_innovation_deg: 25.0
   enabled: false
   fusion:
     enabled: false
