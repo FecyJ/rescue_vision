@@ -339,6 +339,9 @@ class MatchNBSequence(MatchSequence):
         return (
             f"elapsed_ms={elapsed_ms} action_started_ns={started} "
             f"action_deadline_ns={deadline} "
+            f"opening_tolerances=(turn={self.config.nb_opening_turn_tolerance_rad:.4f},"
+            f"heading={self.config.nb_opening_heading_tolerance_rad:.4f},"
+            f"distance={self.config.nb_opening_distance_tolerance_m:.4f}) "
             f"confirmation_progress={confirmation_progress} "
             f"preparation_age_ms=none "
             f"{self._stationary_motion.diagnostic(timestamp_ns)}"
@@ -614,13 +617,9 @@ class MatchNBSequence(MatchSequence):
                 gripper_angles_deg=self._nb_gripper_angles_deg(),
             )
         if self._nb_action_index >= len(self.config.nb_opening_actions):
-            self.state = MatchState.SEARCH_CLUSTER
-            self._begin_cluster_search()
-            return self._decision(
+            return self._handoff_to_match_flow(
                 timestamp_ns,
-                0.0,
-                0.0,
-                "nb_opening_sequence_complete",
+                reason="nb_opening_sequence_complete",
                 posture=posture,
                 gripper_angles_deg=angles,
             )
@@ -631,6 +630,35 @@ class MatchNBSequence(MatchSequence):
             "nb_opening_action_advanced",
             posture=posture,
             gripper_angles_deg=angles,
+        )
+
+    def _handoff_to_match_flow(
+        self,
+        timestamp_ns: int,
+        *,
+        reason: str,
+        posture: GripperPosture,
+        gripper_angles_deg: tuple[float, float] | None,
+    ) -> MatchDecision:
+        """Leave NB opening and enter the current formal match search flow.
+
+        The NB subclass owns only the relative opening actions.  Once those
+        actions have completed, the same search entry used by ``match`` must
+        own every subsequent state transition.  Resetting the shared
+        non-contact executor here also prevents an opening controller or its
+        timeout budget from leaking into the formal flow.
+        """
+
+        self._finish_noncontact()
+        self.state = MatchState.SEARCH_CLUSTER
+        self._begin_cluster_search()
+        return self._decision(
+            timestamp_ns,
+            0.0,
+            self._cluster_search_angular_velocity_rad_s,
+            reason,
+            posture=posture,
+            gripper_angles_deg=gripper_angles_deg,
         )
 
     def _step_nb_gripper_open(self, timestamp_ns: int) -> MatchDecision:
@@ -658,13 +686,9 @@ class MatchNBSequence(MatchSequence):
         action = self._nb_active_action()
         posture, angles = self._nb_posture()
         if action is None:
-            self.state = MatchState.SEARCH_CLUSTER
-            self._begin_cluster_search()
-            return self._decision(
+            return self._handoff_to_match_flow(
                 timestamp_ns,
-                0.0,
-                0.0,
-                "nb_opening_sequence_complete",
+                reason="nb_opening_sequence_complete",
                 posture=posture,
                 gripper_angles_deg=angles,
             )

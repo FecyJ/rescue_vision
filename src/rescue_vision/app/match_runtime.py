@@ -592,6 +592,15 @@ def _run_hardware(
             f"{config.near_field_grasp.no_plan_wait_ms:g} "
             "near_field_grasp_commit_max_observation_age_ms="
             f"{config.near_field_grasp.grasp_commit_max_observation_age_ms:g} "
+            "near_field_stationary_gyro_thresholds_rad_s="
+            f"({config.near_field_grasp.stationary_max_gyro_rad_s:g},"
+            f"{config.near_field_grasp.stationary_exit_gyro_rad_s:g}) "
+            "near_field_stationary_motion_confirm_ms="
+            f"{config.near_field_grasp.stationary_motion_confirm_ms:g} "
+            "near_field_stationary_encoder_tolerance_counts="
+            f"{config.near_field_grasp.stationary_encoder_tolerance_counts} "
+            "near_field_stationary_max_telemetry_gap_ms="
+            f"{config.near_field_grasp.stationary_max_telemetry_gap_ms:g} "
             "near_field_confirmation_frames="
             f"{config.near_field_grasp.confirmation_frames} "
             "orange_isolation_radius_mm="
@@ -614,10 +623,7 @@ def _run_hardware(
             f"close_gripper_spin_angle_rad={config.match.spin_angle_rad:g} "
             f"breakup_confirmation_frames={config.match.breakup_confirmation_frames} "
             f"breakup_field_half_extent_mm={config.match.breakup_field_half_extent_mm:g} "
-            f"breakup_gripper_offset_mm={config.match.breakup_gripper_offset_mm:g} "
-            f"breakup_forward_distance_m={config.match.breakup_forward_distance_m:g} "
-            f"breakup_backward_distance_m={config.match.breakup_backward_distance_m:g} "
-            f"first_breakup_backward_distance_m={config.match.first_breakup_backward_distance_m}",
+            f"breakup_gripper_offset_mm={config.match.breakup_gripper_offset_mm:g}",
             flush=True,
         )
         print(
@@ -1438,16 +1444,30 @@ def _run_hardware(
                         last_state = decision.state
                     # 变体入口可选的动作诊断：按动作变化记录配置量、实际进度和
                     # 传感器状态，便于区分动作配置问题与执行器/航位误差。
-                    opening_phase = getattr(
+                    formal_opening_phase = getattr(
+                        sequence, "opening_route_phase", None
+                    )
+                    nb_opening_phase = getattr(
                         sequence, "nb_opening_route_phase", None
+                    )
+                    opening_phase = (
+                        formal_opening_phase
+                        if formal_opening_phase is not None
+                        else nb_opening_phase
                     )
                     if opening_phase != last_opening_phase:
                         last_opening_phase = opening_phase
-                        diagnostic = getattr(
-                            sequence, "nb_opening_diagnostic", None
-                        )
-                        if diagnostic is not None:
-                            print(f"nb_opening={diagnostic}", flush=True)
+                        if formal_opening_phase is not None:
+                            print(
+                                f"opening_route={formal_opening_phase}",
+                                flush=True,
+                            )
+                        else:
+                            diagnostic = getattr(
+                                sequence, "nb_opening_diagnostic", None
+                            )
+                            if diagnostic is not None:
+                                print(f"nb_opening={diagnostic}", flush=True)
                     if decision.reason == "near_field_opening:open_group_width":
                         plan_age = (
                             None

@@ -262,7 +262,7 @@ def _run_session(
         + runtime_config.match.green_alignment_max_angular_velocity_rad_s * grasp_config.max_range_mm)
     session = GraspPreparationSession(target_tracker, selector)
     pickup_sequence = GripperWidthPickupSequence(
-        black_closed_servo_offset_deg=runtime_config.near_field_grasp.black_closed_servo_offset_deg,
+        black_grasp_servo_offset_deg=runtime_config.near_field_grasp.black_grasp_servo_offset_deg,
         gripper_full_travel_time_s=gripper.full_travel_time_s,
         forward_speed_m_s=runtime_config.match.green_approach_speed_m_s,
         terminal_speed_gain_s_inv=(
@@ -283,6 +283,14 @@ def _run_session(
                 grasp_config.grasp_commit_max_observation_age_ms
             ),
             stationary_max_gyro_rad_s=grasp_config.stationary_max_gyro_rad_s,
+            stationary_exit_gyro_rad_s=grasp_config.stationary_exit_gyro_rad_s,
+            stationary_motion_confirm_ms=grasp_config.stationary_motion_confirm_ms,
+            stationary_encoder_tolerance_counts=(
+                grasp_config.stationary_encoder_tolerance_counts
+            ),
+            stationary_max_telemetry_gap_ms=(
+                grasp_config.stationary_max_telemetry_gap_ms
+            ),
             fine_alignment_zone_rad=grasp_config.fine_alignment_zone_rad,
             fine_alignment_min_wheel_velocity_m_s=(
                 grasp_config.fine_alignment_min_wheel_velocity_m_s

@@ -33,6 +33,7 @@ __all__ = [
 
 SUPPLIES = frozenset((TargetClass.GREEN_SUPPLY, TargetClass.BLACK_CORE))
 GRASPABLE_CLASSES = frozenset((*SUPPLIES, TargetClass.ORANGE_INJURED))
+MATCH_TARGET_NEIGHBOR_CLEARANCE_MM = 10.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -688,14 +689,13 @@ class NearFieldGraspSelector:
         *,
         align: bool = True,
     ) -> str | None:
-        """检查橙色伤员周围的独立性禁入区。"""
+        """检查所有可抓物块统一的 10 mm 独立性禁入区。"""
 
-        if target.observation.target_class is not TargetClass.ORANGE_INJURED:
-            return None
+        del align
         if target.envelope is None:
-            return f"orange_isolation_unknown_ground_track:{target.track_id}"
+            return f"target_isolation_unknown_ground_track:{target.track_id}"
         center = target.envelope.center
-        radius = self.config.orange_isolation_radius_mm
+        radius = MATCH_TARGET_NEIGHBOR_CLEARANCE_MM
         for other in targets:
             if other.track_id == target.track_id:
                 continue
@@ -709,69 +709,13 @@ class NearFieldGraspSelector:
                 center.y - other_point.y,
             )
             if distance_mm <= radius + 1e-9:
-                if self._orange_side_rear_supply_clear(
-                    target,
-                    other,
-                    align=align,
-                ):
-                    continue
-                return (
-                    "orange_not_isolated_track:"
-                    f"{other.track_id}:distance_mm={distance_mm:.1f}"
+                prefix = (
+                    "orange_not_isolated_track"
+                    if target.observation.target_class is TargetClass.ORANGE_INJURED
+                    else "target_not_isolated_track"
                 )
+                return f"{prefix}:{other.track_id}:distance_mm={distance_mm:.1f}"
         return None
-
-    def _orange_side_rear_supply_clear(
-        self,
-        orange: GraspTarget,
-        other: GraspTarget,
-        *,
-        align: bool,
-    ) -> bool:
-        """圆形近邻区内仅放行 K0 位于扫掠外的合法绿/黑物资。
-
-        危险/未知或 K0 进入扫掠的目标仍执行原隔离门禁；不减小隔离半径。
-        """
-        if (other.observation.target_class not in SUPPLIES
-                or not self._eligible(other, self.default_policy)
-                or other.observation.ground_point is None
-                or orange.envelope is None):
-            return False
-        try:
-            geometries = [self._group_geometry(
-                (orange,), align=align,
-                range_limit_mm=self.config.max_range_mm + self.config.range_hysteresis_mm,
-            )]
-            if (
-                align
-                and abs(orange.envelope.center.y)
-                <= self.config.center_tolerance_mm
-                + self.config.alignment_hysteresis_mm
-            ):
-                geometries.append(self._group_geometry(
-                    (orange,), align=False,
-                    range_limit_mm=self.config.max_range_mm + self.config.range_hysteresis_mm,
-                ))
-        except ValueError:
-            return False
-        for geometry in geometries:
-            if geometry.reasons:
-                return False
-            # 扫掠门禁只判断邻近目标的 K0；目标外轮廓不再扩大扫掠阻挡范围。
-            other_point = other.observation.ground_point
-            assert other_point is not None
-            regions = self._regions(
-                geometry.angle_rad,
-                geometry.forward_distance_mm,
-                geometry.left_tip_y_mm,
-                geometry.right_tip_y_mm,
-            )
-            if min(
-                polygon_distance((other_point,), region)
-                for region in regions
-            ) <= 1e-6:
-                return False
-        return True
 
     def _gripper_tip_x_mm(self, servo_angles_deg: tuple[float, float]) -> float:
         """返回给定舵机角度下夹爪末端的前向 ``x``，含走廊起点下限。"""
@@ -912,6 +856,17 @@ class NearFieldGraspSelector:
         side_neighbors: list[tuple[GraspTarget, float, float]] = []
         for other in targets:
             if other.track_id in plan.member_ids or not other.observed:
+                continue
+            member_point = plan.members[0].observation.ground_point
+            other_point = other.observation.ground_point
+            if (
+                member_point is None
+                or other_point is None
+                or math.hypot(
+                    member_point.x - other_point.x,
+                    member_point.y - other_point.y,
+                ) > MATCH_TARGET_NEIGHBOR_CLEARANCE_MM
+            ):
                 continue
             metrics = self._side_neighbor_metrics(plan, other)
             if metrics is None:
@@ -1663,11 +1618,11 @@ class NearFieldGraspSelector:
             for member in plan.members
         )
         return (
+            -plan.score.orange_priority,
             abs(plan.alignment_angle_rad) > 1e-9,
             -len(plan.members),
             -black_count,
             -plan.score.rule_points,
-            -plan.score.orange_priority,
             not any(member.handoff_matched for member in plan.members),
             -plan.score.total,
             -plan.clearance_mm,
@@ -1740,7 +1695,20 @@ class NearFieldGraspSelector:
                     ):
                         return f"member_outside_opening:{current.track_id}"
         for target in targets:
-            if target.track_id not in plan.member_ids and self._obstacle_distance(
+            if target.track_id in plan.member_ids:
+                continue
+            member_point = plan.members[0].observation.ground_point
+            other_point = target.observation.ground_point
+            if (
+                member_point is not None
+                and other_point is not None
+                and math.hypot(
+                    member_point.x - other_point.x,
+                    member_point.y - other_point.y,
+                ) <= MATCH_TARGET_NEIGHBOR_CLEARANCE_MM
+            ):
+                return f"new_target_not_isolated:{target.track_id}:{target.observation.target_class.value}"
+            if self._obstacle_distance(
                 target, regions, obstacle_extent_required=policy.obstacle_extent_required,
             ) <= 1e-6:
                 return f"new_sweep_obstacle:{target.track_id}:{target.observation.target_class.value}"

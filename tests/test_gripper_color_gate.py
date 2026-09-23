@@ -38,6 +38,22 @@ def color_snapshot(frame, capture, result, colors):
     return replace(snapshot(frame, capture), result_timestamp_ns=result, timing=None, gripper_color=evidence)
 
 
+def line_snapshot(frame, capture, line_classes, *, present=None):
+    latest = color_snapshot(
+        frame,
+        capture,
+        capture,
+        line_classes if present is None else present,
+    )
+    return replace(
+        latest,
+        gripper_color=replace(
+            latest.gripper_color,
+            line_crossing_classes=frozenset(line_classes),
+        ),
+    )
+
+
 def orange_detection(frame, capture, box, *, k0=None):
     detected = observation(frame, capture, GroundPoint(200, 0), target_class=O)
     roi_box = UndistortedBoundingBox(
@@ -130,11 +146,69 @@ def test_far_roi_edge_line_moves_forward_100mm_with_ground_mapping():
     assert observation.horizontal_line_v == pytest.approx(439.0)
 
 
+def test_line_crossing_uses_shifted_line_for_detection():
+    hsv = np.full((400, 600, 3), (0, 0, 220), np.uint8)
+    hsv[350:380, 285:315] = (60, 230, 200)
+    image = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    projector = GroundProjector(
+        np.asarray(
+            [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+    )
+
+    observation = observe_gripper_colors(
+        image,
+        GripperColorConfig(line_forward_offset_mm=30.0),
+        color_config(),
+        ground_projector=projector,
+    )
+
+    assert observation is not None
+    assert observation.horizontal_line_v == pytest.approx(369.0)
+    assert observation.line_crossing_classes == frozenset({G})
+
+
+def test_line_crossing_uses_only_center_half_of_roi_width():
+    hsv = np.full((400, 600, 3), (0, 0, 220), np.uint8)
+    # This component crosses the line near the left edge of the ROI bounding
+    # box, but lies outside the configured center-half segment.
+    hsv[320:360, 260:275] = (60, 230, 200)
+    edge = observe_gripper_colors(
+        cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR),
+        GripperColorConfig(line_width_fraction=0.5),
+        color_config(),
+    )
+    assert edge is not None
+    assert edge.line_crossing_classes == frozenset()
+    assert edge.horizontal_line_u_range is not None
+
+    # The same crossing in the middle remains visible.
+    hsv[320:360, 285:315] = (60, 230, 200)
+    center = observe_gripper_colors(
+        cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR),
+        GripperColorConfig(line_width_fraction=0.5),
+        color_config(),
+    )
+    assert center is not None
+    assert center.line_crossing_classes == frozenset({G})
+    assert center.horizontal_line_u_range is not None
+    line_u_min, line_u_max = center.horizontal_line_u_range
+    assert line_u_max - line_u_min + 1 == pytest.approx(42.0)
+
+
 @pytest.mark.parametrize('override', [
     {'polygon_normalized': ((-0.1, 0), (1, 0), (1, 1))},
     {'polygon_normalized': ((0, 0), (1, 1), (0, 1), (1, 0))},
     {'polygon_normalized': ((0, 0), (0, 0), (0, 0))},
     {'min_component_fraction': float('nan')}, {'min_component_fraction': 0}, {'enabled': 1},
+    {'line_contact_hold_ms': -1},
+    {'line_contact_hold_ms': float('nan')},
+    {'line_regrasp_cooldown_ms': -1},
+    {'line_regrasp_cooldown_ms': 999.999},
+    {'line_regrasp_cooldown_ms': float('nan')},
+    {'line_width_fraction': 0},
+    {'line_width_fraction': 1.01},
     {'orange_bbox_min_color_fraction': 0},
     {'orange_bbox_min_color_fraction': 1.1},
     {'orange_bbox_min_color_fraction': float('nan')},
@@ -165,12 +239,133 @@ def test_gate_uses_current_trip_legality_without_reclassifying_targets(transport
     assert seq._transport_target_classes == cargo
 
 
+@pytest.mark.parametrize(
+    ("state", "safe_zone_phase", "expected"),
+    [
+        (MatchState.TRANSPORT_GREEDY_SCAN, "idle", None),
+        (MatchState.TRANSPORT_ALIGN_RED_ZONE, "align_d1_line", "gripper_line_crossing:green_supply"),
+        (MatchState.TRANSPORT_RELEASE, "stopping_before_calibration", None),
+        (MatchState.TRANSPORT_RELEASE, "collecting_safe_zone_keys_closed", None),
+        (MatchState.TRANSPORT_ALIGN_RED_ZONE, "align_d2_line", "gripper_line_crossing:green_supply"),
+        (MatchState.TRANSPORT_FORWARD, "forward_d2_line", "gripper_line_crossing:green_supply"),
+        (MatchState.TRANSPORT_RELEASE, "stopping_before_d2_opening", None),
+        (MatchState.REGRASP_FORWARD, "forward_d1_line", None),
+    ],
+)
+def test_line_crossing_window_is_pickup_to_d2_only(
+    state: MatchState,
+    safe_zone_phase: str,
+    expected: str | None,
+):
+    seq = _sequence(transports=1)
+    # This test isolates the route window; hold timing has dedicated coverage.
+    seq._line_contact_hold_ns = 0
+    seq._transport_target_classes = (G,)
+    seq._cargo_capture_floor_ns = 100
+    seq.state = state
+    seq._safe_zone_phase = safe_zone_phase
+    latest = color_snapshot(1, 100, 200, {G})
+    seq._latest_perception = replace(
+        latest,
+        gripper_color=replace(
+            latest.gripper_color,
+            line_crossing_classes=frozenset({G}),
+        ),
+    )
+
+    assert seq._gripper_color_conflict(200) == expected
+
+
+def test_line_crossing_requires_800ms_of_distinct_capture_frames():
+    seq = _sequence(transports=1)
+    seq._transport_target_classes = (G,)
+    seq._cargo_capture_floor_ns = 1
+    seq.state = MatchState.TRANSPORT_FORWARD
+    seq._safe_zone_phase = "forward_d1_line"
+
+    for frame, capture in (
+        (1, 100_000_000),
+        (2, 500_000_000),
+        (3, 899_999_999),
+    ):
+        seq._latest_perception = line_snapshot(frame, capture, {G})
+        assert seq._gripper_color_conflict(capture) is None
+
+    # Fast control polling of the same frame cannot manufacture hold time.
+    assert seq._gripper_color_conflict(900_000_000) is None
+
+    seq._latest_perception = line_snapshot(4, 900_000_000, {G})
+    assert seq._gripper_color_conflict(900_000_000) == (
+        "gripper_line_crossing:green_supply"
+    )
+
+
+def test_line_crossing_hold_resets_when_new_frame_no_longer_touches_line():
+    seq = _sequence(transports=1)
+    seq._transport_target_classes = (G,)
+    seq._cargo_capture_floor_ns = 1
+    seq.state = MatchState.TRANSPORT_FORWARD
+    seq._safe_zone_phase = "forward_d1_line"
+
+    seq._latest_perception = line_snapshot(1, 100_000_000, {G})
+    assert seq._gripper_color_conflict(100_000_000) is None
+    seq._latest_perception = line_snapshot(2, 500_000_000, set(), present={G})
+    assert seq._gripper_color_conflict(500_000_000) is None
+    seq._latest_perception = line_snapshot(3, 900_000_000, {G})
+    assert seq._gripper_color_conflict(900_000_000) is None
+    seq._latest_perception = line_snapshot(4, 1_300_000_000, {G})
+    assert seq._gripper_color_conflict(1_300_000_000) is None
+    seq._latest_perception = line_snapshot(5, 1_700_000_000, {G})
+    assert seq._gripper_color_conflict(1_700_000_000) == (
+        "gripper_line_crossing:green_supply"
+    )
+
+
+def test_line_crossing_hold_resets_after_observation_gap():
+    seq = _sequence(transports=1)
+    seq._transport_target_classes = (G,)
+    seq._cargo_capture_floor_ns = 1
+    seq.state = MatchState.TRANSPORT_FORWARD
+    seq._safe_zone_phase = "forward_d1_line"
+
+    for frame, capture in (
+        (1, 100_000_000),
+        # Exceeds this sequence's 500 ms perception freshness limit.
+        (2, 700_000_000),
+        (3, 1_100_000_000),
+    ):
+        seq._latest_perception = line_snapshot(frame, capture, {G})
+        assert seq._gripper_color_conflict(capture) is None
+    seq._latest_perception = line_snapshot(4, 1_500_000_000, {G})
+    assert seq._gripper_color_conflict(1_500_000_000) == (
+        "gripper_line_crossing:green_supply"
+    )
+
+
 def test_line_crossing_starts_open_forward_close_regrasp():
     seq = _sequence(transports=1)
+    # This test isolates the correction action after confirmation.
+    seq._line_contact_hold_ns = 0
     seq._started = True
     seq._transport_target_classes = (G,)
     seq._cargo_capture_floor_ns = 100
-    seq.state = MatchState.TRANSPORT_GREEDY_SCAN
+    seq.state = MatchState.TRANSPORT_FORWARD
+    seq._safe_zone_phase = "forward_d1_line"
+    seq._transport_forward_distance_m = 0.4
+    seq._d1_line_heading_rad = 0.0
+    seq._latest_heading_rad = 0.0
+    seq._latest_cumulative_distance_m = 0.0
+    seq._safe_zone_forward_command(
+        100,
+        key="safe_zone_d1_forward",
+        target_distance_m=0.4,
+        speed_m_s=0.5,
+        target_heading_rad=0.0,
+        position_tolerance_mm=20.0,
+    )
+    original_controller = seq._noncontact_controller
+    original_base_distance = seq._noncontact_base_distance
+    original_started_ns = seq._noncontact_started_ns
     latest = color_snapshot(1, 100, 200, {G})
     latest = replace(
         latest,
@@ -242,23 +437,64 @@ def test_line_crossing_starts_open_forward_close_regrasp():
         heading_rad=0.0,
         cumulative_distance_m=0.030,
     )
-    assert decision.state is MatchState.TRANSPORT_GREEDY_SCAN
+    assert decision.state is MatchState.TRANSPORT_FORWARD
+    assert seq._safe_zone_phase == "forward_d1_line"
     assert decision.gripper_posture is GripperPosture.CLOSED
+    assert seq._noncontact_controller is original_controller
+    assert seq._noncontact_base_distance == original_base_distance
+    assert seq._noncontact_started_ns == original_started_ns + 799_999_800
     assert seq._cargo_capture_floor_ns == 800_000_000
+
+    # The 30 mm regrasp correction is progress on the original 400 mm D1 leg,
+    # not a new segment with a reset encoder origin.
+    seq.step(
+        810_000_000,
+        perception=None,
+        heading_rad=0.0,
+        cumulative_distance_m=0.030,
+    )
+    assert seq._noncontact_last_command is not None
+    assert seq._noncontact_last_command.position_error == pytest.approx(0.370)
+
+    # This frame was captured during cooldown but is delivered afterwards;
+    # delivery time alone must not re-arm the gate.
+    repeated = color_snapshot(2, 1_600_000_000, 1_600_000_000, {G})
+    repeated = replace(
+        repeated,
+        gripper_color=replace(
+            repeated.gripper_color,
+            line_crossing_classes=frozenset({G}),
+        ),
+    )
+    seq._latest_perception = repeated
+    assert seq._gripper_color_conflict(1_900_000_000) is None
+    after_cooldown = color_snapshot(3, 1_900_000_000, 1_900_000_000, {G})
+    after_cooldown = replace(
+        after_cooldown,
+        gripper_color=replace(
+            after_cooldown.gripper_color,
+            line_crossing_classes=frozenset({G}),
+        ),
+    )
+    seq._latest_perception = after_cooldown
+    assert seq._gripper_color_conflict(1_900_000_000) == "gripper_line_crossing:green_supply"
 
 
 @pytest.mark.parametrize(
     ("transports", "cargo", "target_class"),
-    [(0, (G,), G), (1, (O,), O)],
+    [(0, (G,), G)],
 )
 def test_illegal_line_target_opens_moves_back_10mm_and_closes(
     transports, cargo, target_class,
 ):
     seq = _sequence(transports=transports)
+    # This test isolates the rule-directed backward correction action.
+    seq._line_contact_hold_ns = 0
     seq._started = True
     seq._transport_target_classes = cargo
     seq._cargo_capture_floor_ns = 100
-    seq.state = MatchState.TRANSPORT_GREEDY_SCAN
+    seq.state = MatchState.TRANSPORT_FORWARD
+    seq._safe_zone_phase = "forward_d1_line"
     latest = color_snapshot(1, 100, 200, {target_class})
     latest = replace(
         latest,
@@ -306,6 +542,25 @@ def test_illegal_line_target_opens_moves_back_10mm_and_closes(
     )
     assert decision.state is MatchState.REGRASP_CLOSE
     assert decision.gripper_posture is GripperPosture.OPEN
+
+
+def test_carried_orange_does_not_regrasp_its_own_line_crossing():
+    seq = _sequence(transports=1)
+    seq._line_contact_hold_ns = 0
+    seq._transport_target_classes = (O,)
+    seq._cargo_capture_floor_ns = 100
+    seq.state = MatchState.TRANSPORT_ALIGN_RED_ZONE
+    seq._safe_zone_phase = "align_d1_line"
+
+    seq._latest_perception = line_snapshot(1, 200, {O}, present={O})
+    assert seq._gripper_color_conflict(200) is None
+
+    # Suppress only the carried orange itself. A foreign green crossing still
+    # requires the invalid mixed cargo to be backed out.
+    seq._latest_perception = line_snapshot(2, 300, {O, G}, present={O})
+    assert seq._gripper_color_conflict(300) == (
+        "gripper_line_crossing_requires_backup:green_supply"
+    )
 
 
 def test_old_preclose_future_and_stale_colors_do_not_release_current_cargo():
@@ -651,7 +906,10 @@ def test_runtime_config_builds_enabled_gripper_color_observation():
     assert config.perception.gripper_color.polygon_normalized == (
         (0.47, 0.85), (0.53, 0.85), (0.57, 0.97), (0.43, 0.97),
     )
-    assert config.perception.gripper_color.line_forward_offset_mm == 100.0
+    assert config.perception.gripper_color.line_forward_offset_mm == 45.0
+    assert config.perception.gripper_color.line_width_fraction == 0.5
+    assert config.perception.gripper_color.line_contact_hold_ms == 800.0
+    assert config.perception.gripper_color.line_regrasp_cooldown_ms == 1000.0
     assert config.perception.gripper_color.min_component_fraction == 0.03
     assert config.perception.gripper_color.black_min_thickness_fraction == 0.12
     assert config.perception.gripper_color.orange_bbox_min_color_fraction == 0.15

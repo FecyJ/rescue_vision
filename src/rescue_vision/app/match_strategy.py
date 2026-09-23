@@ -205,6 +205,18 @@ class MatchSequence(_SharedMatchSequence):
                 config.near_field_grasp.grasp_commit_max_observation_age_ms
             ),
             stationary_max_gyro_rad_s=config.near_field_grasp.stationary_max_gyro_rad_s,
+            stationary_exit_gyro_rad_s=(
+                config.near_field_grasp.stationary_exit_gyro_rad_s
+            ),
+            stationary_motion_confirm_ms=(
+                config.near_field_grasp.stationary_motion_confirm_ms
+            ),
+            stationary_encoder_tolerance_counts=(
+                config.near_field_grasp.stationary_encoder_tolerance_counts
+            ),
+            stationary_max_telemetry_gap_ms=(
+                config.near_field_grasp.stationary_max_telemetry_gap_ms
+            ),
             fine_alignment_zone_rad=config.near_field_grasp.fine_alignment_zone_rad,
             fine_alignment_min_wheel_velocity_m_s=(
                 config.near_field_grasp.fine_alignment_min_wheel_velocity_m_s

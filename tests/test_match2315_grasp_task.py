@@ -8,6 +8,7 @@ import pytest
 from rescue_vision.app.gripper_width_sequence import GraspPreparationSession, GripperWidthPickupState
 from rescue_vision.app.near_field_grasp import GraspTargetTracker, NearFieldHandoffPrior
 from rescue_vision.motion.stationary import StationaryMotionEvidence
+from rescue_vision.perception import TargetClass
 from rescue_vision.tracking import TrackingConfig
 from test_gripper_width_sequence import motion_sample, sequence, snapshot_at
 from test_near_field_grasp import BLUE, GREEN, projector, selector, target
@@ -44,7 +45,7 @@ def test_one_stable_scene_opens_without_consumer_lock_or_new_frame(poll_ms, dela
     assert forward.linear_velocity_m_s > 0
 
 
-def test_illegal_enlargement_does_not_hold_legal_singleton():
+def test_confirmed_nearby_supply_is_added_to_the_group():
     seed = target(x=300, y=0)
     peer = replace(target(2, x=300, y=70), confirmed=False)
     danger = target(3, x=320, y=120, cls=BLUE)
@@ -52,7 +53,7 @@ def test_illegal_enlargement_does_not_hold_legal_singleton():
     assert result.plan is not None
     assert result.plan.member_ids == (1,)
     confirmed = selector().select((seed, replace(peer, confirmed=True), danger))
-    assert confirmed.plan is not None and confirmed.plan.member_ids == (1,)
+    assert confirmed.plan is not None and confirmed.plan.member_ids == (1, 2)
 
 
 @pytest.mark.parametrize('kind,reason', [('wheel', 'encoder_motion'), ('gyro', 'rotation'),
@@ -69,6 +70,38 @@ def test_stationary_diagnostics_explain_actual_invalidation(kind, reason):
     evidence.observe(sample)
     assert evidence.stationary_since(20_000_000) is None
     assert f'stationary_reason={reason}' in evidence.diagnostic(20_000_000)
+
+
+def test_small_motion_jitter_is_debounced_but_persistent_motion_invalidates():
+    evidence = StationaryMotionEvidence(
+        max_gap_ns=250_000_000,
+        max_gyro_rad_s=.03,
+        exit_gyro_rad_s=.06,
+        motion_confirm_ns=80_000_000,
+        encoder_tolerance_counts=0,
+    )
+    evidence.observe(motion_sample(0))
+    evidence.observe(motion_sample(10_000_000))
+    assert evidence.stationary_since(10_000_000) == 10_000_000
+
+    # A value in the hysteresis band does not invalidate an already stable scene.
+    evidence.observe(motion_sample(20_000_000, gyro=50_000))
+    assert evidence.stationary_since(20_000_000) == 10_000_000
+
+    # A short excursion closes the capture gate while pending, but restores the
+    # original evidence when the next packet is stable.
+    evidence.observe(motion_sample(30_000_000, gyro=80_000))
+    assert evidence.stationary_since(30_000_000) is None
+    assert "motion_pending=1" in evidence.diagnostic(30_000_000)
+    evidence.observe(motion_sample(40_000_000))
+    assert evidence.stationary_since(40_000_000) == 10_000_000
+
+    # A persistent one-count encoder displacement survives the debounce window
+    # and is treated as real motion.
+    for stamp in range(50_000_000, 140_000_000, 10_000_000):
+        evidence.observe(motion_sample(stamp, count=1))
+    assert evidence.stationary_since(130_000_000) is None
+    assert "stationary_reason=encoder_motion" in evidence.diagnostic(130_000_000)
 
 
 def test_stable_scene_returns_grasp_obstruction_and_recovery_together():
@@ -95,6 +128,39 @@ def test_stable_scene_returns_grasp_obstruction_and_recovery_together():
     assert prepared.recovery_plan.capture_timestamp_ns == scene.capture_timestamp_ns
     assert prepared.confirmation_progress == (1, 1)
     assert session.update(scene, locked_ids=None, recovery_context=context) is prepared
+
+
+def test_clustered_orange_uses_short_orange_aimed_recovery() -> None:
+    from rescue_vision.app.breakup_planner import BreakupSceneContext
+    from rescue_vision.app.gripper_width_sequence import GraspSceneAction
+    from rescue_vision.config import load_runtime_config
+    from rescue_vision.geometry.types import FieldPoint
+    config = load_runtime_config('configs/runtime.match.yaml')
+    planner = selector(confirmation_frames=1, orange_isolation_radius_mm=10.0)
+    session = GraspPreparationSession(
+        GraspTargetTracker(TrackingConfig(1, 80, .1, 500, 1, .1).build_tracker(),
+                           projector(), planner.config), planner,
+    )
+    context = BreakupSceneContext(replace(config.match, breakup_confirmation_frames=1),
+                                  FieldPoint(0, 0), 0, config.world.static_map,
+                                  (-1500, 1500, -1500, 1500), 110.15)
+    orange = target(1, x=350, y=0, cls=TargetClass.ORANGE_INJURED)
+    neighbor = target(2, x=350, y=8, cls=GREEN)
+    prepared = session.update(
+        snapshot_at(1, 100_000_000, (orange, neighbor)),
+        locked_ids=None,
+        recovery_context=context,
+    )
+
+    assert prepared.action is GraspSceneAction.RECOVERY
+    assert prepared.recovery_plan is not None
+    assert prepared.recovery_plan.aim_id == 1
+    assert prepared.recovery_plan.forward_distance_mm == pytest.approx(
+        config.match.misgrasp_breakup_forward_distance_m * 1000
+    )
+    assert prepared.recovery_plan.backward_distance_mm == pytest.approx(
+        config.match.misgrasp_breakup_backward_distance_m * 1000
+    )
 
 
 @pytest.mark.parametrize('poll_ms,frame_ms,delay_ms', [(5,250,300),(10,400,600)])

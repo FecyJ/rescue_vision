@@ -690,7 +690,7 @@ def test_config_uses_configured_gripper_and_transport_values() -> None:
     assert config.match.opportunistic_single_green_enabled
     assert (
         config.match.opportunistic_single_green_clearance_mm
-        == pytest.approx(120.0)
+        == pytest.approx(10.0)
     )
     assert config.match.safe_zone_grab_to_d1_speed_m_s == pytest.approx(
         0.3
@@ -3185,7 +3185,8 @@ def test_d1_visual_calibration_uses_compensated_straight_line() -> None:
         right_speed_feedback_m_s=0.0,
     )
     assert opened.state is MatchState.RETURN_BACKUP
-    assert opened.reason == "gripper_opened_after_safe_zone_push_start_exit"
+    assert opened.reason == "safe_zone_exit_reverse_open_loop"
+    assert opened.linear_velocity_m_s < 0.0
     assert opened.gripper_posture is GripperPosture.OPEN
     assert sequence._fallback_field_position is not None
     assert sequence._fallback_field_position.x == pytest.approx(-185.0, abs=0.2)
@@ -3306,6 +3307,7 @@ def test_exits_safe_zone_before_rearming_cluster_search() -> None:
             required_transports=4,
             opportunistic_single_green_enabled=True,
             safe_zone_exit_distance_m=0.30,
+            return_backup_speed_m_s=1.0,
             safe_zone_calibration_stop_confirm_time_s=0.30,
         ),
         initial_field_position=FieldPoint(-165.0, 1100.0),
@@ -3368,66 +3370,68 @@ def test_exits_safe_zone_before_rearming_cluster_search() -> None:
         right_speed_feedback_m_s=0.0,
     )
     assert opening_wait.state is MatchState.RETURN_BACKUP
-    assert opening_wait.reason == "gripper_opened_after_safe_zone_push_start_exit"
+    assert opening_wait.reason == "safe_zone_exit_reverse_open_loop"
+    assert opening_wait.linear_velocity_m_s == pytest.approx(-1.0)
 
     opened = sequence.step(
-        1_320_000_021,
-        perception=safe_zone_targets(5, 1_320_000_021),
+        500_000_021,
+        perception=safe_zone_targets(5, 500_000_021),
         heading_rad=math.pi / 2.0,
         cumulative_distance_m=0.1,
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
     )
     assert opened.state is MatchState.RETURN_BACKUP
-    assert opened.reason == "safe_zone_vehicle_stopped_start_exit"
+    assert opened.reason == "safe_zone_exit_reverse_open_loop"
+    assert opened.linear_velocity_m_s == pytest.approx(-1.0)
     assert opened.gripper_posture is GripperPosture.OPEN
 
     exit_started = sequence.step(
-        1_620_000_021,
-        perception=safe_zone_targets(6, 1_620_000_021),
+        600_000_021,
+        perception=safe_zone_targets(6, 600_000_021),
         heading_rad=math.pi / 2.0,
         cumulative_distance_m=0.1,
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
     )
-    assert exit_started.reason == "safe_zone_exit_reverse_to_field"
+    assert exit_started.reason == "safe_zone_exit_reverse_open_loop"
 
     reversing = sequence.step(
-        1_620_000_022,
-        perception=safe_zone_targets(7, 1_620_000_022),
+        600_000_022,
+        perception=safe_zone_targets(7, 600_000_022),
         heading_rad=math.pi / 2.0,
         cumulative_distance_m=0.09,
         left_speed_feedback_m_s=-0.08,
         right_speed_feedback_m_s=-0.08,
     )
     assert reversing.state is MatchState.RETURN_BACKUP
-    assert reversing.reason == "safe_zone_exit_reverse_to_field"
+    assert reversing.reason == "safe_zone_exit_reverse_open_loop"
 
     exit_distance_reached = sequence.step(
-        1_620_000_023,
-        perception=safe_zone_targets(8, 1_620_000_023),
+        620_000_021,
+        perception=safe_zone_targets(8, 620_000_021),
         heading_rad=math.pi / 2.0,
-        cumulative_distance_m=-0.20,
+        cumulative_distance_m=0.1,
         left_speed_feedback_m_s=-0.08,
         right_speed_feedback_m_s=-0.08,
     )
     assert exit_distance_reached.reason == "safe_zone_exit_distance_reached_wait_for_stop"
 
     exit_stop_waiting = sequence.step(
-        1_620_000_024,
-        perception=safe_zone_targets(9, 1_620_000_024),
+        620_000_022,
+        perception=safe_zone_targets(9, 620_000_022),
         heading_rad=math.pi / 2.0,
-        cumulative_distance_m=-0.20,
+        cumulative_distance_m=0.1,
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
     )
     assert exit_stop_waiting.reason == "safe_zone_waiting_for_vehicle_stop_after_exit"
 
     exit_stopped = sequence.step(
-        1_920_000_025,
-        perception=safe_zone_targets(10, 1_920_000_025),
+        920_000_023,
+        perception=safe_zone_targets(10, 920_000_023),
         heading_rad=math.pi / 2.0,
-        cumulative_distance_m=-0.20,
+        cumulative_distance_m=0.1,
         left_speed_feedback_m_s=0.0,
         right_speed_feedback_m_s=0.0,
     )
@@ -3439,8 +3443,8 @@ def test_exits_safe_zone_before_rearming_cluster_search() -> None:
     assert sequence.carried_target_count == 0
     # 同一旧安全区帧不重新校准、不重新成为候选，也不阻止继续转向。
     search = sequence.step(
-        1_920_000_030,
-        perception=safe_zone_targets(10, 1_920_000_025),
+        920_000_030,
+        perception=safe_zone_targets(10, 920_000_023),
         heading_rad=math.pi / 2.0,
         cumulative_distance_m=-0.20,
         left_speed_feedback_m_s=0.0,

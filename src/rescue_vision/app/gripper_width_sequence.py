@@ -427,6 +427,9 @@ class GraspPreparationSession:
             "blocked_target:",
             "side_adjacent_incompatible",
             "orange_not_isolated_track:",
+            "target_not_isolated_track:",
+            "target_isolation_unknown_ground_track:",
+            "new_target_not_isolated:",
             "orange_isolation_unknown_ground_track:",
             "orange_injured_single_only",
             "locked_members_changed",
@@ -599,6 +602,9 @@ class GraspPreparationSession:
                         "blocked_target:",
                         "side_adjacent_incompatible",
                         "orange_not_isolated_track:",
+                        "target_not_isolated_track:",
+                        "target_isolation_unknown_ground_track:",
+                        "new_target_not_isolated:",
                         "orange_isolation_unknown_ground_track:",
                         "maximum_opening_exceeded",
                         "forward_distance_exceeded",
@@ -677,7 +683,9 @@ class GraspPreparationSession:
         # Missing contact or danger geometry is evidence to reobserve, never
         # permission to push. Only concrete grasp obstruction invokes recovery.
         blocked = any(reason.startswith(("blocked_target:", "maximum_opening_exceeded",
-                                         "left_tip_y_mm", "right_tip_y_mm", "locked_members_changed"))
+                                         "left_tip_y_mm", "right_tip_y_mm", "locked_members_changed",
+                                         "orange_not_isolated_track:",
+                                         "target_not_isolated_track:"))
                       for reason in prepared.selection.rejections)
         if not blocked:
             return prepared
@@ -693,10 +701,36 @@ class GraspPreparationSession:
             targets.append(BreakupTarget(item.track_id, prepared.capture_timestamp_ns,
                                          observation.target_class, observation.ground_point,
                                          radius, safety_radius))
+        orange_aim_ids = frozenset(
+            item.track_id
+            for item in prepared.targets
+            if item.observed
+            and item.observation.target_class is TargetClass.ORANGE_INJURED
+            and item.observation.ground_point is not None
+            and any(
+                other.track_id != item.track_id
+                and other.observed
+                and other.observation.ground_point is not None
+                and math.hypot(
+                    item.observation.ground_point.x - other.observation.ground_point.x,
+                    item.observation.ground_point.y - other.observation.ground_point.y,
+                ) <= 10.0 + 1e-9
+                for other in prepared.targets
+            )
+        )
         previous = context.previous_plan
         rejected: list[str] = []
+        recovery_config = (
+            replace(
+                context.config,
+                breakup_forward_distance_m=context.config.misgrasp_breakup_forward_distance_m,
+                breakup_backward_distance_m=context.config.misgrasp_breakup_backward_distance_m,
+            )
+            if orange_aim_ids
+            else context.config
+        )
         candidates = plan_breakup(
-            tuple(targets), config=context.config, origin=context.origin,
+            tuple(targets), config=recovery_config, origin=context.origin,
             heading_rad=context.heading_rad, static_map=context.static_map,
             field_bounds=context.field_bounds, front_mm=context.front_mm,
             allowed_classes=policy.allowed_classes, approach=False,
@@ -705,6 +739,13 @@ class GraspPreparationSession:
             non_contact_ids=frozenset(excluded),
             rejection_reasons=prepared.selection.rejections, rejections=rejected,
         )
+        if orange_aim_ids:
+            # 没有独立橙色时，只接受直接瞄准橙色的短推计划；不能让同组
+            # 低价值物块的普通长解团计划抢先。
+            candidates = tuple(
+                candidate for candidate in candidates
+                if candidate.aim_id in orange_aim_ids
+            )
         if context.objective_field is not None:
             objective = context.objective_field
             candidates = tuple(candidate for candidate in candidates
@@ -1026,13 +1067,17 @@ class GripperWidthPickupDecision:
 class GripperWidthPickupSequence:
     def __init__(self, *, gripper_full_travel_time_s: float, forward_speed_m_s: float,
                  closed_servo_angles_deg: tuple[float, float], max_observation_age_ms: float,
-                 black_closed_servo_offset_deg: float = 5.0,
+                 black_grasp_servo_offset_deg: float = 5.0,
                  alignment_kp_rad_s: float = 1.0, alignment_max_angular_velocity_rad_s: float = 0.35,
                  alignment_min_wheel_velocity_m_s: float | None = None,
                  alignment_timeout_ms: float = 8_000.0,
                  alignment_continue_max_age_ms: float = 400.0,
                  grasp_commit_max_observation_age_ms: float = 150.0,
                  stationary_max_gyro_rad_s: float = 0.03,
+                 stationary_exit_gyro_rad_s: float | None = None,
+                 stationary_motion_confirm_ms: float = 80.0,
+                 stationary_encoder_tolerance_counts: int = 0,
+                 stationary_max_telemetry_gap_ms: float | None = None,
                  fine_alignment_zone_rad: float = 0.08,
                  fine_alignment_min_wheel_velocity_m_s: float = 0.0,
                  cruise_speed_scale: float = 1.0,
@@ -1058,8 +1103,36 @@ class GripperWidthPickupSequence:
             * 1e6
         )
         self.stationary_max_gyro_rad_s = _positive(stationary_max_gyro_rad_s, "stationary_max_gyro_rad_s")
+        self.stationary_exit_gyro_rad_s = (
+            None
+            if stationary_exit_gyro_rad_s is None
+            else _positive(stationary_exit_gyro_rad_s, "stationary_exit_gyro_rad_s")
+        )
+        self.stationary_motion_confirm_ns = round(
+            _positive(stationary_motion_confirm_ms, "stationary_motion_confirm_ms") * 1e6
+        )
+        if (isinstance(stationary_encoder_tolerance_counts, bool)
+                or not isinstance(stationary_encoder_tolerance_counts, int)
+                or stationary_encoder_tolerance_counts < 0):
+            raise ValueError(
+                "stationary_encoder_tolerance_counts must be a non-negative integer, "
+                f"got {stationary_encoder_tolerance_counts!r}."
+            )
+        self.stationary_encoder_tolerance_counts = stationary_encoder_tolerance_counts
+        telemetry_gap_ms = (
+            grasp_commit_max_observation_age_ms
+            if stationary_max_telemetry_gap_ms is None
+            else stationary_max_telemetry_gap_ms
+        )
+        self.stationary_max_telemetry_gap_ns = round(
+            _positive(telemetry_gap_ms, "stationary_max_telemetry_gap_ms") * 1e6
+        )
         self.motion_evidence = StationaryMotionEvidence(
-            max_gap_ns=self.commit_age_ns, max_gyro_rad_s=self.stationary_max_gyro_rad_s,
+            max_gap_ns=self.stationary_max_telemetry_gap_ns,
+            max_gyro_rad_s=self.stationary_max_gyro_rad_s,
+            exit_gyro_rad_s=self.stationary_exit_gyro_rad_s,
+            motion_confirm_ns=self.stationary_motion_confirm_ns,
+            encoder_tolerance_counts=self.stationary_encoder_tolerance_counts,
         )
         self.fine_alignment_zone_rad = _positive(
             fine_alignment_zone_rad,
@@ -1085,8 +1158,10 @@ class GripperWidthPickupSequence:
         if not isinstance(closed_servo_angles_deg, tuple) or len(closed_servo_angles_deg) != 2 or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)) or not 0 <= float(v) <= 180 for v in closed_servo_angles_deg):
             raise ValueError(f"Invalid closed servo angles {closed_servo_angles_deg!r}.")
         self.closed_angles = closed_servo_angles_deg
-        self.black_closed_servo_offset_deg = _nonnegative(black_closed_servo_offset_deg, "black_closed_servo_offset_deg")
-        self.closed_angles_for_classes((TargetClass.BLACK_CORE,))
+        self.black_grasp_servo_offset_deg = _nonnegative(
+            black_grasp_servo_offset_deg,
+            "black_grasp_servo_offset_deg",
+        )
         self.state = GripperWidthPickupState.SEARCH
         self.locked_ids: tuple[int, ...] | None = None
         self.active_plan: NearFieldGraspPlan | None = None
@@ -1112,16 +1187,17 @@ class GripperWidthPickupSequence:
         self._alignment_completed_ns = -1
         self._alignment_finished = False
 
-    def closed_angles_for_classes(self, classes: tuple[TargetClass, ...]) -> tuple[float, float]:
-        """黑色使用绝对命令偏置；几何张开角与全局机械零位仍保持原标定。"""
-        offset = self.black_closed_servo_offset_deg if TargetClass.BLACK_CORE in classes else 0.0
-        angles = (self.closed_angles[0] + offset, self.closed_angles[1] + offset)
+    def grasp_angles_for_plan(self, plan: NearFieldGraspPlan) -> tuple[float, float]:
+        """黑色只偏置目标宽度夹取角；闭爪与带载机械零位保持原标定。"""
+        classes = tuple(member.observation.target_class for member in plan.members)
+        offset = self.black_grasp_servo_offset_deg if TargetClass.BLACK_CORE in classes else 0.0
+        angles = (
+            plan.opening_servo_angles_deg[0] + offset,
+            plan.opening_servo_angles_deg[1] + offset,
+        )
         if any(not 0.0 <= angle <= 180.0 for angle in angles):
-            raise ValueError(f"black closed servo commands outside [0,180]: {angles!r}.")
+            raise ValueError(f"black grasp servo commands outside [0,180]: {angles!r}.")
         return angles
-
-    def _plan_closed_angles(self, plan: NearFieldGraspPlan) -> tuple[float, float]:
-        return self.closed_angles_for_classes(tuple(t.observation.target_class for t in plan.members))
 
     def observe_motion(self, message: OdometryImu) -> None:
         """消费真实编码器/IMU样本；接收时间与相机同为主机单调时钟。
@@ -1454,6 +1530,9 @@ class GripperWidthPickupSequence:
                                 "blocked_target:",
                                 "side_adjacent_incompatible",
                                 "orange_not_isolated_track:",
+                                "target_not_isolated_track:",
+                                "target_isolation_unknown_ground_track:",
+                                "new_target_not_isolated:",
                                 "orange_isolation_unknown_ground_track:",
                                 "ineligible_members_or_capacity",
                                 "orange_injured_single_only",
@@ -1637,16 +1716,16 @@ class GripperWidthPickupSequence:
             self._forward_heading_rad = heading_rad
             self._phase_ns = now
             self.state = GripperWidthPickupState.OPENING
-            return self._decision(now, "open_group_width", angles=plan.opening_servo_angles_deg, brake=True)
+            return self._decision(now, "open_group_width", angles=self.grasp_angles_for_plan(plan), brake=True)
 
         plan = self.active_plan
         # 合爪指令已在有证据时提交；此后只有计时和零底盘意图。
         # 被夹臂遮挡不应把已提交动作改称需要重新抓取。
         if self.state is GripperWidthPickupState.CLOSING:
             if now - self._phase_ns < self.travel_ns:
-                return self._decision(now, "closing_gripper", angles=self._plan_closed_angles(plan), brake=True)
+                return self._decision(now, "closing_gripper", angles=self.closed_angles, brake=True)
             self.state = GripperWidthPickupState.COMPLETE
-            self.result = GripperWidthPickupResult(plan.member_ids, tuple(t.observation.target_class.value for t in plan.members), now, self._plan_closed_angles(plan))
+            self.result = GripperWidthPickupResult(plan.member_ids, tuple(t.observation.target_class.value for t in plan.members), now, self.closed_angles)
             return self._decision(now, "complete_capture_unconfirmed", brake=True)
         if self.state is GripperWidthPickupState.OPENING:
             elapsed_ns = now - self._phase_ns
@@ -1682,7 +1761,7 @@ class GripperWidthPickupSequence:
             if self.progress_mm(cumulative_distance_m) >= plan.forward_distance_mm:
                 self.state = GripperWidthPickupState.CLOSING
                 self._phase_ns = now
-                return self._decision(now, "distance_reached_close_gripper", angles=self._plan_closed_angles(plan), brake=True)
+                return self._decision(now, "distance_reached_close_gripper", angles=self.closed_angles, brake=True)
             # 速度仍受剩余定距限制，但不受视觉观测年龄/退化状态降速。
             remaining_m = (plan.forward_distance_mm - self.progress_mm(cumulative_distance_m)) / 1000
             speed = approach_speed_m_s(remaining_m, self.speed, self.cruise_speed_scale,
@@ -1712,8 +1791,9 @@ class GripperWidthPickupSequence:
         front = mechanics.pivot_x_mm + math.hypot(mechanics.tip_offset_x_mm, mechanics.tip_offset_y_mm)
         # A closed-to-open arm stays laterally inside its final opening for
         # relative angles <= 90 degrees. Reject other calibrated sweeps.
-        left = self.closed_angles[0] - plan.opening_servo_angles_deg[0]
-        right = plan.opening_servo_angles_deg[1] - self.closed_angles[1]
+        grasp_angles = self.grasp_angles_for_plan(plan)
+        left = self.closed_angles[0] - grasp_angles[0]
+        right = grasp_angles[1] - self.closed_angles[1]
         if not (0 <= left <= 90 and 0 <= right <= 90):
             return 0.0
         # Existing checked corridor must also contain the entire moving arm.

@@ -410,6 +410,25 @@ def test_stale_confirmed_plan_is_reselected_without_a_fake_fresh_timestamp() -> 
     assert sequence.near_field_route is GraspRoute.RESELECT
 
 
+def test_stationary_evidence_timeout_reobserves_locked_target_before_reselecting() -> None:
+    sequence = _sequence()
+    sequence._near_field_pickup.locked_ids = (1,)
+    sequence._near_field_confirmation_started_ns = 0
+
+    decision = sequence._step_near_field_grasp(
+        2_000_000_000,
+        cumulative_distance_m=0.0,
+        preparation=None,
+        path_clear=True,
+    )
+
+    assert decision.state is MatchState.TRANSPORT_NEAR_FIELD_GRASP
+    assert decision.reason == (
+        "near_field_reobserve_without_motion:stationary_evidence_timeout"
+    )
+    assert sequence.near_field_route is GraspRoute.DECIDING
+
+
 def test_near_field_route_prefers_far_clear_target_after_blocked_near_target() -> None:
     sequence = _sequence(transports=1)
     decision_timestamp_ns = 800_000_000
@@ -731,6 +750,30 @@ def test_opportunistic_green_uses_fixed_transport_corridor_k0() -> None:
     assert found is not None and found.track_id == 1
     assert sequence.transport_corridor_half_width_mm == 34.0
     assert sequence.transport_corridor_effective_half_width_mm == 44.0
+
+
+def test_first_single_green_only_rejects_neighbors_within_ten_mm() -> None:
+    sequence = _sequence(
+        config=runtime_config(opportunistic_single_green_enabled=True),
+        transport_half_width_mm=34.0,
+    )
+    green = target(i=1, x=400.0, y=0.0, timestamp=10, frame=1).observation
+    neighbor = target(
+        i=2, x=400.0, y=80.0, cls=TargetClass.BLUE_DANGER,
+        timestamp=10, frame=1,
+    ).observation
+    sequence._tracker.update(10, [green, neighbor])
+    green_track = sequence._tracker.tracks[0]
+    assert sequence._transport_group_size(green_track, 10) == 1
+
+    touching = target(
+        i=2, x=400.0, y=10.0, cls=TargetClass.BLUE_DANGER,
+        timestamp=20, frame=2,
+    ).observation
+    refreshed = target(i=1, x=400.0, y=0.0, timestamp=20, frame=2).observation
+    sequence._tracker.update(20, [refreshed, touching])
+    green_track = next(item for item in sequence._tracker.tracks if item.track_id == 1)
+    assert sequence._transport_group_size(green_track, 20) is None
 
 
 def test_single_green_side_adjacent_blue_defers_to_actual_near_field_sweep() -> None:
@@ -1150,6 +1193,38 @@ def test_near_field_complete_enters_existing_d1_transport() -> None:
     )
     assert complete.state is MatchState.TRANSPORT_ALIGN_RED_ZONE
     assert complete.reason == "near_field_grasp_complete_start_safe_zone_d1_line"
+
+
+def test_black_offset_applies_only_to_grasp_width_not_closing_or_carry() -> None:
+    sequence = _sequence(transports=1)
+    plan = selector().select(
+        (target(cls=TargetClass.BLACK_CORE),),
+        policy=sequence.near_field_policy,
+    ).plan
+    assert plan is not None
+    prep = _preparation(plan)
+    expected_grasp = tuple(angle + 5.0 for angle in plan.opening_servo_angles_deg)
+
+    opening = sequence._step_near_field_grasp(0, 0.0, prep, True)
+    assert opening.gripper_angles_deg == expected_grasp
+    forward = sequence._step_near_field_grasp(100_000_001, 0.0, prep, True)
+    assert forward.gripper_angles_deg == expected_grasp
+    closing = sequence._step_near_field_grasp(
+        200_000_001,
+        plan.forward_distance_mm / 1000.0,
+        replace(
+            prep,
+            capture_timestamp_ns=200_000_001,
+            prepared_timestamp_ns=200_000_001,
+            result_timestamp_ns=200_000_001,
+        ),
+        True,
+    )
+    assert closing.gripper_angles_deg == (90.0, 90.0)
+
+    sequence._transport_target_classes = (TargetClass.BLACK_CORE,)
+    carrying = sequence._decision(200_000_002, 0.2, 0.0, "black_carrying")
+    assert carrying.gripper_angles_deg is None
 
 
 def test_single_orange_completion_routes_to_injured_zone_endpoint() -> None:

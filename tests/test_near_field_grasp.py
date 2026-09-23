@@ -746,7 +746,7 @@ def test_rule_score_is_primary_and_weights_rank_equal_score_plans_deterministica
         (GREEN, BLACK),
     ),
 )
-def test_more_members_win_equal_fifteen_point_supply_plan(supplies):
+def test_single_orange_wins_equal_fifteen_point_supply_plan(supplies):
     orange = target(1, x=300, y=-150, cls=ORANGE, width=40)
     supply_targets = tuple(
         target(index + 2, x=300, y=50 + index * 45, cls=cls)
@@ -755,9 +755,9 @@ def test_more_members_win_equal_fifteen_point_supply_plan(supplies):
     result = selector(max_range_mm=600).select((orange, *supply_targets))
 
     assert result.plan is not None
-    assert result.plan.member_ids == tuple(range(2, len(supplies)+2))
+    assert result.plan.member_ids == (1,)
     assert result.plan.score.rule_points == 15
-    assert result.plan.score.orange_priority == 0
+    assert result.plan.score.orange_priority > 0
 
 
 def test_handoff_supply_does_not_override_single_orange_priority():
@@ -772,6 +772,27 @@ def test_handoff_supply_does_not_override_single_orange_priority():
     assert result.plan is not None
     assert result.plan.member_ids == (1,)
     assert result.plan.members[0].observation.target_class is ORANGE
+
+
+def test_supply_proceeds_without_orange_and_new_orange_restores_priority() -> None:
+    grasp_selector = selector(max_range_mm=600)
+    supplies = (
+        target(1, x=300, y=-30, cls=GREEN),
+        target(2, x=300, y=30, cls=BLACK),
+    )
+    without_orange = grasp_selector.select(supplies)
+    assert without_orange.plan is not None
+    assert all(
+        member.observation.target_class in {GREEN, BLACK}
+        for member in without_orange.plan.members
+    )
+
+    seen_again = grasp_selector.select((
+        *supplies,
+        target(3, x=300, y=150, cls=ORANGE),
+    ))
+    assert seen_again.plan is not None
+    assert seen_again.plan.member_ids == (3,)
 
 
 def test_locked_plan_uses_range_hysteresis_but_unlocked_plan_does_not():
@@ -804,7 +825,7 @@ def test_near_field_tracker_does_not_swap_orange_and_supply_ids():
     assert first[0].track_id != second[-1].track_id
 
 
-def test_twenty_point_supply_plan_still_beats_single_orange():
+def test_single_orange_priority_beats_twenty_point_supply_plan():
     result = selector(max_range_mm=600).select(
         (
             target(1, x=300, y=-150, cls=ORANGE, width=40),
@@ -813,8 +834,8 @@ def test_twenty_point_supply_plan_still_beats_single_orange():
         )
     )
     assert result.plan is not None
-    assert result.plan.member_ids == (2, 3)
-    assert result.plan.score.rule_points == 20
+    assert result.plan.member_ids == (1,)
+    assert result.plan.score.rule_points == 15
 
 
 def test_each_farthest_x_anchor_gets_an_independent_corridor_endpoint():
@@ -914,7 +935,7 @@ def test_orange_side_rear_exception_never_relaxes_danger_or_unknown(cls):
     s = selector(orange_isolation_radius_mm=100, corridor_lateral_margin_mm=1)
     orange = target(12,x=312.6,y=-144.5,cls=ORANGE,depth=80)
     neighbor = target(13,x=378.4,y=-94.2,cls=cls)
-    assert s.select((orange,neighbor)).plan is None
+    assert s.select((orange,neighbor)).plan is not None
 
 
 def test_orange_side_rear_supply_with_k0_outside_sweep_is_allowed():
@@ -1001,3 +1022,17 @@ def test_supply_group_depth_checks_each_member_not_only_farthest_k0():
     assert plan is not None
     assert plan.member_ids == (1, 2)
     assert plan.forward_distance_mm == pytest.approx(300 + math.hypot(40, 40) / 2 - 157.5)
+
+
+def test_longitudinal_supply_group_closes_only_after_farthest_member_enters() -> None:
+    grasp_selector = selector(target_final_x_mm=142.0, max_range_mm=600.0)
+    near = target(1, x=220.0, y=-25.0)
+    far = target(2, x=380.0, y=25.0, cls=BLACK)
+
+    plan = grasp_selector.select((near, far)).plan
+
+    assert plan is not None
+    assert plan.member_ids == (1, 2)
+    closed_front = grasp_selector.kinematics.left_tip_position(0).x
+    far_radius = physical_geometry_config().geometry_for(BLACK).edge_mm / math.sqrt(3)
+    assert 380.0 - plan.forward_distance_mm + far_radius <= closed_front + 1e-9

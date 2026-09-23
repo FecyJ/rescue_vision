@@ -157,7 +157,7 @@ def test_nb_config_contains_historical_relative_actions() -> None:
     assert isinstance(turn_3, NBOpeningTurn)
     assert turn_3.angle_rad == pytest.approx(0.97)
     assert isinstance(straight_4, NBOpeningStraight)
-    assert straight_4.distance_m == pytest.approx(1.55)
+    assert straight_4.distance_m == pytest.approx(1.60)
     assert isinstance(reverse, NBOpeningStraight)
     assert reverse.distance_m == pytest.approx(-0.9)
     assert config.nb_opening_gripper_after_action == 2
@@ -259,6 +259,47 @@ def test_nb_opening_runs_configured_actions_in_order() -> None:
     ]
     assert indices == sorted(indices)
     assert records[-1]["state"] is MatchState.SEARCH_CLUSTER
+    assert records[-1]["angular"] == pytest.approx(-0.30)
+    assert sequence.nb_opening_route_phase is None
+    assert sequence._last_timestamp_ns is not None
+    post_opening = sequence.step(
+        sequence._last_timestamp_ns + round(CONTROL_PERIOD_S * 1_000_000_000),
+        perception=None,
+        heading_rad=START_HEADING_RAD,
+        cumulative_distance_m=0.0,
+    )
+    assert post_opening.state is MatchState.SEARCH_CLUSTER
+    assert post_opening.reason.startswith("search_cluster_")
+
+
+def test_nb_opening_turn_tolerance_is_not_used_by_formal_flow() -> None:
+    sequence = make_nb(
+        config=runtime_config(
+            nb_opening_actions=(NBOpeningTurn(0.40, 0.50),),
+            nb_opening_gripper_after_action=None,
+            nb_opening_turn_tolerance_rad=0.20,
+            nb_opening_heading_tolerance_rad=0.12,
+            cluster_align_tolerance_rad=0.01,
+        )
+    )
+    start_nb(sequence)
+
+    sequence.step(
+        2,
+        perception=None,
+        heading_rad=START_HEADING_RAD,
+        cumulative_distance_m=0.0,
+    )
+    opening_controller = sequence._nb_action_controller
+    assert opening_controller is not None
+    assert opening_controller._position_tolerance() == pytest.approx(0.20)
+    assert opening_controller._heading_tolerance() == pytest.approx(0.12)
+
+    # The formal cluster alignment is reached only at its own tolerance.  A
+    # 0.05 rad error would have been accepted by the NB opening tolerance.
+    formal_alignment = sequence._cluster_alignment_decision(3, 0.05)
+    assert formal_alignment.reason == "align_cluster_once"
+    assert formal_alignment.angular_velocity_rad_s != 0.0
 
 
 def test_nb_never_drives_forward_before_turn_finishes() -> None:

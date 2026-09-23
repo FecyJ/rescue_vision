@@ -62,16 +62,17 @@ def start(seq, plan):
 def test_pickup_completes_without_turn_or_automatic_rearm():
     seq=sequence(); plan=selector().select((target(1,y=-30),target(2,y=30,cls=BLACK))).plan
     opening=start(seq,plan)
-    assert opening.state is State.OPENING and opening.gripper_angles_deg==plan.opening_servo_angles_deg
+    expected_grasp_angles=tuple(angle+5 for angle in plan.opening_servo_angles_deg)
+    assert opening.state is State.OPENING and opening.gripper_angles_deg==expected_grasp_angles
     forward=seq.step(100_000_001,prep(plan,100_000_001),cumulative_distance_m=0)
     assert forward.state is State.FORWARD and forward.linear_velocity_m_s>0
     closing=seq.step(200_000_001,prep(plan,200_000_001),cumulative_distance_m=plan.forward_distance_mm/1000)
-    assert closing.state is State.CLOSING and closing.gripper_angles_deg==(95,95)
+    assert closing.state is State.CLOSING and closing.gripper_angles_deg==(90,90)
     complete=seq.step(300_000_001,prep(plan,300_000_001),cumulative_distance_m=plan.forward_distance_mm/1000)
     assert complete.state is State.COMPLETE and complete.angular_velocity_rad_s==0
     assert seq.result.member_ids==(1,2) and not seq.result.capture_confirmed
     assert seq.result.completed_timestamp_ns==300_000_001
-    assert seq.result.final_servo_angles_deg==(95,95)
+    assert seq.result.final_servo_angles_deg==(90,90)
     again=seq.step(10_000_000_000,None,cumulative_distance_m=None)
     assert again.state is State.COMPLETE and again.gripper_angles_deg is None and again.soft_brake
 
@@ -673,7 +674,10 @@ def test_stopped_scene_does_not_freeze_high_overlap_duplicate_detection():
         result.targets[1].observation.box
     ) > planner.config.stopped_scene_new_target_max_bbox_iou
     assert result.selection.plan is None
-    assert "blocked_target:2:black_core" in result.selection.rejections
+    assert any(
+        reason.startswith("target_not_isolated_track:2:")
+        for reason in result.selection.rejections
+    )
 
 
 def test_rejected_orange_alternative_does_not_starve_locked_green_confirmation():

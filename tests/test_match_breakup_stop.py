@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import math
 import struct
 
 import pytest
@@ -12,6 +13,25 @@ from rescue_vision.motion import MessageType, MotionController, SensorFlags
 from test_gripper_width_sequence import motion_sample
 from test_match_breakup import frozen_plan, sequence
 from test_motion import FakeCarChannel, FakeClock, command_reply_frame, limits
+
+
+def test_match_speed_limit_uses_highest_allowed_without_braking_or_exit():
+    channel = FakeCarChannel()
+    controller = MotionController(channel, limits())
+    decision = MatchDecision(
+        1,
+        MatchState.GATE_CLEARANCE,
+        0.0,
+        math.nextafter(controller.limits.max_angular_velocity_rad_s, math.inf),
+        GripperPosture.CLOSED,
+        "point_controller_roundoff_at_limit",
+    )
+
+    braking = _apply_match_motion(controller, decision, braking=False)
+
+    assert not braking
+    assert controller.target_wheel_speeds_m_s == pytest.approx((-0.2, 0.2))
+    assert channel.sent == []
 
 
 @pytest.mark.parametrize('poll_ms', [5, 10])

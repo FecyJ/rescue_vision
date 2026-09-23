@@ -177,9 +177,8 @@ bbox 底边横向边界，并包含模型 K0 或 bbox 底边中点兜底。整�
 `MatchSequence` 持有跨搜索、接近、稳定规划、解团和再抓取的 `GraspTask`。
 解团是当前物理抓取任务的恢复动作，退离后接回该任务；执行次序、规则与时间预算统一见
 [正式流程设计](../../../docs/正式流程设计.md#抓取任务与动作顺序)。
-`breakup_forward_distance_m` / `breakup_backward_distance_m` 在正式流程中是完整动作距离；
-`first_breakup_backward_distance_m` 可为首次正式解团覆盖后退距离，当前 `runtime.match.yaml`
-配置为首次闭爪前进 0.4 m、停稳后倒车 0.2 m，后续重试使用常规后退距离 0.1 m。
+`breakup_forward_distance_m` / `breakup_backward_distance_m` 在正式流程中是完整动作距离，
+当前配置为闭爪前进 0.5 m、闭爪后退 0.3 m。
 `grasp_task.marked_targets` 持有团内得分物块
 的类别、最后实测 `FieldPoint`、采集时间（ns）与可选主 tracker ID；采集位姿补偿与唯一关联
 在解团期间持续更新，退离后以新观测交接同一物块。预览只高亮同帧关联框，日志保留标记及年龄。
@@ -187,21 +186,33 @@ CC 继续使用独立固定动作，单绿运输联调与带载补夹不开放�
 
 ### 实验性门前清障
 
-`match.gate_clearance.enabled` 控制夹取后、投放前的门前清障，当前运行配置默认开启。
-触发只使用带采集时刻位姿的当前帧 K0 场地点：己方物资区前 200 mm 出现橙色，己方伤员区
-前 200 mm 出现绿色或黑色，或任一区前 200 mm 出现蓝色时，流程选择较近一侧开始。
+`match.gate_clearance.enabled` 控制夹取后、投放前的门前清障，当前缺省值及全部运行配置均为关闭；
+需要继续真机试验时再显式开启。
+只有到达 D1 且两帧安全区关键点视觉校准成功、状态进入 `align_d2_line` 或
+`forward_d2_line` 后才检查；校准失败后仅靠航位继续 D2 时不触发。证据只使用带采集时刻
+位姿的当前帧 K0 场地点：己方物资区前出现橙色，己方伤员区前出现绿色或黑色，或任一区前
+出现蓝色时，流程选择较近一侧开始。条带纵向基准、纵深和横向内缩分别由
+`front_edge_inset_mm`、`front_depth_mm`、`lateral_inset_mm` 控制。
 
-机器人先到该侧安全区外沿的暂存轴心点 `x=±470, y=±1115 mm`，朝场外张爪放下本趟载荷，
-倒车 120 mm 到对应的 `S1/S2 (x=±350, y=±1115 mm)`。随后掉头 180°，保持最大张爪，
-沿 `S1 → (0,±1115) → S2` 的整条线高速扫掠；到另一侧合爪，把扫入的物块送到
-`y=±650 mm` 的场地中部释放并退出，再返回暂存点。红蓝方使用同一场地坐标定义并做中心对称。
+触发后先等待编码器/IMU证明真实停稳，再按停稳后的场地位姿选择较近侧。机器人先对准并沿
+冻结航向直线到该侧暂存轴心点 `x=±620, y=±885 mm`，朝场外张爪放下本趟载荷，
+倒车 120 mm 到对应的 `S1/S2 (x=±500, y=±885 mm)`。S1/S2 在 x 方向分别比原点位
+远离安全区 150 mm；该横扫线相对安全区前沿向
+场地中心内移 230 mm。暂存退出后先独立合爪并等待机械行程完成，再按安全区左中、
+中心、右中三点的共线方向完成绝对航向对正，保持闭爪锁定该航向直线前冲，沿
+`S1 → (0,±885) → S2` 的整条线高速扫掠；到另一侧后把扫入的物块送至距场地原点
+200 mm 半径处释放并按配置高速倒车退出；该短退出段按距离/速度固定时长开环，随后仍等待
+真实停稳反馈。红蓝方使用同一场地坐标定义并做中心对称。
 
-回取阶段复用普通近场选组、危险走廊、编码器定距和合爪状态机，并要求计划的类别多重集与
-暂存前载荷完全一致；只看到其中一部分不会提交抓取。清障每趟最多触发一次，整个尝试共用
-`attempt_timeout_s` 截止时间，临时释放和清障物块不增加交付计数。动作日志以
-`gate_clearance:` 开头，等待回取时同时输出确认进度、采集年龄、静止起点和截止时间。
+横扫使用独立 `sweep_heading_tolerance_rad` 对准（当前约 2° / 0.035 rad）；启动前和运行中都复核绝对航向。偏角超过
+门限时立即零速软刹车，真实停稳后重新对正，并按当前 x 位置重算剩余横扫距离；轴心偏离
+S1—S2 横线超过 `sweep_cross_track_tolerance_mm` 时退出清障，禁止继续向安全区方向推进。
 
-该模块尚未完成真机扫掠、制动、暂存保持、回取成功率和危险类推移验收。
+清障结束后不回取暂存载荷，张爪进入普通目标搜索；暂存与中场释放均不增加交付计数。
+整个尝试共用 `attempt_timeout_s` 截止时间。触发日志列出命中类别、命中场地点及条带参数；
+动作日志以 `gate_clearance:` 开头，输出当前场地点、动作目标点、冻结航向、静止起点和截止时间。
+
+该模块尚未完成真机扫掠、制动、暂存保持和危险类推移验收。
 
 选择器依次把不同物资作为最远 X 锚点，分别生成不同长度的扫掠走廊；橙色目标不参与
 多成员组合，只生成单目标计划。每个走廊会把实际进入其中的合法物资闭包纳入。通过
@@ -223,17 +234,15 @@ CC 继续使用独立固定动作，单绿运输联调与带载补夹不开放�
 `grasp_candidate` 诊断的 `corridor_end_x_mm` 与执行走廊共用同一公式。走廊只覆盖夹爪
 张开宽度将要扫过的区域，不再覆盖车体或夹臂的历史全扫掠包络。
 
-绿/黑候选不再因蓝色侧邻被直接淘汰：蓝色只按实际扫掠走廊判定——仅检查 K0
+黑/绿/橙候选统一先检查目标 K0 周围 10 mm 邻物；超过该距离不因邻近本身淘汰。蓝色仍按实际扫掠走廊判定——仅检查 K0
 是否进入夹爪开口将要扫过的矩形；没有其它安全方案时正式路由进入解团。
-`_side_neighbor_metrics()` 的纵向/横向中心差门禁只用于单橙计划的侧邻检查，明显前后
-错开的目标不触发。橙色侧邻不影响绿/黑计划；橙色独立性门禁只约束单橙计划。纯绿黑目标
-即使分布密集，也不会因为彼此接近被拆散，仍允许最多三个成员的多目标计划。
+明显前后错开的目标不触发邻物门禁。纯绿黑目标在通过统一邻物门禁和路径门禁时，仍允许最多
+三个成员的多目标计划。
 
 蓝色危险目标 K0 进入走廊时直接拒绝，不能用评分抵消；不再按实体半径或完整物体轮廓扩大
 扫掠阻挡范围。四类目标缺失模型 K0 时统一使用 bbox 底边中点，因此走廊判断
 仍有明确地面锚点；橙色只能
-作为单目标计划，不能作为额外成员加入绿黑组合。橙色目标地面中心周围
-`orange_isolation_radius_mm` 内有当前可定位的其它目标时拒绝；其它
+作为单目标计划，不能作为额外成员加入绿黑组合。所有候选目标地面中心周围 10 mm 内有当前可定位的其它目标时拒绝；其它
 目标未观测或没有当前地面点时不无条件推定其位于禁区。扫掠门禁只判断目标 K0，完整物体
 外轮廓不扩大阻挡范围；额外绿黑的 K0 落入走廊时加入组合并
 重新检查数量和横向开口；蓝色危险目标只在静止规划阶段影响选组。最终确认通过并提交计划后
@@ -270,9 +279,9 @@ K0 最近的局部目标；首轮单绿优先合法交接目标，也可选择�
 单位 mm；时间为相机与应用共用的单调时钟 ns。`bounds` 是计划对准后的机器人系，
 `regions` 是该计划采集帧的机器人系，不能当作场地坐标。
 
-`NearFieldGraspPolicy.obstacle_extent_required` 默认关闭，由正式 match 首趟单绿启用；
-`select()` 与 `recheck()` 共用当前 K0 和配置实体尺寸的净空检查，日志输出同名字段及阻挡 ID/类别。
-不新增 YAML 配置；后续转运、补夹及独立 CC/单绿运输入口保持原策略。
+正式 match 的黑、绿、橙候选统一要求目标 K0 周围 10 mm 内没有其它已定位物块；路径仍独立
+检查前进走廊、场界和安全区。当前帧没有橙色证据时直接选择黑绿候选；新帧重新看到橙色时
+恢复橙色优先，非独立橙色走短距离瞄准轻撞解团。后续转运、补夹及独立 CC/单绿运输入口保持原策略。
 
 `GraspPreparationSession` 串行处理固定场景；首次合法选组自动持有核心并计入当前帧，
 消费者无须回传锁组后追要另一帧。`locked_ids` 可约束已经冻结的核心，省略时沿用准备器
@@ -286,7 +295,9 @@ K0 最近的局部目标；首轮单绿优先合法交接目标，也可选择�
 使用 `latest_snapshot()` 保留迟到结果，不用通用流的采集年龄提前过滤静止计划。
 连续静止场景可容纳超过800 ms的处理延迟，但采集年龄仍受提交预算限制、结果发布后的
 失联年龄受通用观测上限约束，真实运动、遥测无效或更新的危险/核心缺失仍阻止提交。
-`stationary_reason` 区分编码器运动、旋转、无效传感器、重复设备样本和遥测断档。
+静止判定使用进入阈值、退出阈值和持续运动确认时长；一次小角速度或编码器量化抖动只在
+pending 期间关闭采集门，不重写已有静止起点。`stationary_reason` 区分编码器运动、旋转、
+无效传感器、重复设备样本、遥测断档和当前运动确认状态。
 完整时间与失败语义见[正式流程设计](../../../docs/正式流程设计.md#延迟预算和旁路)。
 
 生产装配见 `gripper_width._run()` 和 `match_runtime._run_hardware()`：从
@@ -311,9 +322,14 @@ require_handoff=..., excluded_observation_indices=..., recovery_context=...)`；
 计划进入 `forward_encoder_heading_hold`。动作退出后必须用退出之后采集的新证据重新选组，不能直接
 重放旧计划。
 合爪指令提交后只等待计时并保持底盘静止，遮挡不会自行重新抓取；不把视觉消失当成成功
-证据。夹爪 ROI 外接矩形最远边向机器人前方暂偏移 100 mm 的绿色/橙色连通域跨线是例外的
-重夹证据：符合当前趟次规则时张爪、编码器前进 30 mm、停稳合爪；不合法的线侧目标则张爪、
-编码器后退 10 mm、停稳合爪，之后均回到原运输状态；`rx_degraded` 只保留在日志诊断中。
+证据。夹爪 ROI 外接矩形最远边向机器人前方暂偏移 100 mm 的绿色/橙色连通域跨线，仅在确认合爪
+并进入 D1 路线后、到达 D2 前作为例外的重夹证据：符合当前趟次规则时张爪、编码器前进 30 mm、
+停稳合爪；不合法的线侧目标则张爪、编码器后退 10 mm、停稳合爪，之后均回到原运输状态。
+同一组跨线类别须按采集时间连续触碰 `line_contact_hold_ms`（默认 800 ms）才触发；重复控制轮询
+不累计，新帧触碰中断、类别变化或离开允许窗口会清零。`REGRASP_*` 期间和合爪后的
+`line_regrasp_cooldown_ms`（默认且最少 1000 ms）内不会重复触发。D1 视觉校准期间不启动重夹；
+直线段中的重夹编码器位移继续计入原 D1/D2 路线进度，不重置里程原点；
+`rx_degraded` 只保留在日志诊断中。
 
 `GraspPreparation` 的 `confirmation_progress`、计划的 `capture_timestamp_ns` 和
 `prepared_timestamp_ns` 分别用于确认进度、计划年龄和准备结果年龄，
@@ -392,13 +408,16 @@ Enter 放行后立即执行启动转向/直行和目标搜索，输入其它文�
 有效样本。观察/确认预算耗尽仍显式退出视觉纠偏并以现有航位继续规划 D2。
 新调整参数、删除的追框字段、采集/发布时间和降级限制统一见[正式流程设计](../../../docs/正式流程设计.md)。
 
-安全区末段的绿/黑物资使用 `match.safe_zone_d2_to_final_speed_m_s` 和
-`match.safe_zone_d2_to_final_braking_overrun_mm`；单个橙色伤员使用独立的
-`match.safe_zone_orange_d2_to_final_speed_m_s` 和
-`match.safe_zone_orange_d2_to_final_braking_overrun_mm`。解团与 D2→末段分别通过
+安全区 d1、d1→d2 和 d2→末段均使用 match 开场相同的编码器/轮速/IMU 严格闭环动作；
+只有确认目标距离、航向和真实停稳后才切换到下一阶段。绿/黑物资末段使用
+`match.safe_zone_d2_to_final_speed_m_s`；单个橙色伤员使用独立的
+`match.safe_zone_orange_d2_to_final_speed_m_s`。原有
+`match.safe_zone_*_d2_to_final_braking_overrun_mm` 保留作现场参数/诊断，不再从闭环停车目标
+扣除。解团与 D2→末段分别通过
 `match.breakup_max_{linear,angular}_{acceleration,deceleration}_*` 和
 `match.safe_zone_d2_to_final_max_{linear,angular}_{acceleration,deceleration}_*`
 逐项覆盖四项车体限制，`null` 表示继承 `motion` 对应全局值。
+末段闭环确认停稳的当个控制决策同时发出张爪和退区倒车，不再进入投递后的停稳/settle 状态。
 
 正常结束、`Ctrl+C`、`SIGTERM`、相机/Hailo/UART/网络异常或旁路线程失败都会进入统一
 软刹车清理路径。重新运行前应确认车辆已停稳、急停状态已复位，并重新提供显式监督确认。
@@ -453,7 +472,30 @@ rescue-vision-grab-transport \
 `approach_seed_diagnostic(now_ns)` 逐个列出新鲜目标被远场入口淘汰的第一个门禁，与
 `_find_approach_seed` 共用同一判据，用于区分「没看见」和「看见了但被否决」；它随每次
 状态决策写入日志的 `approach_seed=` 字段。
-NB 仅替换开场；策略变体的正式阶段显式委托同一基类，删除了与基类相同的方法副本。
+
+正式 `match` 的开场可在 `configs/runtime.match.yaml` 的 `match.opening_actions` 中按顺序
+配置独立的 `turn` / `straight` 动作；每项的角度/距离和速度都只作用于正式流程。动作完成后
+由相对动作控制器确认停稳，再按该项的 `settle_time_s`（省略时使用 `action_settle_time_s`）
+切换到下一项，最后进入 `SEARCH_CLUSTER`。它与 `match_nb` 的 `nb_opening_actions` 是两套
+互不复用的开场配置和状态机。
+
+```yaml
+opening_actions:
+  - type: turn
+    angle_rad: -0.75
+    angular_velocity_rad_s: 3.0
+    settle_time_s: 0.2
+  - type: straight
+    distance_m: 2.5
+    speed_m_s: 1.5
+    settle_time_s: 0.1
+```
+
+正式开场字段：`angle_rad` 左转为正、右转为负；`distance_m` 前进为正、倒车为负；速度
+均为正的幅值。若 `opening_actions` 省略，纯逻辑调用方仍使用原有两段
+`startup_turn_*` / `startup_forward_*` 启动。策略入口的 `startup_*` 配置保持独立。
+
+NB 仅替换自身入口的开场；策略变体的正式阶段显式委托同一基类，删除了与基类相同的方法副本。
 CC 与单绿运输联调保持原有动作能力限制。
 
 ## 纯逻辑装配
@@ -521,11 +563,18 @@ nb_opening_gripper_after_action: 2
 | `nb_opening_actions[].type: straight` | — | 直行；`distance_m` 前进正倒车负，`speed_m_s` 为正速度幅值 |
 | `nb_opening_gripper_after_action` | 1-based 序号 | 完成该动作并停稳后张爪；`null` 表示不自动张爪 |
 | `nb_opening_gripper_left_deg` / `nb_opening_gripper_right_deg` | deg | 张爪左右角度 |
-| `nb_opening_turn_tolerance_rad` | rad | 转向完成误差 |
-| `nb_opening_distance_tolerance_m` | m | 直行完成误差 |
+| `nb_opening_turn_tolerance_rad` | rad | NB 开场动作的转向进度完成误差；不影响正式流程 |
+| `nb_opening_heading_tolerance_rad` | rad | NB 开场动作的航向保持/残差误差；不影响正式流程 |
+| `nb_opening_distance_tolerance_m` | m | NB 开场动作的直行完成误差；不影响正式流程 |
 | `nb_opening_settle_time_s` | s | 连续新遥测的停稳确认时长，不是固定 sleep |
 | `nb_opening_turn_timeout_s` | s | NB 动作诊断截止时间；动作超时只记录并保持开场状态，不把局部动作误差切成 `terminal_stop` |
-| `motion.action_profile` | 多单位 | match 与 match_nb 共用的制动能力、响应延迟、低速收尾、停稳门限及航向保持参数；需用真车标定 |
+| `motion.action_profile` | 多单位 | 两个流程共用的车体能力/响应基线；阶段容差仍由各自的 `match` 字段单独配置 |
+
+开场最后一个动作完成后，`MatchNBSequence` 清理 NB 相对动作控制器并进入
+`SEARCH_CLUSTER`；后续解团、抓取、运输和返回全部调用当前 `MatchSequence` 实现。
+因此开场使用 `nb_opening_turn_tolerance_rad`，正式流程的目标团对准使用
+`cluster_align_tolerance_rad`，普通非接触转向使用 `noncontact_heading_tolerance_rad`，
+三者可以分别调节。
 
 车端诊断：`MatchNBSequence.nb_opening_route_phase` 返回当前动作，`nb_opening_diagnostic`
 返回一行「动作 / 配置量 / 实际进度 / 航向 / 制动距离 / 延迟 / 停稳证据」。`match_runtime`

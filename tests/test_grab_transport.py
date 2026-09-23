@@ -192,8 +192,9 @@ def test_only_final_push_keeps_gripper_open_after_normal_transport_close() -> No
         cumulative_distance_m=0.2,
     )
 
-    assert reached_endpoint.state is MatchState.TRANSPORT_RELEASE
-    assert flow._safe_zone_phase == "stopping_before_exit_opening"
+    assert reached_endpoint.state is MatchState.RETURN_BACKUP
+    assert flow._safe_zone_phase == "idle"
+    assert reached_endpoint.linear_velocity_m_s < 0.0
     assert reached_endpoint.gripper_posture is GripperPosture.OPEN
 
 

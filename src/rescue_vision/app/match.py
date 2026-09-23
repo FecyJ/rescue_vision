@@ -12,8 +12,6 @@ from rescue_vision.app.cluster_breakup import GripperPosture
 from rescue_vision.app.gate_clearance import (
     GateClearanceSession,
     maybe_begin_clearance,
-    reacquire_path_clear,
-    reacquire_plan_matches_cargo,
     step_clearance,
 )
 from rescue_vision.app.breakup_planner import (
@@ -75,6 +73,12 @@ from rescue_vision.motion.relative_action import (
 )
 from rescue_vision.motion.point_action import PointActionController
 from rescue_vision.world.static_map import PhysicalRegionKind, StaticFieldMap, TeamColor
+from rescue_vision.config.runtime import (
+    MatchOpeningStraight,
+    MatchOpeningTurn,
+)
+
+MATCH_TARGET_NEIGHBOR_CLEARANCE_MM = 10.0
 
 if TYPE_CHECKING:
     from rescue_vision.config import AppConfig, MatchRuntimeConfig
@@ -87,6 +91,9 @@ class MatchState(str, Enum):
     STARTUP_TURN_SETTLE = "startup_turn_settle"
     STARTUP_FORWARD = "startup_forward"
     STARTUP_FORWARD_SETTLE = "startup_forward_settle"
+    # 正式 match 自身的可配置开场；与 match_nb 的 NB 开场状态和配置分开。
+    OPENING_SEQUENCE = "opening_sequence"
+    OPENING_SETTLE = "opening_settle"
     SEARCH_CLUSTER = "search_cluster"
     ALIGN_CLUSTER_ONCE = "align_cluster_once"
     APPROACH_CLUSTER = "approach_cluster"
@@ -102,6 +109,7 @@ class MatchState(str, Enum):
     TRANSPORT_APPROACH_GREEN = "transport_approach_green"
     TRANSPORT_NEAR_FIELD_GRASP = "transport_near_field_grasp"
     TRANSPORT_GREEDY_SCAN = "transport_greedy_scan"
+    REOBSERVE_BLUE_DANGER = "reobserve_blue_danger"
     TRANSPORT_PRE_CLOSE_RECHECK = "transport_pre_close_recheck"
     TRANSPORT_CLOSE_GRIPPER = "transport_close_gripper"
     TRANSPORT_ALIGN_RED_ZONE = "transport_align_red_zone"
@@ -439,14 +447,21 @@ class MatchSequence:
     # Provisional correction distance for a target crossing the far ROI edge.
     REGRASP_FORWARD_DISTANCE_M = 0.03
     REGRASP_BACKWARD_DISTANCE_M = 0.01
+    # Line-crossing regrasp is meaningful only after a confirmed pickup and
+    # before the d2 endpoint. D1 visual calibration is deliberately excluded:
+    # opening or translating the robot invalidates its stationary samples and
+    # must not race the absolute-pose commit.
 
     # 独立的抓取—运输联调入口覆盖为只搜索，不执行正式解团路由。
     _first_green_blocked_routes_to_breakup = True
     _dynamic_breakup_enabled = True
-    # 没有发出过任何运动指令的退出原因：允许原地重观测一次，不写失败记忆。
-    # ``confirmation_timeout`` 不在此列：它既表示"完全没有方案"的路由超时，
-    # 也表示提交窗口用尽，两者都应当直接退出，重观测只会拉长零速等待。
-    _NEAR_FIELD_REOBSERVE_REASONS = frozenset({"scene_evidence_unavailable"})
+    # 当前已锁定目标但停稳后有效图像尚未形成时，允许原地重观测一次，不写
+    # 物理失败记忆。普通 confirmation_timeout 仍然直接退出，避免无限延长等待。
+    _NEAR_FIELD_REOBSERVE_REASONS = frozenset({
+        "scene_evidence_unavailable",
+        "stationary_evidence_timeout",
+        "servo_command_out_of_range",
+    })
     _NEAR_FIELD_REOBSERVE_LIMIT = 1
 
     def __init__(
@@ -545,8 +560,19 @@ class MatchSequence:
         )
         self._stationary_motion = (near_field_pickup.motion_evidence if near_field_pickup is not None
                                    else StationaryMotionEvidence(
-                                       max_gap_ns=round(evidence_config.grasp_commit_max_observation_age_ms*1e6),
-                                       max_gyro_rad_s=evidence_config.stationary_max_gyro_rad_s))
+                                       max_gap_ns=round(
+                                           evidence_config.stationary_max_telemetry_gap_ms * 1e6
+                                       ),
+                                       max_gyro_rad_s=evidence_config.stationary_max_gyro_rad_s,
+                                       exit_gyro_rad_s=(
+                                           evidence_config.stationary_exit_gyro_rad_s
+                                       ),
+                                       motion_confirm_ns=round(
+                                           evidence_config.stationary_motion_confirm_ms * 1e6
+                                       ),
+                                       encoder_tolerance_counts=(
+                                           evidence_config.stationary_encoder_tolerance_counts
+                                       )))
         self._breakup_feedback_since_ns: int | None = None
         self._breakup_feedback_pose: tuple[float | None, float | None] | None = None
         self._breakup_anchor: FieldPoint | None = None
@@ -601,6 +627,12 @@ class MatchSequence:
         self._near_field_pickup = near_field_pickup
         self._near_field_grasp_config = near_field_grasp_config
         self._gripper_color_config = gripper_color_config or GripperColorConfig()
+        self._line_contact_hold_ns = round(
+            float(self._gripper_color_config.line_contact_hold_ms) * 1_000_000
+        )
+        self._line_regrasp_cooldown_ns = round(
+            float(self._gripper_color_config.line_regrasp_cooldown_ms) * 1_000_000
+        )
         self._transport_corridor_half_width_mm = (
             float(transport_corridor_half_width_mm)
             if transport_corridor_half_width_mm is not None
@@ -624,6 +656,8 @@ class MatchSequence:
         self._startup_turn_last_heading: float | None = None
         self._startup_turn_progress_rad = 0.0
         self._startup_forward_base_distance_m: float | None = None
+        self._opening_action_index = 0
+        self._opening_action_settle_until_ns = 0
         self._straight_pid_integral = 0.0
         self._straight_pid_last_error: float | None = None
         self._straight_pid_last_timestamp_ns: int | None = None
@@ -661,6 +695,11 @@ class MatchSequence:
         self._regrasp_backward = False
         self._regrasp_resume_state: MatchState | None = None
         self._regrasp_resume_safe_zone_phase: str | None = None
+        self._line_contact_started_capture_ns: int | None = None
+        self._line_contact_last_frame_sequence: int | None = None
+        self._line_contact_last_capture_ns: int | None = None
+        self._line_contact_classes: frozenset[TargetClass] = frozenset()
+        self._line_regrasp_suppressed_until_ns: int | None = None
         self._greedy_active = False
         self._greedy_started_ns = 0
         self._greedy_last_heading: float | None = None
@@ -705,6 +744,10 @@ class MatchSequence:
         )
         self._consecutive_cluster_losses = 0
         self._relocate_forward_base_distance_m: float | None = None
+        self._blue_reobserve_target_field: FieldPoint | None = None
+        self._blue_reobserve_stage = "idle"
+        self._blue_reobserve_distance_m: float | None = None
+        self._blue_reobserve_attempts: list[FieldPoint] = []
         if safe_zone_corner_localizer is not None and not isinstance(
             safe_zone_corner_localizer,
             SafeZoneCornerLocalizer,
@@ -785,6 +828,7 @@ class MatchSequence:
         self._path_recovery_posture = GripperPosture.CLOSED
         self._return_phase = "idle"
         self._safe_zone_exit_base_distance_m: float | None = None
+        self._safe_zone_exit_open_loop_until_ns: int | None = None
         self._d1_line_heading_rad: float | None = None
         self._d1_line_distance_m: float | None = None
         self._d1_line_start_position: FieldPoint | None = None
@@ -830,7 +874,7 @@ class MatchSequence:
         if gripper is None:
             raise RuntimeError("Match flow requires gripper calibration.")
         near_field_pickup = GripperWidthPickupSequence(
-            black_closed_servo_offset_deg=config.near_field_grasp.black_closed_servo_offset_deg,
+            black_grasp_servo_offset_deg=config.near_field_grasp.black_grasp_servo_offset_deg,
             gripper_full_travel_time_s=gripper.full_travel_time_s,
             forward_speed_m_s=runtime.green_approach_speed_m_s,
             cruise_speed_scale=runtime.pickup_cruise_speed_scale,
@@ -858,6 +902,18 @@ class MatchSequence:
                 config.near_field_grasp.grasp_commit_max_observation_age_ms
             ),
             stationary_max_gyro_rad_s=config.near_field_grasp.stationary_max_gyro_rad_s,
+            stationary_exit_gyro_rad_s=(
+                config.near_field_grasp.stationary_exit_gyro_rad_s
+            ),
+            stationary_motion_confirm_ms=(
+                config.near_field_grasp.stationary_motion_confirm_ms
+            ),
+            stationary_encoder_tolerance_counts=(
+                config.near_field_grasp.stationary_encoder_tolerance_counts
+            ),
+            stationary_max_telemetry_gap_ms=(
+                config.near_field_grasp.stationary_max_telemetry_gap_ms
+            ),
             fine_alignment_zone_rad=config.near_field_grasp.fine_alignment_zone_rad,
             fine_alignment_min_wheel_velocity_m_s=(
                 config.near_field_grasp.fine_alignment_min_wheel_velocity_m_s
@@ -1093,6 +1149,14 @@ class MatchSequence:
                         })
         if not members:
             return False
+        members = tuple(sorted(
+            members,
+            key=lambda item: (
+                item.track_id != plan.aim_id,
+                item.observation.target_class is not TargetClass.ORANGE_INJURED,
+                item.track_id,
+            ),
+        ))
         if self._grasp_task is None:
             entry = next((item for item in members
                           if item.observation.target_class in self.near_field_policy.allowed_classes), None)
@@ -1104,6 +1168,20 @@ class MatchSequence:
                                   field=self._field_point_from_pose(pose, point))
         task = self._grasp_task
         assert task is not None
+        aim_member = next(
+            (item for item in members if item.track_id == plan.aim_id),
+            None,
+        )
+        if (
+            aim_member is not None
+            and aim_member.observation.target_class is TargetClass.ORANGE_INJURED
+        ):
+            aim_point = aim_member.observation.ground_point
+            assert aim_point is not None
+            task.entry_class = TargetClass.ORANGE_INJURED
+            task.entry_ground = aim_point
+            task.entry_field = self._field_point_from_pose(pose, aim_point)
+            task.entry_track_id = aim_member.track_id
         # A further recovery cannot silently replace the original physical group.
         if not task.marked_targets:
             task.marked_targets = tuple(BreakupMarkedTarget(
@@ -1347,8 +1425,7 @@ class MatchSequence:
         """补夹尚未锁定执行计划时，要求近场计划保留交接目标。"""
 
         return (
-            (self._greedy_active or bool(self._grasp_task and self._grasp_task.marked_targets)
-             or bool(self._gate_clearance and self._gate_clearance.reacquiring))
+            (self._greedy_active or bool(self._grasp_task and self._grasp_task.marked_targets))
             and self._near_field_handoff_prior is not None
             and self._near_field_pickup is not None
             and self._near_field_pickup.locked_ids is None
@@ -1533,23 +1610,8 @@ class MatchSequence:
         if pose is None:
             return None
         attempt = 1 if task is None else task.recovery_count + 1
-        recovery_config = self.config
-        if (
-            not self._breakup_attempts
-            and not self._misgrasp_breakup_active
-            and attempt == 1
-            and self.config.first_breakup_backward_distance_m is not None
-        ):
-            # Near-field recovery is planned by the background worker. Pass it
-            # the same first-breakup distance used by the synchronous search
-            # path; otherwise the worker silently falls back to 0.1 m.
-            recovery_config = replace(
-                self.config,
-                breakup_backward_distance_m=self.config.first_breakup_backward_distance_m,
-                first_breakup_backward_distance_m=None,
-            )
         return BreakupSceneContext(
-            recovery_config, pose.position, pose.heading_rad, self._breakup_static_map,
+            self.config, pose.position, pose.heading_rad, self._breakup_static_map,
             self._physical_field_bounds(), GripperKinematics().left_tip_position(0).x,
             self._breakup_plan if task is not None and task.recovery_count else None,
             attempt,
@@ -1567,16 +1629,20 @@ class MatchSequence:
             )
         )
 
+    def _near_field_scene_evidence_unavailable(self, timestamp_ns: int) -> bool:
+        """Return whether the locked near-field target lacks a current stable frame."""
+
+        snapshot = self._latest_perception
+        return snapshot is None or not self.grasp_scene_capture_valid(snapshot, timestamp_ns)
+
     @property
     def near_field_policy(self) -> NearFieldGraspPolicy:
-        gate = self._gate_clearance
-        if gate is not None and gate.reacquiring:
-            return NearFieldGraspPolicy(frozenset(gate.original_classes), len(gate.original_classes),
-                                        obstacle_extent_required=True)
         if self._transport_count == 0:
             return NearFieldGraspPolicy(
                 frozenset((TargetClass.GREEN_SUPPLY,)), 1,
-                obstacle_extent_required=self._dynamic_breakup_enabled,
+                # 首趟单绿只要求目标 K0 周围 10 mm 无其它物体；不把
+                # 夹爪实体外接半径扩成首趟候选门禁。
+                obstacle_extent_required=False,
             )
         if self._greedy_active:
             return NearFieldGraspPolicy(
@@ -1668,6 +1734,8 @@ class MatchSequence:
         self._green_turn_attempts = 0
         self._green_turn_active = False
         self._green_alignment_wait_since_ns = None
+        self._opening_action_index = 0
+        self._opening_action_settle_until_ns = timestamp_ns
         if self._near_field_pickup is not None:
             self._near_field_pickup.reset()
             self._near_field_session_id = 0
@@ -1677,10 +1745,15 @@ class MatchSequence:
             self._near_field_far_reapproach_used = False
         self._transport_target_classes = ()
         self._cargo_capture_floor_ns = None
+        self._reset_line_contact_hold(clear_last_frame=True)
+        self._line_regrasp_suppressed_until_ns = None
         self._counted_pickup_session = None
         self._greedy_active = False
         self._begin_safe_zone_scan()
         self._begin_cluster_search()
+        if self.config.opening_actions is not None:
+            self.state = MatchState.OPENING_SEQUENCE
+            return self._decision(timestamp_ns, 0.0, 0.0, "opening_started")
         self.state = MatchState.STARTUP_TURN_RIGHT
         return self._decision(timestamp_ns, 0.0, 0.0, "strategy_started")
 
@@ -1794,6 +1867,10 @@ class MatchSequence:
     ) -> MatchDecision:
         """按当前状态分发控制意图；子类可先处理自身状态再委托父类。"""
 
+        if self.state is MatchState.OPENING_SEQUENCE:
+            return self._step_opening_sequence(timestamp_ns)
+        if self.state is MatchState.OPENING_SETTLE:
+            return self._step_opening_settle(timestamp_ns)
         if self.state is MatchState.STARTUP_TURN_RIGHT:
             return self._step_startup_turn(timestamp_ns, heading_rad)
         if self.state is MatchState.STARTUP_TURN_SETTLE:
@@ -1867,6 +1944,8 @@ class MatchSequence:
             return self._step_approach_green(timestamp_ns, cumulative_distance_m)
         if self.state is MatchState.TRANSPORT_GREEDY_SCAN:
             return self._step_greedy_scan(timestamp_ns, heading_rad)
+        if self.state is MatchState.REOBSERVE_BLUE_DANGER:
+            return self._step_blue_danger_reobserve(timestamp_ns, cumulative_distance_m)
         if self.state is MatchState.TRANSPORT_NEAR_FIELD_GRASP:
             return self._step_near_field_grasp(
                 timestamp_ns,
@@ -1907,7 +1986,11 @@ class MatchSequence:
 
     def _noncontact_motion(self, timestamp_ns: int, key: str, *, target: float,
                            speed: float, turn: bool = False, point: FieldPoint | None = None,
-                           tolerance: float | None = None) -> RelativeActionCommand:
+                           tolerance: float | None = None,
+                           heading_tolerance: float | None = None,
+                           target_heading_rad: float | None = None,
+                           linear_deceleration_m_s2: float | None = None,
+                           angular_deceleration_rad_s2: float | None = None) -> RelativeActionCommand:
         """One action owns its goal, deadline and failure across control polls."""
         if self._noncontact_key != key:
             self._noncontact_key = key
@@ -1921,8 +2004,14 @@ class MatchSequence:
             if point is not None and position is not None and heading is not None:
                 rotation_s = abs(normalize_angle(math.atan2(point.y-position.y, point.x-position.x)-heading)) / min(
                     self._motion_max_angular_rad_s, self.config.safe_zone_fallback_max_angular_velocity_rad_s)
-            deceleration = (self._motion_profile.angular_deceleration_rad_s2 if turn
-                            else self._motion_profile.linear_deceleration_m_s2)
+            deceleration = (
+                angular_deceleration_rad_s2
+                if turn and angular_deceleration_rad_s2 is not None
+                else linear_deceleration_m_s2
+                if not turn and linear_deceleration_m_s2 is not None
+                else (self._motion_profile.angular_deceleration_rad_s2 if turn
+                      else self._motion_profile.linear_deceleration_m_s2)
+            )
             self._noncontact_budget_s = max(self._motion_profile.action_timeout_s,
                 travel / speed + rotation_s + 2 * speed / deceleration
                 + self._motion_profile.stationary_confirm_time_s + self._motion_profile.correction_timeout_s)
@@ -1941,7 +2030,20 @@ class MatchSequence:
             return command
         controller = self._noncontact_controller
         if controller is None:
-            profile = replace(self._motion_profile, action_timeout_s=self._noncontact_budget_s)
+            profile = replace(
+                self._motion_profile,
+                action_timeout_s=self._noncontact_budget_s,
+                linear_deceleration_m_s2=(
+                    self._motion_profile.linear_deceleration_m_s2
+                    if linear_deceleration_m_s2 is None
+                    else linear_deceleration_m_s2
+                ),
+                angular_deceleration_rad_s2=(
+                    self._motion_profile.angular_deceleration_rad_s2
+                    if angular_deceleration_rad_s2 is None
+                    else angular_deceleration_rad_s2
+                ),
+            )
             if point is None:
                 controller = RelativeActionController(profile)
             else:
@@ -1955,8 +2057,10 @@ class MatchSequence:
             controller.set_tolerances(
                 position_tolerance=tolerance or (self.config.noncontact_heading_tolerance_rad if turn
                                                 else self.config.noncontact_distance_tolerance_m),
-                heading_tolerance=(tolerance if turn and tolerance is not None
-                                   else self.config.noncontact_heading_tolerance_rad))
+                heading_tolerance=(heading_tolerance
+                                   if heading_tolerance is not None
+                                   else (tolerance if turn and tolerance is not None
+                                         else self.config.noncontact_heading_tolerance_rad)))
             self._noncontact_base_distance = distance or 0.0
             self._noncontact_last_heading = heading
             self._noncontact_turn_progress = 0.0
@@ -1968,7 +2072,10 @@ class MatchSequence:
                 controller.begin(RelativeActionKind.TURN if turn else RelativeActionKind.STRAIGHT,
                     target if target != 0 else 1e-9, start_heading_rad=heading,
                     timestamp_ns=self._noncontact_started_ns, cruise_speed=speed,
-                    target_heading_rad=normalize_angle(heading + target) if turn else heading)
+                    target_heading_rad=(normalize_angle(heading + target)
+                                        if turn
+                                        else (heading if target_heading_rad is None
+                                              else normalize_angle(target_heading_rad))))
             self._noncontact_controller = controller
         if turn:
             self._noncontact_turn_progress += self._noncontact_direction * normalize_angle(
@@ -2015,6 +2122,110 @@ class MatchSequence:
         self._noncontact_controller = None
         self._noncontact_key = None
         self._noncontact_started_ns = None
+
+    def _opening_active_action(self) -> MatchOpeningTurn | MatchOpeningStraight | None:
+        actions = self.config.opening_actions
+        if actions is None or self._opening_action_index >= len(actions):
+            return None
+        return actions[self._opening_action_index]
+
+    @property
+    def opening_route_phase(self) -> str | None:
+        """返回正式 ``match`` 当前独立开场动作，结束后返回 ``None``。"""
+
+        if self.state not in {
+            MatchState.OPENING_SEQUENCE,
+            MatchState.OPENING_SETTLE,
+        }:
+            return None
+        actions = self.config.opening_actions
+        if actions is None:
+            return None
+        if self.state is MatchState.OPENING_SETTLE:
+            action_number = self._opening_action_index
+            return f"action_{action_number}_{len(actions)}_settle"
+        action = self._opening_active_action()
+        if action is None:
+            return None
+        kind = "turn" if isinstance(action, MatchOpeningTurn) else "straight"
+        return (
+            f"action_{self._opening_action_index + 1}_"
+            f"{len(actions)}_{kind}"
+        )
+
+    def _step_opening_sequence(self, timestamp_ns: int) -> MatchDecision:
+        action = self._opening_active_action()
+        if action is None:
+            self._finish_noncontact()
+            self._begin_cluster_search()
+            self.state = MatchState.SEARCH_CLUSTER
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                self._cluster_search_angular_velocity_rad_s,
+                "opening_sequence_complete",
+            )
+        action_number = self._opening_action_index + 1
+        if isinstance(action, MatchOpeningTurn):
+            command = self._noncontact_motion(
+                timestamp_ns,
+                f"opening_action_{action_number}",
+                target=action.angle_rad,
+                speed=action.angular_velocity_rad_s,
+                turn=True,
+                tolerance=self.config.noncontact_heading_tolerance_rad,
+            )
+            kind = "turn"
+        else:
+            command = self._noncontact_motion(
+                timestamp_ns,
+                f"opening_action_{action_number}",
+                target=action.distance_m,
+                speed=action.speed_m_s,
+                tolerance=self.config.noncontact_distance_tolerance_m,
+            )
+            kind = "straight"
+        if not command.complete:
+            return self._noncontact_decision(timestamp_ns, command)
+
+        self._finish_noncontact()
+        self._opening_action_index += 1
+        settle_time_s = (
+            action.settle_time_s
+            if action.settle_time_s is not None
+            else self.config.action_settle_time_s
+        )
+        self._opening_action_settle_until_ns = timestamp_ns + round(
+            settle_time_s * 1_000_000_000
+        )
+        self.state = MatchState.OPENING_SETTLE
+        return self._decision(
+            timestamp_ns,
+            0.0,
+            0.0,
+            f"opening_{kind}_{action_number}_complete_wait",
+        )
+
+    def _step_opening_settle(self, timestamp_ns: int) -> MatchDecision:
+        if timestamp_ns < self._opening_action_settle_until_ns:
+            return self._decision(timestamp_ns, 0.0, 0.0, "opening_waiting_settle")
+        actions = self.config.opening_actions
+        if actions is None or self._opening_action_index >= len(actions):
+            self._begin_cluster_search()
+            self.state = MatchState.SEARCH_CLUSTER
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                self._cluster_search_angular_velocity_rad_s,
+                "opening_sequence_complete",
+            )
+        self.state = MatchState.OPENING_SEQUENCE
+        return self._decision(
+            timestamp_ns,
+            0.0,
+            0.0,
+            f"opening_action_{self._opening_action_index}_settled",
+        )
 
     def _step_startup_turn(self, timestamp_ns: int, heading_rad: float | None) -> MatchDecision:
         command = self._noncontact_motion(timestamp_ns, "startup_turn",
@@ -2413,16 +2624,6 @@ class MatchSequence:
                 self.config,
                 breakup_forward_distance_m=self.config.misgrasp_breakup_forward_distance_m,
                 breakup_backward_distance_m=self.config.misgrasp_breakup_backward_distance_m,
-                first_breakup_backward_distance_m=None,
-            )
-        elif not self._breakup_attempts and self.config.first_breakup_backward_distance_m is not None:
-            # The first formal breakup has a longer deliberate retreat.  Keep
-            # the override in the sequence layer so the reusable planner and
-            # CC/no-breakup variants retain their regular distance semantics.
-            plan_config = replace(
-                self.config,
-                breakup_backward_distance_m=self.config.first_breakup_backward_distance_m,
-                first_breakup_backward_distance_m=None,
             )
         args = dict(config=plan_config, origin=origin, heading_rad=heading,
                     static_map=self._breakup_static_map, field_bounds=self._physical_field_bounds(),
@@ -2546,8 +2747,7 @@ class MatchSequence:
                 continue
             if self._candidate_path_blocked(target.ground_point, breakup=False):
                 continue
-            if (self._transport_side_neighbor_target(target, timestamp_ns) is not None
-                    or not self._transport_orange_isolation_clear(target, timestamp_ns)
+            if (not self._transport_orange_isolation_clear(target, timestamp_ns)
                     or not self._green_path_is_clear_for_point(
                         target, target.ground_point, timestamp_ns,
                         ignored_track_ids=self._preview_ignored_track_ids(target, timestamp_ns))):
@@ -2765,6 +2965,160 @@ class MatchSequence:
         self.state = MatchState.SEARCH_CLUSTER
         return self._decision(timestamp_ns, 0.0, 0.0, reason, posture=GripperPosture.CLOSED, soft_brake=True)
 
+    def _find_blue_danger_reobserve_target(
+        self,
+        timestamp_ns: int,
+    ) -> tuple[TrackedTarget, GroundPoint] | None:
+        if self._transport_count <= 0:
+            return None
+        robot_position = self.estimated_field_position
+        if robot_position is None:
+            return None
+        perception = self._latest_perception
+        if perception is None:
+            return None
+        candidates: list[tuple[TrackedTarget, GroundPoint, FieldPoint, float]] = []
+        for target in self._tracker.tracks:
+            if (
+                target.target_class is not TargetClass.BLUE_DANGER
+                or not self._target_is_fresh(target, timestamp_ns)
+                or target.status is not TrackStatus.CONFIRMED
+                or target.last_seen_timestamp_ns < perception.capture_timestamp_ns
+                or target.ground_point is None
+            ):
+                continue
+            point = self._current_ground_point_for_track(target, timestamp_ns)
+            if point is None or point.x <= self._near_field_handoff_range_mm():
+                continue
+            field_point = self._field_point_for_target(target)
+            if field_point is None:
+                continue
+            if any(
+                math.hypot(field_point.x - previous.x, field_point.y - previous.y)
+                < self._failure_region_tolerance_mm()
+                for previous in self._blue_reobserve_attempts
+            ):
+                continue
+            distance_mm = math.hypot(point.x, point.y)
+            candidates.append((target, point, field_point, distance_mm))
+        if not candidates:
+            return None
+        target, point, field_point, _ = min(
+            candidates,
+            key=lambda item: (item[3], abs(item[1].y), item[0].track_id),
+        )
+        return target, point
+
+    def _begin_blue_danger_reobserve(
+        self,
+        timestamp_ns: int,
+        target: TrackedTarget,
+        point: GroundPoint,
+    ) -> MatchDecision:
+        field_point = self._field_point_for_target(target)
+        if field_point is None or self._latest_heading_rad is None:
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "blue_danger_reobserve_waiting_for_pose",
+                posture=GripperPosture.CLOSED,
+            )
+        distance_mm = math.hypot(point.x, point.y)
+        self._blue_reobserve_target_field = field_point
+        self._blue_reobserve_distance_m = max(
+            0.1,
+            (distance_mm - self._near_field_handoff_range_mm()) / 1000.0,
+        )
+        self._blue_reobserve_stage = "turn"
+        self._blue_reobserve_attempts.append(field_point)
+        self._blue_reobserve_attempts = self._blue_reobserve_attempts[-16:]
+        self.state = MatchState.REOBSERVE_BLUE_DANGER
+        return self._decision(
+            timestamp_ns,
+            0.0,
+            0.0,
+            f"blue_danger_reobserve_start:{target.track_id}",
+            posture=GripperPosture.CLOSED,
+            soft_brake=True,
+        )
+
+    def _step_blue_danger_reobserve(
+        self,
+        timestamp_ns: int,
+        cumulative_distance_m: float | None,
+    ) -> MatchDecision:
+        target_field = self._blue_reobserve_target_field
+        position = self.estimated_field_position
+        heading = self._latest_heading_rad
+        if target_field is None or position is None or heading is None:
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "blue_danger_reobserve_waiting_for_pose",
+                posture=GripperPosture.CLOSED,
+                soft_brake=True,
+            )
+        target_heading = math.atan2(
+            target_field.y - position.y,
+            target_field.x - position.x,
+        )
+        if self._blue_reobserve_stage == "turn":
+            command = self._noncontact_motion(
+                timestamp_ns,
+                "blue_danger_reobserve_turn",
+                target=normalize_angle(target_heading - heading),
+                speed=self.config.cluster_align_max_angular_velocity_rad_s,
+                turn=True,
+                tolerance=self.config.cluster_align_tolerance_rad,
+            )
+            if not command.complete:
+                return self._noncontact_decision(timestamp_ns, command)
+            self._finish_noncontact()
+            self._blue_reobserve_stage = "forward"
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "blue_danger_reobserve_heading_reached",
+                posture=GripperPosture.CLOSED,
+                soft_brake=True,
+            )
+        distance_m = self._blue_reobserve_distance_m
+        if distance_m is None or cumulative_distance_m is None:
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "blue_danger_reobserve_waiting_for_odometry",
+                posture=GripperPosture.CLOSED,
+                soft_brake=True,
+            )
+        command = self._noncontact_motion(
+            timestamp_ns,
+            "blue_danger_reobserve_forward",
+            target=distance_m,
+            speed=self.config.cluster_relocate_speed_m_s,
+            tolerance=self.config.noncontact_distance_tolerance_m,
+            target_heading_rad=target_heading,
+        )
+        if not command.complete:
+            return self._noncontact_decision(timestamp_ns, command)
+        self._finish_noncontact()
+        self._blue_reobserve_target_field = None
+        self._blue_reobserve_distance_m = None
+        self._blue_reobserve_stage = "idle"
+        self._begin_cluster_search()
+        self.state = MatchState.SEARCH_CLUSTER
+        return self._decision(
+            timestamp_ns,
+            0.0,
+            self._cluster_search_angular_velocity_rad_s,
+            "blue_danger_reobserve_complete_search",
+            posture=GripperPosture.CLOSED,
+        )
+
     def _step_dynamic_cluster_search(self, timestamp_ns: int, heading_rad: float | None) -> MatchDecision:
         if self._greedy_active:
             return self._finish_greedy_pickup(timestamp_ns, "no_direct_plan")
@@ -2808,6 +3162,14 @@ class MatchSequence:
                 # 该计划只用于记录本次待确认区域；执行计划仍必须来自停稳后的当前帧。
                 self._start_breakup_attempt(timestamp_ns, plan)
                 return self._decision(timestamp_ns, 0.0, 0.0, "cluster_seen_stop_collect_reference", soft_brake=True)
+        if is_new:
+            blue_target = self._find_blue_danger_reobserve_target(timestamp_ns)
+            if blue_target is not None:
+                return self._begin_blue_danger_reobserve(
+                    timestamp_ns,
+                    blue_target[0],
+                    blue_target[1],
+                )
         return self._decision(timestamp_ns, 0.0, self._cluster_search_angular_velocity_rad_s,
                               "search_cluster_right" if self._cluster_search_angular_velocity_rad_s < 0 else "search_cluster_left")
 
@@ -3283,14 +3645,6 @@ class MatchSequence:
             return False
         if is_danger:
             return True
-        gate = self._gate_clearance
-        if gate is not None and gate.reacquiring:
-            pose = self._pose_at(item.capture_timestamp_ns)
-            if pose is None or item.ground_point is None or item.target_class not in gate.original_classes:
-                return False
-            field = self._field_point_from_pose(pose, item.ground_point)
-            if math.hypot(field.x-gate.stash.x, field.y-gate.stash.y) > self.config.gate_clearance.reacquire_radius_mm:
-                return False
         if stowed_limit_mm is None or item.ground_point is None:
             return True
         now_ns = self._last_timestamp_ns or item.capture_timestamp_ns
@@ -3813,14 +4167,6 @@ class MatchSequence:
             and gripper_angles_deg is None
         ):
             posture = GripperPosture.CLOSED
-        if gripper_angles_deg is None and posture is GripperPosture.CLOSED and self._near_field_pickup is not None:
-            classes = self._transport_target_classes
-            pickup = self._near_field_pickup
-            if (self.state is MatchState.TRANSPORT_NEAR_FIELD_GRASP and pickup.active_plan is not None
-                    and pickup.state is GripperWidthPickupState.CLOSING):
-                classes = tuple(member.observation.target_class for member in pickup.active_plan.members)
-            if TargetClass.BLACK_CORE in classes:
-                gripper_angles_deg = pickup.closed_angles_for_classes(classes)
         return MatchDecision(
             timestamp_ns=timestamp_ns,
             state=self.state,
@@ -4406,9 +4752,19 @@ class MatchSequence:
         """返回当前 match 动作应使用的车体加减速度覆盖。"""
 
         if self._noncontact_controller is not None:
+            safe_zone_limits = self.safe_zone_motion_acceleration_limits
+            profile = self._noncontact_controller.profile
             return MotionAccelerationOverrides(
-                linear_deceleration_m_s2=self._motion_profile.linear_deceleration_m_s2,
-                angular_deceleration_rad_s2=self._motion_profile.angular_deceleration_rad_s2,
+                linear_acceleration_m_s2=(
+                    None if safe_zone_limits is None
+                    else safe_zone_limits.linear_acceleration_m_s2
+                ),
+                linear_deceleration_m_s2=profile.linear_deceleration_m_s2,
+                angular_acceleration_rad_s2=(
+                    None if safe_zone_limits is None
+                    else safe_zone_limits.angular_acceleration_rad_s2
+                ),
+                angular_deceleration_rad_s2=profile.angular_deceleration_rad_s2,
             )
         breakup_limits = self.breakup_motion_acceleration_limits
         if breakup_limits is not None:
@@ -4601,13 +4957,14 @@ class MatchSequence:
             )
 
     def _safe_zone_final_target_y_mm(self) -> float:
-        """返回应用末段刹车提前量后的安全区停车 y 坐标。"""
+        """返回严格闭环末段的实际安全区停车 y 坐标。
 
-        return (
-            self._safe_zone_transport_endpoint().y
-            - self._safe_zone_forward_y_sign
-            * self._safe_zone_d2_to_final_braking_overrun_mm()
-        )
+        末段现在由 ``RelativeActionController`` 根据实时轮速、遥测延迟和
+        有效减速度动态提前刹车。不能再把旧开环固定过冲量从目标坐标扣掉，
+        否则闭环会在安全区外提前停下。
+        """
+
+        return self._safe_zone_transport_endpoint().y
 
     def _safe_zone_d2_to_final_speed_m_s(self) -> float:
         """返回当前运输类别对应的 d2→安全区末段速度。"""
@@ -5121,14 +5478,15 @@ class MatchSequence:
                 )
                 if first_single_green
                 else (
-                    -item[1],
-                    math.hypot(item[0].ground_point.x, item[0].ground_point.y)
-                    if item[0].ground_point is not None
-                    else math.inf,
-                    abs(item[0].ground_point.y)
-                    if item[0].ground_point is not None
-                    else math.inf,
-                    item[0].track_id,
+                    self._approach_seed_rank(
+                        item[0],
+                        item[0].ground_point,
+                    )[:2]
+                    + (-item[1],)
+                    + self._approach_seed_rank(
+                        item[0],
+                        item[0].ground_point,
+                    )[2:],
                 )
             ),
             default=None,
@@ -5211,7 +5569,7 @@ class MatchSequence:
         """寻找远距接近或近场交接的入口目标；不负责最终选组。
 
         ``minimum_last_seen_ns`` 供补夹扫描限制为扫描开始后的新观测；
-        ``prefer_nearest`` 供补夹在全场候选中优先最近的绿/黑物块。
+        ``prefer_nearest`` 保留调用方兼容性，候选仍统一按近远场和类别优先级排序。
         """
 
         policy = self.near_field_policy
@@ -5241,29 +5599,27 @@ class MatchSequence:
                 current_tracks=current_tracks,
             ) is None
         )
-        if prefer_nearest:
-            return min(
-                candidates,
-                key=lambda target: (
-                    math.hypot(current_points[target.track_id].x, current_points[target.track_id].y),
-                    abs(current_points[target.track_id].y),
-                    target.track_id,
-                ),
-                default=None,
-            )
         return min(
             candidates,
-            key=lambda target: (
-                math.hypot(current_points[target.track_id].x, current_points[target.track_id].y) > self._near_field_handoff_range_mm(),
-                -({TargetClass.GREEN_SUPPLY: self._near_field_grasp_config.green_score_points,
-                   TargetClass.BLACK_CORE: self._near_field_grasp_config.black_score_points,
-                   TargetClass.ORANGE_INJURED: self._near_field_grasp_config.orange_score_points}[target.target_class]
-                  if self._near_field_grasp_config is not None else 0),
-                math.hypot(current_points[target.track_id].x, current_points[target.track_id].y),
-                abs(current_points[target.track_id].y),
-                target.track_id,
+            key=lambda target: self._approach_seed_rank(
+                target,
+                current_points[target.track_id],
             ),
             default=None,
+        )
+
+    def _approach_seed_rank(
+        self,
+        target: TrackedTarget,
+        point: GroundPoint,
+    ) -> tuple[object, ...]:
+        range_mm = math.hypot(point.x, point.y)
+        return (
+            range_mm > self._near_field_handoff_range_mm(),
+            target.target_class is not TargetClass.ORANGE_INJURED,
+            range_mm,
+            abs(point.y),
+            target.track_id,
         )
 
     def _approach_seed_rejection(
@@ -5307,10 +5663,8 @@ class MatchSequence:
             return "inside_stowed_limit"
         if self._candidate_path_blocked(current, breakup=False):
             return "path_blocked"
-        if self._transport_side_neighbor_target(target, timestamp_ns) is not None:
-            return "side_neighbor"
         if not self._transport_orange_isolation_clear(target, timestamp_ns):
-            return "orange_not_isolated"
+            return "target_not_isolated"
         if not self._green_path_is_clear_for_point(
             target, current, timestamp_ns,
             ignored_track_ids=self._preview_ignored_track_ids(target, timestamp_ns),
@@ -5382,12 +5736,6 @@ class MatchSequence:
                 or point.x <= 0.0
                 or math.hypot(point.x, point.y) <= max_range
                 or self._candidate_path_blocked(point, breakup=False)
-                or self._transport_side_neighbor_target(
-                    target,
-                    timestamp_ns,
-                    tracks=source_tracks,
-                )
-                is not None
                 or not self._transport_orange_isolation_clear(
                     target,
                     timestamp_ns,
@@ -5402,10 +5750,9 @@ class MatchSequence:
             candidates.append(target)
         return min(
             candidates,
-            key=lambda target: (
-                math.hypot(target.ground_point.x, target.ground_point.y),
-                abs(math.atan2(target.ground_point.y, target.ground_point.x)),
-                target.track_id,
+            key=lambda target: self._approach_seed_rank(
+                target,
+                target.ground_point,
             ),
             default=None,
         )
@@ -6045,28 +6392,6 @@ class MatchSequence:
     ) -> MatchDecision:
         """数据/确认预算耗尽后回到带原因的搜索，不伪装成解团阻挡。"""
 
-        if self._gate_clearance is not None and self._gate_clearance.reacquiring:
-            # 回取失败后结束本次清障任务；不重开普通近场会话，否则会解除
-            # 暂存点类别/数量约束并可能夹取其它目标。
-            self._gate_clearance = None
-            self._grasp_task = None
-            self._near_field_handoff_prior = None
-            if self._near_field_pickup is not None:
-                self._near_field_pickup.reset()
-                self._near_field_session_id += 1
-            self._near_field_route = GraspRoute.RESELECT
-            self._near_field_confirmation_started_ns = None
-            self._selected_track_id = None
-            self._selected_green_ground = None
-            self._begin_cluster_search()
-            self.state = MatchState.SEARCH_CLUSTER
-            return self._decision(
-                timestamp_ns,
-                0.0,
-                self._cluster_search_angular_velocity_rad_s,
-                f"gate_clearance_reacquire_failed:{reason}",
-                posture=GripperPosture.OPEN,
-            )
         if self._greedy_active:
             return self._finish_greedy_pickup(timestamp_ns, reason)
         if self._reobserve_without_motion(reason):
@@ -6214,6 +6539,7 @@ class MatchSequence:
             return False
         if not self._green_path_is_clear_for_point(target, point, timestamp_ns):
             return False
+        clearance_mm = MATCH_TARGET_NEIGHBOR_CLEARANCE_MM
         for other in self._tracker.tracks:
             if (
                 other.track_id == target.track_id
@@ -6231,7 +6557,7 @@ class MatchSequence:
                     point.x - other.ground_point.x,
                     point.y - other.ground_point.y,
                 )
-                <= self.config.opportunistic_single_green_clearance_mm
+                <= clearance_mm
             ):
                 return False
         return True
@@ -6286,18 +6612,11 @@ class MatchSequence:
         *,
         tracks: tuple[TrackedTarget, ...] | None = None,
     ) -> bool:
-        """检查正式入口的橙色目标 10 mm 独立性门禁。"""
-
-        if target.target_class is not TargetClass.ORANGE_INJURED:
-            return True
+        """检查正式入口所有黑/绿/橙目标统一的 10 mm 独立性门禁。"""
         point = target.ground_point
         if point is None:
             return False
-        radius_mm = (
-            10.0
-            if self._near_field_grasp_config is None
-            else self._near_field_grasp_config.orange_isolation_radius_mm
-        )
+        radius_mm = MATCH_TARGET_NEIGHBOR_CLEARANCE_MM
         source_tracks = self._tracker.tracks if tracks is None else tuple(tracks)
         for other in source_tracks:
             if (
@@ -6317,15 +6636,6 @@ class MatchSequence:
                 )
                 <= radius_mm + 1e-9
             ):
-                relative = self._target_aligned_coordinates(point, other.ground_point)
-                if (self._near_field_pickup is not None
-                        and other.target_class in {TargetClass.GREEN_SUPPLY, TargetClass.BLACK_CORE}
-                        and self._graspable_target_is_usable(other)
-                        and relative is not None
-                        and relative[0] > math.hypot(point.x, point.y)
-                        and abs(relative[1]) > self._transport_corridor_effective_half_width_mm()):
-                    # 侧后方物资仅作为入口预览；最终由近场 K0 扫掠检查证明不混运。
-                    continue
                 return False
         return True
 
@@ -6425,8 +6735,6 @@ class MatchSequence:
             return None
         if not self._transport_orange_isolation_clear(target, timestamp_ns):
             return None
-        if self._transport_side_neighbor_target(target, timestamp_ns) is not None:
-            return None
         for other in self._tracker.tracks:
             if (
                 other.track_id == target.track_id
@@ -6445,6 +6753,11 @@ class MatchSequence:
                 # Carried/delivered material is not a new member for capacity,
                 # but it remains in the scene for the eventual sweep check.
                 continue
+            if math.hypot(
+                point.x - other_point.x,
+                point.y - other_point.y,
+            ) <= MATCH_TARGET_NEIGHBOR_CLEARANCE_MM + 1e-9:
+                return None
             if not self._point_in_transport_corridor(
                 other_point,
                 end_x_mm=point.x,
@@ -7974,8 +8287,6 @@ class MatchSequence:
         distance_m: float,
         *, plan: NearFieldGraspPlan | None = None,
     ) -> bool | None:
-        if self._gate_clearance is not None and self._gate_clearance.reacquiring:
-            return reacquire_path_clear(self, heading_rad, distance_m, plan)
         position = self.estimated_field_position
         if position is None or not math.isfinite(distance_m) or distance_m < 0.0:
             return None
@@ -8047,8 +8358,18 @@ class MatchSequence:
             f"orange_distinct_pair=({distinct_pair_text}),"
             f"horizontal_line_v={evidence.horizontal_line_v},"
             f"line_crossing={tuple(sorted(c.value for c in evidence.line_crossing_classes))},"
+            f"line_contact_classes={tuple(sorted(c.value for c in self._line_contact_classes))},"
+            f"line_contact_started_capture_ns={self._line_contact_started_capture_ns},"
+            f"line_contact_elapsed_ms={self._line_contact_elapsed_ms(snapshot)},"
+            f"line_regrasp_suppressed_until_ns={self._line_regrasp_suppressed_until_ns},"
             f"components=({fractions})"
         )
+
+    def _line_contact_elapsed_ms(self, snapshot: PerceptionSnapshot) -> float | None:
+        started = self._line_contact_started_capture_ns
+        if started is None:
+            return None
+        return max(0.0, (snapshot.capture_timestamp_ns - started) / 1_000_000)
 
     @staticmethod
     def _orange_bbox_roi_observations(
@@ -8114,7 +8435,88 @@ class MatchSequence:
                     return bbox_iou, k0_distance_px
         return None
 
+    def _line_crossing_window_open(
+        self,
+        timestamp_ns: int,
+        *,
+        capture_timestamp_ns: int | None = None,
+    ) -> bool:
+        """Return whether line-crossing evidence may start a line regrasp.
+
+        Perception continues to report the evidence for diagnostics, but task
+        handling is limited to the confirmed-cargo route from pickup through
+        D1 and the D1-to-D2 leg. D2 arrival and all later phases are excluded.
+        """
+
+        suppressed_until = self._line_regrasp_suppressed_until_ns
+        if suppressed_until is not None:
+            if timestamp_ns < suppressed_until:
+                return False
+            if (
+                capture_timestamp_ns is not None
+                and capture_timestamp_ns < suppressed_until
+            ):
+                return False
+        if self.state is MatchState.TRANSPORT_ALIGN_RED_ZONE:
+            return self._safe_zone_phase in {"align_d1_line", "align_d2_line"}
+        if self.state is MatchState.TRANSPORT_FORWARD:
+            return self._safe_zone_phase in {"forward_d1_line", "forward_d2_line"}
+        return False
+
+    def _reset_line_contact_hold(self, *, clear_last_frame: bool = False) -> None:
+        self._line_contact_started_capture_ns = None
+        self._line_contact_classes = frozenset()
+        if clear_last_frame:
+            self._line_contact_last_frame_sequence = None
+            self._line_contact_last_capture_ns = None
+
+    def _line_contact_hold_complete(
+        self,
+        snapshot: PerceptionSnapshot,
+        line_crossing: frozenset[TargetClass],
+    ) -> bool:
+        """Accumulate continuous crossing only from distinct capture frames."""
+
+        if snapshot.frame_sequence == self._line_contact_last_frame_sequence:
+            started = self._line_contact_started_capture_ns
+            return (
+                started is not None
+                and line_crossing == self._line_contact_classes
+                and snapshot.capture_timestamp_ns - started
+                >= self._line_contact_hold_ns
+            )
+        last_capture_ns = self._line_contact_last_capture_ns
+        self._line_contact_last_frame_sequence = snapshot.frame_sequence
+        self._line_contact_last_capture_ns = snapshot.capture_timestamp_ns
+        started = self._line_contact_started_capture_ns
+        observation_gap_too_large = (
+            last_capture_ns is not None
+            and snapshot.capture_timestamp_ns - last_capture_ns
+            > round(self.config.green_max_age_ms * 1_000_000)
+        )
+        if (
+            not line_crossing
+            or started is None
+            or line_crossing != self._line_contact_classes
+            or snapshot.capture_timestamp_ns < started
+            or observation_gap_too_large
+        ):
+            self._reset_line_contact_hold()
+            if not line_crossing:
+                return False
+            self._line_contact_started_capture_ns = snapshot.capture_timestamp_ns
+            self._line_contact_classes = line_crossing
+            started = snapshot.capture_timestamp_ns
+        return snapshot.capture_timestamp_ns - started >= self._line_contact_hold_ns
+
     def _gripper_color_conflict(self, timestamp_ns: int) -> str | None:
+        if self.state in {
+            MatchState.REGRASP_OPEN,
+            MatchState.REGRASP_FORWARD,
+            MatchState.REGRASP_BACKWARD,
+            MatchState.REGRASP_CLOSE,
+        }:
+            return None
         snapshot = self._latest_perception
         floor = self._cargo_capture_floor_ns
         safe_zone_final_push_or_exit = (
@@ -8170,7 +8572,25 @@ class MatchSequence:
             TargetClass.GREEN_SUPPLY,
             TargetClass.ORANGE_INJURED,
         }
-        if line_crossing:
+        if self._transport_target_classes == (TargetClass.ORANGE_INJURED,):
+            # The carried injured target itself fills the gripper ROI and can
+            # keep crossing the provisional line. Treating that same orange
+            # component as a second target caused repeated open/back/close
+            # cycles before D1 in the 20260922 19:19 match. Foreign green
+            # crossing evidence remains active and still requests a backup.
+            line_crossing = line_crossing - {TargetClass.ORANGE_INJURED}
+        line_window_open = self._line_crossing_window_open(
+            timestamp_ns,
+            capture_timestamp_ns=snapshot.capture_timestamp_ns,
+        )
+        if not line_window_open:
+            self._reset_line_contact_hold()
+        elif not self._line_contact_hold_complete(
+            snapshot,
+            frozenset(line_crossing),
+        ):
+            return None
+        if line_crossing and line_window_open:
             present = snapshot.gripper_color.present_classes
             line_classes_not_allowed = line_crossing - allowed
             if line_classes_not_allowed:
@@ -8242,12 +8662,20 @@ class MatchSequence:
     ) -> MatchDecision:
         """Open, make the rule-directed short correction, and close."""
 
+        self._reset_line_contact_hold(clear_last_frame=True)
         self._regrasp_started_ns = timestamp_ns
         self._regrasp_base_distance_m = None
         self._regrasp_heading_rad = self._latest_heading_rad
         self._regrasp_backward = backward
         self._regrasp_resume_state = self.state
         self._regrasp_resume_safe_zone_phase = self._safe_zone_phase
+        # The encoder-backed correction is part of the current D1/D2 straight
+        # leg: +30 mm advances its existing progress and -10 mm subtracts from
+        # it.  Keep that controller and its original distance origin.  A turn
+        # controller has no such linear-progress contract, so restart only the
+        # alignment from the post-regrasp measured heading.
+        if self._safe_zone_phase in {"align_d1_line", "align_d2_line"}:
+            self._finish_noncontact()
         self._gripper_phase_started_ns = timestamp_ns
         self.state = MatchState.REGRASP_OPEN
         return self._decision(
@@ -8422,12 +8850,23 @@ class MatchSequence:
             )
         resume_state = self._regrasp_resume_state or MatchState.TRANSPORT_ALIGN_RED_ZONE
         resume_phase = self._regrasp_resume_safe_zone_phase
+        if (
+            resume_phase in {"forward_d1_line", "forward_d2_line"}
+            and self._noncontact_controller is not None
+            and self._noncontact_started_ns is not None
+        ):
+            pause_ns = timestamp_ns - self._regrasp_started_ns
+            self._noncontact_started_ns += pause_ns
+            self._noncontact_controller.exclude_pause(pause_ns)
         self.state = resume_state
         if resume_phase is not None:
             self._safe_zone_phase = resume_phase
         # Only frames captured after the corrective close may diagnose this
         # cargo again; the triggering frame must not immediately retrigger it.
         self._cargo_capture_floor_ns = timestamp_ns
+        self._line_regrasp_suppressed_until_ns = (
+            timestamp_ns + self._line_regrasp_cooldown_ns
+        )
         self._gripper_phase_started_ns = None
         self._regrasp_backward = False
         self._regrasp_resume_state = None
@@ -8602,6 +9041,22 @@ class MatchSequence:
             self._near_field_route = GraspRoute.DECIDING
             self._greedy_last_heading = self._latest_heading_rad
             self.state = MatchState.TRANSPORT_GREEDY_SCAN
+            alternative = self._find_approach_seed(
+                timestamp_ns,
+            )
+            if alternative is not None:
+                self._near_field_handoff_prior = None
+                return replace(
+                    self._begin_green_transport(
+                        timestamp_ns,
+                        alternative,
+                        group_preview=True,
+                    ),
+                    reason=(
+                        "greedy_reselect_after_plan_failure:"
+                        f"{alternative.track_id}"
+                    ),
+                )
             # Preserve the original scan deadline and swept angle. A failed
             # physical target is excluded above, even after tracker renumbering.
             return self._step_greedy_scan(timestamp_ns, self._latest_heading_rad)
@@ -8729,11 +9184,6 @@ class MatchSequence:
                 self._cargo_capture_floor_ns = timestamp_ns
             if not self._cargo_is_legal():
                 return self._begin_misgrasp_recovery(timestamp_ns, "invalid_cargo_count_or_classes")
-            if self._gate_clearance is not None and self._gate_clearance.reacquiring:
-                self._gate_clearance = None
-                self._greedy_active = False
-                return self._start_safe_zone_transport(timestamp_ns, transport_opened=False,
-                    posture=GripperPosture.CLOSED, reason="gate_clearance_reclaimed_start_normal_delivery")
             if self._greedy_active:
                 # 补夹扫描已经命中并完成一次收拢：直接携已有物资返程，
                 # 不再重复整圈扫描。剩余容量交由下一趟搜索决定。
@@ -8774,7 +9224,9 @@ class MatchSequence:
                 GripperWidthPickupState.FORWARD,
             }
         ):
-            angles = self._near_field_pickup.active_plan.opening_servo_angles_deg
+            angles = self._near_field_pickup.grasp_angles_for_plan(
+                self._near_field_pickup.active_plan
+            )
         if (
             angles is not None
             and decision.state
@@ -8887,46 +9339,6 @@ class MatchSequence:
                                   "grasp_task_waiting_stationary_scene", soft_brake=True)
         if preparation is not None and preparation.session_id != self._near_field_session_id:
             preparation = None
-        gate = self._gate_clearance
-        if (
-            gate is not None
-            and gate.reacquiring
-            and preparation is not None
-            and preparation.selection.plan is not None
-            and not reacquire_plan_matches_cargo(
-                gate,
-                preparation.selection.plan,
-            )
-        ):
-            started = self._near_field_confirmation_started_ns
-            if started is None:
-                self._near_field_confirmation_started_ns = timestamp_ns
-                started = timestamp_ns
-            elapsed_ms = (timestamp_ns - started) / 1_000_000.0
-            if elapsed_ms >= self.config.gate_clearance.observation_timeout_ms:
-                return self._return_to_near_field_search(
-                    timestamp_ns,
-                    "original_cargo_incomplete",
-                )
-            planned = tuple(
-                member.observation.target_class.value
-                for member in preparation.selection.plan.members
-            )
-            required = tuple(item.value for item in gate.original_classes)
-            return self._decision(
-                timestamp_ns,
-                0.0,
-                0.0,
-                "gate_clearance_reacquire_waiting_complete_cargo:"
-                f"planned={planned},required={required},"
-                f"confirmation=0/1,capture_age_ms="
-                f"{self._preparation_observation_age_ms(preparation, timestamp_ns)},"
-                f"preparation_age_ms="
-                f"{self._preparation_result_age_ms(preparation, timestamp_ns)},"
-                f"deadline_ns={started + round(self.config.gate_clearance.observation_timeout_ms * 1_000_000.0)}",
-                posture=GripperPosture.OPEN,
-                soft_brake=True,
-            )
         task = self._grasp_task
         if task is not None and preparation is not None:
             if preparation.capture_timestamp_ns <= task.scene_floor_ns:
@@ -9118,9 +9530,15 @@ class MatchSequence:
             and timestamp_ns - self._near_field_confirmation_started_ns
             >= round(self._near_field_handoff_timeout_ms() * 1_000_000.0)
         ):
+            timeout_reason = "confirmation_timeout"
+            if (
+                self._near_field_pickup.locked_ids is not None
+                and self._near_field_scene_evidence_unavailable(timestamp_ns)
+            ):
+                timeout_reason = "stationary_evidence_timeout"
             return self._return_to_near_field_search(
                 timestamp_ns,
-                "confirmation_timeout",
+                timeout_reason,
             )
         step_preparation, _ = self._preparation_with_current_alignment(
             step_preparation,
@@ -9151,13 +9569,25 @@ class MatchSequence:
                 posture=GripperPosture.TRANSPORT,
                 soft_brake=True,
             )
-        decision = self._near_field_pickup.step(
-            timestamp_ns,
-            step_preparation,
-            cumulative_distance_m=cumulative_distance_m,
-            path_clear=True if path_clear is None else path_clear,
-            heading_rad=self._latest_heading_rad,
-        )
+        try:
+            decision = self._near_field_pickup.step(
+                timestamp_ns,
+                step_preparation,
+                cumulative_distance_m=cumulative_distance_m,
+                path_clear=True if path_clear is None else path_clear,
+                heading_rad=self._latest_heading_rad,
+            )
+        except ValueError as exc:
+            if "servo commands outside [0,180]" not in str(exc):
+                raise
+            self._near_field_last_failure_diagnostic = (
+                "servo_command_out_of_range "
+                f"session={self._near_field_session_id} error={exc}"
+            )
+            return self._return_to_near_field_search(
+                timestamp_ns,
+                "servo_command_out_of_range",
+            )
         if (
             decision.state is GripperWidthPickupState.ABORTED
             and decision.reason != "near_field_path_blocked"
@@ -9374,6 +9804,8 @@ class MatchSequence:
             )
         self._transport_target_classes = (TargetClass.GREEN_SUPPLY,) * max(1, self._green_preclose_carried_count)
         self._cargo_capture_floor_ns = timestamp_ns
+        # A new confirmed pickup starts a fresh line-crossing window.
+        self._line_regrasp_suppressed_until_ns = None
         if not self._cargo_is_legal():
             return self._begin_misgrasp_recovery(timestamp_ns, "invalid_cargo_count_or_classes")
         return self._start_safe_zone_transport(
@@ -9395,6 +9827,7 @@ class MatchSequence:
 
         if self._transport_target_classes and self._cargo_capture_floor_ns is None:
             self._cargo_capture_floor_ns = timestamp_ns
+        self._reset_line_contact_hold(clear_last_frame=True)
         self.state = MatchState.TRANSPORT_ALIGN_RED_ZONE
         self._transport_opened = transport_opened
         self._gripper_phase_started_ns = None
@@ -9703,58 +10136,6 @@ class MatchSequence:
         if self._transport_target_classes == (TargetClass.ORANGE_INJURED,):
             return self.config.safe_zone_injured_target_field
         return self.config.safe_zone_fallback_target_field
-
-    def _safe_zone_line_coordinate_threshold_reached(
-        self,
-        target: FieldPoint,
-        start: FieldPoint | None,
-        tolerance_mm: float | None = None,
-    ) -> bool:
-        """判断直线目标是否命中容差，或沿计划方向已经越过目标。
-
-        直线起点已经落在阈值内的坐标不参与判断，避免某一坐标在直线起点
-        已经达标时提前结束。车辆偏航导致一次采样跨过二维容差窗口时，
-        使用起点到目标向量的投影进度触发越过保护。``tolerance_mm`` 缺省
-        时使用 ``transport_align_tolerance_mm``，供变体开场自定义到达容差。
-        """
-
-        position = self._fallback_field_position
-        if position is None or start is None:
-            return False
-        tolerance = (
-            self.config.transport_align_tolerance_mm
-            if tolerance_mm is None
-            else tolerance_mm
-        )
-        x_needed = abs(start.x - target.x) > tolerance
-        y_needed = abs(start.y - target.y) > tolerance
-        x_reached = not x_needed or abs(position.x - target.x) <= tolerance
-        y_reached = not y_needed or abs(position.y - target.y) <= tolerance
-        if x_reached and y_reached:
-            return True
-
-        delta_x = target.x - start.x
-        delta_y = target.y - start.y
-        target_distance_squared = delta_x * delta_x + delta_y * delta_y
-        if target_distance_squared <= 1e-12:
-            return False
-        progress = (
-            (position.x - start.x) * delta_x
-            + (position.y - start.y) * delta_y
-        )
-        return progress >= target_distance_squared
-
-    def _d1_line_coordinate_threshold_reached(self) -> bool:
-        return self._safe_zone_line_coordinate_threshold_reached(
-            self._safe_zone_d1_target(),
-            self._d1_line_start_position,
-        )
-
-    def _d2_line_coordinate_threshold_reached(self) -> bool:
-        return self._safe_zone_line_coordinate_threshold_reached(
-            self._safe_zone_d2_target(),
-            self._d2_line_start_position,
-        )
 
     def _begin_safe_zone_keypoint_reverse(self) -> None:
         """在 bbox 居中但关键点不足时开始一次有界的小距离倒车。"""
@@ -10154,18 +10535,75 @@ class MatchSequence:
                 settle_phase = "safe_before_d2_forward"
                 start_reason = "safe_zone_d2_line_heading_reached_start_forward"
             heading_error = normalize_angle(target_heading - heading_rad)
-            if abs(heading_error) > self.config.safe_zone_fallback_heading_tolerance_rad:
+            # Do not promote an instantaneous crossing of the heading band to
+            # a straight segment.  The former proportional turn could still
+            # be rotating at several rad/s when the sampled heading happened
+            # to enter the 0.02 rad tolerance.  The following forward command
+            # then inherited that angular momentum and drove the payload along
+            # a completely different ray.  Reuse the profiled turn executor:
+            # it starts braking from measured gyro/wheel feedback and only
+            # completes after continuous encoder/IMU stationarity.
+            alignment_key = (
+                "safe_zone_d1_line_align"
+                if is_d1_line
+                else "safe_zone_d2_line_align"
+            )
+            command = self._noncontact_motion(
+                timestamp_ns,
+                alignment_key,
+                target=heading_error,
+                speed=self.config.safe_zone_fallback_max_angular_velocity_rad_s,
+                turn=True,
+                tolerance=self.config.safe_zone_fallback_heading_tolerance_rad,
+                target_heading_rad=target_heading,
+            )
+            if not command.complete:
+                decision = self._noncontact_decision(
+                    timestamp_ns,
+                    command,
+                    posture=GripperPosture.CLOSED,
+                )
+                return replace(
+                    decision,
+                    reason=f"{turn_reason},{decision.reason}",
+                )
+
+            self._finish_noncontact()
+            # The completion sample is stationary.  Recompute the line from
+            # that pose so braking drift cannot leak into the following
+            # straight segment.
+            position = self._fallback_field_position
+            if position is None:
                 return self._decision(
                     timestamp_ns,
                     0.0,
-                    _clamp(
-                        self.config.safe_zone_fallback_heading_kp_rad_s * heading_error,
-                        -self.config.safe_zone_fallback_max_angular_velocity_rad_s,
-                        self.config.safe_zone_fallback_max_angular_velocity_rad_s,
-                    ),
-                    turn_reason,
+                    0.0,
+                    "safe_zone_route_waiting_for_field_odometry",
                     posture=GripperPosture.CLOSED,
                 )
+            delta_x = target.x - position.x
+            delta_y = target.y - position.y
+            distance_mm = math.hypot(delta_x, delta_y)
+            target_heading = math.atan2(delta_y, delta_x)
+            heading_error = normalize_angle(target_heading - heading_rad)
+            if (
+                distance_mm > 1e-6
+                and abs(heading_error)
+                > self.config.safe_zone_fallback_heading_tolerance_rad
+            ):
+                return self._decision(
+                    timestamp_ns,
+                    0.0,
+                    0.0,
+                    f"{turn_reason}_recompute_after_stop",
+                    posture=GripperPosture.CLOSED,
+                )
+            if is_d1_line:
+                self._d1_line_start_position = position
+                self._d1_line_heading_rad = target_heading
+            else:
+                self._d2_line_start_position = position
+                self._d2_line_heading_rad = target_heading
 
             if is_d1_line:
                 self._d1_line_distance_m = distance_mm / 1000.0
@@ -10191,22 +10629,34 @@ class MatchSequence:
             )
 
         if self._safe_zone_phase == "align_y_at_d2":
+            target_heading = self._safe_zone_forward_heading_rad()
             heading_error = normalize_angle(
-                self._safe_zone_forward_heading_rad() - heading_rad
+                target_heading - heading_rad
             )
-            if abs(heading_error) > self.config.safe_zone_fallback_heading_tolerance_rad:
-                return self._decision(
+            command = self._noncontact_motion(
+                timestamp_ns,
+                "safe_zone_final_heading_align",
+                target=heading_error,
+                speed=self.config.safe_zone_fallback_max_angular_velocity_rad_s,
+                turn=True,
+                tolerance=self.config.safe_zone_fallback_heading_tolerance_rad,
+                target_heading_rad=target_heading,
+            )
+            if not command.complete:
+                decision = self._noncontact_decision(
                     timestamp_ns,
-                    0.0,
-                    _clamp(
-                        self.config.safe_zone_fallback_heading_kp_rad_s * heading_error,
-                        -self.config.safe_zone_fallback_max_angular_velocity_rad_s,
-                        self.config.safe_zone_fallback_max_angular_velocity_rad_s,
-                    ),
-                    "safe_zone_d2_turn_to_"
-                    f"{self._safe_zone_heading_label()}",
+                    command,
                     posture=GripperPosture.OPEN,
                 )
+                return replace(
+                    decision,
+                    reason=(
+                        "safe_zone_d2_turn_to_"
+                        f"{self._safe_zone_heading_label()},"
+                        f"{decision.reason}"
+                    ),
+                )
+            self._finish_noncontact()
             self._safe_zone_phase = "stopping_after_d2_heading"
             self._safe_zone_stop_since_ns = None
             return self._decision(
@@ -10350,7 +10800,7 @@ class MatchSequence:
                 f"final_nominal_y={transport_endpoint.y:.0f},"
                 f"final_target_y={self._safe_zone_final_target_y_mm():.0f},"
                 f"final_speed_m_s={final_speed:.3f},"
-                f"final_braking_overrun_mm={final_braking_overrun:.1f},"
+                f"legacy_final_braking_overrun_mm={final_braking_overrun:.1f},"
                 f"d1_line_heading_deg={d1_line_heading_text},"
                 f"d1_line_distance_m={d1_line_distance_text},"
                 f"d2_line_heading_deg={d2_line_heading_text},"
@@ -10378,13 +10828,53 @@ class MatchSequence:
             f"final_nominal_y={transport_endpoint.y:.0f},"
             f"final_target_y={self._safe_zone_final_target_y_mm():.0f},"
             f"final_speed_m_s={final_speed:.3f},"
-            f"final_braking_overrun_mm={final_braking_overrun:.1f},"
+            f"legacy_final_braking_overrun_mm={final_braking_overrun:.1f},"
             f"d1_offset_mm={self._d1_calibration_offset_mm:.1f},"
             f"d1_offset_bounds_mm=("
             f"{self.config.safe_zone_calibration_min_offset_mm:.1f},"
             f"{self.config.safe_zone_calibration_start_offset_mm:.1f}),"
             f"d2={self.config.safe_zone_open_offset_mm:.1f},"
             f"key_samples={len(self._safe_zone_key_samples)}"
+        )
+
+    def _safe_zone_forward_command(
+        self,
+        timestamp_ns: int,
+        *,
+        key: str,
+        target_distance_m: float,
+        speed_m_s: float,
+        target_heading_rad: float | None,
+        position_tolerance_mm: float,
+    ) -> RelativeActionCommand:
+        """Run one safe-zone line through the same feedback executor as match startup."""
+
+        final_phase = self._safe_zone_phase in {
+            "forward_final_closed",
+            "forward_final_open",
+        }
+        return self._noncontact_motion(
+            timestamp_ns,
+            key,
+            target=max(target_distance_m, 1e-9),
+            speed=speed_m_s,
+            tolerance=position_tolerance_mm / 1000.0,
+            heading_tolerance=(
+                math.pi
+                if final_phase
+                else self.config.safe_zone_fallback_heading_tolerance_rad
+            ),
+            target_heading_rad=target_heading_rad,
+            linear_deceleration_m_s2=(
+                self.config.safe_zone_d2_to_final_max_linear_deceleration_m_s2
+                if final_phase
+                else None
+            ),
+            angular_deceleration_rad_s2=(
+                self.config.safe_zone_d2_to_final_max_angular_deceleration_rad_s2
+                if final_phase
+                else None
+            ),
         )
 
     def _step_transport_forward(
@@ -10429,11 +10919,7 @@ class MatchSequence:
                 settle_phase,
                 cumulative_distance_m,
             )
-        if (
-            cumulative_distance_m is None
-            or self._transport_forward_base_distance_m is None
-            or self._transport_forward_distance_m is None
-        ):
+        if cumulative_distance_m is None or self._transport_forward_distance_m is None:
             return self._decision(
                 timestamp_ns,
                 0.0,
@@ -10453,155 +10939,118 @@ class MatchSequence:
                     )
                 ),
             )
-        travelled = (
-            cumulative_distance_m - self._transport_forward_base_distance_m
-        )
 
         if self._safe_zone_phase == "forward_d1_line":
-            if self._d1_line_coordinate_threshold_reached():
-                self._transport_forward_base_distance_m = None
-                self._transport_forward_distance_m = None
-                self._safe_zone_phase = "stopping_before_calibration"
-                self._safe_zone_key_samples = []
-                self._safe_zone_key_last_frame = None
-                self._safe_zone_key_reobserve_until_ns = None
-                self._safe_zone_key_reobserve_frame_floor = None
-                self._safe_zone_stop_since_ns = None
-                self.state = MatchState.TRANSPORT_RELEASE
-                return self._decision(
-                    timestamp_ns,
-                    0.0,
-                    0.0,
-                    "safe_zone_d1_coordinate_threshold_reached_stop_before_calibration",
-                    posture=GripperPosture.CLOSED,
-                )
-            angular = self._heading_hold_angular_velocity(
-                self._d1_line_heading_rad,
-                kp_rad_s=self.config.safe_zone_fallback_heading_kp_rad_s,
-                max_angular_velocity_rad_s=(
-                    self.config.safe_zone_fallback_max_angular_velocity_rad_s
-                ),
-                tolerance_rad=self.config.safe_zone_fallback_heading_tolerance_rad,
-            )
-            if angular is None:
-                return self._decision(
-                    timestamp_ns,
-                    0.0,
-                    0.0,
-                    "safe_zone_forward_waiting_for_heading",
-                    posture=GripperPosture.CLOSED,
-                )
-            return self._decision(
+            command = self._safe_zone_forward_command(
                 timestamp_ns,
-                self._transport_cruise_speed(
+                key="safe_zone_d1_forward",
+                target_distance_m=self._transport_forward_distance_m,
+                speed_m_s=self._transport_cruise_speed(
                     self._safe_zone_d1_target(),
                     self._d1_line_start_position,
                     self.config.safe_zone_grab_to_d1_speed_m_s,
                 ),
-                angular,
-                "safe_zone_forward_along_gripper_to_d1_line",
+                target_heading_rad=self._d1_line_heading_rad,
+                position_tolerance_mm=self.config.transport_align_tolerance_mm,
+            )
+            if not command.complete:
+                return self._noncontact_decision(
+                    timestamp_ns, command, posture=GripperPosture.CLOSED,
+                )
+            self._finish_noncontact()
+            self._transport_forward_base_distance_m = None
+            self._transport_forward_distance_m = None
+            self._safe_zone_phase = "stopping_before_calibration"
+            self._safe_zone_key_samples = []
+            self._safe_zone_key_last_frame = None
+            self._safe_zone_key_reobserve_until_ns = None
+            self._safe_zone_key_reobserve_frame_floor = None
+            self._safe_zone_stop_since_ns = None
+            self.state = MatchState.TRANSPORT_RELEASE
+            return self._decision(
+                timestamp_ns,
+                0.0,
+                0.0,
+                "safe_zone_d1_closed_loop_complete_stop_before_calibration",
                 posture=GripperPosture.CLOSED,
             )
 
         if self._safe_zone_phase == "forward_d2_line":
-            coordinate_threshold_reached = self._d2_line_coordinate_threshold_reached()
-            if coordinate_threshold_reached:
-                self._transport_forward_base_distance_m = None
-                self._transport_forward_distance_m = None
-                self.state = MatchState.TRANSPORT_RELEASE
-                self._safe_zone_phase = "stopping_before_d2_opening"
-                self._safe_zone_stop_since_ns = None
-                if self._begin_action_settle(
-                    timestamp_ns,
-                    "safe_before_d2_opening",
-                ):
-                    return self._decision(
-                        timestamp_ns,
-                        0.0,
-                        0.0,
-                        "safe_zone_d2_reached_wait_before_opening",
-                        posture=GripperPosture.CLOSED,
-                    )
-                return self._decision(
-                    timestamp_ns,
-                    0.0,
-                    0.0,
-                    "safe_zone_d2_coordinate_threshold_reached_wait_before_opening",
-                    posture=GripperPosture.CLOSED,
-                )
-            angular = self._heading_hold_angular_velocity(
-                self._d2_line_heading_rad,
-                kp_rad_s=self.config.safe_zone_fallback_heading_kp_rad_s,
-                max_angular_velocity_rad_s=(
-                    self.config.safe_zone_fallback_max_angular_velocity_rad_s
-                ),
-                tolerance_rad=self.config.safe_zone_fallback_heading_tolerance_rad,
+            command = self._safe_zone_forward_command(
+                timestamp_ns,
+                key="safe_zone_d2_forward",
+                target_distance_m=self._transport_forward_distance_m,
+                speed_m_s=self.config.safe_zone_d1_to_d2_speed_m_s,
+                target_heading_rad=self._d2_line_heading_rad,
+                position_tolerance_mm=self.config.transport_d2_tolerance_mm,
             )
-            if angular is None:
+            if not command.complete:
+                return self._noncontact_decision(
+                    timestamp_ns, command, posture=GripperPosture.CLOSED,
+                )
+            self._finish_noncontact()
+            self._transport_forward_base_distance_m = None
+            self._transport_forward_distance_m = None
+            self.state = MatchState.TRANSPORT_RELEASE
+            self._safe_zone_phase = "stopping_before_d2_opening"
+            self._safe_zone_stop_since_ns = None
+            if self._begin_action_settle(timestamp_ns, "safe_before_d2_opening"):
                 return self._decision(
                     timestamp_ns,
                     0.0,
                     0.0,
-                    "safe_zone_forward_waiting_for_heading",
+                    "safe_zone_d2_closed_loop_complete_wait_before_opening",
                     posture=GripperPosture.CLOSED,
                 )
             return self._decision(
                 timestamp_ns,
-                self.config.safe_zone_d1_to_d2_speed_m_s,
-                angular,
-                "safe_zone_forward_along_d1_d2_line",
+                0.0,
+                0.0,
+                "safe_zone_d2_closed_loop_complete_wait_before_opening",
                 posture=GripperPosture.CLOSED,
             )
 
-        if travelled >= self._transport_forward_distance_m - 1e-9:
-            self._transport_count += 1
-            self._gripper_phase_started_ns = None
-            self._return_phase = "stopping_before_exit"
-            self._safe_zone_exit_base_distance_m = None
-            self._safe_zone_stop_since_ns = None
-            self._safe_zone_phase = "stopping_before_exit_opening"
-            self.state = MatchState.TRANSPORT_RELEASE
-            if self._begin_action_settle(
+        if self._safe_zone_phase in {"forward_final_closed", "forward_final_open"}:
+            command = self._safe_zone_forward_command(
                 timestamp_ns,
-                "safe_before_exit_opening",
-            ):
-                return self._decision(
+                key=f"safe_zone_{self._safe_zone_phase}",
+                target_distance_m=self._transport_forward_distance_m,
+                speed_m_s=self._safe_zone_d2_to_final_speed_m_s(),
+                target_heading_rad=None,
+                position_tolerance_mm=self.config.transport_align_tolerance_mm,
+            )
+            if not command.complete:
+                return self._noncontact_decision(
                     timestamp_ns,
-                    0.0,
-                    0.0,
-                    "safe_zone_reached_transport_endpoint_wait_before_opening",
-                    posture=GripperPosture.CLOSED,
+                    command,
+                    posture=(GripperPosture.OPEN
+                             if self._safe_zone_phase == "forward_final_open"
+                             else GripperPosture.CLOSED),
                 )
-            return self._decision(
+            self._finish_noncontact()
+            self._transport_count += 1
+            self._transport_opened = True
+            self._gripper_phase_started_ns = None
+            # The relative action reports complete only after the final push
+            # has really stopped. Open the gripper and command the reverse
+            # exit in this same decision; another stop/settle/open sequence
+            # creates a visible dead period without adding safety.
+            self._return_phase = "exit_reverse"
+            self._safe_zone_exit_base_distance_m = cumulative_distance_m
+            self._safe_zone_exit_open_loop_until_ns = None
+            self._safe_zone_stop_since_ns = None
+            self._transport_forward_base_distance_m = None
+            self._transport_forward_distance_m = None
+            self._safe_zone_phase = "idle"
+            self.state = MatchState.RETURN_BACKUP
+            return self._step_return_backup(
                 timestamp_ns,
-                0.0,
-                0.0,
-                "safe_zone_reached_transport_endpoint_wait_before_opening",
-                posture=GripperPosture.CLOSED,
+                cumulative_distance_m,
             )
-        angular = self._heading_hold_angular_velocity(
-            self._safe_zone_forward_heading_rad(),
-            kp_rad_s=self.config.safe_zone_fallback_heading_kp_rad_s,
-            max_angular_velocity_rad_s=(
-                self.config.safe_zone_fallback_max_angular_velocity_rad_s
-            ),
-            tolerance_rad=self.config.safe_zone_fallback_heading_tolerance_rad,
-        )
-        if angular is None:
-            return self._decision(
-                timestamp_ns,
-                0.0,
-                0.0,
-                "safe_zone_forward_waiting_for_heading",
-                posture=GripperPosture.CLOSED,
-            )
-        return self._decision(
-            timestamp_ns,
-            self._safe_zone_d2_to_final_speed_m_s(),
-            angular,
-            "safe_zone_closed_gripper_forward_to_transport_endpoint",
-            posture=GripperPosture.CLOSED,
-        )
+
+        return self._decision(timestamp_ns, 0.0, 0.0,
+                              "safe_zone_forward_unknown_phase_hold",
+                              posture=GripperPosture.CLOSED)
 
     def _step_return_backup(
         self,
@@ -10636,6 +11085,7 @@ class MatchSequence:
                 )
             self._safe_zone_exit_base_distance_m = cumulative_distance_m
             self._safe_zone_stop_since_ns = None
+            self._safe_zone_exit_open_loop_until_ns = None
             self._return_phase = "exit_reverse"
             return self._decision(
                 timestamp_ns,
@@ -10646,11 +11096,34 @@ class MatchSequence:
             )
 
         if phase == "exit_reverse":
-            command = self._noncontact_motion(timestamp_ns, "exit_reverse",
-                target=-self.config.safe_zone_exit_distance_m, speed=self.config.return_backup_speed_m_s)
-            if not command.complete:
-                return self._noncontact_decision(timestamp_ns, command, GripperPosture.OPEN)
-            self._finish_noncontact()
+            # This short safety-zone exit is deliberately open-loop: hold the
+            # configured high reverse speed for distance/speed seconds.  The
+            # following phase still requires real stationary feedback before
+            # handing control back to search.
+            if self._safe_zone_exit_open_loop_until_ns is None:
+                if self.config.return_backup_speed_m_s <= 0.0:
+                    return self._decision(
+                        timestamp_ns,
+                        0.0,
+                        0.0,
+                        "safe_zone_exit_open_loop_invalid_speed",
+                        posture=GripperPosture.OPEN,
+                    )
+                duration_ns = round(
+                    self.config.safe_zone_exit_distance_m
+                    / self.config.return_backup_speed_m_s
+                    * 1_000_000_000
+                )
+                self._safe_zone_exit_open_loop_until_ns = timestamp_ns + duration_ns
+            if timestamp_ns < self._safe_zone_exit_open_loop_until_ns:
+                return self._decision(
+                    timestamp_ns,
+                    -self.config.return_backup_speed_m_s,
+                    0.0,
+                    "safe_zone_exit_reverse_open_loop",
+                    posture=GripperPosture.OPEN,
+                )
+            self._safe_zone_exit_open_loop_until_ns = None
             self._return_phase = "stopping_after_exit"
             self._safe_zone_stop_since_ns = None
             return self._decision(timestamp_ns, 0.0, 0.0,
@@ -10698,6 +11171,7 @@ class MatchSequence:
         self._cargo_capture_floor_ns = None
         self._greedy_active = False
         self._return_backup_base_distance_m = None
+        self._safe_zone_exit_open_loop_until_ns = None
         self._transport_forward_distance_m = None
         self._begin_cluster_search()
         self._reset_rotation_budget()
@@ -10947,13 +11421,20 @@ class MatchSequence:
                 )
             self._gripper_phase_started_ns = None
             self._safe_zone_phase = "idle"
+            # The final closed-loop push already finished with real stationary
+            # feedback, and issuing the release command does not move the
+            # chassis.  Do not enter another stop-confirmation phase after
+            # delivery: start the configured reverse exit now.
+            self._return_phase = "exit_reverse"
+            self._safe_zone_exit_base_distance_m = (
+                self._latest_cumulative_distance_m
+            )
+            self._safe_zone_exit_open_loop_until_ns = None
+            self._safe_zone_stop_since_ns = None
             self.state = MatchState.RETURN_BACKUP
-            return self._decision(
+            return self._step_return_backup(
                 timestamp_ns,
-                0.0,
-                0.0,
-                "gripper_opened_after_safe_zone_push_start_exit",
-                posture=GripperPosture.OPEN,
+                self._latest_cumulative_distance_m,
             )
 
         return self._decision(

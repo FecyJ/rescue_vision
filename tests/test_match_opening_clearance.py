@@ -31,7 +31,7 @@ def test_opening_rejects_body_intrusion_with_center_outside_sweep(cls):
 
 def test_opening_keeps_isolated_green_and_does_not_change_later_policy():
     flow = _sequence()
-    assert flow.near_field_policy.obstacle_extent_required
+    assert not flow.near_field_policy.obstacle_extent_required
     assert selector().select((target(), target(2, y=300, cls=BLUE)),
                              policy=flow.near_field_policy).plan is not None
     flow._transport_count = 1
