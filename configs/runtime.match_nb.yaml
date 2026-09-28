@@ -1,7 +1,7 @@
 # 当前 match 的开场变体，其余配置与正式流程相同。开场从当前起点按相对
 # turn / wheel_turn / straight 动作执行；转角为 rad（左正右负），距离为 m（前进正、倒车负）。
 # 每个动作单独配置速度，动作之间只保留短暂停稳，不按场地点反复校准。
-# 本文件以启动区域 2（地图右上角、红方）为基准，不提供区域 3 中心对称。
+# 四区初始位姿由 match.start_poses 定义；NB 开场动作始终相对所选位姿执行。
 
 camera:
   backend: rpicam_vid
@@ -168,6 +168,36 @@ match:
   robot_footprint_radius_mm: 160.0
   safety_margin_mm: 10.0
   enabled: true
+  start_area: 2
+  start_poses:
+    "1":
+      x_mm: -1350.0
+      y_mm: 1350.0
+      heading_deg: -45.0
+      position_uncertainty_mm: 50.0
+      heading_uncertainty_deg: 5.0
+      confidence: 0.8
+    "2":
+      x_mm: 1350.0
+      y_mm: 1350.0
+      heading_deg: -135.0
+      position_uncertainty_mm: 50.0
+      heading_uncertainty_deg: 5.0
+      confidence: 0.8
+    "3":
+      x_mm: -1350.0
+      y_mm: -1350.0
+      heading_deg: 45.0
+      position_uncertainty_mm: 50.0
+      heading_uncertainty_deg: 5.0
+      confidence: 0.8
+    "4":
+      x_mm: 1350.0
+      y_mm: -1350.0
+      heading_deg: 135.0
+      position_uncertainty_mm: 50.0
+      heading_uncertainty_deg: 5.0
+      confidence: 0.8
   # 按历史开场路线执行：转弯 -> 直行 -> 转弯 -> 直行 -> 倒车直行。
   # angle_rad：左转为正、右转为负；angular_velocity_rad_s 为正的速度幅值。
   # distance_m：前进为正、倒车为负；speed_m_s 为正的速度幅值。
@@ -382,13 +412,6 @@ localization:
   enabled: false
   fusion:
     enabled: false
-    initial_pose:
-      x_mm: 1350.0
-      y_mm: 1350.0
-      heading_deg: -135.0
-      position_uncertainty_mm: 50.0
-      heading_uncertainty_deg: 5.0
-      confidence: 0.8
 
 hailo:
   enabled: true

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import yaml
 
 from rescue_vision.config.runtime import load_runtime_config
 from rescue_vision.geometry.camera_model import CameraCalibration, CameraModelType
@@ -18,6 +19,53 @@ from rescue_vision.world import (
     StaticFieldMap,
     TeamColor,
 )
+
+
+def test_match_start_pose_uses_selected_yaml_area(tmp_path) -> None:
+    raw = yaml.safe_load(Path("configs/runtime.match.yaml").read_text(encoding="utf-8"))
+    raw["match"]["start_area"] = 4
+    raw["match"]["start_poses"]["4"].update(x_mm=1199.0, heading_deg=123.0)
+    path = tmp_path / "match.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    loaded = load_runtime_config(path)
+
+    assert loaded.match.start_area == 4
+    assert loaded.localization.fusion.initial_pose.position == FieldPoint(
+        1199.0, -1350.0
+    )
+    assert loaded.localization.fusion.initial_pose.heading_rad == pytest.approx(
+        np.deg2rad(123.0)
+    )
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (lambda raw: raw["match"]["start_poses"].pop("3"), "exactly string keys"),
+        (
+            lambda raw: raw["match"]["start_poses"]["2"].update(
+                heading_deg=float("nan")
+            ),
+            "heading_deg",
+        ),
+        (lambda raw: raw["match"].update(start_area=5), "match.start_area"),
+        (
+            lambda raw: raw["localization"]["fusion"].update(initial_pose={}),
+            "remove localization.fusion.initial_pose",
+        ),
+    ],
+)
+def test_enabled_match_rejects_ambiguous_or_invalid_start_pose(
+    tmp_path, change, message: str
+) -> None:
+    raw = yaml.safe_load(Path("configs/runtime.match.yaml").read_text(encoding="utf-8"))
+    change(raw)
+    path = tmp_path / "match.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        load_runtime_config(path)
 
 
 def write_intrinsics(path, *, usable: bool = True) -> CameraCalibration:

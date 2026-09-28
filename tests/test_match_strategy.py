@@ -164,14 +164,14 @@ def test_start_resets_strategy_state_and_pose_history() -> None:
     assert sequence._pose_history == []
 
 
-def test_start_area_three_mirrors_to_the_blue_team() -> None:
-    """``--start-area 3`` 在运行时中心对称并切到蓝方。"""
+def test_start_area_three_uses_yaml_pose_without_changing_team() -> None:
+    """``--start-area 3`` 只选择 YAML 位姿，不改写独立红蓝方配置。"""
 
     sequence = StrategySequence.from_app_config(
         load_runtime_config(STRATEGY_CONFIG_PATH),
         start_area="3",
     )
-    assert sequence._team_color is TeamColor.BLUE
+    assert sequence._team_color is TeamColor.RED
     assert sequence._initial_field_position is not None
     assert sequence._initial_field_position.x == -START_FIELD_POSITION.x
     assert sequence._initial_field_position.y == -START_FIELD_POSITION.y

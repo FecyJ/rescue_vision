@@ -1,6 +1,6 @@
 # 正式流程：首轮搜索最近单绿；其走廊不安全时直接解团；一般阶段按不同 X 终点优先寻找可抓取物资组。
-# 本文件以启动区域 2（地图右上角、红方）为坐标基准；区域 3 通过
-# rescue-vision-match 的 --start-area 3 在运行时做中心对称并切换为蓝方。
+# 四个启动区域的初始融合位姿全部由 match.start_poses 定义；Python 不再
+# 推导或校验固定坐标/航向。红蓝方与安全区路线由其它 YAML 字段独立配置。
 
 camera:
   backend: rpicam_vid
@@ -160,14 +160,43 @@ match:
   robot_footprint_radius_mm: 160.0
   safety_margin_mm: 10.0
   enabled: true
+  # 当前配置默认启动区域；CLI --start-area 可在 1..4 中覆盖。
+  start_area: 2
+  # 场地坐标：1 左上、2 右上、3 左下、4 右下；航向均朝向中心。
+  # 每项是所选区域完整的初始融合位姿，也是 match 唯一的出发位姿依据。
+  start_poses:
+    "1":
+      x_mm: -1350.0
+      y_mm: 1350.0
+      heading_deg: -45.0
+      position_uncertainty_mm: 50.0
+      heading_uncertainty_deg: 5.0
+      confidence: 0.8
+    "2":
+      x_mm: 1350.0
+      y_mm: 1350.0
+      heading_deg: -135.0
+      position_uncertainty_mm: 50.0
+      heading_uncertainty_deg: 5.0
+      confidence: 0.8
+    "3":
+      x_mm: -1350.0
+      y_mm: -1350.0
+      heading_deg: 45.0
+      position_uncertainty_mm: 50.0
+      heading_uncertainty_deg: 5.0
+      confidence: 0.8
+    "4":
+      x_mm: 1350.0
+      y_mm: -1350.0
+      heading_deg: 135.0
+      position_uncertainty_mm: 50.0
+      heading_uncertainty_deg: 5.0
+      confidence: 0.8
   # 正式 match 自身的开场动作；与 match_nb 的 nb_opening_actions 分开维护。
   # angle_rad：左转为正、右转为负；angular_velocity_rad_s 为正的速度幅值。
   # distance_m：前进为正、倒车为负；speed_m_s 为正的速度幅值。
   opening_actions:
-    - type: turn
-      angle_rad: -0.69
-      angular_velocity_rad_s: 3.0
-      settle_time_s: 0.2
     - type: straight
       distance_m: 2.5
       speed_m_s: 1.5
@@ -324,9 +353,9 @@ match:
   # d1→d2 的推进速度，单位 m/s。
   safe_zone_d1_to_d2_speed_m_s: 0.5
   # d2 张爪、转向、闭爪后到安全区末端的推进速度，单位 m/s。
-  safe_zone_d2_to_final_speed_m_s: 0.45
+  safe_zone_d2_to_final_speed_m_s: 0.38
   # 单橙色伤员 d2→安全区末端的独立速度，单位 m/s；当前先与通用末段一致，按实测单独调节。
-  safe_zone_orange_d2_to_final_speed_m_s: 0.40
+  safe_zone_orange_d2_to_final_speed_m_s: 0.38
   # 兼容现场诊断记录的旧固定刹车过冲参数；严格闭环运输不再从实际终点扣除，单位 mm。
   safe_zone_d2_to_final_braking_overrun_mm: 40
   # 单橙色伤员对应的旧诊断参数；严格闭环运输不再从实际终点扣除，单位 mm。
@@ -380,13 +409,6 @@ localization:
   enabled: false
   fusion:
     enabled: false
-    initial_pose:
-      x_mm: 1350.0
-      y_mm: 1350.0
-      heading_deg: -90.0
-      position_uncertainty_mm: 50.0
-      heading_uncertainty_deg: 5.0
-      confidence: 0.8
 
 hailo:
   enabled: true

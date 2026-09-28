@@ -1,6 +1,5 @@
 # 正式流程：首轮搜索最近单绿；其走廊不安全时直接解团；一般阶段按不同 X 终点优先寻找可抓取物资组。
-# 本文件以启动区域 2（地图右上角、红方）为坐标基准；区域 3 通过
-# rescue-vision-match 的 --start-area 3 在运行时做中心对称并切换为蓝方。
+# 四区初始位姿由 match.start_poses 定义；红蓝方与路线由其它 YAML 字段独立配置。
 
 camera:
   backend: rpicam_vid
@@ -152,6 +151,36 @@ match:
     attempt_timeout_s: 30.0
   # CC 与正式 match 共享的启动、夹爪近场入口和安全区运输参数。
   enabled: true
+  start_area: 2
+  start_poses:
+    "1":
+      x_mm: -1350.0
+      y_mm: 1350.0
+      heading_deg: -90.0
+      position_uncertainty_mm: 50.0
+      heading_uncertainty_deg: 5.0
+      confidence: 0.8
+    "2":
+      x_mm: 1350.0
+      y_mm: 1350.0
+      heading_deg: -90.0
+      position_uncertainty_mm: 50.0
+      heading_uncertainty_deg: 5.0
+      confidence: 0.8
+    "3":
+      x_mm: -1350.0
+      y_mm: -1350.0
+      heading_deg: 90.0
+      position_uncertainty_mm: 50.0
+      heading_uncertainty_deg: 5.0
+      confidence: 0.8
+    "4":
+      x_mm: 1350.0
+      y_mm: -1350.0
+      heading_deg: 90.0
+      position_uncertainty_mm: 50.0
+      heading_uncertainty_deg: 5.0
+      confidence: 0.8
   robot_footprint_radius_mm: 160.0
   safety_margin_mm: 10.0
   startup_turn_angle_rad: 0.5
@@ -260,13 +289,6 @@ localization:
   enabled: false
   fusion:
     enabled: false
-    initial_pose:
-      x_mm: 1350.0
-      y_mm: 1350.0
-      heading_deg: -90.0
-      position_uncertainty_mm: 50.0
-      heading_uncertainty_deg: 5.0
-      confidence: 0.8
 
 hailo:
   enabled: true

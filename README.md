@@ -270,7 +270,7 @@ GroundPoint ── 中心十字绝对观测 + 编码器/IMU 连续融合 ──>
 | `rescue-vision-gripper-width` | 自动选择 1～3 个绿黑物资或单个橙色目标，对准、按几何收拢并合爪保持；不掉头 |
 | `rescue-vision-motion-sequence` | TUI 输入 `a1 a2`，通过 `--distance-m` 配置距离并自动计算速度；默认前进 1.5 m |
 | `rescue-vision-teach-replay` | 记录手推过程的编码器/IMU JSONL，并立即或以后受监督回放轮轨迹 |
-| `rescue-vision-match` | 正式流程入口；硬件和首帧预检完成后等待 Enter 瞬时放行，支持 `--start-area 2/3`、本地图像预览、observe-only perception JPEG、D2 遥测和按时间命名的流程日志 |
+| `rescue-vision-match` | 正式流程入口；硬件和首帧预检完成后等待 Enter 瞬时放行，支持 `--start-area 1/2/3/4`（位姿读取 YAML）、本地图像预览、observe-only perception JPEG、D2 遥测和按时间命名的流程日志 |
 | `rescue-vision-match-cc` | CC 独立流程入口；使用 `configs/runtime.cc.yaml`，执行稳健解团、单块分级搜索和正式安全区运输 |
 | `rescue-vision-match-nb` | 当前正式流程的开场变体；从起点按 `match.nb_opening_actions` 配置的转角/轮级转向/直行序列执行，随后复用正式流程 |
 | `python -m rescue_vision.app.match_strategy` | 蓝色优先策略变体入口（尚无 console script）；使用 `configs/runtime.strategy.yaml`，启动两段冲刺后只搜蓝色危险物块，能直接夹取则单块转运、否则对全蓝团解团，两趟分别放到对面安全区左右 D2 点，随后翻转进正式流程复用绿块搜索 |

@@ -466,3 +466,12 @@ def test_nb_cli_uses_current_match_subclass(monkeypatch) -> None:
     assert factory.__self__ is MatchNBSequence
     assert factory.__name__ == "from_app_config"
     assert received["mode_name"] == "match_nb"
+
+
+def test_nb_factory_uses_overridden_start_area_heading() -> None:
+    config = load_runtime_config("configs/runtime.match_nb.yaml")
+
+    sequence = MatchNBSequence.from_app_config(config, start_area=4)
+
+    assert sequence._nb_initial_heading_rad == pytest.approx(math.radians(135.0))
+    assert sequence.estimated_field_position == FieldPoint(1350.0, -1350.0)

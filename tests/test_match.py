@@ -308,30 +308,66 @@ def start_sequence(sequence: MatchSequence) -> None:
     sequence.state = MatchState.SEARCH_CLUSTER
 
 
-def test_start_area_3_mirrors_match_pose_route_and_team_color() -> None:
-    area_2 = load_runtime_config("configs/runtime.match.yaml")
-    area_3 = configure_match_start_area(area_2, MatchStartArea.AREA_3)
+def test_all_start_areas_use_yaml_poses_without_changing_team_route() -> None:
+    base = load_runtime_config("configs/runtime.match.yaml")
+    expected = {
+        MatchStartArea.AREA_1: (FieldPoint(-1350.0, 1350.0), -math.pi / 4.0),
+        MatchStartArea.AREA_2: (FieldPoint(1350.0, 1350.0), -3.0 * math.pi / 4.0),
+        MatchStartArea.AREA_3: (FieldPoint(-1350.0, -1350.0), math.pi / 4.0),
+        MatchStartArea.AREA_4: (FieldPoint(1350.0, -1350.0), 3.0 * math.pi / 4.0),
+    }
 
-    assert area_3.world.team_color is TeamColor.BLUE
-    assert area_3.localization.fusion.initial_pose.position == FieldPoint(
-        -1350.0, -1350.0
-    )
-    assert area_3.localization.fusion.initial_pose.heading_rad == pytest.approx(
-        math.pi / 2.0
-    )
-    assert area_3.match.safe_zone_fallback_target_field == FieldPoint(
-        130.0, -1115.0
-    )
-    assert area_3.match.safe_zone_injured_target_field == FieldPoint(
-        -130.0, -1115.0
-    )
-    assert area_3.match.safe_zone_d2_braking_overrun_x_mm == pytest.approx(-20.0)
-    assert area_3.world.static_map is area_2.world.static_map
+    for area, (position, heading_rad) in expected.items():
+        configured = configure_match_start_area(base, area)
+        assert configured.match.start_area == int(area.value)
+        assert configured.localization.fusion.initial_pose.position == position
+        assert configured.localization.fusion.initial_pose.heading_rad == pytest.approx(
+            heading_rad
+        )
+        assert configured.world.team_color is base.world.team_color
+        assert (
+            configured.match.safe_zone_fallback_target_field
+            == base.match.safe_zone_fallback_target_field
+        )
+        assert (
+            configured.match.safe_zone_injured_target_field
+            == base.match.safe_zone_injured_target_field
+        )
+        assert configured.world.static_map is base.world.static_map
 
-    sequence = MatchSequence.from_app_config(area_2, start_area=3)
-    assert sequence._team_color is TeamColor.BLUE
-    assert sequence.estimated_field_position == FieldPoint(-1350.0, -1350.0)
-    assert sequence._safe_zone_transport_endpoint() == FieldPoint(130.0, -1115.0)
+    area_4_sequence = MatchSequence.from_app_config(base, start_area=4)
+    assert area_4_sequence._team_color is TeamColor.RED
+    assert area_4_sequence.estimated_field_position == FieldPoint(1350.0, -1350.0)
+    assert area_4_sequence._safe_zone_transport_endpoint() == FieldPoint(-130.0, 1115.0)
+
+
+def test_start_area_pose_has_no_python_coordinate_or_heading_authority() -> None:
+    base = load_runtime_config("configs/runtime.match.yaml")
+    custom_area_4 = replace(
+        base.match.start_pose(4),
+        pose=FieldPose2D(FieldPoint(1201.0, -1299.0), math.radians(123.0)),
+    )
+    custom = replace(
+        base,
+        match=replace(
+            base.match,
+            start_poses=tuple(
+                custom_area_4 if item.area == 4 else item
+                for item in base.match.start_poses
+            ),
+        ),
+    )
+
+    configured = configure_match_start_area(custom, MatchStartArea.AREA_4)
+
+    assert configured.localization.fusion.initial_pose == custom_area_4.pose
+    sequence = MatchSequence.from_app_config(configured)
+    assert sequence.estimated_field_position == custom_area_4.pose.position
+
+    same_area = configure_match_start_area(
+        replace(configured, localization=base.localization), MatchStartArea.AREA_4
+    )
+    assert same_area.localization.fusion.initial_pose == custom_area_4.pose
 
 
 def test_blue_start_area_uses_negative_y_safe_zone_route() -> None:
@@ -659,13 +695,13 @@ def test_match_cli_passes_selected_start_area(monkeypatch) -> None:
             "--config",
             "configs/runtime.match.yaml",
             "--start-area",
-            "3",
+            "4",
         ],
     )
 
     match_module.main()
 
-    assert received["start_area"] is MatchStartArea.AREA_3
+    assert received["start_area"] is MatchStartArea.AREA_4
 
 
 def test_start_area_parser_accepts_equivalent_enum_instance() -> None:

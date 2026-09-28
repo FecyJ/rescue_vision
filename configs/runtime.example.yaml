@@ -178,6 +178,13 @@ match:
   safety_margin_mm: 80.0
   # 正式流程；启用前必须完成真车门禁和定位/地面标定验收。
   enabled: false
+  # 启用 match 后仅从这里选择和定义出发位姿；与红蓝方分别抽签。
+  start_area: 2
+  start_poses:
+    "1": {x_mm: -1350.0, y_mm: 1350.0, heading_deg: -45.0, position_uncertainty_mm: 50.0, heading_uncertainty_deg: 5.0, confidence: 0.8}
+    "2": {x_mm: 1350.0, y_mm: 1350.0, heading_deg: -135.0, position_uncertainty_mm: 50.0, heading_uncertainty_deg: 5.0, confidence: 0.8}
+    "3": {x_mm: -1350.0, y_mm: -1350.0, heading_deg: 45.0, position_uncertainty_mm: 50.0, heading_uncertainty_deg: 5.0, confidence: 0.8}
+    "4": {x_mm: 1350.0, y_mm: -1350.0, heading_deg: 135.0, position_uncertainty_mm: 50.0, heading_uncertainty_deg: 5.0, confidence: 0.8}
   # 正式 match 的可配置相对开场；每项独立指定动作和速度。
   opening_actions:
     - type: turn
@@ -600,7 +607,7 @@ localization:
   fusion:
     # 真实轮径、计数、轮距、零偏和噪声未标定前保持关闭。
     enabled: false
-    # 物理 FieldPoint 坐标与全局航向；只在进程首个有效里程计基线使用一次。
+    # 非 match 入口的初始位姿；启用 match 前删除整个 initial_pose，改用 match.start_poses。
     initial_pose:
       # 机器人轮轴中点在物理场地坐标中的 x，单位 mm；场地中心十字为零点，
       # +x 沿水平基准线向右。测量发车摆放后的轮轴中点，不是车头或相机位置。

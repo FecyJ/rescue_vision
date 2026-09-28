@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 import math
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -992,10 +992,45 @@ _DEFAULT_NB_OPENING_ACTIONS: tuple[NBOpeningAction, ...] = (
 
 
 @dataclass(frozen=True, slots=True)
+class MatchStartPoseConfig:
+    """一个正式出发区在场地坐标系中的完整初始融合位姿。"""
+
+    area: int
+    pose: FieldPose2D
+    position_uncertainty_mm: float
+    heading_uncertainty_rad: float
+    confidence: float
+
+    def __post_init__(self) -> None:
+        if type(self.area) is not int or self.area not in {1, 2, 3, 4}:
+            raise ValueError(f"area must be one of 1, 2, 3 or 4, got {self.area!r}.")
+        if not isinstance(self.pose, FieldPose2D):
+            raise ValueError("pose must be a FieldPose2D.")
+        _finite_float(
+            self.position_uncertainty_mm,
+            "match.start_poses[].position_uncertainty_mm",
+            minimum=0.001,
+        )
+        _finite_float(
+            self.heading_uncertainty_rad,
+            "match.start_poses[].heading_uncertainty_rad",
+            minimum=0.001,
+        )
+        confidence = _threshold(
+            self.confidence,
+            "match.start_poses[].confidence",
+        )
+        if confidence > 1.0:
+            raise ValueError("match.start_poses[].confidence must be <= 1.")
+
+
+@dataclass(frozen=True, slots=True)
 class MatchRuntimeConfig:
     """固定启动、解团循环和绿色物资转运的 正式策略参数。"""
 
     enabled: bool
+    start_area: int = 2
+    start_poses: tuple[MatchStartPoseConfig, ...] = ()
     gate_clearance: GateClearanceConfig = GateClearanceConfig()
     robot_footprint_radius_mm: float = 160.0
     safety_margin_mm: float = 80.0
@@ -1168,11 +1203,35 @@ class MatchRuntimeConfig:
     nb_opening_turn_timeout_s: float = 8.0
     nb_opening_heading_tolerance_rad: float = 0.03
 
+    def start_pose(self, area: int) -> MatchStartPoseConfig:
+        """返回 YAML 中显式配置的出发区位姿。"""
+
+        if type(area) is not int or area not in {1, 2, 3, 4}:
+            raise ValueError(f"start area must be one of 1, 2, 3 or 4, got {area!r}.")
+        for configured in self.start_poses:
+            if configured.area == area:
+                return configured
+        raise ValueError(f"match.start_poses does not define area {area}.")
+
     def __post_init__(self) -> None:
         if not isinstance(self.gate_clearance, GateClearanceConfig):
             raise ValueError(f"gate_clearance must be GateClearanceConfig, got {self.gate_clearance!r}.")
         if not isinstance(self.enabled, bool):
             raise ValueError("enabled must be a boolean.")
+        if type(self.start_area) is not int or self.start_area not in {1, 2, 3, 4}:
+            raise ValueError(
+                "start_area must be one of 1, 2, 3 or 4, "
+                f"got {self.start_area!r}."
+            )
+        if not isinstance(self.start_poses, tuple) or any(
+            not isinstance(item, MatchStartPoseConfig) for item in self.start_poses
+        ):
+            raise ValueError(
+                "start_poses must be a tuple of MatchStartPoseConfig values."
+            )
+        configured_areas = tuple(item.area for item in self.start_poses)
+        if len(configured_areas) != len(set(configured_areas)):
+            raise ValueError("match.start_poses must not repeat an area.")
         if not isinstance(self.opportunistic_single_green_enabled, bool):
             raise ValueError(
                 "opportunistic_single_green_enabled must be a boolean."
@@ -2742,6 +2801,8 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     )
     match_keys = {
         "gate_clearance",
+        "start_area",
+        "start_poses",
         "breakup_min_penetration_mm",
         "breakup_retreat_clearance_mm",
         "breakup_push_margin_mm",
@@ -2864,6 +2925,93 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     match_enabled = match_raw.get("enabled", False)
     if not isinstance(match_enabled, bool):
         raise ValueError("match.enabled must be a boolean.")
+    match_start_area = _positive_int(
+        match_raw.get("start_area", 2),
+        "match.start_area",
+    )
+    if match_start_area not in {1, 2, 3, 4}:
+        raise ValueError(
+            "match.start_area must be one of 1, 2, 3 or 4, "
+            f"got {match_start_area!r}."
+        )
+
+    def parse_start_poses() -> tuple[MatchStartPoseConfig, ...]:
+        raw_poses = match_raw.get("start_poses")
+        if raw_poses is None:
+            if match_enabled:
+                raise ValueError(
+                    "Enabled match requires match.start_poses for areas 1, 2, 3 and 4."
+                )
+            return ()
+        poses = _mapping(raw_poses, "match.start_poses")
+        if set(poses) != {"1", "2", "3", "4"}:
+            raise ValueError(
+                "match.start_poses must define exactly string keys '1', '2', '3' and '4'."
+            )
+        parsed: list[MatchStartPoseConfig] = []
+        for area in range(1, 5):
+            location = f"match.start_poses.{area}"
+            raw_pose = _mapping(poses[str(area)], location)
+            _reject_unknown(
+                raw_pose,
+                {
+                    "x_mm",
+                    "y_mm",
+                    "heading_deg",
+                    "position_uncertainty_mm",
+                    "heading_uncertainty_deg",
+                    "confidence",
+                },
+                location,
+            )
+            confidence = _threshold(
+                _required(raw_pose, "confidence", location),
+                f"{location}.confidence",
+            )
+            if confidence > 1.0:
+                raise ValueError(f"{location}.confidence must be <= 1.")
+            parsed.append(
+                MatchStartPoseConfig(
+                    area=area,
+                    pose=FieldPose2D(
+                        FieldPoint(
+                            _finite_float(
+                                _required(raw_pose, "x_mm", location),
+                                f"{location}.x_mm",
+                                minimum=-float("inf"),
+                            ),
+                            _finite_float(
+                                _required(raw_pose, "y_mm", location),
+                                f"{location}.y_mm",
+                                minimum=-float("inf"),
+                            ),
+                        ),
+                        math.radians(
+                            _finite_float(
+                                _required(raw_pose, "heading_deg", location),
+                                f"{location}.heading_deg",
+                                minimum=-float("inf"),
+                            )
+                        ),
+                    ),
+                    position_uncertainty_mm=_finite_float(
+                        _required(raw_pose, "position_uncertainty_mm", location),
+                        f"{location}.position_uncertainty_mm",
+                        minimum=0.001,
+                    ),
+                    heading_uncertainty_rad=math.radians(
+                        _finite_float(
+                            _required(raw_pose, "heading_uncertainty_deg", location),
+                            f"{location}.heading_uncertainty_deg",
+                            minimum=0.001,
+                        )
+                    ),
+                    confidence=confidence,
+                )
+            )
+        return tuple(parsed)
+
+    match_start_poses = parse_start_poses()
     opportunistic_single_green_enabled = match_raw.get(
         "opportunistic_single_green_enabled", False
     )
@@ -3102,6 +3250,8 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     )
     match = MatchRuntimeConfig(
         gate_clearance=GateClearanceConfig(**gate_raw),
+        start_area=match_start_area,
+        start_poses=match_start_poses,
         breakup_min_penetration_mm=match_float("breakup_min_penetration_mm", 10.0),
         breakup_retreat_clearance_mm=match_float("breakup_retreat_clearance_mm", 20.0),
         breakup_push_margin_mm=match_float("breakup_push_margin_mm", 30.0),
@@ -4443,9 +4593,17 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         gripper_color=gripper_color,
     )
 
+    localization_overrides = _mapping(root.get("localization", {}), "localization")
+    if match.enabled and "initial_pose" in _mapping(
+        localization_overrides.get("fusion", {}), "localization.fusion"
+    ):
+        raise ValueError(
+            "Enabled match uses match.start_poses; remove "
+            "localization.fusion.initial_pose from YAML."
+        )
     localization_raw = _merge_defaults(
         _localization_defaults(),
-        _mapping(root.get("localization", {}), "localization"),
+        localization_overrides,
     )
     _reject_unknown(
         localization_raw,
@@ -4944,6 +5102,22 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         safe_zone_corners,
         fusion,
     )
+    if match.enabled:
+        start_pose = match.start_pose(match.start_area)
+        localization = replace(
+            localization,
+            fusion=replace(
+                localization.fusion,
+                initial_pose=start_pose.pose,
+                initial_position_uncertainty_mm=(
+                    start_pose.position_uncertainty_mm
+                ),
+                initial_heading_uncertainty_rad=(
+                    start_pose.heading_uncertainty_rad
+                ),
+                initial_confidence=start_pose.confidence,
+            ),
+        )
 
     hailo_raw = _mapping(root.get("hailo", {}), "hailo")
     _reject_unknown(
@@ -5049,16 +5223,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             raise ValueError(
                 "Enabled match requires Hailo and ground mapping."
             )
-        initial = localization.fusion.initial_pose
-        if not (
-            math.isclose(initial.position.x, 1350.0, abs_tol=1e-6)
-            and math.isclose(initial.position.y, 1350.0, abs_tol=1e-6)
-        ):
-            raise ValueError(
-                "Enabled match requires initial position [1350 mm, 1350 mm]."
-            )
-        # The selected sequence factory validates its required start heading:
-        # formal match starts at -90 degrees, NB at -135 degrees.
         if remote.enabled and (
             remote.role is not RemoteRole.SERVER
             or remote.access_mode is not RemoteAccessMode.OBSERVE_ONLY

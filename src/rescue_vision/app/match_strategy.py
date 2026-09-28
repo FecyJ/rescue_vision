@@ -164,7 +164,7 @@ class MatchSequence(_SharedMatchSequence):
         cls,
         config: AppConfig,
         *,
-        start_area: MatchStartArea | str | int = MatchStartArea.AREA_2,
+        start_area: MatchStartArea | str | int | None = None,
     ) -> MatchSequence:
         """从唯一运行配置创建策略，不打开任何硬件资源。"""
 
@@ -172,7 +172,8 @@ class MatchSequence(_SharedMatchSequence):
 
         if not isinstance(config, AppConfig):
             raise TypeError("config must be an AppConfig.")
-        config = configure_match_start_area(config, start_area)
+        if start_area is not None:
+            config = configure_match_start_area(config, start_area)
         runtime = config.match
         if not runtime.enabled:
             raise ValueError("match.enabled must be true.")
@@ -266,27 +267,6 @@ class MatchSequence(_SharedMatchSequence):
                 "Match flow transport gripper calibration produces an invalid opening."
             )
         initial = config.localization.fusion.initial_pose
-        expected_position = (
-            FieldPoint(-1350.0, -1350.0)
-            if config.world.team_color is TeamColor.BLUE
-            else FieldPoint(1350.0, 1350.0)
-        )
-        expected_heading = (
-            math.pi / 2.0
-            if config.world.team_color is TeamColor.BLUE
-            else -math.pi / 2.0
-        )
-        if not (
-            math.isclose(initial.position.x, expected_position.x, abs_tol=1e-6)
-            and math.isclose(initial.position.y, expected_position.y, abs_tol=1e-6)
-            and math.isclose(initial.heading_rad, expected_heading, abs_tol=1e-6)
-        ):
-            raise RuntimeError(
-                "Match flow requires localization.fusion.initial_pose "
-                "to match the selected start area: "
-                "area 2=[1350 mm, 1350 mm, -90 deg] or "
-                "area 3=[-1350 mm, -1350 mm, 90 deg]."
-            )
         sequence = cls(
             runtime,
             tracker=config.tracking.build_tracker(),
@@ -2309,11 +2289,10 @@ def main() -> None:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument(
         "--start-area",
-        choices=(MatchStartArea.AREA_2.value, MatchStartArea.AREA_3.value),
-        default=MatchStartArea.AREA_2.value,
+        choices=tuple(area.value for area in MatchStartArea),
+        default=None,
         help=(
-            "选择正式流程启动区域：2 为地图右上角/红方，"
-            "3 为地图左下角/蓝方（默认 2）。"
+            "选择正式流程启动区域 1/2/3/4；省略时读取 YAML。"
         ),
     )
     parser.add_argument(
@@ -2349,7 +2328,11 @@ def main() -> None:
         jpeg_quality=args.jpeg_quality,
         observer_image_interval_s=args.observer_image_interval_seconds,
         log_dir=args.log_dir,
-        start_area=MatchStartArea.parse(args.start_area),
+        start_area=(
+            None
+            if args.start_area is None
+            else MatchStartArea.parse(args.start_area)
+        ),
         sequence_factory=MatchSequence.from_app_config,
         mode_name="match_strategy",
         log_file_prefix="strategy_",

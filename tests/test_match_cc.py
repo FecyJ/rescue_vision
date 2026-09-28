@@ -137,7 +137,7 @@ def test_runtime_cc_copies_only_shared_original_breakup_values_into_match() -> N
     assert load_runtime_config(CC_CONFIG_PATH).match_cc.enabled
 
 
-def test_area_three_keeps_cc_orange_destination_absolute_x_positive() -> None:
+def test_area_three_only_changes_cc_initial_pose() -> None:
     sequence = MatchCCSequence.from_app_config(
         load_runtime_config(CC_CONFIG_PATH),
         start_area="3",
@@ -145,7 +145,8 @@ def test_area_three_keeps_cc_orange_destination_absolute_x_positive() -> None:
 
     destination = sequence.config.safe_zone_injured_target_field
     assert destination.x > 0.0
-    assert destination.y < 0.0
+    assert destination.y > 0.0
+    assert sequence.estimated_field_position == FieldPoint(-1350.0, -1350.0)
 
 
 def test_cc_sequence_uses_original_five_frame_reference_without_id_locking() -> None:

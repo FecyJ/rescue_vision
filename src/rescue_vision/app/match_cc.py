@@ -208,9 +208,13 @@ class MatchCCSequence(MatchSequence):
         cls,
         config: AppConfig,
         *,
-        start_area: MatchStartArea | str | int = MatchStartArea.AREA_2,
+        start_area: MatchStartArea | str | int | None = None,
     ) -> "MatchCCSequence":
-        configured = configure_match_start_area(config, start_area)
+        configured = (
+            config
+            if start_area is None
+            else configure_match_start_area(config, start_area)
+        )
         # CC 约定伤员运输终点的场地绝对 x 始终为正；y 和其它路线仍按
         # start-area 使用正式流程的中心对称变换。
         injured = configured.match.safe_zone_injured_target_field
@@ -660,7 +664,11 @@ class MatchCCSequence(MatchSequence):
         return self._decision(timestamp_ns, self.cc_config.target_approach_speed_m_s, 0.0, "cc_green_fixed_forward", posture=GripperPosture.TRANSPORT)
 
 
-def _build_sequence(config: AppConfig, *, start_area=MatchStartArea.AREA_2) -> MatchCCSequence:
+def _build_sequence(
+    config: AppConfig,
+    *,
+    start_area: MatchStartArea | str | int | None = None,
+) -> MatchCCSequence:
     """按父类权威装配后，以相同依赖构造 CC 序列。"""
 
     return MatchCCSequence.from_app_config(config, start_area=start_area)
@@ -669,7 +677,11 @@ def _build_sequence(config: AppConfig, *, start_area=MatchStartArea.AREA_2) -> M
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the independent CC rescue match flow.")
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--start-area", choices=("2", "3"), default="2")
+    parser.add_argument(
+        "--start-area",
+        choices=tuple(area.value for area in MatchStartArea),
+        default=None,
+    )
     parser.add_argument("--supervised-physical-stop-ready", action="store_true")
     parser.add_argument("--local-preview", action="store_true")
     parser.add_argument(
@@ -692,7 +704,11 @@ def main() -> None:
         jpeg_quality=args.jpeg_quality,
         observer_image_interval_s=args.observer_image_interval_seconds,
         log_dir=args.log_dir,
-        start_area=MatchStartArea.parse(args.start_area),
+        start_area=(
+            None
+            if args.start_area is None
+            else MatchStartArea.parse(args.start_area)
+        ),
         sequence_factory=lambda config: _build_sequence(config),
         mode_name="match_cc",
         log_file_prefix="match_cc_",

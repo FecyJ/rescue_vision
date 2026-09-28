@@ -146,8 +146,10 @@ class MatchState(str, Enum):
 class MatchStartArea(str, Enum):
     """正式流程支持的物理启动区域。"""
 
+    AREA_1 = "1"
     AREA_2 = "2"
     AREA_3 = "3"
+    AREA_4 = "4"
 
     @classmethod
     def parse(cls, value: object) -> MatchStartArea:
@@ -161,12 +163,14 @@ class MatchStartArea(str, Enum):
         if isinstance(value, Enum):
             value = value.value
         if isinstance(value, bool):
-            raise ValueError(f"start_area must be '2' or '3', got {value!r}.")
+            raise ValueError(
+                f"start_area must be '1', '2', '3' or '4', got {value!r}."
+            )
         try:
             return cls(str(value))
         except ValueError as exc:
             raise ValueError(
-                f"start_area must be '2' or '3', got {value!r}."
+                f"start_area must be '1', '2', '3' or '4', got {value!r}."
             ) from exc
 
 
@@ -320,22 +324,14 @@ def _print_state_banner(state: MatchState, reason: str) -> None:
     )
 
 
-def _central_symmetric_field_point(point: FieldPoint) -> FieldPoint:
-    """把场地坐标绕中心十字原点做 180° 中心对称。"""
-
-    return FieldPoint(-point.x, -point.y)
-
-
 def configure_match_start_area(
     config: AppConfig,
     start_area: MatchStartArea | str | int,
 ) -> AppConfig:
-    """返回指定启动区域的正式流程配置副本。
+    """按 YAML 中的四区位姿返回正式流程配置副本。
 
-    运行配置以区域 2 为基准。区域 3 使用中心十字为原点的 180° 对称：
-    初始场地位姿、己方运输终点和带符号的场地刹车过冲坐标全部变换，
-    并把己方颜色切换为蓝色。``world.static_map`` 不变，它是固定物理
-    地图，已经同时包含红、蓝安全区及其地标。
+    初始融合位姿只读取 ``match.start_poses``。红蓝方由 ``world.team_color``
+    及对应安全区航点独立配置；选择出发区不会改写队伍颜色或运输路线。
     """
 
     from rescue_vision.config import AppConfig
@@ -343,29 +339,20 @@ def configure_match_start_area(
     if not isinstance(config, AppConfig):
         raise TypeError("config must be an AppConfig.")
     area = MatchStartArea.parse(start_area)
-    if area is MatchStartArea.AREA_2:
-        return config
-
-    initial = config.localization.fusion.initial_pose
-    mirrored_initial = FieldPose2D(
-        _central_symmetric_field_point(initial.position),
-        normalize_angle(initial.heading_rad + math.pi),
-    )
-    match = replace(
-        config.match,
-        safe_zone_fallback_target_field=_central_symmetric_field_point(
-            config.match.safe_zone_fallback_target_field
-        ),
-        safe_zone_injured_target_field=_central_symmetric_field_point(
-            config.match.safe_zone_injured_target_field
-        ),
-    )
+    area_number = int(area.value)
+    start_pose = config.match.start_pose(area_number)
+    match = replace(config.match, start_area=area_number)
     localization = replace(
         config.localization,
-        fusion=replace(config.localization.fusion, initial_pose=mirrored_initial),
+        fusion=replace(
+            config.localization.fusion,
+            initial_pose=start_pose.pose,
+            initial_position_uncertainty_mm=start_pose.position_uncertainty_mm,
+            initial_heading_uncertainty_rad=start_pose.heading_uncertainty_rad,
+            initial_confidence=start_pose.confidence,
+        ),
     )
-    world = replace(config.world, team_color=TeamColor.BLUE)
-    return replace(config, match=match, localization=localization, world=world)
+    return replace(config, match=match, localization=localization)
 
 
 @dataclass(frozen=True, slots=True)
@@ -439,7 +426,6 @@ class GraspTask:
 class MatchSequence:
     """可重放的正式动作流程；step() 只消费观测、里程和航向并输出意图。"""
 
-    INITIAL_HEADING_RAD = -math.pi / 2.0
     # 独立的抓取—运输联调入口覆盖为只搜索，不执行正式解团路由。
     _first_green_blocked_routes_to_breakup = True
     _dynamic_breakup_enabled = True
@@ -613,9 +599,8 @@ class MatchSequence:
         self._fallback_last_heading_rad: float | None = None
         self._tracker = tracker
         self._team_color = team_color
-        # 正式运输路线沿己方安全区所在的场地 y 方向前进；区域 2/红方为
-        # +y，区域 3/蓝方为 -y。UNKNOWN 仅保留旧纯逻辑调用的 +y 行为，
-        # 正式配置会在启动区域装配时确定颜色。
+        # 运输方向由独立抽签的队伍颜色决定，不由出发区域推断。
+        # UNKNOWN 仅保留纯逻辑调用方的 +y 行为。
         self._safe_zone_forward_y_sign = (
             -1.0 if team_color is TeamColor.BLUE else 1.0
         )
@@ -838,7 +823,7 @@ class MatchSequence:
         cls,
         config: AppConfig,
         *,
-        start_area: MatchStartArea | str | int = MatchStartArea.AREA_2,
+        start_area: MatchStartArea | str | int | None = None,
     ) -> MatchSequence:
         """从唯一运行配置创建策略，不打开任何硬件资源。"""
 
@@ -846,7 +831,8 @@ class MatchSequence:
 
         if not isinstance(config, AppConfig):
             raise TypeError("config must be an AppConfig.")
-        config = configure_match_start_area(config, start_area)
+        if start_area is not None:
+            config = configure_match_start_area(config, start_area)
         runtime = config.match
         if not runtime.enabled:
             raise ValueError("match.enabled must be true.")
@@ -923,27 +909,6 @@ class MatchSequence:
                 "Match flow transport gripper calibration produces an invalid opening."
             )
         initial = config.localization.fusion.initial_pose
-        expected_position = (
-            FieldPoint(-1350.0, -1350.0)
-            if config.world.team_color is TeamColor.BLUE
-            else FieldPoint(1350.0, 1350.0)
-        )
-        expected_heading = (
-            -cls.INITIAL_HEADING_RAD
-            if config.world.team_color is TeamColor.BLUE
-            else cls.INITIAL_HEADING_RAD
-        )
-        if not (
-            math.isclose(initial.position.x, expected_position.x, abs_tol=1e-6)
-            and math.isclose(initial.position.y, expected_position.y, abs_tol=1e-6)
-            and math.isclose(initial.heading_rad, expected_heading, abs_tol=1e-6)
-        ):
-            raise RuntimeError(
-                "Match flow requires localization.fusion.initial_pose "
-                "to match the selected start area: "
-                f"expected position={expected_position}, heading_rad={expected_heading:g}; "
-                f"got {initial!r}."
-            )
         sequence = cls(
             runtime,
             tracker=config.tracking.build_tracker(),
@@ -11379,11 +11344,11 @@ def main() -> None:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument(
         "--start-area",
-        choices=(MatchStartArea.AREA_2.value, MatchStartArea.AREA_3.value),
-        default=MatchStartArea.AREA_2.value,
+        choices=tuple(area.value for area in MatchStartArea),
+        default=None,
         help=(
-            "选择正式流程启动区域：2 为地图右上角/红方，"
-            "3 为地图左下角/蓝方（默认 2）。"
+            "选择正式流程启动区域 1/2/3/4；省略时读取 YAML "
+            "match.start_area。红蓝方由 world.team_color 独立配置。"
         ),
     )
     parser.add_argument(
@@ -11419,7 +11384,11 @@ def main() -> None:
         jpeg_quality=args.jpeg_quality,
         observer_image_interval_s=args.observer_image_interval_seconds,
         log_dir=args.log_dir,
-        start_area=MatchStartArea.parse(args.start_area),
+        start_area=(
+            None
+            if args.start_area is None
+            else MatchStartArea.parse(args.start_area)
+        ),
     )
 
 

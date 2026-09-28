@@ -20,6 +20,7 @@ from rescue_vision.app.match import (
     MatchSequence,
     MatchStartArea,
     MatchState,
+    configure_match_start_area,
 )
 from rescue_vision.app.match_runtime import _run_hardware
 from rescue_vision.config import (
@@ -55,16 +56,16 @@ if TYPE_CHECKING:
 class MatchNBSequence(MatchSequence):
     """只替换开场动作，其余行为始终委托给当前正式流程。"""
 
-    INITIAL_HEADING_RAD = -3.0 * math.pi / 4.0
-
     @classmethod
     def from_app_config(
         cls,
         config: AppConfig,
         *,
-        start_area: MatchStartArea | str | int = MatchStartArea.AREA_2,
+        start_area: MatchStartArea | str | int | None = None,
     ) -> MatchNBSequence:
-        sequence = super().from_app_config(config, start_area=start_area)
+        if start_area is not None:
+            config = configure_match_start_area(config, start_area)
+        sequence = super().from_app_config(config)
         if not isinstance(sequence, cls):
             raise TypeError("MatchNBSequence factory returned an unexpected type.")
         sequence._nb_motion_profile = replace(
@@ -985,9 +986,9 @@ def main() -> None:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument(
         "--start-area",
-        choices=(MatchStartArea.AREA_2.value,),
-        default=MatchStartArea.AREA_2.value,
-        help="本入口只支持区域 2；开场动作从当前起点按相对配置执行。",
+        choices=tuple(area.value for area in MatchStartArea),
+        default=None,
+        help="选择启动区域 1/2/3/4；省略时读取 YAML，开场动作保持相对执行。",
     )
     parser.add_argument(
         "--supervised-physical-stop-ready",
@@ -1018,7 +1019,11 @@ def main() -> None:
         jpeg_quality=args.jpeg_quality,
         observer_image_interval_s=args.observer_image_interval_seconds,
         log_dir=args.log_dir,
-        start_area=MatchStartArea.parse(args.start_area),
+        start_area=(
+            None
+            if args.start_area is None
+            else MatchStartArea.parse(args.start_area)
+        ),
         sequence_factory=MatchNBSequence.from_app_config,
         mode_name="match_nb",
         log_file_prefix="match_nb_",

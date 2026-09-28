@@ -47,6 +47,16 @@ grab_transport = config.build_grab_transport_sequence()
 `safety_margin_mm` 是解团/绿色接近路径的联合安全膨胀量；它们属于正式流程，不再从
 已删除的模拟流程读取。
 
+`match.start_area` 是 YAML 默认启动区，CLI `--start-area` 可覆盖为 `1..4`。
+`match.start_poses` 必须用字符串键 `"1"`、`"2"`、`"3"`、`"4"` 完整定义四区的
+`x_mm`、`y_mm`、`heading_deg`、位置/航向不确定度和置信度。配置加载后，所选条目会
+整体写入 `localization.fusion`；启用 match 时若仍存在旧的
+`localization.fusion.initial_pose` 则报错，需删除它，Python 也不保存区域坐标或航向常量。
+当前正式配置按规则图编号使用 1 左上、2 右上、3 左下、4 右下，四区均朝向场地中心。
+红蓝方由 `world.team_color` 独立配置，物资区/伤员区航点仍分别来自
+`match.safe_zone_fallback_target_field_mm` 和 `match.safe_zone_injured_target_field_mm`；
+切换 `start_area` 不会隐式翻转这些字段。
+
 `match.grasp_task_timeout_ms`（默认20000 ms，有限正数）是选择物理目标后跨接近、
 停稳、规划、恢复与再抓取的总预算；状态和 tracker ID 变化不重置。
 补夹从开始扫描计时，整次补夹共享此预算，换候选也不续期；已提交抓取由执行阶段完成。

@@ -1,7 +1,6 @@
 # strategy 流程：启动冲刺后只搜索蓝色危险物块，能直接夹取则单个转运，
 # 否则允许对全蓝色目标团执行动态解团；两次分别放到对面安全区左右 D2 点。
-# 本文件以启动区域 2（地图右上角、红方）为坐标基准；区域 3 通过
-# match_strategy 的 --start-area 3 在运行时做中心对称并切换为蓝方。
+# 四区初始位姿由 match.start_poses 定义；红蓝方与路线由其它 YAML 字段独立配置。
 
 camera:
   backend: rpicam_vid
@@ -154,6 +153,36 @@ match:
   robot_footprint_radius_mm: 160.0
   safety_margin_mm: 10.0
   enabled: true
+  start_area: 2
+  start_poses:
+    "1":
+      x_mm: -1350.0
+      y_mm: 1350.0
+      heading_deg: -90.0
+      position_uncertainty_mm: 50.0
+      heading_uncertainty_deg: 5.0
+      confidence: 0.8
+    "2":
+      x_mm: 1350.0
+      y_mm: 1350.0
+      heading_deg: -90.0
+      position_uncertainty_mm: 50.0
+      heading_uncertainty_deg: 5.0
+      confidence: 0.8
+    "3":
+      x_mm: -1350.0
+      y_mm: -1350.0
+      heading_deg: 90.0
+      position_uncertainty_mm: 50.0
+      heading_uncertainty_deg: 5.0
+      confidence: 0.8
+    "4":
+      x_mm: 1350.0
+      y_mm: -1350.0
+      heading_deg: 90.0
+      position_uncertainty_mm: 50.0
+      heading_uncertainty_deg: 5.0
+      confidence: 0.8
   # strategy 启动第一腿右转、第二腿左转的角度；两腿均为 45°。
   startup_turn_angle_rad: 0.7853981634
   startup_turn_angular_velocity_rad_s: -2
@@ -326,13 +355,6 @@ localization:
     max_observation_age_ms: 800.0
   fusion:
     enabled: false
-    initial_pose:
-      x_mm: 1350.0
-      y_mm: 1350.0
-      heading_deg: -90.0
-      position_uncertainty_mm: 50.0
-      heading_uncertainty_deg: 5.0
-      confidence: 0.8
 
 hailo:
   enabled: true
