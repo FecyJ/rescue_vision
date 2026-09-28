@@ -148,23 +148,18 @@ world:
         usable: true
 
 match:
-  # 实验性门前清障：关闭后恢复普通运输；区域沿用 world.static_map。
+  # 门前异类物块触发后执行固定横移、D2 推入和正式倒车退出。
   gate_clearance:
-    enabled: false
-    # 从静态区域 y=±1200 向场地中心移动基准线
+    enabled: true
     front_edge_inset_mm: 0.0
-    # 从基准线向场地中心延伸的纵深
     front_depth_mm: 200.0
-    # 每个安全区左右边界同时内缩
     lateral_inset_mm: 100
-    side_x_mm: 500.0
-    sweep_y_mm: 885.0
-    center_stop_radius_mm: 200.0
-    release_reverse_m: 0.12
-    sweep_speed_m_s: 1.0
+    lane_x_abs_mm: 450.0
+    lane_y_abs_mm: 1022.5
+    lateral_forward_distance_m: 0.9
+    lateral_reverse_distance_m: 0.6
+    d2_push_distance_m: 0.2
     transit_speed_m_s: 0.5
-    sweep_heading_tolerance_rad: 0.035
-    sweep_cross_track_tolerance_mm: 20.0
     attempt_timeout_s: 30.0
   robot_footprint_radius_mm: 160.0
   safety_margin_mm: 10.0

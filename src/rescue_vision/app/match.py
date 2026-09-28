@@ -596,6 +596,7 @@ class MatchSequence:
         self._breakup_confirm_pose: tuple[float | None, float | None] | None = None
         self._gate_clearance: GateClearanceSession | None = None
         self._gate_clearance_attempted = False
+        self._gate_clearance_push_distance_m: float | None = None
         self.config = config
         self._motion_profile = RelativeActionProfile()
         self._motion_wheel_track_m = 0.2
@@ -1707,6 +1708,7 @@ class MatchSequence:
             raise RuntimeError("start() requires a successful PREFLIGHT.")
         self._gate_clearance = None
         self._gate_clearance_attempted = False
+        self._gate_clearance_push_distance_m = None
         self._started = True
         self._startup_turn_last_heading = None
         self._startup_turn_progress_rad = 0.0
@@ -4949,12 +4951,16 @@ class MatchSequence:
             return
         if phase == "safe_before_final_forward":
             self._transport_forward_base_distance_m = cumulative_distance_m
-            self._transport_forward_distance_m = max(
-                0.0,
-                self._safe_zone_forward_y_sign
-                * (self._safe_zone_final_target_y_mm() - position.y)
-                / 1000.0,
-            )
+            if self._gate_clearance_push_distance_m is None:
+                self._transport_forward_distance_m = max(
+                    0.0,
+                    self._safe_zone_forward_y_sign
+                    * (self._safe_zone_final_target_y_mm() - position.y)
+                    / 1000.0,
+                )
+            else:
+                self._transport_forward_distance_m = self._gate_clearance_push_distance_m
+                self._gate_clearance_push_distance_m = None
 
     def _safe_zone_final_target_y_mm(self) -> float:
         """返回严格闭环末段的实际安全区停车 y 坐标。
@@ -9832,6 +9838,7 @@ class MatchSequence:
         self._transport_opened = transport_opened
         self._gripper_phase_started_ns = None
         self._safe_zone_phase = "align_d1_line"
+        self._gate_clearance_push_distance_m = None
         self._safe_zone_observation_deadline_ns = None
         self._safe_zone_confirmation_deadline_ns = None
         self._begin_action_settle(timestamp_ns, "safe_before_d1_line")
@@ -10678,12 +10685,15 @@ class MatchSequence:
                     posture=GripperPosture.OPEN,
                 )
             self._transport_forward_base_distance_m = cumulative_distance_m
-            self._transport_forward_distance_m = max(
-                0.0,
-                self._safe_zone_forward_y_sign
-                * (self._safe_zone_final_target_y_mm() - position.y)
-                / 1000.0,
-            )
+            if self._gate_clearance_push_distance_m is None:
+                self._transport_forward_distance_m = max(
+                    0.0,
+                    self._safe_zone_forward_y_sign
+                    * (self._safe_zone_final_target_y_mm() - position.y)
+                    / 1000.0,
+                )
+            else:
+                self._transport_forward_distance_m = self._gate_clearance_push_distance_m
             self._gripper_phase_started_ns = timestamp_ns
             self._safe_zone_phase = "closing_before_final_forward"
             self.state = MatchState.TRANSPORT_RELEASE
@@ -11028,6 +11038,7 @@ class MatchSequence:
                              else GripperPosture.CLOSED),
                 )
             self._finish_noncontact()
+            self._gate_clearance_push_distance_m = None
             self._transport_count += 1
             self._transport_opened = True
             self._gripper_phase_started_ns = None
@@ -11139,6 +11150,12 @@ class MatchSequence:
                     posture=GripperPosture.OPEN,
                 )
             if self._transport_count >= self.config.required_transports:
+                self._gate_clearance = None
+                self._gate_clearance_attempted = False
+                self._gate_clearance_push_distance_m = None
+                self._transport_target_classes = ()
+                self._cargo_capture_floor_ns = None
+                self._greedy_active = False
                 self._return_phase = "idle"
                 self._search_frame_floor = None
                 self.state = MatchState.FINISH_STOP
@@ -11163,6 +11180,7 @@ class MatchSequence:
         """交付后清空本趟计数和旧候选，立即转向搜索。"""
         self._gate_clearance = None
         self._gate_clearance_attempted = False
+        self._gate_clearance_push_distance_m = None
         self._safe_zone_phase = "idle"
         self._safe_zone_stop_since_ns = None
         self._reset_tracker_for_new_preview_epoch()

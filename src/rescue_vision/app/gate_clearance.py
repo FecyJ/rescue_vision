@@ -1,7 +1,7 @@
-"""实验性门前清障：场地触发几何、暂存任务和可中断动作编排。
+"""实验性门前路线：识别门前异类物块后执行一次定距交付动作。
 
-不创建硬件。MatchSequence 提供采集位姿、真实运动反馈和现有动作控制器；
-原载荷暂存和清障物释放均不生成交付事件，完成后直接交还普通搜索。
+不创建硬件。MatchSequence 提供当前感知、定位、真实运动反馈和动作执行器；
+交付结束后复用正式安全区倒车退出流程。
 """
 from __future__ import annotations
 
@@ -29,8 +29,7 @@ class GateObject:
 @dataclass(frozen=True, slots=True)
 class ClearanceAction:
     name: str
-    kind: str  # point / heading / straight / reverse / gripper
-    opened: bool
+    kind: str  # point / heading / straight / reverse
     point: FieldPoint | None = None
     value: float = 0.0
     target_heading_rad: float | None = None
@@ -39,16 +38,15 @@ class ClearanceAction:
 @dataclass(slots=True)
 class GateClearanceSession:
     actions: tuple[ClearanceAction, ...]
+    start_point: FieldPoint
+    lane_point: FieldPoint
+    lateral_end_point: FieldPoint
+    lateral_return_point: FieldPoint
+    d2_push_end_point: FieldPoint
     trigger_capture_ns: int
     attempt_started_ns: int
     index: int = 0
-    action_started_ns: int | None = None
-    gripper_started_ns: int | None = None
     initial_stop_confirmed: bool = False
-    released: bool = False
-    sweep_realign_pending: bool = False
-    sweep_realign_count: int = 0
-    failure: str | None = None
 
     @property
     def action(self) -> ClearanceAction:
@@ -76,109 +74,90 @@ def gate_obstructions(objects: tuple[GateObject, ...], static_map: StaticFieldMa
                     f"region={region.region_id!r}, bounds=({min(xs)!r},{max(xs)!r}), "
                     f"inset={config.lateral_inset_mm!r}."
                 )
-            edge = (
-                min(sign * p.y for p in region.polygon_field)
-                - config.front_edge_inset_mm
-            )
+            edge = min(sign * p.y for p in region.polygon_field) - config.front_edge_inset_mm
             depth = edge - sign * obj.point.y
-            if not (
-                x_min <= obj.point.x <= x_max
-                and 0 < depth <= config.front_depth_mm
-            ):
+            if not (x_min <= obj.point.x <= x_max and 0 < depth <= config.front_depth_mm):
                 continue
-            wrong = (obj.target_class is TargetClass.BLUE_DANGER
-                     or region.kind is material and obj.target_class is TargetClass.ORANGE_INJURED
-                     or region.kind is injured and obj.target_class in (TargetClass.GREEN_SUPPLY, TargetClass.BLACK_CORE))
+            wrong = (
+                obj.target_class is TargetClass.BLUE_DANGER
+                or region.kind is material and obj.target_class is TargetClass.ORANGE_INJURED
+                or region.kind is injured and obj.target_class in (
+                    TargetClass.GREEN_SUPPLY,
+                    TargetClass.BLACK_CORE,
+                )
+            )
             if wrong:
                 result.append(obj)
                 break
     return tuple(result)
 
 
-def make_clearance_session(config: GateClearanceConfig, position: FieldPoint,
-                           team: TeamColor, capture_ns: int, *,
-                           attempt_started_ns: int | None = None) -> GateClearanceSession:
-    """S 点是横扫轴心；清障物在中场原点 200 mm 半径内释放后直接搜索。"""
-    sign = -1 if team is TeamColor.BLUE else 1
-    left = FieldPoint(-config.side_x_mm, sign * config.sweep_y_mm)
-    right = FieldPoint(config.side_x_mm, sign * config.sweep_y_mm)
-    sweep_start, end = sorted((left, right), key=lambda p: math.hypot(p.x-position.x, p.y-position.y))
-    # 暂存轴心向外让出退出距离；后退后准确落在 S1/S2 开始完整横扫。
-    direction = -1 if sweep_start.x < 0 else 1
-    start = FieldPoint(sweep_start.x + direction*config.release_reverse_m*1000, sweep_start.y)
-    outward = math.pi if start.x < 0 else 0.0
-    sweep_heading = 0.0 if start.x < 0 else math.pi
-    center_heading = math.atan2(-end.y, -end.x)
-    center_start_radius_mm = math.hypot(end.x, end.y)
-    # 直行动作使用 5 mm 完成容差；目标再向原点内收 5 mm，保证动作完成时
-    # 机器人轴心已经进入配置的 200 mm 最大半径，而不是停在其外侧。
-    center_motion_tolerance_m = 0.005
-    center_target_radius_mm = max(
-        0.0,
-        config.center_stop_radius_mm - center_motion_tolerance_m * 1000.0,
+def make_clearance_session(
+    config: GateClearanceConfig,
+    position: FieldPoint,
+    team: TeamColor,
+    capture_ns: int,
+    *,
+    target_classes: tuple[TargetClass, ...] = (),
+    attempt_started_ns: int | None = None,
+) -> GateClearanceSession:
+    """生成从 D1 到门前横移点，再移交正式 D2 投递的动作序列。
+
+    显式坐标以红方为基准；蓝方通过绕场地原点旋转 180°获得中心对称路线。
+    """
+    orange = target_classes == (TargetClass.ORANGE_INJURED,)
+    red_x_mm = config.lane_x_abs_mm if orange else -config.lane_x_abs_mm
+    team_sign = -1 if team is TeamColor.BLUE else 1
+    lane = FieldPoint(team_sign * red_x_mm, team_sign * config.lane_y_abs_mm)
+
+    # 绿/黑从红方 D1 朝 +x 清行，橙色朝 -x；蓝方中心对称转换。
+    red_lateral_heading = math.pi if orange else 0.0
+    lateral_heading = normalize_angle(red_lateral_heading + (math.pi if team_sign < 0 else 0.0))
+    lateral_direction = 1.0 if math.cos(lateral_heading) >= 0.0 else -1.0
+    lateral_end = FieldPoint(
+        lane.x + lateral_direction * config.lateral_forward_distance_m * 1000.0,
+        lane.y,
     )
-    center_distance_m = (
-        center_start_radius_mm - center_target_radius_mm
-    ) / 1000.0
-    center_stop = FieldPoint(
-        end.x * center_target_radius_mm / center_start_radius_mm,
-        end.y * center_target_radius_mm / center_start_radius_mm,
+    lateral_return = FieldPoint(
+        lateral_end.x - lateral_direction * config.lateral_reverse_distance_m * 1000.0,
+        lane.y,
     )
-    stash_heading = math.atan2(start.y - position.y, start.x - position.x)
-    stash_distance_m = math.hypot(start.x - position.x, start.y - position.y) / 1000.0
+    d2_push_end = FieldPoint(
+        lateral_return.x,
+        lateral_return.y + team_sign * config.d2_push_distance_m * 1000.0,
+    )
+
     actions = (
-        ClearanceAction("align_stash_heading", "heading", False, value=stash_heading),
+        ClearanceAction("to_lane", "point", point=lane),
+        ClearanceAction("align_lateral_heading", "heading", value=lateral_heading),
         ClearanceAction(
-            "to_stash_s",
+            "lateral_forward_900mm",
             "straight",
-            False,
-            point=start,
-            value=stash_distance_m,
-            target_heading_rad=stash_heading,
+            value=config.lateral_forward_distance_m,
+            target_heading_rad=lateral_heading,
         ),
-        ClearanceAction("face_outward", "heading", False, value=outward),
-        ClearanceAction("stash_open", "gripper", True),
-        ClearanceAction("stash_reverse_120mm", "reverse", True, value=-config.release_reverse_m),
-        # 暂存退出时仍保持张爪；必须完成一次独立合爪和机械等待后才允许横扫。
-        ClearanceAction("sweep_close", "gripper", False),
-        ClearanceAction("align_sweep_heading", "heading", False, value=sweep_heading),
-        # 左中、中心、右中三点共线。先完成上一步绝对航向对正，再锁定该航向直行；
-        # end 只保留给扫掠风险几何，不能交给点跟随器重新选择切入角。
         ClearanceAction(
-            "sweep_via_midpoint",
-            "straight",
-            False,
-            point=end,
-            value=2.0 * config.side_x_mm / 1000.0,
-            target_heading_rad=sweep_heading,
-        ),
-        ClearanceAction("align_field_center", "heading", False, value=center_heading),
-        ClearanceAction(
-            "center_forward_200mm_radius",
-            "straight",
-            False,
-            point=center_stop,
-            value=center_distance_m,
-            target_heading_rad=center_heading,
-        ),
-        ClearanceAction("center_open", "gripper", True),
-        ClearanceAction(
-            "center_reverse_120mm",
+            "lateral_reverse_600mm",
             "reverse",
-            True,
-            value=-config.release_reverse_m,
-            target_heading_rad=center_heading,
+            value=-config.lateral_reverse_distance_m,
+            target_heading_rad=lateral_heading,
         ),
     )
     return GateClearanceSession(
-        actions,
-        capture_ns,
-        capture_ns if attempt_started_ns is None else attempt_started_ns,
+        actions=actions,
+        start_point=position,
+        lane_point=lane,
+        lateral_end_point=lateral_end,
+        lateral_return_point=lateral_return,
+        d2_push_end_point=d2_push_end,
+        trigger_capture_ns=capture_ns,
+        attempt_started_ns=capture_ns if attempt_started_ns is None else attempt_started_ns,
     )
 
 
 def _objects(sequence: MatchSequence, now_ns: int) -> tuple[GateObject, ...]:
     from rescue_vision.app.breakup_planner import physical_radii
+
     snapshot = sequence._latest_perception
     geometry = sequence._breakup_target_geometry
     if snapshot is None or geometry is None or not sequence._fresh_perception(snapshot, now_ns):
@@ -197,39 +176,37 @@ def _objects(sequence: MatchSequence, now_ns: int) -> tuple[GateObject, ...]:
 
 def maybe_begin_clearance(sequence: MatchSequence, now_ns: int) -> MatchDecision | None:
     from rescue_vision.app.match import MatchState
+
     cfg = sequence.config.gate_clearance
     if (not cfg.enabled or sequence._gate_clearance_attempted
             or not sequence._transport_target_classes or sequence._near_field_pickup is None
             or sequence._breakup_static_map is None):
         return None
-    # 只在 D1 两帧视觉校准成功后、D2 到达前检查。D1 前的远场投影误差
-    # 不能再截获运输，D2 末段也不能把已经投放的物体当作本趟载荷搬走。
-    calibrated_route = (
+    # 新动作必须从 D1 开始，因此仅在两帧校准完成、D2 直线尚未启动时拦截。
+    calibrated_d1 = (
         sequence._safe_zone_calibration_pose is not None
-        and (
-            sequence.state is MatchState.TRANSPORT_ALIGN_RED_ZONE
-            and sequence._safe_zone_phase == "align_d2_line"
-            or sequence.state is MatchState.TRANSPORT_FORWARD
-            and sequence._safe_zone_phase == "forward_d2_line"
-        )
+        and sequence.state is MatchState.TRANSPORT_ALIGN_RED_ZONE
+        and sequence._safe_zone_phase == "align_d2_line"
     )
-    if not calibrated_route:
+    if not calibrated_d1:
         return None
     position = sequence.estimated_field_position
     snapshot = sequence._latest_perception
     if position is None or snapshot is None:
         return None
     obstructions = gate_obstructions(
-        _objects(sequence, now_ns),
-        sequence._breakup_static_map,
-        sequence._team_color,
-        cfg,
+        _objects(sequence, now_ns), sequence._breakup_static_map, sequence._team_color, cfg
     )
     if not obstructions:
         return None
-    sequence._gate_clearance = make_clearance_session(cfg, position, sequence._team_color,
+    sequence._gate_clearance = make_clearance_session(
+        cfg,
+        position,
+        sequence._team_color,
         snapshot.capture_timestamp_ns,
-        attempt_started_ns=now_ns)
+        target_classes=sequence._transport_target_classes,
+        attempt_started_ns=now_ns,
+    )
     sequence._gate_clearance_attempted = True
     sequence._finish_noncontact()
     sequence._action_settle_phase = None
@@ -247,9 +224,8 @@ def maybe_begin_clearance(sequence: MatchSequence, now_ns: int) -> MatchDecision
         0.0,
         "gate_clearance_triggered:"
         f"capture_ns={snapshot.capture_timestamp_ns},objects={evidence},"
-        f"front_edge_inset_mm={cfg.front_edge_inset_mm:.1f},"
-        f"front_depth_mm={cfg.front_depth_mm:.1f},"
-        f"lateral_inset_mm={cfg.lateral_inset_mm:.1f}",
+        f"lane=({sequence._gate_clearance.lane_point.x:.1f},"
+        f"{sequence._gate_clearance.lane_point.y:.1f})",
         soft_brake=True,
     )
 
@@ -259,114 +235,141 @@ def _action_diagnostic(sequence: MatchSequence, action: ClearanceAction) -> str:
     current = "none" if position is None else f"({position.x:.1f},{position.y:.1f})"
     target = "none" if action.point is None else f"({action.point.x:.1f},{action.point.y:.1f})"
     target_heading_rad = action.value if action.kind == "heading" else action.target_heading_rad
-    heading = (
-        "none" if target_heading_rad is None
-        else f"{math.degrees(target_heading_rad):.1f}deg"
-    )
+    heading = "none" if target_heading_rad is None else f"{math.degrees(target_heading_rad):.1f}deg"
     return f"field_position={current},target_field={target},target_heading={heading}"
 
 
-def _advance(sequence: MatchSequence, now_ns: int) -> None:
+def _advance(sequence: MatchSequence) -> None:
     session = sequence._gate_clearance
     assert session is not None
-    if session.action.name == "stash_open":
-        session.released = True
-        sequence._transport_target_classes = ()
-        sequence._cargo_capture_floor_ns = None
-        sequence._counted_pickup_session = None
     session.index += 1
-    session.action_started_ns = None
-    session.gripper_started_ns = None
     sequence._finish_noncontact()
 
 
-def _action_index(session: GateClearanceSession, name: str) -> int:
-    return next(index for index, action in enumerate(session.actions) if action.name == name)
+def _segment_risk(sequence: MatchSequence, now_ns: int,
+                  start: FieldPoint, end: FieldPoint) -> str | None:
+    """拒绝可能把蓝色危险物推入任一安全区或场界外的线段。"""
+    session = sequence._gate_clearance
+    assert session is not None
+    bounds = sequence._physical_field_bounds()
+    reach = max(
+        sequence.config.robot_footprint_radius_mm,
+        sequence.config.breakup_gripper_offset_mm,
+    )
+    dx = end.x - start.x
+    dy = end.y - start.y
+    segment_length_sq = dx * dx + dy * dy
+    if segment_length_sq <= 1e-9:
+        return None
+    for obj in _objects(sequence, now_ns):
+        if obj.target_class is not TargetClass.BLUE_DANGER:
+            continue
+        fraction = max(0.0, min(1.0, (
+            (obj.point.x - start.x) * dx + (obj.point.y - start.y) * dy
+        ) / segment_length_sq))
+        closest = FieldPoint(start.x + fraction * dx, start.y + fraction * dy)
+        if math.hypot(obj.point.x - closest.x, obj.point.y - closest.y) > reach + obj.radius_mm:
+            continue
+        norm = math.sqrt(segment_length_sq)
+        for direction in (-1.0, 1.0):
+            pushed = FieldPoint(
+                obj.point.x + direction * dx / norm * reach,
+                obj.point.y + direction * dy / norm * reach,
+            )
+            radius = obj.radius_mm
+            if not (bounds[0] + radius <= pushed.x <= bounds[1] - radius
+                    and bounds[2] + radius <= pushed.y <= bounds[3] - radius):
+                return "danger_route_out_of_field"
+            swept_min_x = min(obj.point.x, pushed.x) - radius
+            swept_max_x = max(obj.point.x, pushed.x) + radius
+            swept_min_y = min(obj.point.y, pushed.y) - radius
+            swept_max_y = max(obj.point.y, pushed.y) + radius
+            for region in sequence._breakup_static_map.regions:
+                if region.kind is PhysicalRegionKind.FIELD:
+                    continue
+                if "material" not in region.kind.value and "injured" not in region.kind.value:
+                    continue
+                xs = [p.x for p in region.polygon_field]
+                ys = [p.y for p in region.polygon_field]
+                if (swept_max_x >= min(xs) and swept_min_x <= max(xs)
+                        and swept_max_y >= min(ys) and swept_min_y <= max(ys)):
+                    return "danger_route_intersects_safe_zone"
+    return None
+
+
+def _action_risk(sequence: MatchSequence, now_ns: int, action: ClearanceAction) -> str | None:
+    session = sequence._gate_clearance
+    assert session is not None
+    segment = {
+        "to_lane": (session.start_point, session.lane_point),
+        "lateral_forward_900mm": (session.lane_point, session.lateral_end_point),
+        "lateral_reverse_600mm": (session.lateral_end_point, session.lateral_return_point),
+    }.get(action.name)
+    return None if segment is None else _segment_risk(sequence, now_ns, *segment)
 
 
 def _fail(sequence: MatchSequence, now_ns: int, reason: str) -> MatchDecision:
-    """暂存前失败继续投放；暂存后失败放弃本次载荷并回到普通搜索。"""
+    """门前横移移交正式 D2 投递前失败时，保持载荷并恢复普通运输。"""
     from rescue_vision.app.cluster_breakup import GripperPosture
-    from rescue_vision.app.match import MatchState
-    session = sequence._gate_clearance
-    assert session is not None
-    sequence._finish_noncontact()
-    session.failure = reason
-    if not session.released:
-        sequence._gate_clearance = None
-        return sequence._start_safe_zone_transport(now_ns, transport_opened=False,
-            posture=GripperPosture.CLOSED, reason=f"gate_clearance_aborted_before_stash:{reason}")
-    return _finish_to_search(sequence, now_ns, f"gate_clearance_failed_search:{reason}")
 
-
-def _finish_to_search(sequence: MatchSequence, now_ns: int, reason: str) -> MatchDecision:
-    """张爪结束清障；不返回暂存点，也不建立定向回取任务。"""
-    from rescue_vision.app.cluster_breakup import GripperPosture
-    from rescue_vision.app.match import MatchState
     sequence._finish_noncontact()
     sequence._gate_clearance = None
-    sequence._gate_clearance_attempted = False
-    sequence._transport_target_classes = ()
-    sequence._cargo_capture_floor_ns = None
-    sequence._counted_pickup_session = None
-    sequence._begin_cluster_search()
-    sequence._reset_rotation_budget()
-    sequence.state = MatchState.SEARCH_CLUSTER
+    sequence._safe_zone_phase = "idle"
+    return sequence._start_safe_zone_transport(
+        now_ns,
+        transport_opened=False,
+        posture=GripperPosture.CLOSED,
+        reason=f"gate_clearance_aborted_resume_transport:{reason}",
+    )
+
+
+def _handoff_to_normal_d2_delivery(sequence: MatchSequence, now_ns: int) -> MatchDecision:
+    """横移后交给正式 D2 开爪、对准、闭爪推入及倒车状态机。"""
+    from rescue_vision.app.match import MatchState
+    from rescue_vision.app.cluster_breakup import GripperPosture
+
+    session = sequence._gate_clearance
+    assert session is not None
+    risk = _segment_risk(
+        sequence, now_ns, session.lateral_return_point, session.d2_push_end_point
+    )
+    if risk is not None:
+        return _fail(sequence, now_ns, risk)
+    sequence._finish_noncontact()
+    sequence._gate_clearance = None
+    sequence._gate_clearance_push_distance_m = sequence.config.gate_clearance.d2_push_distance_m
+    sequence._gate_clearance_attempted = True
+    sequence._transport_opened = False
+    sequence._gripper_phase_started_ns = None
+    sequence._safe_zone_stop_since_ns = None
+    sequence._safe_zone_phase = "stopping_before_d2_opening"
+    sequence._transport_forward_base_distance_m = None
+    sequence._transport_forward_distance_m = None
+    sequence.state = MatchState.TRANSPORT_RELEASE
+    position = sequence.estimated_field_position
+    current = "none" if position is None else f"({position.x:.1f},{position.y:.1f})"
     return sequence._decision(
         now_ns,
         0.0,
         0.0,
-        reason,
-        posture=GripperPosture.OPEN,
+        "gate_clearance:lateral_reverse_600mm:complete_handoff_to_normal_d2,"
+        f"field_position={current},target_field=({session.d2_push_end_point.x:.1f},"
+        f"{session.d2_push_end_point.y:.1f}),d2_push_mm="
+        f"{sequence.config.gate_clearance.d2_push_distance_m * 1000:.1f}",
+        posture=GripperPosture.CLOSED,
         soft_brake=True,
     )
 
 
-def _sweep_risk(sequence: MatchSequence, now_ns: int) -> str | None:
-    """新危险侵入仍检查：横扫不允许把危险实体推入安全区或推出场界。"""
-    session = sequence._gate_clearance
-    assert session is not None
-    bounds = sequence._physical_field_bounds()
-    end = next(action.point for action in session.actions if action.name == "sweep_via_midpoint")
-    assert end is not None
-    direction = 1 if end.x > 0 else -1
-    footprint = sequence.config.robot_footprint_radius_mm
-    # 夹爪及被推物块均在路径前方；向场地中央搬运前的最大前伸包络。
-    reach = max(footprint, sequence.config.breakup_gripper_offset_mm)
-    for obj in _objects(sequence, now_ns):
-        if obj.target_class is not TargetClass.BLUE_DANGER:
-            continue
-        if abs(obj.point.y-end.y) > reach + obj.radius_mm:
-            continue
-        pushed = FieldPoint(end.x + direction*reach, obj.point.y)
-        radius = obj.radius_mm
-        if not (bounds[0]+radius <= pushed.x <= bounds[1]-radius
-                and bounds[2]+radius <= pushed.y <= bounds[3]-radius):
-            return "danger_sweep_out_of_field"
-        for region in sequence._breakup_static_map.regions:
-            if region.kind is PhysicalRegionKind.FIELD:
-                continue
-            if "material" not in region.kind.value and "injured" not in region.kind.value:
-                continue
-            xs = [p.x for p in region.polygon_field]
-            ys = [p.y for p in region.polygon_field]
-            # 整个平移线段的实体包络，而不是只有终点。
-            if (max(obj.point.x, pushed.x)+radius >= min(xs)
-                    and min(obj.point.x, pushed.x)-radius <= max(xs)
-                    and min(ys)-radius <= obj.point.y <= max(ys)+radius):
-                return "danger_sweep_intersects_safe_zone"
-    return None
-
-
 def step_clearance(sequence: MatchSequence, now_ns: int) -> MatchDecision:
     from rescue_vision.app.cluster_breakup import GripperPosture
+
     cfg = sequence.config.gate_clearance
     session = sequence._gate_clearance
     assert session is not None
-    deadline = session.attempt_started_ns + round(cfg.attempt_timeout_s*1e9)
+    deadline = session.attempt_started_ns + round(cfg.attempt_timeout_s * 1e9)
     if now_ns >= deadline:
-        action_name = "initial_stop" if not session.initial_stop_confirmed else session.action.name
-        return _fail(sequence, now_ns, f"{action_name}:deadline")
+        return _fail(sequence, now_ns, f"{session.action.name}:deadline")
     if not session.initial_stop_confirmed:
         stationary_since = sequence._stationary_motion.stationary_since(now_ns)
         if stationary_since is None:
@@ -398,9 +401,15 @@ def step_clearance(sequence: MatchSequence, now_ns: int) -> MatchDecision:
             position,
             sequence._team_color,
             session.trigger_capture_ns,
+            target_classes=sequence._transport_target_classes,
             attempt_started_ns=session.attempt_started_ns,
         )
         session.actions = replanned.actions
+        session.start_point = replanned.start_point
+        session.lane_point = replanned.lane_point
+        session.lateral_end_point = replanned.lateral_end_point
+        session.lateral_return_point = replanned.lateral_return_point
+        session.d2_push_end_point = replanned.d2_push_end_point
         session.initial_stop_confirmed = True
         return sequence._decision(
             now_ns,
@@ -412,98 +421,20 @@ def step_clearance(sequence: MatchSequence, now_ns: int) -> MatchDecision:
             posture=GripperPosture.CLOSED,
             soft_brake=True,
         )
+
     action = session.action
-    if session.sweep_realign_pending:
-        stationary_since = sequence._stationary_motion.stationary_since(now_ns)
-        if stationary_since is None:
-            return sequence._decision(
-                now_ns,
-                0.0,
-                0.0,
-                "gate_clearance:sweep_realign_waiting_stationary,"
-                f"attempt={session.sweep_realign_count},deadline_ns={deadline},"
-                + sequence._stationary_motion.diagnostic(now_ns),
-                posture=GripperPosture.OPEN,
-                soft_brake=True,
-            )
-        session.sweep_realign_pending = False
-        session.index = _action_index(session, "align_sweep_heading")
-        session.action_started_ns = None
-        session.gripper_started_ns = None
-        sequence._finish_noncontact()
-        return sequence._decision(
-            now_ns,
-            0.0,
-            0.0,
-            "gate_clearance:sweep_realign_ready,"
-            f"attempt={session.sweep_realign_count},stationary_since_ns={stationary_since},"
-            f"deadline_ns={deadline}",
-            posture=GripperPosture.OPEN,
-            soft_brake=True,
-        )
-    if session.action_started_ns is None:
-        session.action_started_ns = now_ns
-    posture = GripperPosture.OPEN if action.opened else GripperPosture.CLOSED
-    if action.kind == "gripper":
-        # 必须真正停稳才开始机械等待；零命令不能冒充静止。
-        if sequence._stationary_motion.stationary_since(now_ns) is None:
-            return sequence._decision(now_ns, 0, 0,
-                f"gate_clearance:{action.name}:await_stationary,deadline_ns={deadline},"
-                + _action_diagnostic(sequence, action) + ","
-                + sequence._stationary_motion.diagnostic(now_ns), posture=posture, soft_brake=True)
-        if session.gripper_started_ns is None:
-            session.gripper_started_ns = now_ns
-        if now_ns-session.gripper_started_ns >= sequence._gripper_full_travel_time_ns:
-            _advance(sequence, now_ns)
-        return sequence._decision(
-            now_ns, 0, 0,
-            f"gate_clearance:{action.name},deadline_ns={deadline},"
-            + _action_diagnostic(sequence, action),
-            posture=posture, soft_brake=True,
-        )
-    if action.name == "sweep_via_midpoint":
-        risk = _sweep_risk(sequence, now_ns)
-        if risk is not None:
-            return _fail(sequence, now_ns, risk)
-        position = sequence.estimated_field_position
-        if position is not None and action.point is not None:
-            cross_track_error_mm = abs(position.y - action.point.y)
-            if cross_track_error_mm > cfg.sweep_cross_track_tolerance_mm:
-                return _fail(
-                    sequence,
-                    now_ns,
-                    "sweep_cross_track_outside:"
-                    f"error_mm={cross_track_error_mm:.1f},"
-                    f"limit_mm={cfg.sweep_cross_track_tolerance_mm:.1f}",
-                )
-        heading = sequence._latest_heading_rad
-        if action.target_heading_rad is not None and heading is not None:
-            heading_error = normalize_angle(action.target_heading_rad - heading)
-            if abs(heading_error) > cfg.sweep_heading_tolerance_rad:
-                sequence._finish_noncontact()
-                session.sweep_realign_pending = True
-                session.sweep_realign_count += 1
-                session.action_started_ns = None
-                return sequence._decision(
-                    now_ns,
-                    0.0,
-                    0.0,
-                    "gate_clearance:sweep_heading_drift_brake,"
-                    f"error_rad={heading_error:.4f},"
-                    f"limit_rad={cfg.sweep_heading_tolerance_rad:.4f},"
-                    f"attempt={session.sweep_realign_count},deadline_ns={deadline}",
-                    posture=GripperPosture.OPEN,
-                    soft_brake=True,
-                )
+    risk = _action_risk(sequence, now_ns, action)
+    if risk is not None:
+        return _fail(sequence, now_ns, risk)
+
     turn = action.kind == "heading"
     heading = sequence._latest_heading_rad
-    target = normalize_angle(action.value-heading) if turn and heading is not None else action.value
-    if action.name == "sweep_via_midpoint" and action.point is not None:
-        position = sequence.estimated_field_position
-        if position is not None:
-            target = max(1e-6, abs(action.point.x - position.x) / 1000.0)
-    speed = (sequence.config.safe_zone_fallback_max_angular_velocity_rad_s if turn
-             else cfg.sweep_speed_m_s if action.name == "sweep_via_midpoint" else cfg.transit_speed_m_s)
+    target = normalize_angle(action.value - heading) if turn and heading is not None else action.value
+    speed = (
+        sequence.config.safe_zone_fallback_max_angular_velocity_rad_s
+        if turn
+        else cfg.transit_speed_m_s
+    )
     command = sequence._noncontact_motion(
         now_ns,
         "gate_" + action.name,
@@ -511,34 +442,25 @@ def step_clearance(sequence: MatchSequence, now_ns: int) -> MatchDecision:
         speed=speed,
         turn=turn,
         point=action.point if action.kind == "point" else None,
-        tolerance=(
-            cfg.sweep_heading_tolerance_rad
-            if action.name == "align_sweep_heading"
-            else 0.005
-            if action.name == "center_forward_200mm_radius"
-            else None
-        ),
         target_heading_rad=action.target_heading_rad,
     )
     if command.timed_out:
-        return _fail(sequence, now_ns, action.name+":"+command.reason)
+        return _fail(sequence, now_ns, action.name + ":" + command.reason)
     if command.complete:
-        if action.name == "center_reverse_120mm":
-            return _finish_to_search(
-                sequence,
-                now_ns,
-                "gate_clearance_complete_search",
-            )
-        _advance(sequence, now_ns)
+        if action.name == "lateral_reverse_600mm":
+            return _handoff_to_normal_d2_delivery(sequence, now_ns)
+        _advance(sequence)
         return sequence._decision(
-            now_ns, 0, 0,
+            now_ns,
+            0.0,
+            0.0,
             f"gate_clearance:{action.name}:complete,"
             + _action_diagnostic(sequence, action),
-            posture=posture,
+            posture=GripperPosture.CLOSED,
         )
-    decision = sequence._noncontact_decision(now_ns, command, posture)
+    decision = sequence._noncontact_decision(now_ns, command, GripperPosture.CLOSED)
     return replace(
         decision,
-        reason=(f"{decision.reason},gate_attempt_deadline_ns={deadline},"
-                + _action_diagnostic(sequence, action)),
+        reason=f"{decision.reason},gate_attempt_deadline_ns={deadline},"
+        + _action_diagnostic(sequence, action),
     )

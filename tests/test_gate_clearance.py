@@ -7,7 +7,7 @@ import pytest
 
 from rescue_vision.app.gate_clearance import (
     GateObject, gate_obstructions, make_clearance_session, maybe_begin_clearance,
-    step_clearance, _sweep_risk,
+    step_clearance, _segment_risk,
 )
 from rescue_vision.app.match import MatchState, GripperPosture
 from rescue_vision.config import load_runtime_config
@@ -55,52 +55,49 @@ def test_trigger_strip_thresholds_are_configurable():
     assert not gate_obstructions(orange(-25,1100),MAP,TeamColor.RED,narrowed)
 
 
-@pytest.mark.parametrize('start_x', [-600,600])
-@pytest.mark.parametrize('team,y_sign', [(TeamColor.RED,1),(TeamColor.BLUE,-1)])
-def test_nearest_s_outward_heading_and_center_disposal(start_x,team,y_sign):
+@pytest.mark.parametrize('team,sign', [(TeamColor.RED,1),(TeamColor.BLUE,-1)])
+@pytest.mark.parametrize('classes,red_point,red_heading', [
+    ((GREEN,),FieldPoint(-450,1022.5),0.0),
+    ((BLACK,GREEN),FieldPoint(-450,1022.5),0.0),
+    ((ORANGE,),FieldPoint(450,1022.5),math.pi),
+])
+def test_clearance_route_uses_cargo_lane_and_team_mirror(team,sign,classes,red_point,red_heading):
     session=make_clearance_session(
-        GateClearanceConfig(),FieldPoint(start_x,y_sign*800),team,0,
+        GateClearanceConfig(),FieldPoint(0,sign*800),team,0,target_classes=classes,
     )
-    x_sign=1 if start_x>0 else -1
-    assert session.actions[0].name=='align_stash_heading'
-    assert session.actions[1].point==FieldPoint(x_sign*620,y_sign*885)
-    assert session.actions[1].kind=='straight'
-    assert session.actions[1].target_heading_rad==pytest.approx(session.actions[0].value)
-    assert math.cos(session.actions[2].value)==pytest.approx(x_sign)
-    assert session.actions[4].value==-0.12
-    assert session.actions[5].name=='sweep_close'
-    assert session.actions[5].kind=='gripper' and not session.actions[5].opened
-    assert math.cos(session.actions[6].value)==pytest.approx(-x_sign)
-    assert session.actions[7].point==FieldPoint(-x_sign*500,y_sign*885)
-    assert session.actions[7].kind=='straight'
-    assert session.actions[7].value==pytest.approx(1.0)
-    assert session.actions[7].target_heading_rad is not None
-    assert math.cos(session.actions[7].target_heading_rad)==pytest.approx(-x_sign)
-    assert not session.actions[7].opened
-    assert math.hypot(session.actions[9].point.x,session.actions[9].point.y)==pytest.approx(195)
-    assert session.actions[9].kind=='straight'
-    assert session.actions[9].target_heading_rad==pytest.approx(session.actions[8].value)
-    assert math.cos(session.actions[8].value)*x_sign>0
-    assert math.sin(session.actions[8].value)*(-y_sign)>0
+    lateral_heading=(red_heading if sign>0 else math.remainder(red_heading+math.pi,2*math.pi))
+    assert session.lane_point==FieldPoint(sign*red_point.x,sign*red_point.y)
+    assert session.actions[0].name=='to_lane'
+    assert session.actions[0].point==session.lane_point
+    assert session.actions[1].name=='align_lateral_heading'
+    assert math.cos(session.actions[1].value)==pytest.approx(math.cos(lateral_heading))
+    assert math.sin(session.actions[1].value)==pytest.approx(math.sin(lateral_heading))
+    assert session.actions[2].value==pytest.approx(0.9)
+    assert session.actions[3].value==pytest.approx(-0.6)
+    assert len(session.actions)==4
+    assert session.d2_push_end_point.y==pytest.approx(session.lane_point.y+sign*200)
 
 
-@pytest.mark.parametrize('field,value', [('enabled','yes'),('sweep_speed_m_s',float('nan')),
-    ('release_reverse_m',0),('center_stop_radius_mm',1100),
+@pytest.mark.parametrize('field,value', [('enabled','yes'),('transit_speed_m_s',float('nan')),
+    ('d2_push_distance_m',0),('lane_x_abs_mm',0),
     ('front_edge_inset_mm',-1),('lateral_inset_mm',-1)])
 def test_bad_experiment_config_is_rejected(field,value):
     with pytest.raises(ValueError,match='gate_clearance'):
         replace(GateClearanceConfig(),**{field:value})
 
 
-def test_runtime_disables_experimental_clearance_explicitly():
+def test_runtime_enables_experimental_clearance_explicitly():
     config=load_runtime_config('configs/runtime.match.yaml').match.gate_clearance
-    assert not config.enabled
-    assert config.sweep_heading_tolerance_rad==pytest.approx(math.radians(2),abs=0.0001)
+    assert config.enabled
+    assert config.lane_x_abs_mm==pytest.approx(450)
+    assert config.lane_y_abs_mm==pytest.approx(1022.5)
+    assert config.d2_push_distance_m==pytest.approx(0.2)
 
 
 def gate_sequence(*,enabled=True,position=FieldPoint(-500,800)):
     seq=_sequence(transports=1,config=runtime_config(
         gate_clearance=GateClearanceConfig(enabled=enabled),
+        required_transports=2,
         safe_zone_fallback_max_angular_velocity_rad_s=1.0,
         green_max_age_ms=1800, action_settle_time_s=0))
     seq._started=True
@@ -168,7 +165,7 @@ def test_missing_motion_feedback_holds_clearance_action():
     assert 'initial_stop_waiting' in decision.reason
 
 
-def test_clearance_waits_for_real_stop_before_freezing_stash_route():
+def test_clearance_waits_for_real_stop_before_freezing_route():
     seq=gate_sequence(position=FieldPoint(-100,700))
     session=make_clearance_session(
         seq.config.gate_clearance,seq.estimated_field_position,TeamColor.RED,
@@ -183,7 +180,7 @@ def test_clearance_waits_for_real_stop_before_freezing_stash_route():
     assert not session.initial_stop_confirmed
 
 
-def test_moving_trigger_brakes_before_selecting_stash_side():
+def test_moving_trigger_brakes_before_selecting_lane():
     seq=gate_sequence(position=FieldPoint(-100,700))
     session=make_clearance_session(
         seq.config.gate_clearance,seq.estimated_field_position,TeamColor.RED,
@@ -200,97 +197,56 @@ def test_moving_trigger_brakes_before_selecting_stash_side():
     assert not session.initial_stop_confirmed
     plant.until(lambda d:'initial_stop_complete' in d.reason,seconds=2)
     assert session.initial_stop_confirmed
-    assert session.action.name=='align_stash_heading'
+    assert session.action.name=='to_lane'
 
 
-def test_old_zone_edge_danger_is_outside_inward_sweep(monkeypatch):
+def test_danger_outside_clearance_lane_does_not_block_route(monkeypatch):
     seq=gate_sequence(position=FieldPoint(-500,885))
     session=make_clearance_session(
         seq.config.gate_clearance,seq.estimated_field_position,TeamColor.RED,
         1,attempt_started_ns=1,
     )
-    session.index=7
     seq._gate_clearance=session
     monkeypatch.setattr(
         'rescue_vision.app.gate_clearance._objects',
-        lambda _sequence,_now: (GateObject(BLUE,FieldPoint(0,1190),30),),
+        lambda _sequence,_now: (GateObject(BLUE,FieldPoint(0,500),30),),
     )
-    assert _sweep_risk(seq,2) is None
+    assert _segment_risk(seq,2,session.lane_point,session.lateral_end_point) is None
 
 
-def test_new_danger_intrusion_that_would_leave_field_stops_sweep(monkeypatch):
-    seq=gate_sequence(position=FieldPoint(-500,885))
-    field_right=seq._physical_field_bounds()[1]
+def test_danger_push_toward_field_edge_aborts_lateral_route(monkeypatch):
+    seq=gate_sequence(position=FieldPoint(-1300,900))
     config=replace(
         seq.config.gate_clearance,
-        side_x_mm=field_right-100,
+        lane_x_abs_mm=1300,
+        lateral_forward_distance_m=0.2,
     )
+    seq.config=replace(seq.config,gate_clearance=config)
     session=make_clearance_session(
-        config,FieldPoint(-config.side_x_mm,885),TeamColor.RED,
+        config,FieldPoint(-1300,900),TeamColor.RED,
         1,attempt_started_ns=1,
     )
-    session.index=7
     seq._gate_clearance=session
     monkeypatch.setattr(
         'rescue_vision.app.gate_clearance._objects',
-        lambda _sequence,_now: (GateObject(BLUE,FieldPoint(0,885),30),),
+        lambda _sequence,_now: (GateObject(BLUE,FieldPoint(-1300,1022.5),30),),
     )
-    assert _sweep_risk(seq,2)=='danger_sweep_out_of_field'
-
-
-def test_sweep_heading_drift_brakes_before_more_linear_motion():
-    seq=gate_sequence(position=FieldPoint(500,885))
-    session=make_clearance_session(
-        seq.config.gate_clearance,seq.estimated_field_position,TeamColor.RED,
-        1,attempt_started_ns=1,
+    assert (
+        _segment_risk(seq,2,session.lane_point,session.lateral_end_point)
+        == 'danger_route_out_of_field'
     )
-    session.initial_stop_confirmed=True
-    session.index=7
-    session.released=True
-    seq._gate_clearance=session
-    seq.state=MatchState.GATE_CLEARANCE
-    seq._latest_heading_rad=math.pi-0.05
-
-    decision=step_clearance(seq,2)
-
-    assert decision.linear_velocity_m_s==0
-    assert decision.angular_velocity_rad_s==0
-    assert decision.soft_brake
-    assert decision.reason.startswith('gate_clearance:sweep_heading_drift_brake,')
-    assert session.sweep_realign_pending
-    assert session.sweep_realign_count==1
-
-
-def test_sweep_cross_track_error_exits_instead_of_driving_into_zone():
-    seq=gate_sequence(position=FieldPoint(500,906))
-    session=make_clearance_session(
-        seq.config.gate_clearance,FieldPoint(500,885),TeamColor.RED,
-        1,attempt_started_ns=1,
-    )
-    session.initial_stop_confirmed=True
-    session.index=7
-    session.released=True
-    seq._gate_clearance=session
-    seq.state=MatchState.GATE_CLEARANCE
-    seq._latest_heading_rad=math.pi
-
-    decision=step_clearance(seq,2)
-
-    assert decision.state is MatchState.SEARCH_CLUSTER
-    assert 'sweep_cross_track_outside:error_mm=21.0,limit_mm=20.0' in decision.reason
-    assert decision.linear_velocity_m_s==0
 
 
 @pytest.mark.parametrize('dt,latency,interval',[(.005,.6,.25),(.01,.3,.4)])
-def test_delayed_perception_clearance_completes_without_point_follower_or_delivery(dt,latency,interval):
+def test_delayed_perception_clearance_delivers_and_uses_normal_exit(dt,latency,interval):
     seq=gate_sequence()
     original_count=seq._transport_count
     def scene(frame,stamp,pose):
         points=[]
         session=seq._gate_clearance
-        if session is None or session.index<8:
+        if session is None or session.index<len(session.actions):
             points.append((ORANGE,FieldPoint(-150,1100)))
-        # 外围目标闪烁，不影响已提交的暂存或扫掠动作。
+        # 外围目标闪烁，不影响已提交的门前动作。
         if frame%2:
             points.append((BLACK,FieldPoint(900,500)))
         return snapshot(frame,stamp,*(observation(frame,stamp,field_to_ground(pose,p),
@@ -298,51 +254,44 @@ def test_delayed_perception_clearance_completes_without_point_follower_or_delive
     plant=MotionPlant(seq,heading=math.pi/2,dt=dt,latency_s=latency,
                       frame_interval_s=interval,perception=scene)
     plant.until(lambda d:d.reason.startswith('gate_clearance_triggered:'),seconds=3)
-    plant.until(lambda d:d.reason=='gate_clearance_complete_search',seconds=40)
+    plant.until(lambda d:d.state is MatchState.FINISH_STOP,seconds=40)
     reasons=[d.reason for d in plant.records]
     assert any(reason.startswith('gate_clearance:initial_stop_complete,') for reason in reasons)
-    for stage in ('align_stash_heading','to_stash_s','stash_reverse_120mm',
-                  'align_sweep_heading','sweep_via_midpoint','align_field_center',
-                  'center_forward_200mm_radius'):
+    for stage in ('to_lane','align_lateral_heading','lateral_forward_900mm'):
         assert any(reason.startswith(f'gate_clearance:{stage}:complete,') for reason in reasons)
-    assert any(reason.startswith('gate_clearance:sweep_close,') for reason in reasons)
-    stash=[d for d in plant.records if 'noncontact=gate_to_stash_s,' in d.reason]
-    assert stash
-    assert all('point_tracking:' not in d.reason and 'point_correction:' not in d.reason for d in stash)
-    assert max(abs(d.angular_velocity_rad_s) for d in stash)<0.15
-    sweep=[d for d in plant.records if 'noncontact=gate_sweep_via_midpoint,' in d.reason]
-    assert any(d.linear_velocity_m_s>0.3 for d in sweep)
-    assert all('point_tracking:' not in d.reason for d in sweep)
-    assert max(abs(d.angular_velocity_rad_s) for d in sweep)<0.15
-    assert all(d.gripper_posture is GripperPosture.CLOSED for d in sweep)
-    center=[d for d in plant.records if 'noncontact=gate_center_forward_200mm_radius,' in d.reason]
-    assert center
-    assert all('point_tracking:' not in d.reason and 'point_correction:' not in d.reason for d in center)
-    assert max(abs(d.angular_velocity_rad_s) for d in center)<0.15
-    opened=next(d for d in plant.records if d.reason.startswith('gate_clearance:center_open'))
-    field_text=opened.reason.split('field_position=(',1)[1].split(')',1)[0]
-    field_x,field_y=(float(value) for value in field_text.split(','))
-    assert math.hypot(field_x,field_y)<=200
-    assert seq.carried_target_count==0 and seq._transport_count==original_count
-    assert seq.state is MatchState.SEARCH_CLUSTER
+    assert any(reason.startswith(
+        'gate_clearance:lateral_reverse_600mm:complete_handoff_to_normal_d2,'
+    ) for reason in reasons)
+    lateral_forward=[d for d in plant.records if 'noncontact=gate_lateral_forward_900mm,' in d.reason]
+    lateral_reverse=[d for d in plant.records if 'noncontact=gate_lateral_reverse_600mm,' in d.reason]
+    d2_push=[d for d in plant.records if 'noncontact=safe_zone_forward_final_closed,' in d.reason]
+    assert lateral_forward and any(d.linear_velocity_m_s>0 for d in lateral_forward)
+    assert lateral_reverse and any(d.linear_velocity_m_s<0 for d in lateral_reverse)
+    assert d2_push and any(d.linear_velocity_m_s>0 for d in d2_push)
+    assert all(d.gripper_posture is GripperPosture.CLOSED for d in d2_push)
+    exit_reverse=[d for d in plant.records if d.reason.startswith('safe_zone_exit_reverse_open_loop')]
+    assert exit_reverse and any(d.linear_velocity_m_s<0 for d in exit_reverse)
+    assert seq.carried_target_count==0 and seq._transport_count==original_count+1
+    assert seq.state is MatchState.FINISH_STOP
     assert not seq._gate_clearance_attempted
 
 
-def test_failure_after_stash_exits_to_search():
+def test_failure_before_delivery_resumes_normal_transport():
     seq=gate_sequence(position=FieldPoint(-500,885))
     session=make_clearance_session(
         seq.config.gate_clearance,seq.estimated_field_position,TeamColor.RED,
         0,attempt_started_ns=0,
     )
     session.initial_stop_confirmed=True
-    session.index=11
-    session.released=True
+    session.index=2
     seq._gate_clearance=session
     seq._gate_clearance_attempted=True
-    seq._transport_target_classes=()
     seq.state=MatchState.GATE_CLEARANCE
-    plant=MotionPlant(seq,heading=math.pi)
     decision=step_clearance(seq,31_000_000_000)
-    assert decision.state is MatchState.SEARCH_CLUSTER
-    assert decision.reason.startswith('gate_clearance_failed_search:')
+    assert decision.state in {
+        MatchState.TRANSPORT_ALIGN_RED_ZONE,
+        MatchState.TRANSPORT_FORWARD,
+        MatchState.TRANSPORT_RELEASE,
+    }
+    assert seq._transport_target_classes == (GREEN,)
     assert seq._gate_clearance is None
