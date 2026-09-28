@@ -1148,6 +1148,33 @@ def test_near_field_path_block_returns_to_formal_search_before_opening() -> None
     assert sequence.near_field_active_plan is None
 
 
+def test_static_path_block_does_not_record_a_physical_grasp_failure() -> None:
+    sequence = _sequence()
+
+    sequence._remember_near_field_failure(100_000_000, "static_path_blocked")
+
+    assert sequence._near_field_failures == []
+    assert "physical_failure_recorded=false" in sequence._near_field_last_failure_diagnostic
+
+
+def test_recent_coasting_green_keeps_precision_search_speed_during_empty_frame() -> None:
+    config = runtime_config(
+        cluster_search_angular_velocity_rad_s=-0.7,
+        cluster_search_empty_angular_velocity_rad_s=-3.0,
+    )
+    sequence = _sequence(config=config)
+    target_observation = target(timestamp=100_000_000, frame=1).observation
+    sequence._tracker.update(100_000_000, (target_observation,))
+    tracks = sequence._tracker.update(200_000_000, ())
+    sequence._latest_perception = snapshot(2, 200_000_000)
+    sequence._last_timestamp_ns = 200_000_000
+
+    assert tracks[0].status.value == "coasting"
+    sequence._update_cluster_search_velocity()
+
+    assert abs(sequence._cluster_search_angular_velocity_rad_s) == pytest.approx(0.7)
+
+
 def test_approach_seed_checks_same_field_boundary_as_near_field(monkeypatch):
     sequence = _sequence(transports=1)
     sequence._latest_heading_rad = 0.0

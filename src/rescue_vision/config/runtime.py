@@ -1054,10 +1054,14 @@ class MatchRuntimeConfig:
     # 在新一帧检出新的可接触成员时才可能改变结果，所以只等一到两帧，不占满
     # 按确认帧数计的完整确认预算。
     breakup_no_plan_reobserve_ms: float = 1_000.0
-    # 误夹释放后原团短解团；速度和制动复用普通解团，航向相对释放姿态。
+    # 误夹开爪退出和释放区短解团；制动仍复用近场/解团参数。
+    misgrasp_backup_distance_m: float = 0.25
+    misgrasp_backup_speed_m_s: float = 0.08
     misgrasp_breakup_forward_distance_m: float = 0.30
+    misgrasp_breakup_forward_speed_m_s: float = 0.40
     misgrasp_breakup_backward_distance_m: float = 0.08
-    misgrasp_breakup_max_heading_change_rad: float = math.radians(10.0)
+    misgrasp_breakup_backward_speed_m_s: float = 0.08
+    misgrasp_breakup_max_heading_change_rad: float = math.radians(30.0)
     breakup_forward_distance_m: float = 0.5
     breakup_forward_speed_m_s: float = 0.40
     breakup_backward_distance_m: float = 0.3
@@ -1073,6 +1077,7 @@ class MatchRuntimeConfig:
     green_max_age_ms: float = 500.0
     green_align_hold_ms: float = 500.0
     green_alignment_tolerance_mm: float = 10.0
+    orange_alignment_tolerance_mm: float = 10.0
     green_alignment_hysteresis_mm: float = 5.0
     grasp_task_timeout_ms: float = 20_000.0
     green_alignment_timeout_ms: float = 8_000.0
@@ -1252,8 +1257,12 @@ class MatchRuntimeConfig:
             "cluster_search_sweep_angle_rad",
             "opportunistic_single_green_clearance_mm",
             "opportunistic_single_green_realign_standoff_mm",
+            "misgrasp_backup_distance_m",
+            "misgrasp_backup_speed_m_s",
             "misgrasp_breakup_forward_distance_m",
+            "misgrasp_breakup_forward_speed_m_s",
             "misgrasp_breakup_backward_distance_m",
+            "misgrasp_breakup_backward_speed_m_s",
             "misgrasp_breakup_max_heading_change_rad",
             "breakup_forward_distance_m",
             "breakup_forward_speed_m_s",
@@ -1264,6 +1273,7 @@ class MatchRuntimeConfig:
             "green_max_age_ms",
             "green_align_hold_ms",
             "green_alignment_tolerance_mm",
+            "orange_alignment_tolerance_mm",
             "green_alignment_hysteresis_mm",
             "grasp_task_timeout_ms",
             "green_alignment_timeout_ms",
@@ -2776,8 +2786,12 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         "cluster_relocate_speed_m_s",
         "opportunistic_single_green_enabled",
         "opportunistic_single_green_clearance_mm",
+        "misgrasp_backup_distance_m",
+        "misgrasp_backup_speed_m_s",
         "misgrasp_breakup_forward_distance_m",
+        "misgrasp_breakup_forward_speed_m_s",
         "misgrasp_breakup_backward_distance_m",
+        "misgrasp_breakup_backward_speed_m_s",
         "misgrasp_breakup_max_heading_change_rad",
         "breakup_forward_distance_m",
         "breakup_forward_speed_m_s",
@@ -2793,6 +2807,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         "green_max_age_ms",
         "green_align_hold_ms",
         "green_alignment_tolerance_mm",
+        "orange_alignment_tolerance_mm",
         "green_alignment_hysteresis_mm",
         "grasp_task_timeout_ms",
         "green_alignment_timeout_ms",
@@ -3083,6 +3098,12 @@ def load_runtime_config(path: str | Path) -> AppConfig:
 
     gate_raw = _mapping(match_raw.get("gate_clearance", {}), "match.gate_clearance")
     _reject_unknown(gate_raw, {item.name for item in fields(GateClearanceConfig)}, "match.gate_clearance")
+    green_alignment_tolerance_mm = match_float(
+        "green_alignment_tolerance_mm", 10.0
+    )
+    orange_alignment_tolerance_mm = match_float(
+        "orange_alignment_tolerance_mm", green_alignment_tolerance_mm
+    )
     match = MatchRuntimeConfig(
         gate_clearance=GateClearanceConfig(**gate_raw),
         breakup_min_penetration_mm=match_float("breakup_min_penetration_mm", 10.0),
@@ -3185,9 +3206,13 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         opportunistic_single_green_clearance_mm=match_float(
             "opportunistic_single_green_clearance_mm", 120.0
         ),
+        misgrasp_backup_distance_m=match_float("misgrasp_backup_distance_m", 0.25),
+        misgrasp_backup_speed_m_s=match_float("misgrasp_backup_speed_m_s", 0.08),
         misgrasp_breakup_forward_distance_m=match_float("misgrasp_breakup_forward_distance_m", 0.30),
+        misgrasp_breakup_forward_speed_m_s=match_float("misgrasp_breakup_forward_speed_m_s", 0.40),
         misgrasp_breakup_backward_distance_m=match_float("misgrasp_breakup_backward_distance_m", 0.08),
-        misgrasp_breakup_max_heading_change_rad=match_float("misgrasp_breakup_max_heading_change_rad", math.radians(10.0)),
+        misgrasp_breakup_backward_speed_m_s=match_float("misgrasp_breakup_backward_speed_m_s", 0.08),
+        misgrasp_breakup_max_heading_change_rad=match_float("misgrasp_breakup_max_heading_change_rad", math.radians(30.0)),
         breakup_forward_distance_m=match_float(
             "breakup_forward_distance_m", 0.5
         ),
@@ -3222,9 +3247,8 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         ),
         green_max_age_ms=match_float("green_max_age_ms", 500.0),
         green_align_hold_ms=match_float("green_align_hold_ms", 500.0),
-        green_alignment_tolerance_mm=match_float(
-            "green_alignment_tolerance_mm", 10.0
-        ),
+        green_alignment_tolerance_mm=green_alignment_tolerance_mm,
+        orange_alignment_tolerance_mm=orange_alignment_tolerance_mm,
         green_alignment_hysteresis_mm=match_float(
             "green_alignment_hysteresis_mm", 5.0
         ),

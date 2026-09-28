@@ -73,7 +73,12 @@ def test_failed_greedy_candidate_resumes_original_scan_and_selects_far_alternati
     assert sequence._target_attempt_blocked(first, now)
     assert sequence._target_attempt_blocked(replace(first, track_id=first.track_id + 100), now)
     assert sequence._transport_target_classes == (GREEN,)
-    expired = sequence._step_greedy_scan(100_000_000_000, 0.0)
+    sequence._tracker.reset()
+    sequence.state = MatchState.TRANSPORT_GREEDY_SCAN
+    resumed = sequence._step_greedy_scan(100_000_000_000, 0.0)
+    assert resumed.state is MatchState.TRANSPORT_GREEDY_SCAN
+    assert resumed.angular_velocity_rad_s != 0
+    expired = sequence._step_greedy_scan(200_000_000_000, 0.0)
     assert expired.reason == 'greedy_return:scan_timeout'
 
 

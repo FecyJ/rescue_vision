@@ -206,10 +206,14 @@ match:
   breakup_max_attempts: 2
   # 停稳后当前接触核心需要的连续有效帧数；不再执行接近后第二轮复核。
   breakup_confirmation_frames: 1
-  # 误夹释放后锁定原团短解团；速度/制动继承 breakup，航向只允许微调。
+  # 误夹开爪退出与释放区短解团独立配置距离和速度；制动仍继承近场/解团参数。
+  misgrasp_backup_distance_m: 0.25
+  misgrasp_backup_speed_m_s: 0.3
   misgrasp_breakup_forward_distance_m: 0.30
+  misgrasp_breakup_forward_speed_m_s: 0.4
   misgrasp_breakup_backward_distance_m: 0.08
-  misgrasp_breakup_max_heading_change_rad: 0.17453292519943295
+  misgrasp_breakup_backward_speed_m_s: 0.3
+  misgrasp_breakup_max_heading_change_rad: 0.5235987755982988
   breakup_forward_distance_m: 0.5
   breakup_forward_speed_m_s: 0.4
   breakup_backward_distance_m: 0.3
@@ -229,10 +233,12 @@ match:
   green_max_age_ms: 1000.0
   # 绿色目标对准阶段的失鲜保持窗口，单位 ms。
   green_align_hold_ms: 1500.0
-  # 绿色目标横向对准容差，单位 mm；其余对准参数单位为 rad/s。
+  # 绿/橙目标分别设置横向对准容差，单位 mm；其余对准参数单位为 rad/s。
   # 只要求粗对准：目标大致对中间即可，剩余横向偏差由近场停稳后的
   # 左右边界不对称开爪吸收，不再追精对准。
   green_alignment_tolerance_mm: 40.0
+  # 单个橙色伤员的横向对准容差；独立于绿色物资。
+  orange_alignment_tolerance_mm: 40.0
   green_alignment_kp_rad_s: 1.0
   green_alignment_max_angular_velocity_rad_s: 0.35
   # 远场绿色目标对准的单轮最低速度；近场旋转使用 motion 下限。

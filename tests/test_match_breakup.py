@@ -123,7 +123,7 @@ def test_attempt_without_contact_plan_leaves_after_the_reobserve_window():
     seq._start_breakup_attempt(0, None)
     assert seq.state is MatchState.BREAKUP_SETTLE
     # 单个物资达不到 cluster_min_detections，本次尝试不可能选出接触计划。
-    window_ns = round(seq.config.breakup_no_plan_reobserve_ms * 1e6)
+    window_ns = round(seq._breakup_no_plan_budget_ms * 1e6)
     full_budget_ns = (seq._cluster_align_hold_ns
                       + seq.config.breakup_confirmation_frames
                       * round(seq.config.green_max_age_ms * 1e6))

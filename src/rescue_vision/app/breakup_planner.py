@@ -213,6 +213,7 @@ def plan_breakup(
     required_aim_id: int | None = None,
     non_contact_ids: frozenset[int] = frozenset(),
     rejections: list[str] | None = None,
+    shorten_to_safe: bool = False,
 ) -> tuple[BreakupPlan, ...]:
     """Rank real K0 contact rays. Check entire group displacement, including blue.
 
@@ -328,9 +329,31 @@ def plan_breakup(
             if backward < config.breakup_retreat_clearance_mm + config.breakup_braking_margin_mm:
                 skip("retreat_below_clearance", aim.track_id, backward_mm=backward)
                 continue
-            if not clear():
+            path_is_clear = clear()
+            if not path_is_clear and shorten_to_safe:
+                # A release push has no approach phase. Its configured stroke is
+                # an upper bound: use the longest safe shorter stroke that still
+                # crosses the contact disk and leaves braking clearance.
+                minimum_forward = max(
+                    gap + minimum_depth,
+                    gap + penetration + config.breakup_braking_margin_mm,
+                    gap + min((x0 for t, x0, _ in contact if t.track_id == aim.track_id),
+                              default=near) - near,
+                )
+                maximum_forward = forward
+                for reduction_mm in range(10, max(10, math.ceil(maximum_forward-minimum_forward)+10), 10):
+                    forward = max(minimum_forward, maximum_forward-reduction_mm)
+                    depth = forward-gap
+                    blocked_path = "none"
+                    if clear():
+                        path_is_clear = True
+                        break
+                    if forward <= minimum_forward:
+                        break
+            if not path_is_clear:
                 skip("fixed_push_path_blocked", aim.track_id, blocked_path=blocked_path,
-                     forward_mm=forward, backward_mm=backward)
+                     forward_mm=config.breakup_forward_distance_m * 1000,
+                     shortest_checked_mm=forward, backward_mm=backward)
                 continue
             hit_ids = tuple(t.track_id for t, x0, _ in contact if x0 <= near+depth)
             if aim.track_id not in hit_ids:

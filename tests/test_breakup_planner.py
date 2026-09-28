@@ -86,7 +86,7 @@ def test_shallow_contact_span_is_plannable_within_its_own_span():
     assert plan.contact_ids == (1,)
     assert 2 * items[0].contact_radius_mm < floor_mm
     assert plan.penetration_mm >= 2 * items[0].contact_radius_mm
-    assert plan.forward_distance_mm == 500
+    assert plan.forward_distance_mm == runtime.match.breakup_forward_distance_m * 1000
     # 整段推穿：前推行程覆盖接触跨度，不是被门槛截断的部分推进。
     assert plan.forward_distance_mm >= plan.penetration_mm
 
@@ -151,7 +151,23 @@ def test_dense_core_and_blue_mixed_group_are_candidates():
     assert result[0].contact_ids == (1, 2, 3)
     runtime = load_runtime_config("configs/runtime.match.yaml")
     assert runtime.match.breakup_min_penetration_mm <= result[0].penetration_mm
-    assert result[0].penetration_mm <= result[0].forward_distance_mm == 500
+    assert result[0].penetration_mm <= result[0].forward_distance_mm == runtime.match.breakup_forward_distance_m * 1000
+
+
+def test_release_push_shortens_only_when_full_stroke_is_unsafe():
+    runtime = load_runtime_config('configs/runtime.match.yaml')
+    config = replace(runtime.match, cluster_min_detections=1,
+                     breakup_forward_distance_m=0.35, breakup_backward_distance_m=0.08)
+    options = dict(config=config, approach=False,
+                   field_bounds=(-1500, 690, -1500, 1500))
+    assert not plans([target(1, 370, 0)], **options)
+    shortened = plans([target(1, 370, 0)], shorten_to_safe=True, **options)
+    assert shortened and shortened[0].forward_distance_mm == 340
+    # The selected stroke still has a real contact and a checked return path.
+    assert shortened[0].aim_id in shortened[0].contact_ids
+    assert shortened[0].backward_distance_mm == 80
+    assert not plans([target(1, 370, 0)], shorten_to_safe=True,
+                     **{**options, 'field_bounds': (-1500, 600, -1500, 1500)})
     assert not plans([target(1, 450, 0, TargetClass.BLUE_DANGER), target(2, 480, 0, TargetClass.BLUE_DANGER)])
 
 

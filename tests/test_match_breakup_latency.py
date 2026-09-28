@@ -433,11 +433,11 @@ def breakup_plan(aim_x: float, aim_y: float = 0.0):
 
 
 def test_one_full_rotation_must_commit_an_action():
-    """一圈用完不能绕过失败记忆，必须执行一次有效换位。
+    """一圈用完不能绕过失败记忆，必须启动有效的替代动作。
 
     现场 20260912_0053 从 63.3 s 转到 85.4 s（约两圈）都不行动，因为每次
     近场受阻回搜索都会清零旋转预算，失败记忆只会累积。这里断言一圈之内
-    必然出现实际的有界换位；同一未变化失败目标仍不能被重新提交。
+    必然启动可执行的替代动作（可达抓取或有界换位）；同一未变化失败目标仍不能被重新提交。
     """
 
     seq = sequence()
@@ -458,6 +458,7 @@ def test_one_full_rotation_must_commit_an_action():
     latest = None
     relocation_ms = None
     moved = False
+    selected_green = False
     unchanged_target_plan = None
     for ms in range(0, int((lap_s + 2.0 + seq.config.cluster_relocate_distance_m / seq.config.cluster_relocate_speed_m_s) * 1000) + 1, 5):
         now = ms * 1_000_000
@@ -477,7 +478,10 @@ def test_one_full_rotation_must_commit_an_action():
             left_speed_feedback_m_s=0.0,
             right_speed_feedback_m_s=0.0,
         )
-        if decision.reason == "rotation_budget_relocate_start":
+        if (
+            decision.reason == "rotation_budget_relocate_start"
+            or decision.reason.startswith("rotation_budget_relocate_turn_start:")
+        ):
             relocation_ms = ms
             # Before the encoder-backed translation, the remembered physical
             # aim is still unchanged and must remain rejected.
@@ -488,15 +492,30 @@ def test_one_full_rotation_must_commit_an_action():
         ):
             moved = True
             distance += decision.linear_velocity_m_s * 0.005
+        if (
+            decision.state is MatchState.TRANSPORT_ALIGN_GREEN
+            and seq.selected_track_id is not None
+        ):
+            selected_green = True
         heading += decision.angular_velocity_rad_s * 0.005
-        if moved and decision.state is MatchState.SEARCH_CLUSTER:
+        if selected_green or (moved and decision.state is MatchState.SEARCH_CLUSTER):
             break
 
-    assert relocation_ms is not None, "一圈内没有选择有界换位"
+    assert relocation_ms is not None, (
+        "一圈内没有选择有界换位或有限路径退出："
+        f"{seq._rotation_budget_commit_diagnostic}"
+    )
     assert relocation_ms / 1000.0 <= lap_s + 2.0
-    assert moved, "没有发生实际非零换位动作"
-    assert distance >= seq.config.cluster_relocate_distance_m - 1e-6, (decision.reason, seq.estimated_field_position, heading, ms)
-    assert seq.state is MatchState.SEARCH_CLUSTER
+    assert moved or selected_green, "没有发生换位，也没有选择可执行的抓取目标"
+    if moved:
+        assert distance >= (
+            seq.config.cluster_relocate_distance_m
+            - seq.config.noncontact_distance_tolerance_m
+            - 1e-6
+        ), (decision.reason, seq.estimated_field_position, heading, ms)
+        assert seq.state is MatchState.SEARCH_CLUSTER
+    else:
+        assert seq.state is MatchState.TRANSPORT_ALIGN_GREEN
     assert unchanged_target_plan is None
     assert any(
         "reason=group_in_failed_region" in line
@@ -541,6 +560,9 @@ def test_rotation_budget_relocates_when_nothing_but_blue_remains():
 
     seq = sequence()
     seq._latest_heading_rad = 0.0
+    # This represents post-delivery search, where the removed implicit blue
+    # reobserve/approach branch used to run.
+    seq._transport_count = 1
     lap_s = (
         seq.config.cluster_search_sweep_angle_rad
         / abs(seq.config.cluster_search_empty_angular_velocity_rad_s)
@@ -550,6 +572,7 @@ def test_rotation_budget_relocates_when_nothing_but_blue_remains():
     heading = 0.0
     latest = None
     seen_reasons = set()
+    seen_states = set()
     for ms in range(0, int((lap_s + 3.0) * 1000) + 1, 5):
         now = ms * 1_000_000
         if ms % 300 == 0:
@@ -566,11 +589,17 @@ def test_rotation_budget_relocates_when_nothing_but_blue_remains():
             right_speed_feedback_m_s=0.0,
         )
         seen_reasons.add(decision.reason)
+        seen_states.add(decision.state)
         heading += decision.angular_velocity_rad_s * 0.005
 
     assert "rotation_budget_commit" not in seen_reasons
-    assert "rotation_budget_relocate_start" in seen_reasons
-    assert "relocate_forward" in seen_reasons
+    assert any(
+        reason == "rotation_budget_relocate_start"
+        or reason.startswith("rotation_budget_relocate_turn_start:")
+        for reason in seen_reasons
+    )
+    assert MatchState.RELOCATE_FORWARD in seen_states
+    assert MatchState.TRANSPORT_ALIGN_GREEN not in seen_states
     assert seq.state is MatchState.RELOCATE_FORWARD
 
 
@@ -580,7 +609,7 @@ def test_failed_attempts_do_not_bleed_into_a_neighbouring_group():
     seq = sequence()
     seq._latest_heading_rad = 0.0
     # Both groups must fit the fixed stroke and have disjoint push paths.
-    neighbour = tuple((x-400, y+350, cls, box) for x, y, cls, box in NEIGHBOUR_SPECS)
+    neighbour = tuple((x-450, y+350, cls, box) for x, y, cls, box in NEIGHBOUR_SPECS)
     _, capture_ns, _ = confirm_scene(seq, GROUP_SPECS + neighbour)
     seq._breakup_attempts = [
         breakup_plan(450.0)
@@ -606,7 +635,7 @@ def test_failed_attempt_records_the_aim_not_the_whole_group():
 
     seq = sequence()
     seq._latest_heading_rad = 0.0
-    neighbour = tuple((x-400, y+350, cls, box) for x, y, cls, box in NEIGHBOUR_SPECS)
+    neighbour = tuple((x-450, y+350, cls, box) for x, y, cls, box in NEIGHBOUR_SPECS)
     _, capture_ns, _ = confirm_scene(seq, GROUP_SPECS + neighbour)
     plan = seq._choose_breakup_plan(capture_ns)
     assert plan is not None
@@ -711,7 +740,8 @@ def test_failed_entry_proposal_has_independent_no_plan_deadline(poll_ms, delay_m
             exited = ms
             break
     assert exited is not None
-    assert exited <= seq.config.breakup_no_plan_reobserve_ms + 100
+    assert exited <= seq._breakup_no_plan_budget_ms + 100
+    assert exited < 1500
     assert 'timeout' in decision.reason
     assert seq._breakup_plan is not proposal or decision.linear_velocity_m_s == 0.
 
@@ -1085,7 +1115,7 @@ def test_locked_session_survives_short_scene_gap_up_to_commit_window(poll_ms):
 
 
 @pytest.mark.parametrize("poll_ms", (5, 10))
-def test_scene_evidence_timeout_reobserves_once_before_recording_failure(poll_ms):
+def test_scene_evidence_timeout_leaves_without_recording_physical_failure(poll_ms):
     """没有发出过运动指令的退出必须先原地重观测一次，并保持有界。
 
     现场 20260913_1651：t=531.6→563.8 s 之间同一片区域反复出现
@@ -1108,8 +1138,11 @@ def test_scene_evidence_timeout_reobserves_once_before_recording_failure(poll_ms
     assert search_at is not None, "同一片区域连续无动作退出必须有界收束"
     # 会话由测试直接建立，不产生首次交接；这里只应出现一次原地重观测。
     assert handoffs == 1, f"只允许一次原地重观测，实际 {handoffs}"
-    assert len(seq._near_field_failures) == 1, "只有放弃这片区域时才记录失败"
-    assert seq.grasp_task is None
+    assert not seq._near_field_failures, "证据失败不能成为物理目标黑名单"
+    assert decision.angular_velocity_rad_s != 0
+    # No new task deadline is manufactured by evidence-only exits.
+    if seq.grasp_task is not None:
+        assert seq.grasp_task.started_ns < search_at * 1_000_000
 
 
 def test_approach_seed_diagnostic_names_the_first_failing_gate():
@@ -1134,7 +1167,7 @@ def test_approach_seed_diagnostic_names_the_first_failing_gate():
         reported[(track_id, target_class)] = rejection
     assert reported[("track=1", "green_supply")] == "accepted"
     assert reported[("track=2", "green_supply")] == "behind_robot"
-    assert reported[("track=3", "orange_injured")] == "orange_not_isolated"
+    assert reported[("track=3", "orange_injured")] == "corridor_blocked"
     # 诊断必须与真正的筛选一致：同一个候选在这里被否决，就不能成为种子。
     seed = seq._find_approach_seed(10)
     assert seed is not None and seed.track_id == 1

@@ -264,15 +264,7 @@ def test_line_crossing_window_is_pickup_to_d2_only(
     seq._cargo_capture_floor_ns = 100
     seq.state = state
     seq._safe_zone_phase = safe_zone_phase
-    latest = color_snapshot(1, 100, 200, {G})
-    seq._latest_perception = replace(
-        latest,
-        gripper_color=replace(
-            latest.gripper_color,
-            line_crossing_classes=frozenset({G}),
-        ),
-    )
-
+    seq._latest_perception = line_snapshot(1, 100, {G})
     assert seq._gripper_color_conflict(200) == expected
 
 
@@ -366,16 +358,7 @@ def test_line_crossing_starts_open_forward_close_regrasp():
     original_controller = seq._noncontact_controller
     original_base_distance = seq._noncontact_base_distance
     original_started_ns = seq._noncontact_started_ns
-    latest = color_snapshot(1, 100, 200, {G})
-    latest = replace(
-        latest,
-        gripper_color=replace(
-            latest.gripper_color,
-            line_crossing_classes=frozenset({G}),
-            horizontal_line_v=339.0,
-        ),
-    )
-
+    latest = line_snapshot(1, 100, {G})
     decision = seq.step(
         200,
         perception=latest,
@@ -396,7 +379,6 @@ def test_line_crossing_starts_open_forward_close_regrasp():
     )
     assert decision.state is MatchState.REGRASP_FORWARD
     assert decision.gripper_posture is GripperPosture.OPEN
-
     decision = seq.step(
         310_000_000,
         perception=None,
@@ -405,7 +387,6 @@ def test_line_crossing_starts_open_forward_close_regrasp():
     )
     assert decision.state is MatchState.REGRASP_FORWARD
     assert decision.linear_velocity_m_s > 0.0
-
     decision = seq.step(
         320_000_000,
         perception=None,
@@ -423,13 +404,12 @@ def test_line_crossing_starts_open_forward_close_regrasp():
         heading_rad=0.0,
         cumulative_distance_m=0.030,
     ).state is MatchState.REGRASP_CLOSE
-    decision = seq.step(
+    assert seq.step(
         700_000_000,
         perception=None,
         heading_rad=0.0,
         cumulative_distance_m=0.030,
-    )
-    assert decision.state is MatchState.REGRASP_CLOSE
+    ).state is MatchState.REGRASP_CLOSE
     seq.observe_grasp_motion(motion_sample(800_000_000))
     decision = seq.step(
         800_000_000,
@@ -456,28 +436,13 @@ def test_line_crossing_starts_open_forward_close_regrasp():
     assert seq._noncontact_last_command is not None
     assert seq._noncontact_last_command.position_error == pytest.approx(0.370)
 
-    # This frame was captured during cooldown but is delivered afterwards;
-    # delivery time alone must not re-arm the gate.
-    repeated = color_snapshot(2, 1_600_000_000, 1_600_000_000, {G})
-    repeated = replace(
-        repeated,
-        gripper_color=replace(
-            repeated.gripper_color,
-            line_crossing_classes=frozenset({G}),
-        ),
-    )
-    seq._latest_perception = repeated
+    # This frame was captured during cooldown and must not re-arm the gate later.
+    seq._latest_perception = line_snapshot(2, 1_600_000_000, {G})
     assert seq._gripper_color_conflict(1_900_000_000) is None
-    after_cooldown = color_snapshot(3, 1_900_000_000, 1_900_000_000, {G})
-    after_cooldown = replace(
-        after_cooldown,
-        gripper_color=replace(
-            after_cooldown.gripper_color,
-            line_crossing_classes=frozenset({G}),
-        ),
+    seq._latest_perception = line_snapshot(3, 1_900_000_000, {G})
+    assert seq._gripper_color_conflict(1_900_000_000) == (
+        "gripper_line_crossing:green_supply"
     )
-    seq._latest_perception = after_cooldown
-    assert seq._gripper_color_conflict(1_900_000_000) == "gripper_line_crossing:green_supply"
 
 
 @pytest.mark.parametrize(
@@ -495,15 +460,7 @@ def test_illegal_line_target_opens_moves_back_10mm_and_closes(
     seq._cargo_capture_floor_ns = 100
     seq.state = MatchState.TRANSPORT_FORWARD
     seq._safe_zone_phase = "forward_d1_line"
-    latest = color_snapshot(1, 100, 200, {target_class})
-    latest = replace(
-        latest,
-        gripper_color=replace(
-            latest.gripper_color,
-            line_crossing_classes=frozenset({target_class}),
-        ),
-    )
-
+    latest = line_snapshot(1, 100, {target_class})
     decision = seq.step(
         200,
         perception=latest,
@@ -524,7 +481,6 @@ def test_illegal_line_target_opens_moves_back_10mm_and_closes(
     )
     assert decision.state is MatchState.REGRASP_BACKWARD
     assert decision.gripper_posture is GripperPosture.OPEN
-
     decision = seq.step(
         310_000_000,
         perception=None,
@@ -533,7 +489,6 @@ def test_illegal_line_target_opens_moves_back_10mm_and_closes(
     )
     assert decision.state is MatchState.REGRASP_BACKWARD
     assert decision.linear_velocity_m_s < 0.0
-
     decision = seq.step(
         320_000_000,
         perception=None,
@@ -820,7 +775,7 @@ def test_delayed_color_conflict_opens_reverses_250mm_then_tries_locked_breakup(p
         if velocity < 0:
             reversed_at = reversed_at or ms
             assert decision.gripper_posture is GripperPosture.OPEN
-        if decision.reason == 'misgrasp_released_backed_250mm_breakup_locked_group':
+        if decision.reason == 'misgrasp_released_backed_breakup_locked_group':
             assert -distance == pytest.approx(0.250, abs=0.002)
             assert seq.carried_target_count == 0
             assert decision.angular_velocity_rad_s == 0
@@ -847,10 +802,112 @@ def test_delayed_color_conflict_opens_reverses_250mm_then_tries_locked_breakup(p
             break
     else:
         pytest.fail(f'No bounded no-plan exit: {decision}')
-    assert ms - exit_started_ms <= (seq.config.breakup_no_plan_reobserve_ms
+    # 本次窗口容纳已测得的处理延迟与两帧间隔，不能随轮询重新延长。
+    assert ms - exit_started_ms <= (seq._breakup_no_plan_budget_ms
                                    + seq.config.safe_zone_calibration_stop_confirm_time_s * 1000
                                    + 2 * poll_ms)
+    assert seq._breakup_no_plan_budget_ms <= max(
+        seq.config.breakup_no_plan_reobserve_ms, delay_ms + 2 * period_ms)
     assert not seq._misgrasp_breakup_active
+
+
+@pytest.mark.parametrize('poll_ms,delay_ms,period_ms', [(5, 300, 250), (10, 600, 400)])
+def test_first_single_green_misgrasp_releases_and_selects_other_green(poll_ms, delay_ms, period_ms):
+    seq = _sequence(transports=0)
+    seq._started = True
+    seq.config = replace(seq.config, green_max_age_ms=1200)
+    seq._transport_target_classes = (G,)
+    seq._cargo_capture_floor_ns = 0
+    seq.state = MatchState.TRANSPORT_ALIGN_RED_ZONE
+    seq._safe_zone_phase = 'align_d1_line'
+    latest = None
+    distance = velocity = 0.0
+    for ms in range(poll_ms, 6000, poll_ms):
+        now = ms * 1_000_000
+        distance += velocity * poll_ms / 1000
+        if ms % 10 == 0:
+            count = round(distance * 10000)
+            seq.observe_grasp_motion(replace(motion_sample(now), left_encoder_count=count,
+                                             right_encoder_count=count))
+        if ms >= delay_ms and (ms-delay_ms) % period_ms == 0:
+            frame = (ms-delay_ms)//period_ms + 1
+            latest = color_snapshot(frame, now-delay_ms*1_000_000, now, {G, B})
+        decision = seq.step(now, perception=latest, heading_rad=0.0,
+                            cumulative_distance_m=distance,
+                            left_speed_feedback_m_s=velocity, right_speed_feedback_m_s=velocity)
+        velocity = decision.linear_velocity_m_s
+        if decision.reason == 'misgrasp_released_backed_search_other_single_green':
+            break
+    else:
+        pytest.fail(f'First green did not exit misgrasp: {decision}')
+    assert -distance == pytest.approx(0.250, abs=0.002)
+    assert seq.carried_target_count == 0
+    assert decision.state is MatchState.SEARCH_CLUSTER
+    assert not seq._misgrasp_breakup_active
+    assert seq._first_green_misgrasp_reselect
+    assert any(record.reason == 'first_green_misgrasp_release'
+               for record in seq._near_field_failures)
+    decision = seq.step(now + poll_ms * 1_000_000, perception=latest,
+                        heading_rad=0.0, cumulative_distance_m=distance,
+                        left_speed_feedback_m_s=0, right_speed_feedback_m_s=0)
+    assert decision.state is MatchState.SEARCH_CLUSTER
+    assert not seq._misgrasp_breakup_active
+
+    # The released block has a new tracker ID after recovery. Seeing only it
+    # must keep the robot searching instead of starting breakup or regrasp.
+    for frame in range(1, 3):
+        ms += period_ms
+        now = ms * 1_000_000
+        seq.observe_grasp_motion(replace(motion_sample(now),
+            left_encoder_count=round(distance * 10000),
+            right_encoder_count=round(distance * 10000)))
+        latest = snapshot(100 + frame, now,
+            observation(100 + frame, now, GroundPoint(355, 0)))
+        decision = seq.step(now, perception=latest, heading_rad=0.0,
+                            cumulative_distance_m=distance,
+                            left_speed_feedback_m_s=0, right_speed_feedback_m_s=0)
+        assert decision.reason == 'first_green_misgrasp_search_other_single_green'
+        assert decision.state is MatchState.SEARCH_CLUSTER
+        assert not seq._misgrasp_breakup_active
+
+    # A dangerous object in its route still blocks the alternative.
+    ms += period_ms
+    now = ms * 1_000_000
+    seq.observe_grasp_motion(replace(motion_sample(now),
+        left_encoder_count=round(distance * 10000),
+        right_encoder_count=round(distance * 10000)))
+    latest = snapshot(103, now,
+        observation(103, now, GroundPoint(355, 0)),
+        observation(103, now, GroundPoint(450, 350), box_x=60),
+        observation(103, now, GroundPoint(350, 280), target_class=B, box_x=80))
+    decision = seq.step(now, perception=latest, heading_rad=0.0,
+                        cumulative_distance_m=distance,
+                        left_speed_feedback_m_s=0, right_speed_feedback_m_s=0)
+    assert decision.state is MatchState.SEARCH_CLUSTER
+    assert not seq._misgrasp_breakup_active
+
+    # A separate green remains eligible once its route is clear.
+    for frame in range(4, 7):
+        ms += period_ms
+        now = ms * 1_000_000
+        seq.observe_grasp_motion(replace(motion_sample(now),
+            left_encoder_count=round(distance * 10000),
+            right_encoder_count=round(distance * 10000)))
+        latest = snapshot(100 + frame, now,
+            observation(100 + frame, now, GroundPoint(355, 0)),
+            observation(100 + frame, now, GroundPoint(450, 350), box_x=60))
+        decision = seq.step(now, perception=latest, heading_rad=0.0,
+                            cumulative_distance_m=distance,
+                            left_speed_feedback_m_s=0, right_speed_feedback_m_s=0)
+        if decision.state is MatchState.TRANSPORT_ALIGN_GREEN:
+            break
+        assert decision.state is MatchState.SEARCH_CLUSTER
+        assert not seq._misgrasp_breakup_active
+    else:
+        pytest.fail(f'Other green was not selected: {decision}')
+    selected = seq._selected_target()
+    assert selected is not None
+    assert selected.ground_point == GroundPoint(450, 350)
 
 
 @pytest.mark.parametrize('mode', ['motion', 'invalid', 'stale', 'duplicate'])
@@ -906,7 +963,7 @@ def test_runtime_config_builds_enabled_gripper_color_observation():
     assert config.perception.gripper_color.polygon_normalized == (
         (0.47, 0.85), (0.53, 0.85), (0.57, 0.97), (0.43, 0.97),
     )
-    assert config.perception.gripper_color.line_forward_offset_mm == 45.0
+    assert config.perception.gripper_color.line_forward_offset_mm == 48.0
     assert config.perception.gripper_color.line_width_fraction == 0.5
     assert config.perception.gripper_color.line_contact_hold_ms == 800.0
     assert config.perception.gripper_color.line_regrasp_cooldown_ms == 1000.0

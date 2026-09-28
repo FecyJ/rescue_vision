@@ -189,10 +189,14 @@ match:
   breakup_deceleration_m_s2: 0.8
   breakup_max_attempts: 2
   breakup_confirmation_frames: 3
-  # 误夹释放后锁定原团短解团；速度/制动继承 breakup，航向只允许微调。
+  # 误夹开爪退出与释放区短解团独立配置距离和速度；制动仍继承近场/解团参数。
+  misgrasp_backup_distance_m: 0.25
+  misgrasp_backup_speed_m_s: 0.3
   misgrasp_breakup_forward_distance_m: 0.30
+  misgrasp_breakup_forward_speed_m_s: 0.4
   misgrasp_breakup_backward_distance_m: 0.08
-  misgrasp_breakup_max_heading_change_rad: 0.17453292519943295
+  misgrasp_breakup_backward_speed_m_s: 0.3
+  misgrasp_breakup_max_heading_change_rad: 0.5235987755982988
   breakup_forward_distance_m: 0.4
   breakup_forward_speed_m_s: 0.4
   breakup_backward_distance_m: 0.4

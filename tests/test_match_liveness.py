@@ -407,9 +407,11 @@ def test_rejected_handoff_selects_another_physical_target_without_session_loop(d
             break
     assert routed is not None
     assert seq.selected_track_id == other.track_id
-    assert seq._target_attempt_blocked(first, now)
+    # 选择另一可执行核心本身不证明原目标失败，也不应按 ID 重编号制造黑名单。
+    assert not seq._target_attempt_blocked(first, now)
     assert not seq._target_attempt_blocked(other, now)
-    assert seq._target_attempt_blocked(replace(first, track_id=100), now)
+    assert not seq._target_attempt_blocked(replace(first, track_id=100), now)
+    assert not seq._near_field_failures
     assert seq.near_field_session_id == initial_session
     assert seq.grasp_task is initial_task and seq.grasp_task.deadline_ns == deadline
 

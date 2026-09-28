@@ -22,7 +22,7 @@ perception:
   gripper_color:
     enabled: true
     polygon_normalized: [[0.47, 0.85], [0.53, 0.85], [0.57, 0.97], [0.43, 0.97]]
-    line_forward_offset_mm: 45.0
+    line_forward_offset_mm: 48.0
     line_width_fraction: 0.5
     line_contact_hold_ms: 800.0
     line_regrasp_cooldown_ms: 1000.0
@@ -169,7 +169,7 @@ match:
   # distance_m：前进为正、倒车为负；speed_m_s 为正的速度幅值。
   opening_actions:
     - type: turn
-      angle_rad: -0.71
+      angle_rad: -0.69
       angular_velocity_rad_s: 3.0
       settle_time_s: 0.2
     - type: straight
@@ -185,11 +185,11 @@ match:
   # 启动右转角，单位 rad；角速度符号决定右转方向。
   startup_turn_angle_rad: 0.73
   startup_turn_angular_velocity_rad_s: -3.0
-  startup_turn_settle_time_s: 0.2
+  startup_turn_settle_time_s: 0.05
   # 启动直行距离和速度，单位 m、m/s。
   startup_forward_distance_m: 2.5
   startup_forward_speed_m_s: 1.5
-  startup_forward_settle_time_s: 0.1
+  startup_forward_settle_time_s: 0.05
   # 启动直行的左右轮速 PID；现场先调 P，I/D 通常保持 0。
   startup_straight_pid_kp_rad_s_per_m_s: 2.0
   startup_straight_pid_ki_rad_s_per_m: 0.0
@@ -198,9 +198,9 @@ match:
   startup_straight_pid_deadband_m_s: 0.0
   startup_straight_pid_max_angular_velocity_rad_s: 0.08
   # 目标团搜索原地转速和单方向扫描跨度，单位 rad/s、rad。
-  cluster_search_angular_velocity_rad_s: -1
+  cluster_search_angular_velocity_rad_s: -1.5
   # 当前帧只有蓝色或没有任务目标时使用的同向快速扫描角速度。
-  cluster_search_empty_angular_velocity_rad_s: -2
+  cluster_search_empty_angular_velocity_rad_s: -3
   # 一次决策的旋转预算，单位 rad。搜索、对准、近场和重选之间连续累计绝对
   # 转角，只有真正执行完一次抓取或一次解团推挤、或确认场上不再有蓝块以外
   # 的可收集信息时才重新计时。整整一圈用完仍未执行任何动作时必须推进：
@@ -224,14 +224,14 @@ match:
   # 动态解团确认窗口上限，单位 ms；正式流程不再使用单独的对准/接近阶段。
   cluster_align_hold_ms: 2000.0
   # 对准比例增益翻倍；仍受下方角速度上限约束。
-  cluster_align_kp_rad_s: 1.0
-  cluster_align_max_angular_velocity_rad_s: 0.4
+  cluster_align_kp_rad_s: 2.0
+  cluster_align_max_angular_velocity_rad_s: 1.5
   # 搜索目标团时启用机会抓取；首轮单绿，一般阶段优先多物资组。
   opportunistic_single_green_enabled: true
   # 黑/绿/橙候选统一的 K0 邻物半径，单位 mm；路径仍独立检查安全区和场界。
   opportunistic_single_green_clearance_mm: 10.0
   # 解团前推/后退的距离和速度，单位 m、m/s。
-  # match: 闭爪定距前进 0.5 m、后退 0.3 m，整段路径不可行时拒绝该计划。
+  # match: 普通解团闭爪前进 0.4 m、后退 0.10 m；误夹短解团参数见下方。
   # 最小推进门槛，单位 mm。门槛取 `breakup_min_penetration_mm +
   # breakup_braking_margin_mm` 与局部接触集自身纵向跨度的较小值：浅团只要能
   # 整段推穿就成立。40 mm 正四面体黑核的内切接触盘只有 2r≈23 mm，固定门槛
@@ -241,7 +241,7 @@ match:
   breakup_retreat_clearance_mm: 40.0
   breakup_push_margin_mm: 60.0
   breakup_braking_margin_mm: 20.0
-  breakup_deceleration_m_s2: 0.8
+  breakup_deceleration_m_s2: 3
   # 同一个物理瞄准点（场地点，容差 cluster_group_ground_mm）最多尝试次数；
   # 用尽后换下一个瞄准点或下一个团，不再连坐整片区域。
   breakup_max_attempts: 3
@@ -251,10 +251,16 @@ match:
   # 新一帧检出新的可接触成员时才可能改变结果，所以只等一到两帧就退出本次
   # 区域，不占满上面的确认帧预算（现场感知 250～430 ms，取约两帧）。
   breakup_no_plan_reobserve_ms: 300
-  # 误夹释放后锁定原团短解团；速度/制动继承 breakup，航向只允许微调。
-  misgrasp_breakup_forward_distance_m: 0.30
+  # 误夹开爪退出及释放区短解团；首轮单绿杂物误夹退出后改搜其它单绿。
+  misgrasp_backup_distance_m: 0.25
+  misgrasp_backup_speed_m_s: 1.5
+  # 闭爪前推上限；完整路径被挡时规划器可缩短至安全的有效接触行程。
+  misgrasp_breakup_forward_distance_m: 0.35
+  misgrasp_breakup_forward_speed_m_s: 1.5
   misgrasp_breakup_backward_distance_m: 0.08
-  misgrasp_breakup_max_heading_change_rad: 0.17453292519943295
+  misgrasp_breakup_backward_speed_m_s: 1.5
+  # 相对释放瞬间的航向修正上限 30°，同时要求 K0 落在释放区且整段路径安全。
+  misgrasp_breakup_max_heading_change_rad: 0.5235987755982988
   breakup_forward_distance_m: 0.4
   breakup_forward_speed_m_s: 1.5
   breakup_backward_distance_m: 0.10
@@ -280,15 +286,17 @@ match:
   green_max_age_ms: 1000.0
   # 绿色目标对准阶段的失鲜保持窗口，单位 ms。
   green_align_hold_ms: 1500.0
-  # 绿色目标横向对准容差，单位 mm；其余对准参数单位为 rad/s。
+  # 绿/橙目标分别设置横向对准容差，单位 mm；其余对准参数单位为 rad/s。
   # 只要求粗对准：目标大致对中间即可，剩余横向偏差由近场停稳后的
   # 左右边界不对称开爪吸收，不再追精对准。
-  green_alignment_tolerance_mm: 40.0
+  green_alignment_tolerance_mm: 70.0
+  # 单个橙色伤员的横向对准容差；独立于绿色物资。
+  orange_alignment_tolerance_mm: 70.0
   # 远场及近场共用：比例增益翻倍，保留接近对准时的递减曲线。
   green_alignment_kp_rad_s: 2.0
-  green_alignment_max_angular_velocity_rad_s: 0.6
+  green_alignment_max_angular_velocity_rad_s: 1.0
   # 远场绿色目标对准的单轮最低速度；近场旋转使用 motion 下限。
-  green_alignment_min_wheel_velocity_m_s: 0.01
+  green_alignment_min_wheel_velocity_m_s: 0.02
   # 对准的滞回、最长持续时间和进入允许范围所需的新鲜观测帧数。
   # 滞回加宽到接近容差，避免在带边反复进出导致的来回摆。
   green_alignment_hysteresis_mm: 20.0
@@ -320,9 +328,9 @@ match:
   # d1→d2 的推进速度，单位 m/s。
   safe_zone_d1_to_d2_speed_m_s: 0.5
   # d2 张爪、转向、闭爪后到安全区末端的推进速度，单位 m/s。
-  safe_zone_d2_to_final_speed_m_s: 0.40
+  safe_zone_d2_to_final_speed_m_s: 0.45
   # 单橙色伤员 d2→安全区末端的独立速度，单位 m/s；当前先与通用末段一致，按实测单独调节。
-  safe_zone_orange_d2_to_final_speed_m_s: 0.35
+  safe_zone_orange_d2_to_final_speed_m_s: 0.40
   # 兼容现场诊断记录的旧固定刹车过冲参数；严格闭环运输不再从实际终点扣除，单位 mm。
   safe_zone_d2_to_final_braking_overrun_mm: 40
   # 单橙色伤员对应的旧诊断参数；严格闭环运输不再从实际终点扣除，单位 mm。
@@ -366,6 +374,8 @@ match:
   required_transports: 16
   # 退出安全区后的倒车速度，单位 m/s。
   return_backup_speed_m_s: 1.5
+
+  cluster_relocate_speed_m_s: 0.5
 
 localization:
   # 与感知快照年龄门一致，静止采集仍由编码器/IMU验证。
