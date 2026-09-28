@@ -33,6 +33,7 @@ grab_transport = config.build_grab_transport_sequence()
 | `uart` / `remote` | 通信设备、队列、观察权限和超时 |
 | `motion` | 轮距、速度/加速度限制、里程计机械量、夹爪标定和解团试验参数 |
 | `match` | 正式流程启动、目标团、机会抓取、绿色接近、安全区 d1/d2、刹车补偿和退出参数 |
+| `match_capture` | 训练集采集参数；开关使用 CLI `--capture-dataset`，YAML 不接受 `enabled`；输出路径、频率和实测线/角速度门限见[采集手册](../../../docs/数据采集工具使用.md#match-流程中的可选预标注采集) |
 | `match_cc` | CC 严格成团、单块通道净空、单块对准、20 ms 指令间隔和动作速度参数 |
 | `tracking` / `world` / `mission` | 轨迹生命周期、静态地图、颜色派生和规则状态机 |
 | `perception` / `hailo` | Pose、HSV、中心十字和安全区观测；模型类别为权威，HSV 只提取几何掩码 |
@@ -48,11 +49,27 @@ grab_transport = config.build_grab_transport_sequence()
 
 `match.grasp_task_timeout_ms`（默认20000 ms，有限正数）是选择物理目标后跨接近、
 停稳、规划、恢复与再抓取的总预算；状态和 tracker ID 变化不重置。
+补夹从开始扫描计时，整次补夹共享此预算，换候选也不续期；已提交抓取由执行阶段完成。
 `near_field_grasp.no_plan_wait_ms` 是无计划的短观察，`alignment_timeout_ms` 是稳定场景
 与异步准备的提交窗口，均受任务剩余预算约束。`confirmation_frames=1` 在第一张可靠
 静止帧中完成确认，无消费者锁组握手；`breakup_confirmation_frames` 单独约束恢复核心。
 正式恢复由同一准备器在抓取确实受阻时规划；带载补夹、单绿联调和CC保持各自限制。
 完整规则、机械可达性及时间语义见[正式流程设计](../../../docs/正式流程设计.md)。
+
+误夹开爪退出和释放区短解团在 `match` 节分别设置距离、速度上限：
+
+| 动作 | 距离（m） | 速度上限（m/s） |
+| --- | --- | --- |
+| 开爪后退 | `misgrasp_backup_distance_m` | `misgrasp_backup_speed_m_s` |
+| 闭爪前推 | `misgrasp_breakup_forward_distance_m` | `misgrasp_breakup_forward_speed_m_s` |
+| 闭爪退离 | `misgrasp_breakup_backward_distance_m` | `misgrasp_breakup_backward_speed_m_s` |
+
+正式 `runtime.match.yaml` 当前依次为 `0.25/1.5`、`0.35/1.5`、`0.08/1.5`。
+闭爪前推距离是上限，完整路径不安全时可选更短的有效接触行程；释放航向
+修正上限由 `misgrasp_breakup_max_heading_change_rad` 设置，正式配置为 30°。
+实际速度仍按剩余距离减速，并受车体速度、加减速度限制；三组速度不再读取
+`return_backup_speed_m_s` 或普通 `breakup_*_speed_m_s`。首轮单绿杂物误夹退出后
+搜索其他单绿，不执行释放区短解团。
 
 正式 `match` 的开场动作使用 `match.opening_actions`，每项为独立的 `turn` 或 `straight`：
 `turn.angle_rad` 左正右负，`straight.distance_m` 前正后负，速度均为正的幅值；可选
@@ -85,6 +102,9 @@ d1→d2、d2→末段三段；d1→d2 严格使用 `safe_zone_d1_to_d2_speed_m_s
 （远场和近场共用）、解团对准增益 `cluster_align_kp_rad_s=1.0` 均为原值两倍；
 角速度继续随角度误差递减，并分别受原有 `0.6`、`0.4 rad/s` 上限约束。
 近场前进的航向纠偏也复用抓取对准增益；此次调参的真机响应与过冲未验证。
+横向对准容差分别由 `green_alignment_tolerance_mm` 和
+`orange_alignment_tolerance_mm` 控制；橙色伤员现有正式配置与绿色容差相同，
+可独立调整。未配置橙色字段时使用与绿色相同的默认值。
 抓取接近的最后 50 mm 使用 `pickup_terminal_speed_gain_s_inv`（单位 `s^-1`）按
 `目标速度 = 增益 × 剩余距离` 收速；默认 `1.0` 保持原曲线，最低目标速度仍为
 `0.005 m/s`。该增益同时用于远场接近终点和近场编码器定距收拢，不影响安全区运输。
@@ -94,8 +114,10 @@ d1→d2、d2→末段三段；d1→d2 严格使用 `safe_zone_d1_to_d2_speed_m_s
 `safe_zone_bbox_edge_margin_px` 同时约束完整 bbox 四边和按画面位置选出的对侧两点；
 第三点允许缺失，完整框不可缺失。
 正式入口的 `localization.safe_zone_corners.max_observation_age_ms` 与 processing 对齐为 800 ms。
-`max_prior_position_innovation_mm=200.0` 和 `max_prior_heading_innovation_deg=25.0`
-是安全区绝对位姿相对里程计先验的硬门限；超限候选即使内部拟合残差很小也不提交。
+安全区角点定位的先验仅用于对称解排序，不以航位跳变幅度拒绝几何有效的视觉。
+删除 `localization.safe_zone_corners.max_prior_position_innovation_mm` 和
+`localization.safe_zone_corners.max_prior_heading_innovation_deg`，外部 YAML 需移除这两项；
+严格配置不兼容旧字段。中心十字自己的同名航向配置保留。
 两点和静态
 地标拟合 `FieldPose2D` 后覆盖当前航位。`safe_zone_d2_braking_overrun_*`
 和 `safe_zone_d2_to_final_braking_overrun_mm` 只补偿预计刹车过冲。绿/黑物资末段使用
@@ -196,20 +218,17 @@ bbox IoU 上限；
 `black_grasp_servo_offset_deg=5` 只在计划包含黑色物块时，把目标宽度对应的抓取开度及前进期间
 保持的左右绝对舵机命令各增加 5°；到达目标后的合爪及带载保持仍使用原机械标定值。
 
-`match.gate_clearance` 是独立的实验模块配置，当前 `enabled=false`；显式开启后只在 D1 两帧
-视觉校准成功后至 D2 前生效。
+`match.gate_clearance` 是门前路线配置。正式 `match`、`match_nb`、`match_cc` 和策略运行配置
+当前 `enabled=true`，示例模板保持 `false`。模块只在 D1 两帧视觉校准成功且 D2 直线尚未启动时生效。
 `front_edge_inset_mm` 将静态安全区前沿向场地中心移动，`front_depth_mm` 定义从该基准线继续
 向场地中心延伸的触发深度，`lateral_inset_mm` 同时内缩每个安全区的左右边界；三者共同定义
-门前触发条带，两个 inset 允许为 0，其余数值必须为正。
-`side_x_mm` / `sweep_y_mm` 定义 S1/S2；当前 `side_x_mm=500`，左右点分别比原位置向外
-移动 150 mm；当前 `sweep_y_mm=885`，相对原 `y=±1115 mm` 点位向场地中心内移 230 mm。
-`release_reverse_m` 同时定义暂存点向外偏移和放置后
-退出距离，`center_stop_radius_mm` 定义清障物释放时距场地原点的最大半径。`sweep_speed_m_s` 仅用于
-横扫，普通转场用 `transit_speed_m_s`；`attempt_timeout_s` 是从首次触发起连续计算的整次
-清障截止时间。`sweep_heading_tolerance_rad` 是横扫前及运行中的绝对航向门限，当前约为
-2°（0.035 rad），超限先
-刹车停稳再重对正；`sweep_cross_track_tolerance_mm` 限制轴心偏离 S1—S2 横线。所有数值
-必须有限，未知键拒绝加载。
+门前触发条带；两个 inset 允许为 0，其余数值必须为正。`lane_x_abs_mm`、`lane_y_abs_mm`
+定义红方路线的门前点，绿/黑使用负 x、橙色使用正 x；蓝方按场地原点中心对称。横移的
+前进、倒退距离由 `lateral_forward_distance_m` / `lateral_reverse_distance_m` 定义，D2 推入
+距离由 `d2_push_distance_m` 定义，前三段转场速度使用 `transit_speed_m_s`。横移结束后交给
+正式 D2 投递状态机完成张爪、转向、闭爪和定距推入；推入复用正式安全区末段速度，完成后
+沿用正常倒车参数退出。`attempt_timeout_s` 从首次触发起连续计算，限制至 600 mm 倒车结束并
+移交正式 D2 投递。所有数值必须有限，未知键拒绝加载。
 
 ## 夹爪内颜色门禁配置
 
