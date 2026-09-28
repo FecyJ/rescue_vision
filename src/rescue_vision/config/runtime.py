@@ -307,10 +307,6 @@ def _perception_defaults() -> dict[str, Any]:
         "gripper_color": {
             "enabled": True,
             "polygon_normalized": [[0.47, 0.85], [0.53, 0.85], [0.57, 0.97], [0.43, 0.97]],
-            "line_forward_offset_mm": 100.0,
-            "line_width_fraction": 0.5,
-            "line_contact_hold_ms": 800.0,
-            "line_regrasp_cooldown_ms": 1000.0,
             "min_component_fraction": 0.03,
             "black_min_thickness_fraction": 0.12,
             "shadow_min_value": 30,
@@ -4406,10 +4402,8 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     )
     gripper_color_raw = _mapping(perception_raw["gripper_color"], "perception.gripper_color")
     _reject_unknown(gripper_color_raw, {
-        "enabled", "polygon_normalized", "line_forward_offset_mm",
-        "line_width_fraction",
-        "line_contact_hold_ms",
-        "line_regrasp_cooldown_ms", "min_component_fraction",
+        "enabled", "polygon_normalized",
+        "min_component_fraction",
         "black_min_thickness_fraction", "shadow_min_value",
         "orange_bbox_min_color_fraction",
         "orange_distinct_max_bbox_iou", "orange_distinct_min_k0_distance_px",
@@ -4421,26 +4415,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         enabled=gripper_color_raw["enabled"],
         shadow_min_value=gripper_color_raw["shadow_min_value"],
         polygon_normalized=tuple(tuple(point) for point in polygon),
-        line_forward_offset_mm=_finite_float(
-            gripper_color_raw["line_forward_offset_mm"],
-            "perception.gripper_color.line_forward_offset_mm",
-            minimum=0.0,
-        ),
-        line_width_fraction=_finite_float(
-            gripper_color_raw["line_width_fraction"],
-            "perception.gripper_color.line_width_fraction",
-            minimum=0.000001,
-        ),
-        line_contact_hold_ms=_finite_float(
-            gripper_color_raw["line_contact_hold_ms"],
-            "perception.gripper_color.line_contact_hold_ms",
-            minimum=0.0,
-        ),
-        line_regrasp_cooldown_ms=_finite_float(
-            gripper_color_raw["line_regrasp_cooldown_ms"],
-            "perception.gripper_color.line_regrasp_cooldown_ms",
-            minimum=1000.0,
-        ),
         min_component_fraction=_finite_float(gripper_color_raw["min_component_fraction"], "perception.gripper_color.min_component_fraction", minimum=0.000001),
         black_min_thickness_fraction=_finite_float(gripper_color_raw["black_min_thickness_fraction"], "perception.gripper_color.black_min_thickness_fraction", minimum=0.000001),
         orange_bbox_min_color_fraction=_finite_float(

@@ -306,25 +306,6 @@ class RelativeActionController:
         self._last_linear_command_m_s = 0.0
         self._last_angular_command_rad_s = 0.0
 
-    def exclude_pause(self, duration_ns: int) -> None:
-        """Exclude a caller-owned pause while preserving measured progress.
-
-        The action's encoder/heading origin is intentionally unchanged.  This
-        is for bounded interruptions such as a gripper regrasp whose chassis
-        displacement still belongs to the active straight leg, while the
-        mechanical open/close wait must not consume the action timeout.
-        """
-
-        if (
-            isinstance(duration_ns, bool)
-            or not isinstance(duration_ns, int)
-            or duration_ns < 0
-        ):
-            raise ValueError("duration_ns must be a non-negative integer.")
-        if self._started_ns is None:
-            raise RuntimeError("begin() must be called before exclude_pause().")
-        self._started_ns += duration_ns
-
     def update(self, feedback: RelativeActionFeedback) -> RelativeActionCommand:
         if not self.active:
             raise RuntimeError("begin() must be called before update().")

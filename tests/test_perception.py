@@ -13,7 +13,6 @@ from rescue_vision.camera.frame import CameraFrame
 from rescue_vision.evaluation.report import evaluate_records
 from rescue_vision.geometry.ground_projector import GroundProjector
 from rescue_vision.geometry.types import GroundPoint, UndistortedPixel
-from rescue_vision.perception.gripper_color import GripperColorObservation
 from rescue_vision.perception import (
     ClassProbabilities,
     ColorSegmentationStatus,
@@ -528,32 +527,6 @@ def test_perception_visualization_isolated_and_marks_stale_results() -> None:
     assert preview.shape == image.shape
     assert not np.array_equal(preview, image)
     assert not np.array_equal(stale_preview, image)
-
-
-def test_perception_visualization_always_draws_gripper_far_edge() -> None:
-    image = np.zeros((12, 16, 3), dtype=np.uint8)
-    gripper_color = GripperColorObservation(
-        polygon=(
-            UndistortedPixel(4.0, 5.0),
-            UndistortedPixel(11.0, 5.0),
-            UndistortedPixel(10.0, 8.0),
-            UndistortedPixel(5.0, 8.0),
-        ),
-        component_fractions=(),
-        present_classes=frozenset(),
-        horizontal_line_v=5.0,
-        horizontal_line_u_range=(6.0, 9.0),
-    )
-
-    preview = render_target_observations(
-        image,
-        (),
-        gripper_color=gripper_color,
-    )
-
-    assert np.all(np.all(preview[5, 6:10] == (255, 0, 255), axis=1))
-    assert not np.all(preview[5, 4] == (255, 0, 255))
-    assert not np.all(preview[5, 11] == (255, 0, 255))
 
 
 def test_perception_frame_renderer_keeps_latest_result_off_realtime_thread() -> None:

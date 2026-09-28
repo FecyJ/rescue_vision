@@ -362,7 +362,6 @@ class TargetPoseDetector:
         )
         gripper_color = observe_gripper_colors(
             undistorted_image_bgr, self._gripper_color, self._color_classifier,
-            ground_projector=self._ground_projector,
         )
         completed_timestamp_ns = (
             self._clock_ns() if result_timestamp_ns is None else result_timestamp_ns

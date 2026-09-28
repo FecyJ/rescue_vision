@@ -7,8 +7,7 @@ import math
 import cv2
 import numpy as np
 
-from rescue_vision.geometry.ground_projector import GroundProjector
-from rescue_vision.geometry.types import GroundPoint, UndistortedPixel
+from rescue_vision.geometry.types import UndistortedPixel
 from rescue_vision.perception.color_segmentation import _class_mask
 from rescue_vision.perception.types import (
     COLOR_TARGET_CLASSES,
@@ -25,15 +24,6 @@ class GripperColorConfig:
     polygon_normalized: tuple[tuple[float, float], ...] = (
         (0.47, 0.85), (0.53, 0.85), (0.57, 0.97), (0.43, 0.97),
     )
-    # 暂定把判定线放在 ROI 最远边前方 100 mm；真实位置需现场校准。
-    line_forward_offset_mm: float = 100.0
-    # 水平判定线占 ROI 外接矩形宽度的比例；以图像中心对称收缩。
-    line_width_fraction: float = 0.5
-    # 同一组跨线类别按采集时间持续达到该时长后，任务层才允许触发重夹。
-    line_contact_hold_ms: float = 800.0
-    # 重夹结束后屏蔽同一跨线证据的时间，单位 ms；
-    # 机械动作和延迟帧不得连续启动重夹，因此最少为 1000 ms。
-    line_regrasp_cooldown_ms: float = 1000.0
     min_component_fraction: float = 0.03
     black_min_thickness_fraction: float = 0.12
     shadow_min_value: int = 30
@@ -48,46 +38,6 @@ class GripperColorConfig:
             raise ValueError(f"gripper_color.shadow_min_value must be an integer in [1,255], got {self.shadow_min_value!r}")
         if not isinstance(self.enabled, bool):
             raise ValueError(f"gripper_color.enabled must be boolean, got {self.enabled!r}")
-        if (
-            isinstance(self.line_forward_offset_mm, bool)
-            or not isinstance(self.line_forward_offset_mm, (int, float))
-            or not math.isfinite(self.line_forward_offset_mm)
-            or self.line_forward_offset_mm < 0.0
-        ):
-            raise ValueError(
-                "gripper_color.line_forward_offset_mm must be finite and non-negative, "
-                f"got {self.line_forward_offset_mm!r}"
-            )
-        if (
-            isinstance(self.line_contact_hold_ms, bool)
-            or not isinstance(self.line_contact_hold_ms, (int, float))
-            or not math.isfinite(self.line_contact_hold_ms)
-            or self.line_contact_hold_ms < 0.0
-        ):
-            raise ValueError(
-                "gripper_color.line_contact_hold_ms must be finite and "
-                f"non-negative, got {self.line_contact_hold_ms!r}"
-            )
-        if (
-            isinstance(self.line_width_fraction, bool)
-            or not isinstance(self.line_width_fraction, (int, float))
-            or not math.isfinite(self.line_width_fraction)
-            or not 0.0 < self.line_width_fraction <= 1.0
-        ):
-            raise ValueError(
-                "gripper_color.line_width_fraction must be finite in (0,1], "
-                f"got {self.line_width_fraction!r}"
-            )
-        if (
-            isinstance(self.line_regrasp_cooldown_ms, bool)
-            or not isinstance(self.line_regrasp_cooldown_ms, (int, float))
-            or not math.isfinite(self.line_regrasp_cooldown_ms)
-            or self.line_regrasp_cooldown_ms < 1000.0
-        ):
-            raise ValueError(
-                "gripper_color.line_regrasp_cooldown_ms must be finite and "
-                f"at least 1000 ms, got {self.line_regrasp_cooldown_ms!r}"
-            )
         points = self.polygon_normalized
         if len(points) < 3 or any(
             len(p) != 2 or any(isinstance(v, bool) or not isinstance(v, (int, float))
@@ -161,13 +111,6 @@ class GripperColorObservation:
     black_raw_fraction: float = 0.0
     black_chromatic_fraction: float = 0.0
     components: tuple[GripperColorComponent, ...] = ()
-    # The provisional regrasp line starts at the far edge of the ROI bounding
-    # rectangle and may be shifted forward by the configured ground distance.
-    # A class is present here only when one connected color component has
-    # pixels on both sides of that line.
-    horizontal_line_v: float | None = None
-    horizontal_line_u_range: tuple[float, float] | None = None
-    line_crossing_classes: frozenset[TargetClass] = frozenset()
 
 
 def bounding_box_overlaps_gripper_polygon(
@@ -218,8 +161,6 @@ def observe_gripper_colors(
     image_bgr: np.ndarray,
     config: GripperColorConfig,
     colors: HsvColorClassifierConfig,
-    *,
-    ground_projector: GroundProjector | None = None,
 ) -> GripperColorObservation | None:
     if not config.enabled:
         return None
@@ -297,63 +238,6 @@ def observe_gripper_colors(
             ),
         ))
 
-    # The normal color evidence is deliberately clipped to the polygon.  The
-    # provisional regrasp line needs a little image on the far side of the
-    # polygon, so inspect the full-width bounding rectangle and an equally
-    # deep band in front of it.  ``y`` is the rectangle's far/top edge in the
-    # image; the configured ground offset moves the temporary line forward.
-    line_v = float(y)
-    if config.line_forward_offset_mm > 0.0 and ground_projector is not None:
-        center_pixel = UndistortedPixel(x + (w - 1) / 2.0, float(y))
-        try:
-            center_ground = ground_projector.pixel_to_ground(center_pixel)
-            shifted_pixel = ground_projector.ground_to_pixel(
-                GroundPoint(
-                    center_ground.x + config.line_forward_offset_mm,
-                    center_ground.y,
-                )
-            )
-        except (TypeError, ValueError):
-            # Calibration-only callers may intentionally omit a projector.
-            # The match pipeline supplies one before enabling physical motion.
-            pass
-        else:
-            if np.isfinite(shifted_pixel.v):
-                line_v = float(shifted_pixel.v)
-    line_center = round(line_v)
-    line_band_y_min = max(0, line_center - h)
-    line_band_y_max = min(height, line_center + h + 1)
-    line_width = max(1, min(w, round(w * config.line_width_fraction)))
-    line_x_min = x + (w - line_width) // 2
-    line_x_max = line_x_min + line_width
-    line_band = image_bgr[
-        line_band_y_min:line_band_y_max,
-        line_x_min:line_x_max,
-    ]
-    line_hsv = cv2.cvtColor(line_band, cv2.COLOR_BGR2HSV)
-    line_crossing_classes: set[TargetClass] = set()
-    for target_class in (TargetClass.GREEN_SUPPLY, TargetClass.ORANGE_INJURED):
-        mask = _class_mask(
-            line_hsv,
-            target_class,
-            colors,
-            shadow_min_value=config.shadow_min_value,
-        )
-        _, labels, stats, _ = cv2.connectedComponentsWithStats(
-            mask,
-            connectivity=8,
-        )
-        for label in range(1, len(stats)):
-            component_area = int(stats[label, cv2.CC_STAT_AREA])
-            component_top = line_band_y_min + int(stats[label, cv2.CC_STAT_TOP])
-            component_bottom = component_top + int(stats[label, cv2.CC_STAT_HEIGHT]) - 1
-            if (
-                component_area >= area * config.min_component_fraction
-                and component_top < line_v < component_bottom
-            ):
-                line_crossing_classes.add(target_class)
-                break
-
     return GripperColorObservation(
         polygon=polygon,
         component_fractions=tuple(fractions),
@@ -361,7 +245,4 @@ def observe_gripper_colors(
         black_raw_fraction=black_raw_fraction,
         black_chromatic_fraction=black_chromatic_fraction,
         components=tuple(components),
-        horizontal_line_v=line_v,
-        horizontal_line_u_range=(float(line_x_min), float(line_x_max - 1)),
-        line_crossing_classes=frozenset(line_crossing_classes),
     )

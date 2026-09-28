@@ -34,7 +34,6 @@ _TARGET_COLORS: dict[TargetClass, tuple[int, int, int]] = {
 }
 _K0_COLOR = (0, 0, 255)
 _STALE_COLOR = (0, 0, 255)
-_GRIPPER_LINE_COLOR = (255, 0, 255)
 
 # 推理旁路 worker 的耗时诊断打印间隔；只用于定位感知链路瓶颈。
 _TIMING_REPORT_INTERVAL_NS = 2_000_000_000
@@ -170,53 +169,14 @@ def _draw_observation_mask(
     ).astype(np.uint8)
 
 
-def _draw_gripper_far_edge(
-    image_bgr: np.ndarray,
-    gripper_color: GripperColorObservation | None,
-) -> None:
-    """持续显示夹爪 ROI 的临时最远边水平线。"""
-
-    if gripper_color is None or gripper_color.horizontal_line_v is None:
-        return
-    if len(gripper_color.polygon) < 3:
-        return
-    line_v = float(gripper_color.horizontal_line_v)
-    if not np.isfinite(line_v):
-        return
-
-    if gripper_color.horizontal_line_u_range is None:
-        contour = np.rint(
-            [(point.u, point.v) for point in gripper_color.polygon]
-        ).astype(np.int32)
-        x, _, width, _ = cv2.boundingRect(contour)
-        x_min = max(0, x)
-        x_max = min(image_bgr.shape[1] - 1, x + width - 1)
-    else:
-        line_u_min, line_u_max = gripper_color.horizontal_line_u_range
-        x_min = max(0, round(line_u_min))
-        x_max = min(image_bgr.shape[1] - 1, round(line_u_max))
-    y = max(0, min(image_bgr.shape[0] - 1, round(line_v)))
-    if x_max <= x_min:
-        return
-    cv2.line(
-        image_bgr,
-        (x_min, y),
-        (x_max, y),
-        _GRIPPER_LINE_COLOR,
-        3,
-        cv2.LINE_AA,
-    )
-
-
 def render_target_observations(
     image_bgr: np.ndarray,
     observations: Sequence[TargetObservation],
     *,
     dropped_stale_age_ms: float | None = None,
     field_features: FieldFeatureDetectionResult | None = None,
-    gripper_color: GripperColorObservation | None = None,
 ) -> np.ndarray:
-    """在图像副本上叠加检测框、颜色掩码、K0、夹爪水平线和质量信息。
+    """在图像副本上叠加检测框、颜色掩码、K0 和质量信息。
 
     输入图像必须是 BGR、``uint8`` 且形状为 ``(height, width, 3)``。输出始终
     是独立的可写副本；输入图像和观测中的只读掩码不会被修改。观测使用
@@ -283,8 +243,6 @@ def render_target_observations(
             (max(0, start[0]), max(20, start[1] - 8)),
             color,
         )
-
-    _draw_gripper_far_edge(preview, gripper_color)
 
     if field_features is not None:
         if field_features.image_size != image_size:
@@ -687,7 +645,6 @@ class PerceptionFrameRenderer:
                             snapshot.observations,
                             dropped_stale_age_ms=snapshot.dropped_stale_age_ms,
                             field_features=snapshot.field_features,
-                            gripper_color=snapshot.gripper_color,
                         ),
                         metadata={
                             "perception_stale_dropped": snapshot.dropped_stale_age_ms
