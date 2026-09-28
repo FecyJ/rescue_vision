@@ -324,8 +324,6 @@ localization:
   # 关闭时不受影响。
   safe_zone_corners:
     max_observation_age_ms: 800.0
-    max_prior_position_innovation_mm: 200.0
-    max_prior_heading_innovation_deg: 25.0
   fusion:
     enabled: false
     initial_pose:

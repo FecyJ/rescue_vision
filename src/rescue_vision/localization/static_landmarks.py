@@ -380,8 +380,6 @@ class SafeZoneCornerLocalizerConfig:
     max_fit_residual_mm: float = 80.0
     position_uncertainty_floor_mm: float = 30.0
     heading_uncertainty_floor_deg: float = 3.0
-    max_prior_position_innovation_mm: float = 200.0
-    max_prior_heading_innovation_deg: float = 25.0
 
     def __post_init__(self) -> None:
         for name in (
@@ -391,8 +389,6 @@ class SafeZoneCornerLocalizerConfig:
             "max_fit_residual_mm",
             "position_uncertainty_floor_mm",
             "heading_uncertainty_floor_deg",
-            "max_prior_position_innovation_mm",
-            "max_prior_heading_innovation_deg",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
@@ -464,7 +460,6 @@ class SafeZoneCornerRejectionReason(str, Enum):
     FIT_RESIDUAL_TOO_LARGE = "fit_residual_too_large"
     NO_POSE_CANDIDATE = "no_pose_candidate"
     AMBIGUOUS_POSE_CANDIDATE = "ambiguous_pose_candidate"
-    PRIOR_INNOVATION_TOO_LARGE = "prior_innovation_too_large"
 
 
 @dataclass(frozen=True, slots=True)
@@ -835,23 +830,8 @@ class SafeZoneCornerLocalizer:
                 SafeZoneCornerRejectionReason.AMBIGUOUS_POSE_CANDIDATE
             )
         best = ranked[0][1]
-        position_innovation_mm = math.hypot(
-            best.pose.position.x - prior_pose.position.x,
-            best.pose.position.y - prior_pose.position.y,
-        )
-        heading_innovation = angular_distance(
-            best.pose.heading_rad,
-            prior_pose.heading_rad,
-        )
-        if (
-            position_innovation_mm
-            > self.config.max_prior_position_innovation_mm
-            or heading_innovation
-            > math.radians(self.config.max_prior_heading_innovation_deg)
-        ):
-            return _rejected(
-                SafeZoneCornerRejectionReason.PRIOR_INNOVATION_TOO_LARGE
-            )
+        # 航位只用于对称候选消歧；可靠地标可以纠正累积漂移，
+        # 不能因与待纠正的先验差距大而拒绝几何有效的视觉解。
         return SafeZoneCornerLocalization(observation=best)
 
 

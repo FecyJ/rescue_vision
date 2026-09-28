@@ -598,8 +598,6 @@ localization:
     position_uncertainty_floor_mm: 30.0
     heading_uncertainty_floor_deg: 3.0
     # 相对里程计先验的最大允许跳变；超限不提交绝对位姿。
-    max_prior_position_innovation_mm: 200.0
-    max_prior_heading_innovation_deg: 25.0
   fusion:
     # 真实轮径、计数、轮距、零偏和噪声未标定前保持关闭。
     enabled: false

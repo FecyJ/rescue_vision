@@ -429,8 +429,8 @@ def test_safe_zone_image_order_hypotheses_use_prior() -> None:
     assert observation.pose.position.y == pytest.approx(pose.position.y, abs=1e-6)
 
 
-def test_safe_zone_rejects_large_jump_even_when_geometry_fits() -> None:
-    """A small internal residual must not authorize a large absolute-pose jump."""
+def test_safe_zone_corrects_drift_when_geometry_fits() -> None:
+    """Valid absolute geometry corrects drift; the prior only disambiguates."""
 
     observed_pose = FieldPose2D(FieldPoint(170.0, -42.0), math.radians(73.0))
     prior_pose = FieldPose2D(FieldPoint(170.0, 411.0), math.radians(69.5))
@@ -448,11 +448,11 @@ def test_safe_zone_rejects_large_jump_even_when_geometry_fits() -> None:
         prior_pose=prior_pose,
     )
 
-    assert localization.observation is None
-    assert (
-        localization.rejection
-        is SafeZoneCornerRejectionReason.PRIOR_INNOVATION_TOO_LARGE
-    )
+    assert localization.observation is not None
+    actual = localization.observation.pose
+    assert actual.position.x == pytest.approx(observed_pose.position.x)
+    assert actual.position.y == pytest.approx(observed_pose.position.y)
+    assert actual.heading_rad == pytest.approx(observed_pose.heading_rad)
 
 
 def test_tracker_hint_carries_prior_uncertainties() -> None:

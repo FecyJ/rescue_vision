@@ -379,8 +379,6 @@ localization:
   # 与感知快照年龄门一致，静止采集仍由编码器/IMU验证。
   safe_zone_corners:
     max_observation_age_ms: 800.0
-    max_prior_position_innovation_mm: 200.0
-    max_prior_heading_innovation_deg: 25.0
   enabled: false
   fusion:
     enabled: false

@@ -440,8 +440,6 @@ def _localization_defaults() -> dict[str, Any]:
             "max_fit_residual_mm": 80.0,
             "position_uncertainty_floor_mm": 30.0,
             "heading_uncertainty_floor_deg": 3.0,
-            "max_prior_position_innovation_mm": 200.0,
-            "max_prior_heading_innovation_deg": 25.0,
         },
         "fusion": {
             "enabled": False,
@@ -4626,8 +4624,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         "max_fit_residual_mm",
         "position_uncertainty_floor_mm",
         "heading_uncertainty_floor_deg",
-        "max_prior_position_innovation_mm",
-        "max_prior_heading_innovation_deg",
     }
     _reject_unknown(
         safe_zone_corners_raw,
@@ -4663,16 +4659,6 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         heading_uncertainty_floor_deg=_finite_float(
             safe_zone_corners_raw["heading_uncertainty_floor_deg"],
             "localization.safe_zone_corners.heading_uncertainty_floor_deg",
-            minimum=0.001,
-        ),
-        max_prior_position_innovation_mm=_finite_float(
-            safe_zone_corners_raw["max_prior_position_innovation_mm"],
-            "localization.safe_zone_corners.max_prior_position_innovation_mm",
-            minimum=0.001,
-        ),
-        max_prior_heading_innovation_deg=_finite_float(
-            safe_zone_corners_raw["max_prior_heading_innovation_deg"],
-            "localization.safe_zone_corners.max_prior_heading_innovation_deg",
             minimum=0.001,
         ),
     )
