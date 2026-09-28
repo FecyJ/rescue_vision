@@ -100,5 +100,5 @@
 - 一个 commit 只包含一个明确目的；实现、对应测试及必要文档应在同一 commit 中，不得混入无关重构、格式化或其他任务。
 - 只暂存本任务文件；提交前检查 `git status --short`、本任务 diff 和 staged diff，不夹带用户或其他任务修改。
 - commit message 使用英文 Conventional Commits 格式：`<type>(<scope>): <imperative summary>`。常用 type 包括 `feat`、`fix`、`refactor`、`test`、`docs`、`chore`、`perf`、`build` 和 `ci`；scope 可省略。summary 必须具体说明该提交做了什么，使用祈使语现在时，禁止 `update files`、`fix bug`、`changes` 等含糊描述。
-- 验证失败时不得提交；必须在交付说明中记录失败项和未提交原因。除非用户明确要求不提交，不得在任务完成后留下本任务的未提交改动。
+- 本任务相关验证失败时不得提交；与本任务修改无关的既有测试失败不阻止提交，但必须在交付说明中记录失败项及判定无关的依据。除非用户明确要求不提交，不得在任务完成后留下本任务的未提交改动。
 - 未经用户明确授权，不执行 push、amend、rebase、reset、强制更新历史、删除分支或破坏性文件清理。
