@@ -1358,3 +1358,29 @@ def test_strategy_safe_zone_corner_gate_is_not_tighter_than_pipeline() -> None:
 
     assert corners.max_observation_age_ms <= config.processing.max_observation_age_ms
     assert corners.max_observation_age_ms >= 500.0
+
+
+def test_match_capture_defaults_and_relative_output(tmp_path):
+    path = tmp_path / 'runtime.yaml'
+    base = config_text(intrinsics_enabled=False, ground_mapping_enabled=False)
+    path.write_text(base)
+    assert load_runtime_config(path).match_capture.frequency_hz == 1.0
+    path.write_text(base + '\nmatch_capture:\n  output_dir: ../captures\n  frequency_hz: 2.5\n  max_linear_speed_m_s: 0\n')
+    config = load_runtime_config(path).match_capture
+    assert config.output_dir == (tmp_path / '../captures').resolve()
+    assert config.frequency_hz == 2.5
+    assert config.max_linear_speed_m_s == 0
+
+
+@pytest.mark.parametrize('value', [
+    'frequency_hz: 0', 'frequency_hz: true', 'frequency_hz: .nan',
+    'frequency_hz: .inf', 'enabled: true', 'max_linear_speed_m_s: -0.1',
+    'max_angular_speed_rad_s: -0.1', 'max_telemetry_gap_ms: 0',
+    'output_dir: 42', 'unknown_field: true',
+])
+def test_match_capture_rejects_invalid_yaml(tmp_path, value):
+    path = tmp_path / 'runtime.yaml'
+    path.write_text(config_text(intrinsics_enabled=False, ground_mapping_enabled=False)
+                    + f'\nmatch_capture:\n  {value}\n')
+    with pytest.raises(ValueError, match='match_capture'):
+        load_runtime_config(path)

@@ -485,3 +485,11 @@ near_field_grasp:
   distance_weight: 0.12
   # 选组评分中对准转角的权重；所需转角越小得分越高。
   alignment_weight: 0.08
+
+# --capture-dataset 启用训练集采集旁路；预标注须人工复核，说明见 docs/数据采集工具使用.md。
+match_capture:
+  output_dir: null  # 默认当前工作目录 data/YYYYmmdd_HHMMSS_ffffff；指定路径相对本 YAML
+  frequency_hz: 1.0
+  max_linear_speed_m_s: 0.50
+  max_angular_speed_rad_s: 0.50
+  max_telemetry_gap_ms: 200.0

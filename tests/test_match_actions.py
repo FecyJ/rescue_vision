@@ -425,8 +425,9 @@ def test_no_isolated_green_keeps_attempt_budget_and_loops_to_search() -> None:
     "failure_phase",
     [None, "uart_open", "uart_synchronize", "uart_write_timeout"],
 )
+@pytest.mark.parametrize("capture_enabled", [False, True])
 def test_hardware_entry_reaches_control_without_building_fusion(
-    monkeypatch, tmp_path, failure_phase,
+    monkeypatch, tmp_path, failure_phase, capture_enabled,
 ) -> None:
     from pathlib import Path
     from types import SimpleNamespace
@@ -439,6 +440,13 @@ def test_hardware_entry_reaches_control_without_building_fusion(
     import sys
 
     config = load_runtime_config("configs/runtime.match.yaml")
+    from rescue_vision.data import match_capture
+    import rescue_vision.config as config_module
+    monkeypatch.setattr(config_module, "load_runtime_config", lambda path: config)
+    capture = MagicMock()
+    capture.worker_error = "injected disk failure"
+    capture_factory = MagicMock(return_value=capture)
+    monkeypatch.setattr(match_capture, "MatchDatasetCapture", capture_factory)
     channel = MagicMock()
     controller = MagicMock()
     controller.motion_synchronized = True
@@ -484,6 +492,7 @@ def test_hardware_entry_reaches_control_without_building_fusion(
     renderer.latest_snapshot.return_value = snapshot(1, 10)
     renderer.latest_fresh_snapshot.return_value = snapshot(1, 10)
     renderer.latest.return_value = None
+    renderer.latest_detection_sample.return_value = (object(), object())
     monkeypatch.setattr(perception_module, "PerceptionFrameRenderer", lambda factory, **kwargs: renderer)
     def release_start_gate(**kwargs):
         kwargs["service"]()
@@ -527,7 +536,7 @@ def test_hardware_entry_reaches_control_without_building_fusion(
             controller.update.side_effect = update
             match_runtime._run_hardware(
                 Path("configs/runtime.match.yaml"),
-                supervised_stop_ready=True, log_dir=None,
+                supervised_stop_ready=True, log_dir=None, capture_dataset=capture_enabled,
             )
             assert channel.start.call_count == 2
             assert channel.stop.call_count == 2
@@ -536,7 +545,7 @@ def test_hardware_entry_reaches_control_without_building_fusion(
         with pytest.raises(UartError) as raised:
             match_runtime._run_hardware(
                 Path("configs/runtime.match.yaml"),
-                supervised_stop_ready=True, log_dir=tmp_path,
+                supervised_stop_ready=True, log_dir=tmp_path, capture_dataset=capture_enabled,
             )
         assert raised.value is original_error
         text = next(tmp_path.glob("match_*.log")).read_text()
@@ -560,11 +569,19 @@ def test_hardware_entry_reaches_control_without_building_fusion(
         return
     match_runtime._run_hardware(
         Path("configs/runtime.match.yaml"),
-        supervised_stop_ready=True, log_dir=None,
+        supervised_stop_ready=True, log_dir=None, capture_dataset=capture_enabled,
     )
     fusion_factory.assert_not_called()
     start_gate.assert_called_once()
     assert len(received) == 1
+    if capture_enabled:
+        capture.start.assert_called_once()
+        capture.stop.assert_called_once()
+        assert capture.observe_motion.call_count >= 2
+        capture.submit.assert_called_once()
+    else:
+        capture_factory.assert_not_called()
+        renderer.latest_detection_sample.assert_not_called()
     assert received[0]["heading_rad"] == pytest.approx(-math.pi / 2 - 0.01)
     assert received[0]["cumulative_distance_m"] > 0
     camera.stop.assert_called_once()

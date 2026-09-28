@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 
 from rescue_vision.camera.frame import CameraFrame
-from rescue_vision.perception.detector import TargetPoseDetector
+from rescue_vision.perception.detector import RealtimeDetectionResult, TargetPoseDetector
 from rescue_vision.perception.gripper_color import GripperColorObservation
 from rescue_vision.perception.field_feature_types import FieldFeatureDetectionResult, SafeZoneColor
 from rescue_vision.perception.types import (
@@ -374,6 +374,7 @@ class PerceptionFrameRenderer:
         *,
         render_enabled: bool = True,
         report_timing: bool = True,
+        retain_detection_sample: bool = False,
     ) -> None:
         if not callable(detector_factory):
             raise TypeError("detector_factory must be callable.")
@@ -382,6 +383,10 @@ class PerceptionFrameRenderer:
             raise TypeError("render_enabled must be a boolean.")
         if not isinstance(report_timing, bool):
             raise TypeError("report_timing must be a boolean.")
+        if not isinstance(retain_detection_sample, bool):
+            raise TypeError("retain_detection_sample must be a boolean.")
+        self._retain_detection_sample = retain_detection_sample
+        self._latest_detection_sample: tuple[CameraFrame, RealtimeDetectionResult] | None = None
         self._render_enabled = render_enabled
         self._report_timing = report_timing
         self._condition = Event()
@@ -422,6 +427,7 @@ class PerceptionFrameRenderer:
             self._pending_render = None
             self._latest_frame = None
             self._latest_snapshot = None
+            self._latest_detection_sample = None
             self._worker_error = None
             self._detector = None
             self._render_ms_total = 0.0
@@ -502,6 +508,13 @@ class PerceptionFrameRenderer:
         with self._lock:
             return self._latest_snapshot
 
+    def latest_detection_sample(self) -> tuple[CameraFrame, RealtimeDetectionResult] | None:
+        """返回同帧未叠加图像和模型结果；仅启用保留时占用一帧内存。"""
+        self._require_started()
+        self._raise_worker_error()
+        with self._lock:
+            return self._latest_detection_sample
+
     def latest_fresh_snapshot(
         self,
         now_ns: int,
@@ -522,6 +535,7 @@ class PerceptionFrameRenderer:
         with self._lock:
             self._latest_frame = None
             self._latest_snapshot = None
+            self._latest_detection_sample = None
             self._pending_frame = None
             self._pending_render = None
 
@@ -607,6 +621,8 @@ class PerceptionFrameRenderer:
                     )
                     with self._lock:
                         self._latest_snapshot = snapshot
+                        if self._retain_detection_sample:
+                            self._latest_detection_sample = (frame, result)
                         self._processed_count += 1
                         self._stale_dropped_count += int(result.stale_dropped)
                         if self._render_enabled:

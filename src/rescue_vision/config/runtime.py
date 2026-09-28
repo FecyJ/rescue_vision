@@ -12,6 +12,7 @@ import yaml
 from rescue_vision.perception.gripper_color import GripperColorConfig
 from rescue_vision.config.near_field_grasp import NearFieldGraspConfig
 from rescue_vision.config.gate_clearance import GateClearanceConfig
+from rescue_vision.data.match_capture import MatchCaptureConfig
 from rescue_vision.config.match_cc import MatchCCRuntimeConfig, parse_match_cc_config
 
 from rescue_vision.communication.remote import RemoteAccessMode, RemoteRole
@@ -1814,6 +1815,7 @@ class AppConfig:
     green_grab: GreenGrabRuntimeConfig
     near_field_grasp: NearFieldGraspConfig = NearFieldGraspConfig()
     match_cc: MatchCCRuntimeConfig = MatchCCRuntimeConfig()
+    match_capture: MatchCaptureConfig = MatchCaptureConfig()
 
     def build_camera_model(self) -> CameraModel | None:
         """内参启用时加载并校验与运行分辨率一致的相机模型。"""
@@ -2017,6 +2019,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
             "motion",
             "match",
             "match_cc",
+            "match_capture",
             "near_field_grasp",
             "tracking",
             "world",
@@ -5085,6 +5088,13 @@ def load_runtime_config(path: str | Path) -> AppConfig:
     _reject_unknown(near_raw, {item.name for item in fields(NearFieldGraspConfig)}, "near_field_grasp")
     near_field_grasp = NearFieldGraspConfig(**near_raw)
 
+    capture_raw = dict(_mapping(root.get("match_capture", {}), "match_capture"))
+    _reject_unknown(capture_raw, {item.name for item in fields(MatchCaptureConfig)}, "match_capture")
+    capture_raw["output_dir"] = _path_or_none(
+        capture_raw.get("output_dir"), config_path.parent, "match_capture.output_dir"
+    )
+    match_capture = MatchCaptureConfig(**capture_raw)
+
     return AppConfig(
         camera,
         geometry,
@@ -5103,4 +5113,5 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         green_grab,
         near_field_grasp,
         match_cc,
+        match_capture,
     )

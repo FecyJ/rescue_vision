@@ -81,6 +81,7 @@ class RealtimeDetectionResult:
     timing: PerceptionTiming
     dropped_stale_age_ms: float | None = None
     gripper_color: GripperColorObservation | None = None
+    model_detections: tuple[ModelDetection, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -122,6 +123,7 @@ class PoseDetectionResult:
     field_features: FieldFeatureDetectionResult
     timing: PerceptionTiming
     gripper_color: GripperColorObservation | None = None
+    model_detections: tuple[ModelDetection, ...] = ()
 
     def __iter__(self):
         return iter(self.observations)
@@ -416,7 +418,9 @@ class TargetPoseDetector:
             )
             for item in processed
         )
-        return PoseDetectionResult(observations, field_features, timing, gripper_color)
+        return PoseDetectionResult(
+            observations, field_features, timing, gripper_color, tuple(candidate_detections)
+        )
 
     def _timing(
         self,
@@ -639,6 +643,7 @@ class TargetPoseDetector:
             field_features=detection_result.field_features,
             timing=detection_result.timing,
             gripper_color=detection_result.gripper_color,
+            model_detections=detection_result.model_detections,
         )
 
     def close(self) -> None:

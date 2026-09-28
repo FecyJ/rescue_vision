@@ -672,6 +672,10 @@ def main() -> None:
     parser.add_argument("--start-area", choices=("2", "3"), default="2")
     parser.add_argument("--supervised-physical-stop-ready", action="store_true")
     parser.add_argument("--local-preview", action="store_true")
+    parser.add_argument(
+        "--capture-dataset", action="store_true",
+        help="启用后台训练集采集；频率、输出目录和速度阈值读取 YAML match_capture。",
+    )
     parser.add_argument("--jpeg-quality", type=int, default=80)
     parser.add_argument("--observer-image-interval-seconds", type=float, default=1.0)
     parser.add_argument("--log-dir", type=Path, default=Path("logs"))
@@ -684,6 +688,7 @@ def main() -> None:
         args.config,
         supervised_stop_ready=args.supervised_physical_stop_ready,
         local_preview=args.local_preview,
+        capture_dataset=args.capture_dataset,
         jpeg_quality=args.jpeg_quality,
         observer_image_interval_s=args.observer_image_interval_seconds,
         log_dir=args.log_dir,

@@ -131,3 +131,12 @@ background, target_pose, contact_state
 缺失信息显式写为 `unknown`，不能省略或留空。同一录像、连拍或相同物理布置必须共享 `recording_id`；不要为了让样本“更随机”而按单帧改组。
 
 完整字段定义见 [`docs/数据集与评测.md`](../../../docs/数据集与评测.md)，现场采集、覆盖维度和排障见 [`docs/数据采集工具使用.md`](../../../docs/数据采集工具使用.md)。
+
+## match 模型预标注旁路
+
+`MatchDatasetCapture` 由 `app/match_runtime.py` 在传入 `--capture-dataset` 时创建，
+参数来自 `configs/runtime.match.yaml` 的 `match_capture` 节。控制线程调用 `observe_motion()` 保留最多 512 包遥测，
+调用 `submit(frame, result)` 非阻塞提交同帧引用；工作线程按采集单调时间 ns 对齐
+遥测、编码 JPEG 和写 JSON。`start()` / `stop()` 由运行时生命周期管理，错误通过
+`worker_error` 显式上报。此输出不属于上面的 recorder/manifest 格式，完整生产用法见
+[采集手册](../../../docs/数据采集工具使用.md#match-流程中的可选预标注采集)。

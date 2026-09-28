@@ -24,6 +24,14 @@
 迁移未修改它。跟踪和任务流程直接消费 `TargetObservation.ground_point`，其
 语义现为目标接触底面的几何中心。
 
+`PoseDetectionResult` 和 `RealtimeDetectionResult.model_detections` 保留通过模型框阈值的
+六类 `ModelDetection`，像素来自全尺寸去畸变图，不含 HSV/地面几何回退；过期丢弃结果为空。
+正式入口使用 `configs/runtime.match.yaml` 并传入 `--capture-dataset` 后，运行装配会设置
+`PerceptionFrameRenderer(retain_detection_sample=True)`，由 `latest_detection_sample()`
+原子读取 `(CameraFrame, RealtimeDetectionResult)`。此接口不依赖预览开关；图像只读，
+时间为采集单调 ns，且与结果帧号匹配。默认不保留额外图像；仍由相机泵管理
+renderer 的 `start()` / `stop()`。采集生产用法见[采集手册](../../../docs/数据采集工具使用.md#match-流程中的可选预标注采集)。
+
 ## 独立夹爪宽度估计
 
 `estimate_gripper_width()` 只消费已有的 `TargetObservation` 和同一

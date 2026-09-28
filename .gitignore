@@ -17,7 +17,7 @@ configs/runtime.yaml
 
 docs/reviews
 
-data/
+/data/
 
 dsh-anchored-standard/
 .zcode/

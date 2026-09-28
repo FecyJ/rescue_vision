@@ -417,6 +417,7 @@ def _run_hardware(
     *,
     supervised_stop_ready: bool,
     local_preview: bool = False,
+    capture_dataset: bool = False,
     jpeg_quality: int = 80,
     observer_image_interval_s: float = 1.0,
     log_dir: Path | None = Path("logs"),
@@ -452,6 +453,8 @@ def _run_hardware(
     near_field_selector = None
     preview = None
     d2_telemetry_logger = None
+    dataset_capture = None
+    capture_error_reported = None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     stop_requested = False
     runtime_phase = "assembly"
@@ -656,11 +659,24 @@ def _run_hardware(
                 "Match visual calibration requires a ground mapping "
                 "with full physical camera extrinsics."
             )
+        if capture_dataset:
+            from rescue_vision.data.match_capture import MatchDatasetCapture
+
+            dataset_capture = MatchDatasetCapture(
+                config.match_capture, odometry_calibration,
+                keypoint_threshold=config.perception.k0_threshold,
+            )
+            dataset_capture.start()
+            print(
+                f"match_capture_output={dataset_capture.output_dir} "
+                f"frequency_hz={config.match_capture.frequency_hz:g}", flush=True,
+            )
         renderer = PerceptionFrameRenderer(
             lambda: config.build_target_pose_detector(
                 ground_projector=pipeline.ground_projector
             ),
             render_enabled=local_preview or config.remote.enabled,
+            retain_detection_sample=dataset_capture is not None,
         )
         camera_pump = CameraPerceptionPump(pipeline.source, pipeline.prepare, renderer)
         if local_preview:
@@ -805,6 +821,8 @@ def _run_hardware(
             nonlocal latest_status, previous_odometry
             nonlocal latest_speed_feedback, gyro_heading_rad
             if isinstance(message, OdometryImu):
+                if dataset_capture is not None:
+                    dataset_capture.observe_motion(message)
                 if d2_telemetry_logger is not None:
                     d2_telemetry_logger.record_odometry(
                         message,
@@ -1213,6 +1231,17 @@ def _run_hardware(
                     except Exception as exc:
                         branch_error = branch_error or f"perception_renderer:{exc}"
                     latest_snapshot = fresh_snapshot
+                    if dataset_capture is not None:
+                        try:
+                            sample = renderer.latest_detection_sample()
+                            if sample is not None:
+                                dataset_capture.submit(*sample)
+                        except Exception as exc:
+                            dataset_capture.worker_error = repr(exc)
+                        if (dataset_capture.worker_error is not None
+                                and dataset_capture.worker_error != capture_error_reported):
+                            capture_error_reported = dataset_capture.worker_error
+                            print(f"match_capture_error={capture_error_reported}", flush=True)
                     rendered = renderer.latest()
                     if rendered is not None:
                         recent_rendered_frames[rendered.timestamp_ns] = rendered
@@ -1646,5 +1675,13 @@ def _run_hardware(
                 add_exception_note(error, f"exception logging failed: {log_error!r}")
         raise
     finally:
+        if dataset_capture is not None:
+            dataset_capture.stop()
+            print(
+                f"match_capture_written={dataset_capture.written} "
+                f"dropped={dataset_capture.dropped} "
+                f"motion_skipped={dataset_capture.motion_skipped} "
+                f"error={dataset_capture.worker_error}", flush=True,
+            )
         signal.signal(signal.SIGTERM, previous_sigterm)
         _end_time_named_log(log_stream, original_stdout, original_stderr)

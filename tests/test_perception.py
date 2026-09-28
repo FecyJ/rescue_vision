@@ -800,3 +800,36 @@ def test_detection_set_metrics_tolerate_empty_frame() -> None:
         "max_box_kpx": 0.0,
         "field_area_kpx": 0.0,
     }
+
+
+@pytest.mark.parametrize('retain', [False, True])
+def test_renderer_retains_same_unpainted_frame_and_model_pose_without_preview(retain):
+    image = image_with_regions()
+    source = CameraFrame(7, time.monotonic_ns() - 1_000_000, image)
+    raw = detection(k0_confidence=0.1)
+    renderer = PerceptionFrameRenderer(
+        lambda: detector([[raw]]), render_enabled=False, report_timing=False,
+        retain_detection_sample=retain,
+    )
+    renderer.start()
+    try:
+        renderer.submit(source)
+        deadline = time.monotonic() + 1.0
+        while renderer.latest_snapshot() is None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert renderer.latest_snapshot() is not None
+        assert renderer.latest() is None
+        pair = renderer.latest_detection_sample()
+        if retain:
+            assert pair is not None
+            assert pair[0] is source
+            assert pair[1].frame_sequence == source.sequence
+            assert pair[1].model_detections == (raw,)
+            # Low-confidence model K0 remains raw, independent of geometry fallback.
+            assert pair[1].model_detections[0].keypoints[0].confidence == 0.1
+        else:
+            assert pair is None
+        renderer.clear_latest()
+        assert renderer.latest_detection_sample() is None
+    finally:
+        renderer.stop()
