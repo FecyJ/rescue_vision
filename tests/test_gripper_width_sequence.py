@@ -542,7 +542,7 @@ def test_required_handoff_reports_disappearance_instead_of_switching_plan():
     )
 
     assert missing.selection.plan is None
-    assert missing.selection.rejections == ("locked_member_class_changed",)
+    assert missing.selection.rejections == ("locked_member_not_selectable",)
 
 
 def test_preparation_session_uses_current_servo_reach_without_alignment_plan():

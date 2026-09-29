@@ -666,3 +666,10 @@ bbox 与夹爪内侧多边形 ROI 存在正面积重叠、每个框内的橙色 
 启动仍使用 `configs/runtime.match.yaml` 和本页命令，
 资源由 `match_runtime` 的现有上下文与 `finally` 管理。退区停稳后立即转向搜索，取消退区安全区校准；
 两点校准、累计数量、时间语义与现场限制统一见[正式流程设计](../../../docs/正式流程设计.md)。
+
+近场准备线程的 `submit()` / `GraspPreparationSession.update()` 现在接收可选
+`capture_pose: FieldPose2D` 和 `stationary_since_ns`。正式 match 用
+`grasp_capture_pose(snapshot.capture_timestamp_ns)` 和 `grasp_stationary_since_ns(now_ns)`
+从现有编码器/IMU历史提供；位姿属于曝光时刻，ns 使用同一单调时钟，不改写原始观测时间。
+真实运动后只重建局部图像关联，锁定核心按采集位姿变换并重验完整新场景；
+独立静止调用可省略两项。线程仍由原有上下文管理器停止和回收，无新增资源。

@@ -16,7 +16,7 @@ from rescue_vision.motion.approach_speed import approach_speed_m_s
 from rescue_vision.motion.gripper_kinematics import GripperKinematics
 from rescue_vision.motion.protocol import OdometryImu
 from rescue_vision.motion.stationary import StationaryMotionEvidence
-from rescue_vision.localization import normalize_angle
+from rescue_vision.localization import FieldPose2D, normalize_angle
 from rescue_vision.geometry.types import GroundPoint
 from rescue_vision.perception import PerceptionSnapshot, TargetObservation
 from rescue_vision.perception.types import ObservationQuality, TargetClass
@@ -207,6 +207,7 @@ class GraspPreparationSession:
         self._recovery_plan: BreakupPlan | None = None
         self._recovery_count = 0
         self._frozen_scene_ids: set[int] = set()
+        self._capture_pose: FieldPose2D | None = None
 
     def reset(self) -> None:
         """清空确认窗口并重置近场 tracker。"""
@@ -224,6 +225,7 @@ class GraspPreparationSession:
         self._recovery_plan = None
         self._recovery_count = 0
         self._frozen_scene_ids.clear()
+        self._capture_pose = None
 
     def _clear_confirmation(self) -> None:
         self._confirmation_count = 0
@@ -287,7 +289,9 @@ class GraspPreparationSession:
         used_actual: set[int] = set()
         replacements: dict[int, int] = {}
         max_distance = self.tracker.tracker.config.max_association_ground_mm * 1.5
-        for canonical_id in locked_ids:
+        for member_index, canonical_id in enumerate(locked_ids):
+            expected = (None if self._locked_member_classes is None
+                        else self._locked_member_classes[member_index])
             if canonical_id not in self._locked_member_points:
                 continue
             reference = self._locked_member_points[canonical_id]
@@ -297,6 +301,7 @@ class GraspPreparationSession:
                     for target in targets
                     if target.track_id == canonical_id
                     and target.observed
+                    and (expected is None or target.observation.target_class is expected)
                     and target.observation.target_class is not TargetClass.BLUE_DANGER
                     and target.observation.model_target_class is not TargetClass.BLUE_DANGER
                     and target.observation.ground_point is not None
@@ -316,6 +321,7 @@ class GraspPreparationSession:
                 for target in targets
                 if target.observed
                 and target.track_id not in used_actual
+                and (expected is None or target.observation.target_class is expected)
                 and target.observation.target_class is not TargetClass.BLUE_DANGER
                 and target.observation.model_target_class is not TargetClass.BLUE_DANGER
                 and target.observation.ground_point is not None
@@ -453,7 +459,9 @@ class GraspPreparationSession:
                handoff_prior: NearFieldHandoffPrior | None = None,
                excluded_observation_indices: frozenset[int] = frozenset(),
                require_handoff: bool = False,
-               recovery_context: BreakupSceneContext | None = None) -> GraspPreparation:
+               recovery_context: BreakupSceneContext | None = None,
+               capture_pose: FieldPose2D | None = None,
+               stationary_since_ns: int | None = None) -> GraspPreparation:
         if not isinstance(snapshot, PerceptionSnapshot):
             raise TypeError("snapshot must be a PerceptionSnapshot.")
         _validate_candidate_exclusions(snapshot, excluded_observation_indices)
@@ -506,6 +514,26 @@ class GraspPreparationSession:
                 )
             else:
                 self._locked_member_classes = None
+
+        previous_pose = self._capture_pose
+        if previous_pose is not None and capture_pose is not None:
+            c0, s0 = math.cos(previous_pose.heading_rad), math.sin(previous_pose.heading_rad)
+            c1, s1 = math.cos(capture_pose.heading_rad), math.sin(capture_pose.heading_rad)
+            rebased = {}
+            for identity, point in self._locked_member_points.items():
+                dx = previous_pose.position.x + c0*point.x - s0*point.y - capture_pose.position.x
+                dy = previous_pose.position.y + s0*point.x + c0*point.y - capture_pose.position.y
+                rebased[identity] = GroundPoint(c1*dx+s1*dy, -s1*dx+c1*dy)
+            self._locked_member_points = rebased
+            if (stationary_since_ns is not None and self._last_preparation is not None
+                    and stationary_since_ns > self._last_preparation.capture_timestamp_ns):
+                # A new stopped scene follows actual motion. Old pixel boxes
+                # and local tracker IDs cannot identify objects after the turn.
+                # Retain the physical core in the new capture coordinates.
+                self.tracker.reset()
+                self._frozen_scene_ids.clear()
+                self._clear_confirmation()
+        self._capture_pose = capture_pose
 
         self.tracker.set_handoff_prior(
             handoff_prior
@@ -800,6 +828,8 @@ class GraspPreparationWorker:
             frozenset[int],
             bool,
             BreakupSceneContext | None,
+            FieldPose2D | None,
+            int | None,
         ] | None = None
         self._latest: GraspPreparation | None = None
         self._computing_session_id: int | None = None
@@ -855,6 +885,8 @@ class GraspPreparationWorker:
         excluded_observation_indices: frozenset[int] = frozenset(),
         require_handoff: bool = False,
         recovery_context: BreakupSceneContext | None = None,
+        capture_pose: FieldPose2D | None = None,
+        stationary_since_ns: int | None = None,
     ) -> None:
         if not isinstance(snapshot, PerceptionSnapshot):
             raise TypeError("snapshot must be a PerceptionSnapshot.")
@@ -886,6 +918,8 @@ class GraspPreparationWorker:
                 excluded_observation_indices,
                 require_handoff,
                 recovery_context,
+                capture_pose,
+                stationary_since_ns,
             )
             self._condition.notify_all()
 
@@ -919,6 +953,8 @@ class GraspPreparationWorker:
                     excluded_observation_indices,
                     require_handoff,
                     recovery_context,
+                    capture_pose,
+                    stationary_since_ns,
                 ) = request
                 if self._worker_session_id != session_id:
                     self.session.reset()
@@ -933,6 +969,8 @@ class GraspPreparationWorker:
                         excluded_observation_indices=excluded_observation_indices,
                         require_handoff=require_handoff,
                         recovery_context=recovery_context,
+                        capture_pose=capture_pose,
+                        stationary_since_ns=stationary_since_ns,
                     )
                 except Exception as exc:
                     with self._condition:
@@ -1185,6 +1223,7 @@ class GripperWidthPickupSequence:
         self._alignment_attempts = 0
         self.alignment_motion_allowance_ns = 0
         self._alignment_completed_ns = -1
+        self._alignment_stop_accounted = False
         self._alignment_finished = False
 
     def grasp_angles_for_plan(self, plan: NearFieldGraspPlan) -> tuple[float, float]:
@@ -1266,6 +1305,7 @@ class GripperWidthPickupSequence:
         self._alignment_attempts = 0
         self.alignment_motion_allowance_ns = 0
         self._alignment_completed_ns = -1
+        self._alignment_stop_accounted = False
         self._alignment_finished = False
 
     def progress_mm(self, cumulative_distance_m: float | None) -> float:
@@ -1303,6 +1343,25 @@ class GripperWidthPickupSequence:
         self._alignment_progress_rad = 0.0
         self._alignment_finished = False
         return self._decision(now_ns, f"candidate_replan:{reason}", brake=True)
+
+    def account_alignment_stop(self, timestamp_ns: int) -> None:
+        """Reserve the observation budget after measured turn/braking completion."""
+        if (self.state is not GripperWidthPickupState.ALIGNING
+                or not self._alignment_finished
+                or self._alignment_stop_accounted
+                or self._alignment_started_ns is None
+                or self._alignment_turn_started_ns is None):
+            return
+        since = self.motion_evidence.stationary_since(timestamp_ns)
+        if since is not None and since >= self._alignment_turn_started_ns:
+            self._alignment_stop_accounted = True
+            # since is continuous evidence, not the current poll time. Repeated
+            # reads cannot extend this budget; the match task deadline still
+            # bounds the entire attempt, including any correction turn.
+            self.alignment_motion_allowance_ns = max(
+                self.alignment_motion_allowance_ns,
+                since - self._alignment_started_ns,
+            )
 
     def alignment_timeout_reached(self, timestamp_ns: int) -> bool:
         """报告当前近场尝试的对准/确认总预算是否已超时。"""
@@ -1409,6 +1468,7 @@ class GripperWidthPickupSequence:
         self._alignment_progress_rad = 0.0
         self._alignment_start_heading_rad = heading_rad
         self._alignment_turn_started_ns = now_ns
+        self._alignment_stop_accounted = False
         if self._alignment_started_ns is None:
             self._alignment_started_ns = now_ns
         self.state = GripperWidthPickupState.ALIGNING
@@ -1488,6 +1548,7 @@ class GripperWidthPickupSequence:
             # 预算从首次进入近场尝试开始，覆盖无结果等待、必要对准和
             # 唯一确认窗口；重复控制周期不会重新起算。
             self._alignment_started_ns = now
+        self.account_alignment_stop(now)
         if self.alignment_timeout_reached(now):
             self.state = GripperWidthPickupState.SEARCH
             self.locked_ids = None

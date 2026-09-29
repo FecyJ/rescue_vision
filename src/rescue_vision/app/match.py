@@ -1584,6 +1584,14 @@ class MatchSequence:
             None if task is None else task.entry_field,
         )
 
+    def grasp_capture_pose(self, capture_timestamp_ns: int) -> FieldPose2D | None:
+        """Measured capture pose for associating a core across stopped scenes."""
+        pose = self._pose_at(capture_timestamp_ns)
+        return None if pose is None else FieldPose2D(pose.position, pose.heading_rad)
+
+    def grasp_stationary_since_ns(self, timestamp_ns: int) -> int | None:
+        return self._stationary_motion.stationary_since(timestamp_ns)
+
     def grasp_scene_capture_valid(self, snapshot: PerceptionSnapshot, timestamp_ns: int) -> bool:
         """Stable capture and bounded delivery; generic stream expiry is separate."""
         return (
@@ -9058,7 +9066,12 @@ class MatchSequence:
         scene = self._latest_perception
         if scene is None or scene.capture_timestamp_ns <= plan.capture_timestamp_ns:
             return True
-        observations = scene.observations
+        observations = tuple(
+            replace(item, ground_point=self._ground_point_at_now(
+                item.ground_point, scene.capture_timestamp_ns, plan.capture_timestamp_ns))
+            if item.ground_point is not None and self._pose_history else item
+            for item in scene.observations
+        )
         matched: set[int] = set()
         for member in plan.members:
             center = member.observation.ground_point
@@ -9100,6 +9113,7 @@ class MatchSequence:
         path_clear: bool | None,
     ) -> MatchDecision:
         assert self._near_field_pickup is not None
+        self._near_field_pickup.account_alignment_stop(timestamp_ns)
         settling = self._consume_action_settle(
             timestamp_ns,
             "near_field_grasp",

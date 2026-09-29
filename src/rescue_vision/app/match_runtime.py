@@ -1319,6 +1319,8 @@ def _run_hardware(
                                 handoff_prior=sequence.near_field_handoff_prior,
                                 require_handoff=sequence.near_field_handoff_required,
                                 recovery_context=sequence.grasp_recovery_context(planning_snapshot),
+                                capture_pose=sequence.grasp_capture_pose(planning_snapshot.capture_timestamp_ns),
+                                stationary_since_ns=sequence.grasp_stationary_since_ns(now_ns),
                             )
                         near_field_preparation = near_field_worker.latest(session_id)
                         sequence.grasp_planning_pending = near_field_worker.pending(session_id)
