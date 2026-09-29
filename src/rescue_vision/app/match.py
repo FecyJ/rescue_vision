@@ -8596,15 +8596,9 @@ class MatchSequence:
         conflicts = snapshot.gripper_color.present_classes - allowed
         if conflicts:
             return "conflicting_gripper_colors:" + ",".join(sorted(c.value for c in conflicts))
-        if any(
-            observation.model_target_class is TargetClass.BLUE_DANGER
-            and bounding_box_overlaps_gripper_polygon(
-                observation.box, snapshot.gripper_color.polygon,
-                include_boundary=True,
-            )
-            for observation in snapshot.observations
-        ):
-            return "blue_detection_touches_gripper_roi"
+        # 2010 footage labels the carried orange itself blue near D2. A model
+        # box alone does not justify releasing the cargo. Keep its model label
+        # for path planning; actual gripper color occupancy drives release.
         distinct_pair = self._distinct_orange_bbox_k0_pair(snapshot)
         if distinct_pair is not None:
             bbox_iou, k0_distance_px = distinct_pair

@@ -369,12 +369,19 @@ def test_delayed_color_conflict_opens_reverses_250mm_then_tries_locked_breakup(p
             if blue_bbox_only:
                 capture = now - delay_ms * 1_000_000
                 blue = replace(orange_detection(frame, capture, UndistortedBoundingBox(30, 60, 40, 70)),
-                               model_target_class=B)
+                               model_target_class=B, target_class=B, ground_point=None)
                 latest = replace(color_snapshot(frame, capture, now, {G}),
                                  observations=(blue,))
         decision = seq.step(now, perception=latest, heading_rad=0.0, cumulative_distance_m=distance,
                             left_speed_feedback_m_s=velocity, right_speed_feedback_m_s=velocity)
         velocity = decision.linear_velocity_m_s
+        if blue_bbox_only:
+            assert decision.gripper_posture is GripperPosture.CLOSED
+            assert decision.state is MatchState.TRANSPORT_GREEDY_SCAN
+            assert decision.angular_velocity_rad_s != 0
+            if ms >= delay_ms + 2 * period_ms:
+                return
+            continue
         if decision.state is MatchState.MISGRASP_OPEN:
             opened = opened or ms
             assert decision.gripper_posture is GripperPosture.OPEN
@@ -558,7 +565,7 @@ def test_runtime_config_builds_enabled_gripper_color_observation():
     config = load_runtime_config('configs/runtime.match.yaml')
     assert config.perception.gripper_color.enabled
     assert config.perception.gripper_color.polygon_normalized == (
-        (0.47, 0.85), (0.53, 0.85), (0.57, 0.97), (0.43, 0.97),
+        (0.47, 0.68), (0.53, 0.68), (0.57, 0.97), (0.43, 0.97),
     )
     assert config.perception.gripper_color.min_component_fraction == 0.03
     assert config.perception.gripper_color.black_min_thickness_fraction == 0.12
@@ -684,7 +691,7 @@ def test_first_green_with_dark_face_does_not_release_but_actual_black_beside_it_
     ((30, 60, 39.999, 70), False),
     ((40, 90, 45, 95), False),  # In ROI bounding box, outside polygon.
 ])
-def test_blue_model_bbox_contact_triggers_misgrasp_without_hsv_or_k0(box, expected):
+def test_blue_model_bbox_alone_does_not_release_cargo(box, expected):
     seq = _sequence(transports=1)
     seq._started = True
     seq._transport_target_classes = (G,)
@@ -694,12 +701,15 @@ def test_blue_model_bbox_contact_triggers_misgrasp_without_hsv_or_k0(box, expect
                    k0=None, k0_confidence=0.0, ground_point=None)
     seq._latest_perception = replace(color_snapshot(1, 100, 200, set()),
                                      observations=(blue,))
-    assert bool(seq._gripper_color_conflict(200)) is expected
-    if expected:
-        decision = seq.step(200, perception=seq._latest_perception,
-                            heading_rad=0.0, cumulative_distance_m=0.0)
-        assert decision.state is MatchState.MISGRASP_OPEN
-        assert decision.gripper_posture is GripperPosture.OPEN
+    assert seq._gripper_color_conflict(200) is None
+    assert seq._latest_perception.observations[0].model_target_class is B
+    seq._latest_perception = replace(seq._latest_perception,
+        gripper_color=replace(seq._latest_perception.gripper_color,
+                              present_classes=frozenset({B})))
+    decision = seq.step(200, perception=seq._latest_perception,
+                        heading_rad=0.0, cumulative_distance_m=0.0)
+    assert decision.state is MatchState.MISGRASP_OPEN
+    assert decision.gripper_posture is GripperPosture.OPEN
 
 
 @pytest.mark.parametrize("capture,result,now", [
@@ -716,3 +726,33 @@ def test_blue_bbox_contact_respects_capture_and_result_age(capture, result, now)
     seq._latest_perception = replace(color_snapshot(1, capture, result, set()),
                                      observations=(blue,))
     assert seq._gripper_color_conflict(now) is None
+
+
+def test_match_roi_detects_green_blocks_in_front_of_carried_orange():
+    runtime = load_runtime_config('configs/runtime.match.yaml')
+    image = np.full((1296, 2304, 3), 220, np.uint8)
+    # 3543 frame geometry: the two green blocks touch ahead of the orange.
+    image[730:1000, 960:1330] = (20, 240, 20)
+    image[1060:1250, 1060:1590] = (0, 120, 255)
+    evidence = observe_gripper_colors(image, runtime.perception.gripper_color,
+                                     runtime.perception.color_classifier)
+    assert evidence.present_classes == {G, O}
+    seq = _sequence(transports=1)
+    seq._transport_target_classes = (O,)
+    seq._cargo_capture_floor_ns = 100
+    seq._latest_perception = replace(snapshot(1, 100), gripper_color=evidence)
+    assert seq._gripper_color_conflict(100) == 'conflicting_gripper_colors:green_supply'
+
+
+def test_carried_orange_misclassified_blue_does_not_release_near_d2():
+    seq = _sequence(transports=1)
+    seq._started = True
+    seq.state = MatchState.TRANSPORT_FORWARD
+    seq._safe_zone_phase = 'forward_d2_line'
+    seq._transport_target_classes = (O,)
+    seq._cargo_capture_floor_ns = 100
+    blue = blue_detection(1, 100, UndistortedBoundingBox(30, 60, 70, 99))
+    seq._latest_perception = replace(color_snapshot(1, 100, 200, {O}), observations=(blue,))
+    assert seq._gripper_color_conflict(200) is None
+    assert seq._transport_target_classes == (O,)
+    assert seq._latest_perception.observations[0].model_target_class is B

@@ -163,7 +163,7 @@ Hailo P50/P95 观测年龄及远场精度目前均未验证。
 `PerceptionSnapshot`。禁用或过期结果不提供颜色证据。检测后处理计时包括此步骤，结果仍
 先于渲染发布，不在控制循环转换图像。短杠检测和绘制已移除，颜色证据只供任务层检查与日志
 诊断消费。`render_target_observations()` 不再接收夹爪颜色参数；快照仍携带爪内颜色证据。
-`bounding_box_overlaps_gripper_polygon()` 默认要求正面积重叠；任务层对蓝色模型框传入
-`include_boundary=True`，将框与凸 ROI 的边缘或角点接触也计入误夹证据。
+`bounding_box_overlaps_gripper_polygon()` 要求正面积重叠，供任务层双橙候选检查使用；
+蓝色模型框单独触及 ROI 不触发释放，实际颜色冲突仍由同帧颜色观测提供。
 纯函数不持有设备资源，生产装配由 `AppConfig.build_target_detector()` 与现有上下文关闭后端。
 模型类别不由门禁改写；误夹恢复归任务层。阈值和现场调节以 [config README](../config/README.md#夹爪内颜色门禁配置) 为准。

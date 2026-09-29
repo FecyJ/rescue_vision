@@ -21,7 +21,8 @@ perception:
   # 夹爪内侧颜色仅用于误夹恢复；归一化去畸变图 (u,v)，排除夹臂和车体。
   gripper_color:
     enabled: true
-    polygon_normalized: [[0.47, 0.85], [0.53, 0.85], [0.57, 0.97], [0.43, 0.97]]
+    # 覆盖夹爪前端被载荷顶住的物块；2010 实拍中两绿位于 v=0.57..0.78。
+    polygon_normalized: [[0.47, 0.68], [0.53, 0.68], [0.57, 0.97], [0.43, 0.97]]
     min_component_fraction: 0.03
     # 黑色先去除细于 ROI 短边此比例的线条，再检查实体色块面积。
     black_min_thickness_fraction: 0.12

@@ -116,10 +116,8 @@ class GripperColorObservation:
 def bounding_box_overlaps_gripper_polygon(
     box: UndistortedBoundingBox,
     polygon: tuple[UndistortedPixel, ...],
-    *,
-    include_boundary: bool = False,
 ) -> bool:
-    """Check convex ROI overlap, optionally including edge/corner contact."""
+    """Check positive-area overlap with the convex gripper ROI."""
 
     if len(polygon) < 3:
         return False
@@ -136,23 +134,6 @@ def bounding_box_overlaps_gripper_polygon(
         ],
         np.float32,
     )
-    if include_boundary:
-        # Separating-axis test in float64 preserves subpixel gaps and includes
-        # zero-area contact. The ROI is convex by GripperColorConfig contract.
-        roi = np.asarray([(point.u, point.v) for point in polygon], np.float64)
-        rectangle = np.asarray([
-            (box.x_min, box.y_min), (box.x_max, box.y_min),
-            (box.x_max, box.y_max), (box.x_min, box.y_max),
-        ], np.float64)
-        for contour in (roi, rectangle):
-            for edge in np.roll(contour, -1, axis=0) - contour:
-                axis = np.asarray((-edge[1], edge[0]))
-                roi_projection = roi @ axis
-                box_projection = rectangle @ axis
-                if (roi_projection.max() < box_projection.min()
-                        or box_projection.max() < roi_projection.min()):
-                    return False
-        return True
     intersection_area, _ = cv2.intersectConvexConvex(polygon_contour, box_contour)
     return bool(intersection_area > 0.0)
 
