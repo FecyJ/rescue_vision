@@ -668,7 +668,6 @@ class MatchSequence:
         self._misgrasp_heading_rad: float | None = None
         self._misgrasp_release_pose: FieldPose2D | None = None
         self._misgrasp_breakup_active = False
-        self._first_green_misgrasp_reselect = False
         self._greedy_active = False
         self._greedy_started_ns = 0
         self._greedy_scan_elapsed_ns = 0
@@ -1689,7 +1688,6 @@ class MatchSequence:
         self._pose_history.clear()
         self._grasp_task = None
         self._near_field_failures.clear()
-        self._first_green_misgrasp_reselect = False
         self._breakup_failed_aims.clear()
         self._breakup_failed_aim_positions.clear()
         self._breakup_attempts.clear()
@@ -3042,10 +3040,6 @@ class MatchSequence:
         committed = self._advance_cluster_search_sweep(timestamp_ns, heading_rad)
         if committed is not None:
             return committed
-        if self._first_green_misgrasp_reselect:
-            return self._decision(timestamp_ns, 0.0, self._cluster_search_angular_velocity_rad_s,
-                                  "first_green_misgrasp_search_other_single_green",
-                                  posture=GripperPosture.OPEN)
         if is_new and self._breakup_geometric_block(timestamp_ns) and self.near_field_enabled:
             target = next((item for item in self._tracker.tracks
                            if self._target_is_fresh(item, timestamp_ns)
@@ -4876,7 +4870,6 @@ class MatchSequence:
         """路径无阻挡时直接进入物资目标对准，不做反向回转确认。"""
 
         self._greedy_scan_last_ns = None
-        self._first_green_misgrasp_reselect = False
         if self.near_field_enabled:
             self._adopt_grasp_task(
                 timestamp_ns, track_id=target.track_id, target_class=target.target_class,
@@ -8649,10 +8642,6 @@ class MatchSequence:
         timestamp_ns: int,
         reason: str,
     ) -> MatchDecision:
-        self._first_green_misgrasp_reselect = (
-            self._transport_count == 0
-            and self._transport_target_classes == (TargetClass.GREEN_SUPPLY,)
-        )
         self._misgrasp_release_pose = None
         self._misgrasp_breakup_active = False
         self.state = MatchState.MISGRASP_OPEN
@@ -8739,31 +8728,13 @@ class MatchSequence:
                                   f"misgrasp_backup:remaining_mm={remaining_m * 1000:.1f}", posture=GripperPosture.OPEN)
         if self._stationary_motion.stationary_since(timestamp_ns) is None:
             return self._decision(timestamp_ns, 0.0, 0.0, "misgrasp_wait_reverse_stop:" + self._stationary_motion.diagnostic(timestamp_ns), posture=GripperPosture.OPEN, soft_brake=True)
-        if self._first_green_misgrasp_reselect and self._misgrasp_release_pose is not None:
-            release = self._misgrasp_release_pose
-            jaws = GripperKinematics()
-            jaw_center_x = (jaws.pivot_x_mm + jaws.left_tip_position(0).x) / 2
-            released_green = FieldPoint(
-                release.position.x + math.cos(release.heading_rad) * jaw_center_x,
-                release.position.y + math.sin(release.heading_rad) * jaw_center_x,
-            )
-            self._near_field_failures.append(_AttemptFailureRecord(
-                TargetClass.GREEN_SUPPLY, None, released_green,
-                self.estimated_field_position, self._latest_heading_rad, None,
-                "first_green_misgrasp_release", timestamp_ns, (released_green,),
-            ))
-            del self._near_field_failures[:-32]
         self._reset_tracker_for_new_preview_epoch()
         self._selected_track_id = None
         self._begin_cluster_search()
         self._reset_rotation_budget()
-        if self._first_green_misgrasp_reselect:
-            self.state = MatchState.SEARCH_CLUSTER
-            return self._decision(timestamp_ns, 0.0,
-                                  self.config.cluster_search_angular_velocity_rad_s,
-                "misgrasp_released_backed_search_other_single_green",
-                                  posture=GripperPosture.OPEN)
         if self._dynamic_breakup_enabled:
+            # Confirmed misgrasp owns the front release area, including the
+            # first single-green trip. Do not rerun search/grasp arbitration.
             self._misgrasp_breakup_active = True
             self._near_field_route_rejections = ()
             self._start_breakup_attempt(timestamp_ns)

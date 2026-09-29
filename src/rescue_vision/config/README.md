@@ -78,8 +78,8 @@ grab_transport = config.build_grab_transport_sequence()
 闭爪前推距离是上限，完整路径不安全时可选更短的有效接触行程；释放航向
 修正上限由 `misgrasp_breakup_max_heading_change_rad` 设置，正式配置为 30°。
 实际速度仍按剩余距离减速，并受车体速度、加减速度限制；三组速度不再读取
-`return_backup_speed_m_s` 或普通 `breakup_*_speed_m_s`。首轮单绿杂物误夹退出后
-搜索其他单绿，不执行释放区短解团。
+`return_backup_speed_m_s` 或普通 `breakup_*_speed_m_s`。包括首轮单绿在内的误夹均在
+后退停稳后直接执行释放区短解团，路由与安全检查见[正式流程设计](../../../docs/正式流程设计.md#夹爪内颜色误夹检查)。
 
 正式 `match` 的开场动作使用 `match.opening_actions`，每项为独立的 `turn` 或 `straight`：
 `turn.angle_rad` 左正右负，`straight.distance_m` 前正后负，速度均为正的幅值；可选

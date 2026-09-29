@@ -343,13 +343,14 @@ def test_two_leaves_one_slot_and_three_skips_supplement(count):
         assert decision.state is MatchState.TRANSPORT_ALIGN_RED_ZONE
 
 
+@pytest.mark.parametrize('transports', [0, 1])
 @pytest.mark.parametrize('blue_bbox_only', [False, True])
 @pytest.mark.parametrize('poll_ms,delay_ms,period_ms', [(5, 300, 250), (10, 600, 400)])
-def test_delayed_color_conflict_opens_reverses_250mm_then_tries_locked_breakup(poll_ms, delay_ms, period_ms, blue_bbox_only):
-    seq = _sequence(transports=1)
+def test_delayed_color_conflict_opens_reverses_250mm_then_tries_locked_breakup(poll_ms, delay_ms, period_ms, blue_bbox_only, transports):
+    seq = _sequence(transports=transports)
     seq._started = True
     seq.config = replace(seq.config, green_max_age_ms=1200)
-    seq._transport_target_classes = (G, K)
+    seq._transport_target_classes = (G,) if transports == 0 else (G, K)
     seq._cargo_capture_floor_ns = 0
     seq.state = MatchState.TRANSPORT_GREEDY_SCAN
     seq._greedy_started_ns = 0
@@ -416,12 +417,15 @@ def test_delayed_color_conflict_opens_reverses_250mm_then_tries_locked_breakup(p
     assert not seq._misgrasp_breakup_active
 
 
+@pytest.mark.parametrize('transports', [0, 1])
+@pytest.mark.parametrize('confirmation_frames', [1, 3])
 @pytest.mark.parametrize('poll_ms,delay_ms,period_ms', [(5, 300, 250), (10, 600, 400)])
-def test_first_single_green_misgrasp_releases_and_selects_other_green(poll_ms, delay_ms, period_ms):
-    seq = _sequence(transports=0)
+def test_misgrasp_directly_breaks_up_front_group(poll_ms, delay_ms, period_ms, transports, confirmation_frames, monkeypatch):
+    seq = _sequence(transports=transports)
     seq._started = True
-    seq.config = replace(seq.config, green_max_age_ms=1200)
-    seq._transport_target_classes = (G,)
+    seq.config = replace(seq.config, green_max_age_ms=1200,
+                         breakup_confirmation_frames=confirmation_frames)
+    seq._transport_target_classes = (G,) if transports == 0 else (G, K)
     seq._cargo_capture_floor_ns = 0
     seq.state = MatchState.TRANSPORT_ALIGN_RED_ZONE
     seq._safe_zone_phase = 'align_d1_line'
@@ -441,78 +445,66 @@ def test_first_single_green_misgrasp_releases_and_selects_other_green(poll_ms, d
                             cumulative_distance_m=distance,
                             left_speed_feedback_m_s=velocity, right_speed_feedback_m_s=velocity)
         velocity = decision.linear_velocity_m_s
-        if decision.reason == 'misgrasp_released_backed_search_other_single_green':
+        if decision.reason == 'misgrasp_released_backed_breakup_locked_group':
             break
     else:
-        pytest.fail(f'First green did not exit misgrasp: {decision}')
+        pytest.fail(f'Did not exit misgrasp: {decision}')
     assert -distance == pytest.approx(0.250, abs=0.002)
     assert seq.carried_target_count == 0
-    assert decision.state is MatchState.SEARCH_CLUSTER
-    assert not seq._misgrasp_breakup_active
-    assert seq._first_green_misgrasp_reselect
-    assert any(record.reason == 'first_green_misgrasp_release'
-               for record in seq._near_field_failures)
-    decision = seq.step(now + poll_ms * 1_000_000, perception=latest,
-                        heading_rad=0.0, cumulative_distance_m=distance,
-                        left_speed_feedback_m_s=0, right_speed_feedback_m_s=0)
-    assert decision.state is MatchState.SEARCH_CLUSTER
-    assert not seq._misgrasp_breakup_active
+    assert decision.state is MatchState.BREAKUP_SETTLE
+    assert decision.angular_velocity_rad_s == 0
+    assert decision.gripper_posture is GripperPosture.CLOSED
+    assert seq._misgrasp_breakup_active
+    assert not seq._near_field_failures
+    if transports == 0:
+        assert seq.near_field_policy.allowed_classes == frozenset({G})
+        assert seq.near_field_policy.max_targets == 1
 
-    # The released block has a new tracker ID after recovery. Seeing only it
-    # must keep the robot searching instead of starting breakup or regrasp.
-    for frame in range(1, 3):
-        ms += period_ms
-        now = ms * 1_000_000
-        seq.observe_grasp_motion(replace(motion_sample(now),
-            left_encoder_count=round(distance * 10000),
-            right_encoder_count=round(distance * 10000)))
-        latest = snapshot(100 + frame, now,
-            observation(100 + frame, now, GroundPoint(355, 0)))
+    def unexpected_decision(*args, **kwargs):
+        pytest.fail("Misgrasp exit must not search, regrasp, or compare other targets")
+
+    monkeypatch.setattr(seq, '_step_dynamic_cluster_search', unexpected_decision)
+    monkeypatch.setattr(seq, '_try_dynamic_grasp', unexpected_decision)
+    monkeypatch.setattr(seq, '_begin_near_field_grasp', unexpected_decision)
+    exit_ms = ms
+    for elapsed_ms in range(poll_ms, 3500, poll_ms):
+        now = (exit_ms + elapsed_ms) * 1_000_000
+        if (exit_ms + elapsed_ms) % 10 == 0:
+            count = round(distance * 10000)
+            seq.observe_grasp_motion(replace(motion_sample(now), left_encoder_count=count,
+                                             right_encoder_count=count))
+        if elapsed_ms >= delay_ms and (elapsed_ms - delay_ms) % period_ms == 0:
+            frame = 100 + (elapsed_ms - delay_ms) // period_ms
+            capture_ns = now - delay_ms * 1_000_000
+            # A tempting alternative and flickering peripheral block must not
+            # divert the released core. IDs can also change without restarting.
+            seq._tracker._tracks = {
+                t.track_id + 100: replace(t, track_id=t.track_id + 100)
+                for t in seq._tracker.tracks
+            }
+            seq._tracker._next_track_id += 100
+            members = [observation(frame, capture_ns, GroundPoint(120 - distance * 1000, 0)),
+                       observation(frame, capture_ns, GroundPoint(450, 230), box_x=60)]
+            if frame % 2 == 0:
+                members.append(observation(frame, capture_ns,
+                    GroundPoint(115 - distance * 1000, 70), target_class=K, box_x=40))
+            latest = replace(snapshot(frame, capture_ns, *members),
+                             result_timestamp_ns=now, timing=None)
         decision = seq.step(now, perception=latest, heading_rad=0.0,
                             cumulative_distance_m=distance,
                             left_speed_feedback_m_s=0, right_speed_feedback_m_s=0)
-        assert decision.reason == 'first_green_misgrasp_search_other_single_green'
-        assert decision.state is MatchState.SEARCH_CLUSTER
-        assert not seq._misgrasp_breakup_active
-
-    # A dangerous object in its route still blocks the alternative.
-    ms += period_ms
-    now = ms * 1_000_000
-    seq.observe_grasp_motion(replace(motion_sample(now),
-        left_encoder_count=round(distance * 10000),
-        right_encoder_count=round(distance * 10000)))
-    latest = snapshot(103, now,
-        observation(103, now, GroundPoint(355, 0)),
-        observation(103, now, GroundPoint(450, 350), box_x=60),
-        observation(103, now, GroundPoint(350, 280), target_class=B, box_x=80))
-    decision = seq.step(now, perception=latest, heading_rad=0.0,
-                        cumulative_distance_m=distance,
-                        left_speed_feedback_m_s=0, right_speed_feedback_m_s=0)
-    assert decision.state is MatchState.SEARCH_CLUSTER
-    assert not seq._misgrasp_breakup_active
-
-    # A separate green remains eligible once its route is clear.
-    for frame in range(4, 7):
-        ms += period_ms
-        now = ms * 1_000_000
-        seq.observe_grasp_motion(replace(motion_sample(now),
-            left_encoder_count=round(distance * 10000),
-            right_encoder_count=round(distance * 10000)))
-        latest = snapshot(100 + frame, now,
-            observation(100 + frame, now, GroundPoint(355, 0)),
-            observation(100 + frame, now, GroundPoint(450, 350), box_x=60))
-        decision = seq.step(now, perception=latest, heading_rad=0.0,
-                            cumulative_distance_m=distance,
-                            left_speed_feedback_m_s=0, right_speed_feedback_m_s=0)
-        if decision.state is MatchState.TRANSPORT_ALIGN_GREEN:
+        assert decision.state in {MatchState.BREAKUP_SETTLE, MatchState.BREAKUP_FORWARD}
+        assert decision.angular_velocity_rad_s == 0
+        assert decision.gripper_posture is GripperPosture.CLOSED
+        if decision.linear_velocity_m_s > 0:
             break
-        assert decision.state is MatchState.SEARCH_CLUSTER
-        assert not seq._misgrasp_breakup_active
     else:
-        pytest.fail(f'Other green was not selected: {decision}')
-    selected = seq._selected_target()
-    assert selected is not None
-    assert selected.ground_point == GroundPoint(450, 350)
+        pytest.fail(f'No bounded forward breakup: {decision}; {seq.cluster_diagnostic(now)}')
+    assert elapsed_ms < 2500
+    assert seq._breakup_plan.aim_field.x == pytest.approx(120)
+    assert seq._breakup_plan.aim_field.y == pytest.approx(0)
+    assert len(seq._breakup_reference_frames) == confirmation_frames
+    assert seq._breakup_plan.approach_distance_mm == 0
 
 
 @pytest.mark.parametrize('mode', ['motion', 'invalid', 'stale', 'duplicate'])
