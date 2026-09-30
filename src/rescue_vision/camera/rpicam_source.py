@@ -12,6 +12,9 @@ from rescue_vision.exception_notes import add_exception_note
 
 from .frame import CameraFrame
 
+# Pi 5 PiSP planar YUV420: U/V rows align to 64 bytes, Y stride is twice that.
+_PISP_YUV420_STRIDE_ALIGNMENT = 128
+
 
 class RpicamSource:
     """
@@ -51,10 +54,11 @@ class RpicamSource:
         self.lens_position = lens_position
         self.camera_index = camera_index
 
-        # YUV420 每帧占 width × height × 1.5 字节。
-        self.frame_size = (
-            self.width * self.height * 3 // 2
-        )
+        # rpicam 的 null encoder 输出带行尾填充的完整 PiSP 缓冲。
+        # 1640 px 的实际 Y stride 为 1664，而不是可见图像宽度。
+        alignment = _PISP_YUV420_STRIDE_ALIGNMENT
+        self.yuv_stride = (self.width + alignment - 1) // alignment * alignment
+        self.frame_size = self.yuv_stride * self.height * 3 // 2
 
         self._process: subprocess.Popen[bytes] | None = None
         self._reader_thread: threading.Thread | None = None
@@ -195,12 +199,18 @@ class RpicamSource:
             dtype=np.uint8,
         ).reshape(
             self.height * 3 // 2,
-            self.width,
+            self.yuv_stride,
         )
 
-        image_bgr = cv2.cvtColor(
+        padded_bgr = cv2.cvtColor(
             yuv,
             cv2.COLOR_YUV2BGR_I420,
+        )
+        # 只去掉内存布局填充，保留请求尺寸和全部实际像素；不裁剪相机视野。
+        image_bgr = (
+            padded_bgr
+            if self.yuv_stride == self.width
+            else padded_bgr[:, :self.width].copy()
         )
 
         return CameraFrame(
@@ -215,6 +225,7 @@ class RpicamSource:
                 "source": "rpicam-vid",
                 "camera_index": self.camera_index,
                 "image_coordinate_system": "raw_pixel",
+                "yuv_stride_bytes": self.yuv_stride,
                 "configured_fps": self.fps,
                 "lens_position": self.lens_position,
                 "timestamp_source": "host_frame_first_byte_monotonic",

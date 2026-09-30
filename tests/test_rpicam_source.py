@@ -49,7 +49,9 @@ class FakeProcess:
 
 
 def fake_payload(width: int, height: int) -> bytes:
-    return np.zeros(width * height * 3 // 2, dtype=np.uint8).tobytes()
+    # Existing fixtures use 4 px images: one PiSP Y row still occupies 128 bytes.
+    assert width == 4
+    return np.zeros(128 * height * 3 // 2, dtype=np.uint8).tobytes()
 
 
 def test_read_before_start_and_negative_timeout_are_rejected() -> None:
@@ -140,3 +142,41 @@ def test_select_fixed_focus_camera_without_lens_option(monkeypatch) -> None:
         assert frame.metadata['image_coordinate_system'] == 'raw_pixel'
     assert commands[0][commands[0].index('--camera') + 1] == '1'
     assert '--lens-position' not in commands[0]
+
+
+@pytest.mark.parametrize(('width', 'stride'), [(1640, 1664), (800, 896), (2304, 2304)])
+def test_pisp_yuv_padding_preserves_colors_and_next_frame(monkeypatch, width, stride) -> None:
+    import cv2
+
+    height = 8
+    images = []
+    buffers = []
+    for colors in (((255, 0, 0), (0, 255, 0)), ((0, 0, 255), (255, 255, 255))):
+        bgr = np.empty((height, width, 3), dtype=np.uint8)
+        bgr[:, :width // 2] = colors[0]
+        bgr[:, width // 2:] = colors[1]
+        packed = cv2.cvtColor(bgr, cv2.COLOR_BGR2YUV_I420)
+        images.append(cv2.cvtColor(packed, cv2.COLOR_YUV2BGR_I420))
+        flat = packed.ravel()
+        y_size = width * height
+        chroma_size = y_size // 4
+        planes = [flat[:y_size].reshape(height, width),
+                  flat[y_size:y_size+chroma_size].reshape(height // 2, width // 2),
+                  flat[y_size+chroma_size:].reshape(height // 2, width // 2)]
+        padded_planes = []
+        for plane, row_stride in zip(planes, (stride, stride // 2, stride // 2)):
+            padded = np.full((plane.shape[0], row_stride), 197, dtype=np.uint8)
+            padded[:, :plane.shape[1]] = plane
+            padded_planes.append(padded.tobytes())
+        buffers.append(b''.join(padded_planes))
+    process = FakeProcess(b''.join(buffers))
+    monkeypatch.setattr(source_module.subprocess, 'Popen', lambda *a, **kw: process)
+    with RpicamSource(image_size=(width, height), lens_position=None) as camera:
+        with camera._condition:
+            assert camera._condition.wait_for(lambda: camera._latest_sequence == 1, timeout=1)
+        frame = camera.read(timeout=0.1)
+        assert camera.frame_size == len(buffers[0])
+        assert frame.sequence == 1
+        assert frame.metadata['yuv_stride_bytes'] == stride
+        assert frame.image_bgr.shape == (height, width, 3)
+        np.testing.assert_array_equal(frame.image_bgr, images[1])

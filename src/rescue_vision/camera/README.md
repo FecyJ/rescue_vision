@@ -50,6 +50,12 @@ source = source_class(
 帧元数据保存 `camera_index` 和 `image_coordinate_system="raw_pixel"`，
 各路的序号分别从零开始，采集时间仍是统一单调 ns。
 
+`RpicamSource` 的原始 YUV420 解码按目标 Raspberry Pi 5 PiSP 内存布局：
+Y 行步长向上对齐到 128 字节，U/V 行步长为其一半，先读取完整带填充帧，
+转换后只移除行尾填充。请求图像尺寸和有效像素保持不变；1640×1232 的实际步长
+为 1664 字节、每帧 3,075,072 字节。帧元数据的 `yuv_stride_bytes` 可用于诊断。
+这项布局适用于本项目目标 Pi 5，不作为其它 ISP 的通用原始流解码约定。
+
 ## 2. 打开相机并读取最新帧
 
 以下片段承接前文的 `source`。上下文管理器负责异常路径关闭相机：
