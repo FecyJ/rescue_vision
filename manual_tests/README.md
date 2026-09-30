@@ -63,6 +63,59 @@ PYTHONPATH=src .venv/bin/python manual_tests/camera_stream.py \
 这些图片用于视野检查或原图采样；正式去畸变数据采集使用[数据采集手册](../docs/数据采集工具使用.md)。
 硬件画面、窗口按键和实际写盘耗时须在树莓派人工验证。
 
+## 双 CSI 相机预览
+
+`dual_camera_preview.py` 同时预览两路原图；`dual_camera_perception.py` 同时显示
+两路原图及各自处理图，共四个窗口。两者只打开相机（后者另打开 Hailo），不打开 UART、
+不发送底盘或夹爪命令。配置统一从 `configs/runtime.match.yaml` 读取，原图脚本不加载标定。
+
+本机 IMX708 Wide 接 CAM/DISP1，IMX219 接 CAM/DISP0。启动配置
+`/boot/firmware/config.txt` 采用 `camera_auto_detect=0`、`dtoverlay=imx708` 和
+`dtoverlay=imx219,cam0`；2026-10-01 已即时加载 IMX219 并验证双路取帧，重启后的持久配置
+尚未复测。修改前备份为 `/boot/firmware/config.txt.before-imx219-20261001-003719.bak`。
+
+先运行 `rpicam-hello --list-cameras` 核对编号；当前近场 IMX219 为 **0**，主相机
+IMX708 Wide 为 **1**。新脚本明确选择这两个编号。原有正式入口仍默认选择 0，
+尚未接入双相机，不能直接在这个双相机枚举环境中沿用主相机标定运行正式入口。
+
+在树莓派桌面打开终端，分别运行：
+
+```bash
+.venv/bin/python manual_tests/dual_camera_preview.py --config configs/runtime.match.yaml
+.venv/bin/python manual_tests/dual_camera_perception.py --config configs/runtime.match.yaml
+```
+
+不要同时运行两个脚本，它们会占用同一组相机。可通过 `--main-camera-index 1`、
+`--near-camera-index 0` 明确指定编号；主相机分辨率、帧率和焦点沿用运行配置，
+近场默认 1640×1232、相同帧率、固定焦点，可用 `--near-size WIDTH HEIGHT` 改尺寸。
+显示用 `--preview-width 720` 等比缩放，不改变输入推理的图像。
+
+主路使用现有 `CameraModel`、`GroundProjector` 和 `TargetPoseDetector`，显示全尺寸
+去畸变输入上的六类检测、任务目标 HSV 掩码与场地关键点。近场路直接在原图运行同一个
+Hailo 后端，只叠加模型框和可靠关键点，明确标记 `raw_pixel`；它不加载内外参、不去畸变、
+不生成地面点，也不把原图结果伪装成正式去畸变观测。现有模型训练于主相机去畸变图，
+IMX219 的识别效果（尤其危险类漏检）**未验证**，本工具用于检查，不能当作近场控制已接入。
+
+两路各保留一张最新待处理帧，在独立线程中轮流使用一个 Hailo 后端，采集和窗口轮询
+不等待推理。原图与处理图可能对应不同帧，窗口标明序号及采集年龄；终端每秒报告
+每路收到的帧数及最新结果的采集年龄、结果发布时间年龄、采集到结果和处理耗时（ms），
+近场蓝色危险类检出数单列。Rpicam 采集时刻是首批字节到达的单调 ns 代理，不是曝光真值。
+按 Q/Esc、关闭窗口或 Ctrl+C 退出，异常也关闭相机进程、推理线程、Hailo 和窗口。
+
+通过 SSH 做有界无窗口验证：
+
+```bash
+.venv/bin/python manual_tests/dual_camera_preview.py \
+  --config configs/runtime.match.yaml --headless --duration-seconds 5
+.venv/bin/python manual_tests/dual_camera_perception.py \
+  --config configs/runtime.match.yaml --headless --duration-seconds 6
+```
+
+2026-10-01 本机实测：5 s 原图测试两路各交付 101 帧；6 s 带 Hailo 测试两路各交付
+121 帧，两个处理结果持续更新并正常退出。另已同时打开两个 Picamera2 相机，各取 5 帧。
+这些是短时可用性检查，不是整车端到端时延或识别质量验收；长时间双路负载、GUI 按键/
+关闭窗口、近场类别指标和重启后枚举均**未验证**。
+
 ## STM32 串口监测
 
 持续被动监测，按 `Ctrl+C` 退出：

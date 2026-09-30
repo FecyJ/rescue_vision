@@ -36,6 +36,7 @@ python -m pytest
 
 | 目的 | 从这里开始 |
 | --- | --- |
+| 双 CSI 原图与处理画面预览 | [双相机人工检查](manual_tests/README.md#双-csi-相机预览) |
 | 相机已经接好，准备采集数据 | [数据采集手册](docs/数据采集工具使用.md) |
 | 采集棋盘、求内参或地面映射 | [标定说明](src/rescue_vision/calibration/README.md) |
 | 标注或部署四类目标模型 | [Pose 模型约定](docs/Pose视觉模型约定.md) |
