@@ -126,3 +126,17 @@ def test_repeated_start_stop_and_read_timeout(monkeypatch) -> None:
     assert camera.read(timeout=0.1).sequence == 0
     camera.stop()
     assert len(processes) == 2
+
+
+def test_select_fixed_focus_camera_without_lens_option(monkeypatch) -> None:
+    commands = []
+    def create(command, **kwargs):
+        commands.append(command)
+        return FakeProcess(fake_payload(4, 4))
+    monkeypatch.setattr(source_module.subprocess, 'Popen', create)
+    with RpicamSource(image_size=(4, 4), camera_index=1, lens_position=None) as camera:
+        frame = camera.read()
+        assert frame.metadata['camera_index'] == 1
+        assert frame.metadata['image_coordinate_system'] == 'raw_pixel'
+    assert commands[0][commands[0].index('--camera') + 1] == '1'
+    assert '--lens-position' not in commands[0]

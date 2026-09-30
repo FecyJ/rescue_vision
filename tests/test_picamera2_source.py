@@ -86,6 +86,8 @@ def test_picamera2_source_returns_latest_frame_with_sensor_metadata() -> None:
     assert frame.image_bgr.flags.writeable is False
     assert frame.metadata == {
         "source": "picamera2",
+        "camera_index": 0,
+        "image_coordinate_system": "raw_pixel",
         "configured_fps": 20,
         "configured_lens_position": 0.95,
         "sensor_timestamp_ns": 123456789,
@@ -154,3 +156,30 @@ def test_picamera2_stop_still_closes_after_stop_timeout(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="shutdown"):
         source.stop()
     assert camera.closed
+
+
+def test_fixed_focus_camera_does_not_receive_lens_controls() -> None:
+    camera = FakeCamera()
+    with Picamera2Source(image_size=(8, 6), lens_position=None, camera_index=1,
+                         camera_factory=lambda: camera) as source:
+        frame = source.read()
+        assert frame.metadata['camera_index'] == 1
+        assert frame.metadata['configured_lens_position'] is None
+        assert camera.controls is None
+    assert camera.closed
+
+
+def test_picamera2_opens_requested_camera_index(monkeypatch) -> None:
+    import sys
+    from types import SimpleNamespace
+
+    calls = []
+    camera = FakeCamera()
+    def create(*, camera_num):
+        calls.append(camera_num)
+        return camera
+    monkeypatch.setitem(sys.modules, 'picamera2', SimpleNamespace(Picamera2=create))
+    monkeypatch.setitem(sys.modules, 'libcamera', SimpleNamespace(controls=None))
+    with Picamera2Source(image_size=(8, 6), lens_position=None, camera_index=1) as source:
+        source.read()
+    assert calls == [1]

@@ -44,6 +44,12 @@ source = source_class(
 创建 `source` 时尚未打开相机。后续算法只依赖 `FrameSource`，不需要知道
 当前选择的是 Picamera2 还是 `rpicam-vid`。
 
+两个真机源都支持关键字参数 `camera_index`（默认 `0`）；相机编号以
+`rpicam-hello --list-cameras` 为准，增加第二路 CSI 后可能改变，不能把编号当作物理身份。
+固定焦点相机（如 IMX219）使用 `lens_position=None`，不发送 AF/焦点控制。
+帧元数据保存 `camera_index` 和 `image_coordinate_system="raw_pixel"`，
+各路的序号分别从零开始，采集时间仍是统一单调 ns。
+
 ## 2. 打开相机并读取最新帧
 
 以下片段承接前文的 `source`。上下文管理器负责异常路径关闭相机：

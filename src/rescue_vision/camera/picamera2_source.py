@@ -20,15 +20,20 @@ class Picamera2Source:
         self,
         image_size: tuple[int, int] = (2304, 1296),
         fps: int = 20,
-        lens_position: float = 1.0,
+        lens_position: float | None = 1.0,
         *,
+        camera_index: int = 0,
         camera_factory: Callable[[], Any] | None = None,
     ) -> None:
         if len(image_size) != 2 or any(value <= 0 for value in image_size):
             raise ValueError(f"image_size must be positive, got {image_size}.")
         if fps <= 0:
             raise ValueError(f"fps must be positive, got {fps}.")
-        if not np.isfinite(lens_position) or lens_position < 0:
+        if camera_index < 0:
+            raise ValueError(f"camera_index must be non-negative, got {camera_index}.")
+        if lens_position is not None and (
+            not np.isfinite(lens_position) or lens_position < 0
+        ):
             raise ValueError(
                 f"lens_position must be finite and non-negative, got "
                 f"{lens_position}."
@@ -36,6 +41,7 @@ class Picamera2Source:
         self._image_size = image_size
         self.fps = fps
         self.lens_position = lens_position
+        self.camera_index = camera_index
         self._camera_factory = camera_factory
         self._camera: Any | None = None
         self._thread: threading.Thread | None = None
@@ -65,7 +71,8 @@ class Picamera2Source:
                 buffer_count=4,
             )
             camera.configure(configuration)
-            camera.set_controls(manual_focus)
+            if manual_focus:
+                camera.set_controls(manual_focus)
             camera.start()
         except BaseException:
             camera.close()
@@ -109,15 +116,20 @@ class Picamera2Source:
 
     def _create_camera(self) -> tuple[Any, dict[str, Any]]:
         if self._camera_factory is not None:
-            return self._camera_factory(), {"LensPosition": self.lens_position}
+            return self._camera_factory(), (
+                {} if self.lens_position is None else {"LensPosition": self.lens_position}
+            )
 
         from libcamera import controls
         from picamera2 import Picamera2
 
-        return Picamera2(), {
-            "AfMode": controls.AfModeEnum.Manual,
-            "LensPosition": self.lens_position,
-        }
+        focus = {}
+        if self.lens_position is not None:
+            focus = {
+                "AfMode": controls.AfModeEnum.Manual,
+                "LensPosition": self.lens_position,
+            }
+        return Picamera2(camera_num=self.camera_index), focus
 
     def read(self, timeout: float = 1.0) -> CameraFrame:
         if timeout < 0:
@@ -256,6 +268,8 @@ class Picamera2Source:
     ) -> dict[str, MetadataValue]:
         result: dict[str, MetadataValue] = {
             "source": "picamera2",
+            "camera_index": self.camera_index,
+            "image_coordinate_system": "raw_pixel",
             "configured_fps": self.fps,
             "configured_lens_position": self.lens_position,
         }

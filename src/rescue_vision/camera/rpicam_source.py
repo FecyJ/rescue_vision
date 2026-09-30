@@ -25,7 +25,9 @@ class RpicamSource:
         self,
         image_size: tuple[int, int] = (2304, 1296),
         fps: int = 20,
-        lens_position: float = 1.0,
+        lens_position: float | None = 1.0,
+        *,
+        camera_index: int = 0,
     ) -> None:
         if len(image_size) != 2 or any(value <= 0 for value in image_size):
             raise ValueError(f"image_size must be positive, got {image_size}.")
@@ -35,7 +37,11 @@ class RpicamSource:
             )
         if fps <= 0:
             raise ValueError(f"fps must be positive, got {fps}.")
-        if not np.isfinite(lens_position) or lens_position < 0:
+        if camera_index < 0:
+            raise ValueError(f"camera_index must be non-negative, got {camera_index}.")
+        if lens_position is not None and (
+            not np.isfinite(lens_position) or lens_position < 0
+        ):
             raise ValueError(
                 f"lens_position must be finite and non-negative, got "
                 f"{lens_position}."
@@ -43,6 +49,7 @@ class RpicamSource:
         self.width, self.height = image_size
         self.fps = fps
         self.lens_position = lens_position
+        self.camera_index = camera_index
 
         # YUV420 每帧占 width × height × 1.5 字节。
         self.frame_size = (
@@ -77,6 +84,7 @@ class RpicamSource:
 
         command = [
             "rpicam-vid",
+            "--camera", str(self.camera_index),
             "--nopreview",
             "--timeout", "0",
             "--width", str(self.width),
@@ -85,10 +93,11 @@ class RpicamSource:
             "--codec", "yuv420",
             "--no-raw",
             "--buffer-count", "6",
-            "--lens-position", str(self.lens_position),
             "--flush",
             "--output", "-",
         ]
+        if self.lens_position is not None:
+            command.extend(["--lens-position", str(self.lens_position)])
 
         self._process = subprocess.Popen(
             command,
@@ -204,6 +213,8 @@ class RpicamSource:
             image_bgr=image_bgr,
             metadata={
                 "source": "rpicam-vid",
+                "camera_index": self.camera_index,
+                "image_coordinate_system": "raw_pixel",
                 "configured_fps": self.fps,
                 "lens_position": self.lens_position,
                 "timestamp_source": "host_frame_first_byte_monotonic",
