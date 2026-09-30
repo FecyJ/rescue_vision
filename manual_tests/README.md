@@ -5,7 +5,7 @@
 这些脚本只用于人工验收，不是可被运行代码导入的公共 API。默认相机脚本使用 `camera/rpicam_source.py`；逐帧传感器元数据后端由自动测试和录制命令覆盖。
 
 - `camera_capture.py`：抓取单帧。
-- `camera_stream.py`：实时预览和 FPS。
+- `camera_stream.py`：实时预览和 FPS；窗口聚焦后按 `Enter` 保存当前全分辨率原始帧，`Q/Esc` 退出。
 - `camera_undistort.py --intrinsics PATH`：加载指定内参实时预览去畸变结果。
 - `picamera_minimal.py`：直接使用 Picamera2 的最小检查。
 - `geometry_projection.py`：使用本地测试图片人工检查 BEV 和点投影。
@@ -45,6 +45,23 @@
 位姿发布；v3 场地结果会在实测地标和定位门禁满足时提交视觉纠偏。
 
 运行前先执行 `python -m pip install -e .`，并确保系统包和显示环境可用。
+
+## 相机预览与单帧拍摄
+
+在树莓派桌面环境下运行：
+
+```bash
+PYTHONPATH=src .venv/bin/python manual_tests/camera_stream.py \
+  --output-dir output/camera_snapshots
+```
+
+点击 `camera` 预览窗口使其获得键盘焦点，每按一次 `Enter` 保存一张 PNG，可连续拍摄；
+按 `Q/Esc` 或终端 `Ctrl+C` 退出并释放相机和窗口。目录自动创建，文件名包含本地时间
+（微秒）和相机帧号，终端打印保存路径、帧号和采集时间 `timestamp_ns`（单调时钟）。
+相机沿用此脚本的 `rpicam-vid` 后端、2304×1296、30 FPS、焦点 1.0；预览缩小至
+1152×648，保存的是当前显示帧对应的全尺寸原始畸变图（`raw_pixel`），不含叠加。
+这些图片用于视野检查或原图采样；正式去畸变数据采集使用[数据采集手册](../docs/数据采集工具使用.md)。
+硬件画面、窗口按键和实际写盘耗时须在树莓派人工验证。
 
 ## STM32 串口监测
 
