@@ -83,9 +83,9 @@ class PreviewWorker:
 def preview_parser(description: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--config", type=Path, default=Path("configs/runtime.match.yaml"))
-    parser.add_argument("--main-camera-index", type=int, default=1, help="IMX708 当前编号，默认 1")
-    parser.add_argument("--near-camera-index", type=int, default=0, help="IMX219 当前编号，默认 0")
-    parser.add_argument("--near-size", type=int, nargs=2, default=(1640, 1232), metavar=("WIDTH", "HEIGHT"))
+    parser.add_argument("--main-csi-port", type=int, choices=(0, 1), help="覆盖 camera.csi_port")
+    parser.add_argument("--near-csi-port", type=int, choices=(0, 1), help="覆盖 near_camera.csi_port")
+    parser.add_argument("--near-size", type=int, nargs=2, metavar=("WIDTH", "HEIGHT"))
     parser.add_argument("--duration-seconds", type=float)
     parser.add_argument("--headless", action="store_true", help="只取帧/打印，不打开窗口；须指定时长")
     parser.add_argument("--preview-width", type=int, default=720, help="每路显示宽度，保持纵横比")
@@ -93,8 +93,6 @@ def preview_parser(description: str) -> argparse.ArgumentParser:
 
 
 def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    if args.main_camera_index == args.near_camera_index:
-        parser.error(f"两个相机编号不能相同：{args.main_camera_index}")
     if args.headless and args.duration_seconds is None:
         parser.error("--headless 必须同时指定 --duration-seconds")
     if args.duration_seconds is not None and (
@@ -116,14 +114,21 @@ def display_frame(title: str, frame: CameraFrame, width: int) -> None:
 
 
 def run_preview(args: argparse.Namespace, config, process: Callable[[int, CameraFrame], CameraFrame] | None = None) -> None:
-    source_class = Picamera2Source if config.camera.backend == "picamera2" else RpicamSource
-    sources = [
-        source_class(image_size=config.camera.image_size, fps=config.camera.fps,
-                     lens_position=config.camera.lens_position, camera_index=args.main_camera_index),
-        source_class(image_size=tuple(args.near_size), fps=config.camera.fps,
-                     lens_position=None, camera_index=args.near_camera_index),
-    ]
-    labels = [f"main camera {args.main_camera_index}", f"near camera {args.near_camera_index}"]
+    if config.near_camera is None:
+        raise ValueError("双相机预览需要 YAML near_camera 配置。")
+    main_port = config.camera.csi_port if args.main_csi_port is None else args.main_csi_port
+    near_port = config.near_camera.csi_port if args.near_csi_port is None else args.near_csi_port
+    if main_port == near_port:
+        raise ValueError(f"两个相机不能使用相同的 csi_port={main_port}。")
+    sources = []
+    for settings, port, size in (
+        (config.camera, main_port, config.camera.image_size),
+        (config.near_camera, near_port, tuple(args.near_size) if args.near_size else config.near_camera.image_size),
+    ):
+        source_class = Picamera2Source if settings.backend == "picamera2" else RpicamSource
+        sources.append(source_class(image_size=size, fps=settings.fps,
+                                    lens_position=settings.lens_position, csi_port=port))
+    labels = [f"main CAM/DISP{main_port}", f"near CAM/DISP{near_port}"]
     counts = [0, 0]
     processed_sequences: dict[int, int] = {}
     try:

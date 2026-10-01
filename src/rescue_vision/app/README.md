@@ -23,6 +23,12 @@ Hailo、UART、夹爪、观察发布和资源生命周期。纯逻辑对象不�
 生产调用仍使用 `configs/runtime.match.yaml` 和 `MatchSequence.step()`，时间为同一单调时钟的 ns，
 视觉几何按采集位姿对齐；无新增硬件资源或线程。完整契约见[正式流程设计](../../../docs/正式流程设计.md)。
 
+正式 match/NB/CC、独立抓取、运动预览和手动采集共用 `build_camera_pipeline()`；
+帧源使用运行 YAML 的 `camera.csi_port` 选择 Pi 5 物理 CAM/DISP0/1，当前主相机接0。
+该设置只选择主感知相机；`near_camera` 目前只由双相机手动预览消费。
+换接口时保留同一主相机的标定条件，并按[配置说明](../config/README.md#相机物理接口)
+同步系统传感器 overlay。相机 start()/stop() 生命周期及采集单调 ns 时间不变。
+
 ## 常用入口
 
 | 入口 | 配置和用途 |

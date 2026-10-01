@@ -65,6 +65,7 @@ with Picamera2Source(
     image_size=config.camera.image_size,
     fps=config.camera.fps,
     lens_position=config.camera.lens_position,
+    csi_port=config.camera.csi_port,
 ) as source:
     raw_frame = source.read(timeout=1.0)
 

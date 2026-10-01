@@ -24,6 +24,39 @@ grab_transport = config.build_grab_transport_sequence()
 两个装配方法只创建纯逻辑状态机，不打开相机、Hailo、串口或网络。车端入口在
 `app/match_runtime.py` 创建并关闭这些资源。
 
+## 相机物理接口
+
+`camera.csi_port` 选择主相机物理接口（0=CAM/DISP0，1=CAM/DISP1，省略时为0）。
+当前实车配置为主相机 IMX708 接0、近场 IMX219 接1；所有配置驱动生产入口均使用此值，
+不依赖 libcamera 枚举编号。可选的 `near_camera` 使用与 `camera` 相同的 schema，
+仅由双相机手动预览消费，不加载几何、不接入比赛控制。
+
+```yaml
+camera:
+  csi_port: 0
+  backend: rpicam_vid
+  image_size: [2304, 1296]
+  fps: 20
+  lens_position: 0.9687536954879761
+near_camera:
+  csi_port: 1
+  backend: rpicam_vid
+  image_size: [1640, 1232]
+  fps: 20
+  lens_position: null
+```
+
+相机字段仅允许 `csi_port/backend/image_size/fps/lens_position`；固定焦点可设
+`lens_position: null`。两路配置必须选择不同接口，近场分辨率和帧率独立配置。
+正式使用 `configs/runtime.match.yaml` 时，主相机几何仍由原有 geometry 装配和校验。
+`CameraConfig` 只保存设置，构造帧源不打开硬件；start()/上下文进入才解析物理接口并取帧，
+stop()/上下文退出释放资源。时间仍为采集单调 ns，原图像素为 raw_pixel。
+
+YAML 选择已被系统驱动识别的相机，不修改系统启动配置。交换不同型号相机的接口时，
+需同步 `/boot/firmware/config.txt` 的 sensor overlay。本次接线对应
+`camera_auto_detect=0`、`dtoverlay=imx708,cam0` 和 `dtoverlay=imx219`，修改后重启。
+现场操作和验证以[双相机检查](../../../manual_tests/README.md#双-csi-相机预览)为准。
+
 ## 配置分区
 
 | 分区 | 责任 |

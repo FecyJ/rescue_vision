@@ -10,6 +10,7 @@ import numpy as np
 
 from rescue_vision.exception_notes import add_exception_note
 
+from .csi import resolve_csi_camera_index
 from .frame import CameraFrame
 
 # Pi 5 PiSP planar YUV420: U/V rows align to 64 bytes, Y stride is twice that.
@@ -31,6 +32,7 @@ class RpicamSource:
         lens_position: float | None = 1.0,
         *,
         camera_index: int = 0,
+        csi_port: int | None = None,
     ) -> None:
         if len(image_size) != 2 or any(value <= 0 for value in image_size):
             raise ValueError(f"image_size must be positive, got {image_size}.")
@@ -52,6 +54,9 @@ class RpicamSource:
         self.width, self.height = image_size
         self.fps = fps
         self.lens_position = lens_position
+        if csi_port is not None and (isinstance(csi_port, bool) or not isinstance(csi_port, int) or csi_port not in (0, 1)):
+            raise ValueError(f"csi_port must be 0 or 1, got {csi_port!r}.")
+        self.csi_port = csi_port
         self.camera_index = camera_index
 
         # rpicam 的 null encoder 输出带行尾填充的完整 PiSP 缓冲。
@@ -85,6 +90,9 @@ class RpicamSource:
             self._latest_sequence = -1
             self._delivered_sequence = -1
             self._reader_error = None
+
+        if self.csi_port is not None:
+            self.camera_index = resolve_csi_camera_index(self.csi_port)
 
         command = [
             "rpicam-vid",
@@ -224,6 +232,7 @@ class RpicamSource:
             metadata={
                 "source": "rpicam-vid",
                 "camera_index": self.camera_index,
+                "csi_port": self.csi_port,
                 "image_coordinate_system": "raw_pixel",
                 "yuv_stride_bytes": self.yuv_stride,
                 "configured_fps": self.fps,

@@ -69,14 +69,17 @@ PYTHONPATH=src .venv/bin/python manual_tests/camera_stream.py \
 两路原图及各自处理图，共四个窗口。两者只打开相机（后者另打开 Hailo），不打开 UART、
 不发送底盘或夹爪命令。配置统一从 `configs/runtime.match.yaml` 读取，原图脚本不加载标定。
 
-本机 IMX708 Wide 接 CAM/DISP1，IMX219 接 CAM/DISP0。启动配置
-`/boot/firmware/config.txt` 采用 `camera_auto_detect=0`、`dtoverlay=imx708` 和
-`dtoverlay=imx219,cam0`；2026-10-01 已即时加载 IMX219 并验证双路取帧，重启后的持久配置
-尚未复测。修改前备份为 `/boot/firmware/config.txt.before-imx219-20261001-003719.bak`。
+本机交换接口后，IMX708 Wide 接 CAM/DISP0、IMX219 接 CAM/DISP1。启动配置
+`/boot/firmware/config.txt` 使用 `camera_auto_detect=0`、`dtoverlay=imx708,cam0` 和
+`dtoverlay=imx219`；修改前备份为
+`/boot/firmware/config.txt.before-csi-swap-20261001-193233.bak`。新启动映射等待重启复测；
+旧接线下即时加载两路的取帧/画面检查不能替代此次重启验证。
 
-先运行 `rpicam-hello --list-cameras` 核对编号；当前近场 IMX219 为 **0**，主相机
-IMX708 Wide 为 **1**。新脚本明确选择这两个编号。原有正式入口仍默认选择 0，
-尚未接入双相机，不能直接在这个双相机枚举环境中沿用主相机标定运行正式入口。
+运行 YAML 的 `camera.csi_port: 0` 选择主相机，`near_camera.csi_port: 1` 选择近场，
+0/1 表示物理 CAM/DISP0/1，不是枚举编号。两路各自配置 backend、image_size、fps 和
+lens_position；IMX219 使用 null。程序按 Pi 5 设备路径解析编号，找不到指定接口时报告
+枚举结果；正式比赛、录制和采集入口也使用同一主相机设置。YAML 不会自行加载内核驱动，
+换接口后仍需对应的系统 sensor overlay；schema 以[配置说明](../src/rescue_vision/config/README.md#相机物理接口)为准。
 
 在树莓派桌面打开终端，分别运行：
 
@@ -85,9 +88,9 @@ IMX708 Wide 为 **1**。新脚本明确选择这两个编号。原有正式入�
 .venv/bin/python manual_tests/dual_camera_perception.py --config configs/runtime.match.yaml
 ```
 
-不要同时运行两个脚本，它们会占用同一组相机。可通过 `--main-camera-index 1`、
-`--near-camera-index 0` 明确指定编号；主相机分辨率、帧率和焦点沿用运行配置，
-近场默认 1640×1232、相同帧率、固定焦点，可用 `--near-size WIDTH HEIGHT` 改尺寸。
+不要同时运行两个脚本，它们会占用同一组相机。可用 `--main-csi-port 0`、
+`--near-csi-port 1` 临时覆盖 YAML 的接口；旧编号参数已移除。主/近相机分辨率、
+帧率和焦点分别沿用各自运行配置，可用 `--near-size WIDTH HEIGHT` 临时改近场尺寸。
 显示用 `--preview-width 720` 等比缩放，不改变输入推理的图像。
 
 主路使用现有 `CameraModel`、`GroundProjector` 和 `TargetPoseDetector`，显示全尺寸

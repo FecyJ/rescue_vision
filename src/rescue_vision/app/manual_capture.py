@@ -1222,6 +1222,7 @@ def build_camera_pipeline(config: AppConfig) -> CameraPipeline:
         image_size=config.camera.image_size,
         fps=config.camera.fps,
         lens_position=config.camera.lens_position,
+        csi_port=config.camera.csi_port,
     )
     return CameraPipeline(
         source,

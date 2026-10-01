@@ -500,7 +500,31 @@ class CameraConfig:
     backend: str
     image_size: tuple[int, int]
     fps: int
-    lens_position: float
+    lens_position: float | None
+    csi_port: int = 0
+
+
+def _parse_camera_config(raw: object, location: str) -> CameraConfig:
+    data = _mapping(raw, location)
+    _reject_unknown(data, {"backend", "image_size", "fps", "lens_position", "csi_port"}, location)
+    backend = _required(data, "backend", location)
+    if backend not in {"rpicam_vid", "picamera2"}:
+        raise ValueError(f"{location}.backend must be rpicam_vid or picamera2, got {backend!r}.")
+    image_size_raw = _required(data, "image_size", location)
+    if not isinstance(image_size_raw, list) or len(image_size_raw) != 2:
+        raise ValueError(f"{location}.image_size must be [width, height], got {image_size_raw!r}.")
+    image_size = (
+        _positive_int(image_size_raw[0], f"{location}.image_size[0]"),
+        _positive_int(image_size_raw[1], f"{location}.image_size[1]"),
+    )
+    port = _nonnegative_int(data.get("csi_port", 0), f"{location}.csi_port")
+    if port not in (0, 1):
+        raise ValueError(f"{location}.csi_port must be 0 or 1, got {port}.")
+    lens = _required(data, "lens_position", location)
+    return CameraConfig(backend, image_size,
+                        _positive_int(_required(data, "fps", location), f"{location}.fps"),
+                        None if lens is None else _finite_float(lens, f"{location}.lens_position", minimum=0.0),
+                        port)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1879,6 +1903,7 @@ class AppConfig:
     near_field_grasp: NearFieldGraspConfig = NearFieldGraspConfig()
     match_cc: MatchCCRuntimeConfig = MatchCCRuntimeConfig()
     match_capture: MatchCaptureConfig = MatchCaptureConfig()
+    near_camera: CameraConfig | None = None
 
     def build_camera_model(self) -> CameraModel | None:
         """内参启用时加载并校验与运行分辨率一致的相机模型。"""
@@ -2074,6 +2099,7 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         root,
         {
             "camera",
+            "near_camera",
             "geometry",
             "recording",
             "processing",
@@ -2095,34 +2121,13 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         "root",
     )
 
-    camera_raw = _mapping(_required(root, "camera", "root"), "camera")
-    _reject_unknown(
-        camera_raw,
-        {"backend", "image_size", "fps", "lens_position"},
-        "camera",
+    camera = _parse_camera_config(_required(root, "camera", "root"), "camera")
+    near_camera = (
+        _parse_camera_config(root["near_camera"], "near_camera")
+        if "near_camera" in root else None
     )
-    backend = _required(camera_raw, "backend", "camera")
-    if backend not in {"rpicam_vid", "picamera2"}:
-        raise ValueError(
-            "camera.backend must be 'rpicam_vid' or 'picamera2'."
-        )
-    image_size_raw = _required(camera_raw, "image_size", "camera")
-    if not isinstance(image_size_raw, list) or len(image_size_raw) != 2:
-        raise ValueError("camera.image_size must be [width, height].")
-    image_size = (
-        _positive_int(image_size_raw[0], "camera.image_size[0]"),
-        _positive_int(image_size_raw[1], "camera.image_size[1]"),
-    )
-    camera = CameraConfig(
-        backend=backend,
-        image_size=image_size,
-        fps=_positive_int(_required(camera_raw, "fps", "camera"), "camera.fps"),
-        lens_position=_finite_float(
-            _required(camera_raw, "lens_position", "camera"),
-            "camera.lens_position",
-            minimum=0.0,
-        ),
-    )
+    if near_camera is not None and near_camera.csi_port == camera.csi_port:
+        raise ValueError(f"camera and near_camera must use different csi_port values, got {camera.csi_port}.")
 
     geometry_raw = _mapping(root.get("geometry", {}), "geometry")
     _reject_unknown(
@@ -5262,4 +5267,5 @@ def load_runtime_config(path: str | Path) -> AppConfig:
         near_field_grasp,
         match_cc,
         match_capture,
+        near_camera,
     )

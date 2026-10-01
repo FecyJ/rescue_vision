@@ -38,16 +38,21 @@ source = source_class(
     image_size=config.camera.image_size,
     fps=config.camera.fps,
     lens_position=config.camera.lens_position,
+    csi_port=config.camera.csi_port,
 )
 ```
 
 创建 `source` 时尚未打开相机。后续算法只依赖 `FrameSource`，不需要知道
 当前选择的是 Picamera2 还是 `rpicam-vid`。
 
-两个真机源都支持关键字参数 `camera_index`（默认 `0`）；相机编号以
+配置驱动入口传入 `csi_port`：`0` 为 Pi 5 CAM/DISP0，`1` 为 CAM/DISP1。
+两种后端在 start() 时由 `csi.py` 按物理总线路径解析相机编号，不依赖枚举顺序；
+找不到指定接口时报告实际枚举列表，不改选另一台。枚举延迟导入 Picamera2，
+因此 RpicamSource 的物理接口选择也需要系统 python3-picamera2。
+底层直接调用仍可用 `camera_index`（默认 `0`；指定 csi_port 时以物理接口为准）；相机编号以
 `rpicam-hello --list-cameras` 为准，增加第二路 CSI 后可能改变，不能把编号当作物理身份。
 固定焦点相机（如 IMX219）使用 `lens_position=None`，不发送 AF/焦点控制。
-帧元数据保存 `camera_index` 和 `image_coordinate_system="raw_pixel"`，
+帧元数据保存解析后的 `camera_index`、可选 `csi_port` 和 `image_coordinate_system="raw_pixel"`，
 各路的序号分别从零开始，采集时间仍是统一单调 ns。
 
 `RpicamSource` 的原始 YUV420 解码按目标 Raspberry Pi 5 PiSP 内存布局：
@@ -181,6 +186,7 @@ source = source_class(
     image_size=config.camera.image_size,
     fps=config.camera.fps,
     lens_position=config.camera.lens_position,
+    csi_port=config.camera.csi_port,
 )
 ```
 
@@ -243,6 +249,7 @@ with source, recorder:
 
 | 文件 | 用途 |
 | --- | --- |
+| `csi.py` | Pi 5 物理 CSI 接口选择，相机编号解析 |
 | `frame.py` | `CameraFrame`、`FrameSource` |
 | `picamera2_source.py` | 带逐帧元数据的最新帧源 |
 | `rpicam_source.py` | 基于 `rpicam-vid` 的最新帧源 |

@@ -87,6 +87,7 @@ def test_picamera2_source_returns_latest_frame_with_sensor_metadata() -> None:
     assert frame.metadata == {
         "source": "picamera2",
         "camera_index": 0,
+        "csi_port": None,
         "image_coordinate_system": "raw_pixel",
         "configured_fps": 20,
         "configured_lens_position": 0.95,
@@ -183,3 +184,17 @@ def test_picamera2_opens_requested_camera_index(monkeypatch) -> None:
     with Picamera2Source(image_size=(8, 6), lens_position=None, camera_index=1) as source:
         source.read()
     assert calls == [1]
+
+
+def test_picamera2_resolves_configured_physical_port(monkeypatch) -> None:
+    ports = []
+    def resolve(port):
+        ports.append(port)
+        return 1
+    monkeypatch.setattr(source_module, 'resolve_csi_camera_index', resolve)
+    camera = FakeCamera()
+    with Picamera2Source(image_size=(8, 6), csi_port=0, camera_factory=lambda: camera) as source:
+        frame = source.read()
+    assert ports == [0]
+    assert frame.metadata['csi_port'] == 0
+    assert frame.metadata['camera_index'] == 1

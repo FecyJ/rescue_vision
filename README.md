@@ -32,6 +32,8 @@ python -m pytest
 
 `tests/` 不访问相机或 Hailo。需要相机、显示器、Hailo 或本地标定资产的检查在 [`manual_tests/`](manual_tests/README.md)。
 
+双 CSI 相机由 YAML 的 `camera.csi_port` / `near_camera.csi_port` 选择物理接口；当前主相机接 CAM0、近场接 CAM1，详见[相机接口配置](src/rescue_vision/config/README.md#相机物理接口)。
+
 ### 3. 选择当前工作
 
 | 目的 | 从这里开始 |

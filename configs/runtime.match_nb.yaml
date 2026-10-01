@@ -4,10 +4,18 @@
 # 四区初始位姿由 match.start_poses 定义；NB 开场动作始终相对所选位姿执行。
 
 camera:
+  csi_port: 0  # CAM/DISP0：主相机 IMX708
   backend: rpicam_vid
   image_size: [2304, 1296]
   fps: 20
   lens_position: 0.9687536954879761
+
+near_camera:
+  csi_port: 1  # CAM/DISP1：近场 IMX219
+  backend: rpicam_vid
+  image_size: [1640, 1232]
+  fps: 20
+  lens_position: null  # IMX219 不发送焦点控制
 
 geometry:
   intrinsics_enabled: true

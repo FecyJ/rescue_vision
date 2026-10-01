@@ -172,6 +172,7 @@ def main() -> None:
         image_size=config.camera.image_size,
         fps=config.camera.fps,
         lens_position=config.camera.lens_position,
+        csi_port=config.camera.csi_port,
     )
 
     # 检测器从构造开始接管 backend；参数校验失败时也会先关闭设备。

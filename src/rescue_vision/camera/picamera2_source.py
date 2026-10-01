@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 
+from rescue_vision.camera.csi import resolve_csi_camera_index
 from rescue_vision.camera.frame import CameraFrame, MetadataValue
 from rescue_vision.exception_notes import add_exception_note
 
@@ -23,6 +24,7 @@ class Picamera2Source:
         lens_position: float | None = 1.0,
         *,
         camera_index: int = 0,
+        csi_port: int | None = None,
         camera_factory: Callable[[], Any] | None = None,
     ) -> None:
         if len(image_size) != 2 or any(value <= 0 for value in image_size):
@@ -41,6 +43,9 @@ class Picamera2Source:
         self._image_size = image_size
         self.fps = fps
         self.lens_position = lens_position
+        if csi_port is not None and (isinstance(csi_port, bool) or not isinstance(csi_port, int) or csi_port not in (0, 1)):
+            raise ValueError(f"csi_port must be 0 or 1, got {csi_port!r}.")
+        self.csi_port = csi_port
         self.camera_index = camera_index
         self._camera_factory = camera_factory
         self._camera: Any | None = None
@@ -62,6 +67,9 @@ class Picamera2Source:
             self._latest_frame = None
             self._delivered_sequence = -1
             self._reader_error = None
+
+        if self.csi_port is not None:
+            self.camera_index = resolve_csi_camera_index(self.csi_port)
 
         camera, manual_focus = self._create_camera()
         try:
@@ -269,6 +277,7 @@ class Picamera2Source:
         result: dict[str, MetadataValue] = {
             "source": "picamera2",
             "camera_index": self.camera_index,
+            "csi_port": self.csi_port,
             "image_coordinate_system": "raw_pixel",
             "configured_fps": self.fps,
             "configured_lens_position": self.lens_position,

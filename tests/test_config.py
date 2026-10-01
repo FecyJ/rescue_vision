@@ -1432,3 +1432,27 @@ def test_match_capture_rejects_invalid_yaml(tmp_path, value):
                     + f'\nmatch_capture:\n  {value}\n')
     with pytest.raises(ValueError, match='match_capture'):
         load_runtime_config(path)
+
+
+def test_camera_physical_ports_and_fixed_focus_near_camera_load(tmp_path) -> None:
+    raw = yaml.safe_load(Path('configs/runtime.match.yaml').read_text())
+    raw['camera']['csi_port'] = 1
+    raw['near_camera']['csi_port'] = 0
+    path = tmp_path / 'cameras.yaml'
+    path.write_text(yaml.safe_dump(raw))
+    config = load_runtime_config(path)
+    assert config.camera.csi_port == 1
+    assert config.near_camera.csi_port == 0
+    assert config.near_camera.image_size == (1640, 1232)
+    assert config.near_camera.lens_position is None
+
+
+@pytest.mark.parametrize('main_port,near_port', [(0, 0), (2, 1), (True, 1)])
+def test_camera_yaml_rejects_shared_or_invalid_physical_ports(tmp_path, main_port, near_port) -> None:
+    raw = yaml.safe_load(Path('configs/runtime.match.yaml').read_text())
+    raw['camera']['csi_port'] = main_port
+    raw['near_camera']['csi_port'] = near_port
+    path = tmp_path / 'cameras.yaml'
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match='csi_port'):
+        load_runtime_config(path)

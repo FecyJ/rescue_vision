@@ -1,4 +1,5 @@
 camera:
+  csi_port: 0  # CAM/DISP0：主相机 IMX708
   # picamera2 可记录逐帧曝光/增益等元数据；rpicam_vid 是低开销备选。
   backend: picamera2
   image_size: [2304, 1296]

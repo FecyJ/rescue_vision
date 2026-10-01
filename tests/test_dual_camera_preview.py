@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from dataclasses import replace
 from pathlib import Path
 from threading import Event
 from time import monotonic_ns
@@ -9,6 +10,7 @@ import numpy as np
 import pytest
 
 from rescue_vision.camera.frame import CameraFrame
+from rescue_vision.config import load_runtime_config
 from rescue_vision.geometry.types import UndistortedPixel
 from rescue_vision.perception.types import ModelDetection, PoseKeypoint, UndistortedBoundingBox
 
@@ -87,3 +89,44 @@ def test_near_preview_keeps_raw_identity_capture_time_and_input(preview_module) 
     assert output.metadata['result_timestamp_ns'] >= sample.timestamp_ns
     assert not sample.image_bgr.any()
     assert output.image_bgr.any()
+
+
+@pytest.mark.parametrize('override', [False, True])
+def test_preview_uses_yaml_ports_and_independent_near_settings(preview_module, monkeypatch, override) -> None:
+    config = load_runtime_config('configs/runtime.match.yaml')
+    config = replace(config, near_camera=replace(config.near_camera, backend='picamera2'))
+    created = []
+    closed = []
+    class FakeSource:
+        def __init__(self, **settings):
+            created.append((self.backend, settings))
+            self.delivered = False
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            closed.append(self.backend)
+        def read(self, timeout):
+            if self.delivered:
+                raise TimeoutError
+            self.delivered = True
+            return frame(0)
+    class Rpicam(FakeSource):
+        backend = 'rpicam_vid'
+    class Picamera(FakeSource):
+        backend = 'picamera2'
+    monkeypatch.setattr(preview_module, 'RpicamSource', Rpicam)
+    monkeypatch.setattr(preview_module, 'Picamera2Source', Picamera)
+    parser = preview_module.preview_parser('test')
+    argv = ['--headless', '--duration-seconds', '0.01']
+    if override:
+        argv += ['--main-csi-port', '1', '--near-csi-port', '0', '--near-size', '800', '480']
+    args = parser.parse_args(argv)
+    preview_module.validate_args(parser, args)
+    preview_module.run_preview(args, config)
+    assert created == [
+        ('rpicam_vid', dict(image_size=config.camera.image_size, fps=config.camera.fps,
+                           lens_position=config.camera.lens_position, csi_port=1 if override else 0)),
+        ('picamera2', dict(image_size=(800, 480) if override else (1640, 1232), fps=20,
+                          lens_position=None, csi_port=0 if override else 1)),
+    ]
+    assert closed == ['picamera2', 'rpicam_vid']

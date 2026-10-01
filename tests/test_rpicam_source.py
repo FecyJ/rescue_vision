@@ -144,6 +144,27 @@ def test_select_fixed_focus_camera_without_lens_option(monkeypatch) -> None:
     assert '--lens-position' not in commands[0]
 
 
+def test_rpicam_resolves_physical_port_before_starting_process(monkeypatch) -> None:
+    commands = []
+    resolved_ports = []
+    def resolve(port):
+        resolved_ports.append(port)
+        return 1
+    def create(command, **kwargs):
+        commands.append(command)
+        return FakeProcess(fake_payload(4, 4))
+    monkeypatch.setattr(source_module, 'resolve_csi_camera_index', resolve)
+    monkeypatch.setattr(source_module.subprocess, 'Popen', create)
+    camera = RpicamSource(image_size=(4, 4), csi_port=0, lens_position=None)
+    assert resolved_ports == []
+    with camera:
+        sample = camera.read(timeout=0.1)
+        assert sample.metadata['csi_port'] == 0
+        assert sample.metadata['camera_index'] == 1
+    assert resolved_ports == [0]
+    assert commands[0][commands[0].index('--camera') + 1] == '1'
+
+
 @pytest.mark.parametrize(('width', 'stride'), [(1640, 1664), (800, 896), (2304, 2304)])
 def test_pisp_yuv_padding_preserves_colors_and_next_frame(monkeypatch, width, stride) -> None:
     import cv2
